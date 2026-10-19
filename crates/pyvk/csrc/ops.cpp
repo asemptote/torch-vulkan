@@ -173,10 +173,6 @@ bool kind_allows(Kind kind, at::ScalarType t) {
   return false;
 }
 
-bool is_vk(const at::Tensor& t) {
-  return t.device().type() == kDevice;
-}
-
 at::Tensor to_dtype(const at::Tensor& t, at::ScalarType dtype) {
   return t.scalar_type() == dtype ? t : t.to(dtype);
 }
@@ -192,18 +188,6 @@ void with_output(const at::Tensor& out, at::ScalarType dtype, F&& body) {
     body(tmp);
     out.copy_(tmp);
   }
-}
-
-// Runs aten op `name.overload` on the CPU with these arguments (vk tensors
-// are copied over and mutated/out arguments copied back). Returns the stack.
-template <typename... Args>
-torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... args) {
-  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
-  record_fallback(*overload ? std::string(name) + "." + overload : std::string(name));
-  torch::jit::Stack stack;
-  (stack.emplace_back(args), ...);
-  at::native::cpu_fallback(op, &stack);
-  return stack;
 }
 
 // ---------------------------------------------------------------- unary

@@ -3,20 +3,54 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M3 — native PyTorch backend**: device `"vk"` is a real PyTorch
-backend implemented in C++ on the PrivateUse1 dispatch key. Element-wise ops,
-casts, copies and fills run as Vulkan kernels; every other op runs on the CPU
-through PyTorch's boxed fallback. Tested on an Intel UHD 620 with the
-validation layer clean.
+Status: **M4 — reductions, scans and float64 math**: device `"vk"` is a
+native PyTorch backend (C++ on PrivateUse1). Element-wise ops (float32 and
+float64, including exp/log/sin/cos/tanh/...), reductions (sum, mean, prod,
+max/min, argmax, var/std, norms, any/all) and scans (cumsum, cumprod) run as
+Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
+fallback. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
 import torch, torch_vulkan
 
 x = torch.randn(1_000_000, dtype=torch.float64, device="vk")  # random fill runs on the CPU
 y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
-print(y[:3], y.sum())           # sum runs on the CPU for now (warns once per op)
-torch_vulkan.fallback_counts()  # {'aten::normal_': 1, 'aten::sum.IntList_out': 1}
+print(y[:3], y.sum())           # sum is a Vulkan reduction
+torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Reductions, scans, float64 math (M4)
+
+- `shaders/reduce.slang` + `csrc/reduce.cpp`: tree reduction over any set of
+  dims (up to 4 non-mergeable kept and reduced dims each). Large reductions
+  are split into chunks across workgroups and the partials reduced again, so
+  float32 sums stay as accurate as the CPU's. When the reduced dims are
+  strided and outputs are adjacent (column reductions), each thread owns one
+  output so reads are coalesced. Integer and bool inputs accumulate in int64,
+  as in PyTorch. Ops: `sum`, `mean`, `prod`, `amax`/`amin`, `max`/`min`
+  (NaN-propagating), `var`/`std` (two passes, any correction),
+  `linalg.vector_norm` (ord 1, 2, ±inf), `any`/`all`.
+- `shaders/argreduce.slang`: (value, index) reduction for `argmax`/`argmin`
+  and `max`/`min` along a dim; ties and NaNs resolve to the first index, as on
+  the CPU.
+- `shaders/scan.slang`: `cumsum`/`cumprod` along any dim: per-chunk workgroup
+  scans, the chunk totals scanned recursively, then added back.
+- `shaders/_math64.slang`: float64 `exp`, `exp2`, `log`, `log2`, `sin`, `cos`,
+  `tan`, `tanh`, `sigmoid` (SPIR-V has no 64-bit transcendentals). Measured
+  against PyTorch's CPU over 200k inputs each plus special values: exp/exp2 ≤ 1
+  ULP, log/log2/sigmoid/tan ≤ 2 ULP, tanh ≤ 3 ULP, sin/cos ≤ 1 ULP of scale.
+  sin/cos/tan reduce arguments exactly up to |x| ≈ 1.6e6.
+- Kernels preserve denormals (`-denorm-mode-fp32/fp64 preserve`): the UHD 620
+  otherwise flushes subnormal float64 results to zero.
+
+Measured (`python benchmarks/elementwise.py`, 16M elements, UHD 620 vs 4-thread CPU):
+
+| | vk float32 | CPU float32 | vk float64 | CPU float64 |
+|---|---|---|---|---|
+| `sum()` | 2.5 ms | 2.7 ms | 8.7 ms | 4.9 ms |
+| `var(dim=1)`, 4096×4096 | 6.3 ms | 93 ms | 17 ms | 88 ms |
+| `amax(dim=0)`, 4096×4096 | 4.7 ms | 6.3 ms | 13 ms | 14 ms |
+| `cumsum` | 23 ms | 31 ms | 52 ms | 34 ms |
 
 ## PyTorch backend (M3)
 
@@ -57,8 +91,7 @@ coalesced (size, stride) dims, so broadcasting, transposes and slices need no co
 
 Precision: float32 `sin/cos/tan/exp/log/...` use the GPU's built-ins, which
 Vulkan only requires to be accurate to ~2^-11 absolute (sin/cos) or a few ULP;
-tests use those bounds. SPIR-V has no 64-bit transcendentals, so float64
-`exp/log/sin/...` currently run on the CPU (a float64 math library is planned).
+tests use those bounds. float64 uses `_math64.slang` (see M4).
 
 Measured (`python benchmarks/elementwise.py`, UHD 620 vs 4-thread CPU, torch 2.14.1):
 
@@ -141,12 +174,13 @@ crates/vkcore/             Rust Vulkan core
 crates/pyvk/               extension module torch_vulkan._native
   csrc/backend.cpp         allocator, device guard, hooks, views, resize, copies, CPU fallback
   csrc/ops.cpp             element-wise aten kernels (strided launches)
+  csrc/reduce.cpp          reductions, arg-reductions, scans
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_vk.py    140 tests: results on "vk" vs CPU, no unexpected fallbacks
-benchmarks/elementwise.py  per-op overhead and throughput vs CPU
+tests/python/test_vk.py    233 tests: results on "vk" vs CPU, no unexpected fallbacks
+benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
 pyproject.toml             maturin build of the Python package
 ```
 
@@ -183,7 +217,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 140 Python tests pass with no validation messages.
+All 233 Python tests pass with no validation messages.
 
 ## Roadmap
 
@@ -193,8 +227,10 @@ All 140 Python tests pass with no validation messages.
 3. ~~**M3 native backend**~~: done (see above). Not yet: bool binary ops
    (`&`, `*` on masks), multiple devices, pinned memory, a GPU random-number
    generator (random fills run on the CPU).
-4. **M4 reductions and scans**: sum/mean/var/norm/min/max, cumsum/cumprod/logcumsumexp;
-   float64 math library (exp/log/sin/cos/...) for the element-wise kernels.
+4. ~~**M4 reductions, scans, float64 math**~~: done (see above). Not yet:
+   `logcumsumexp`, `cummax`, `median`/`sort`-based ops, `masked_select`,
+   float64 `pow`/`atan2`, the arg-reduction thread-per-output mode, and
+   Payne-Hanek reduction for huge sin/cos arguments.
 5. **M5 matmul** (f32/f64, tiled, subgroup ops).
 6. **M6 complex dtypes + FFT** (VkFFT).
 7. **M7 linear algebra**: blocked LU/Cholesky/QR with GPU trailing updates; eigh/svd via CPU initially.

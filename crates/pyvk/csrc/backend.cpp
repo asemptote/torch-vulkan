@@ -308,7 +308,10 @@ extern "C" size_t vkt_fallback_counts(char* buf, size_t len) {
 // Called once from the Python module's init: registers everything. Kept as
 // an explicit call (rather than only static initializers) so the linker
 // cannot drop this object file from the extension.
+extern "C" void vkt_reduce_linked();
+
 extern "C" void vkt_register_backend() {
+  vkt_reduce_linked();  // keeps reduce.cpp (and its kernel registrations) in the link
   static bool done = false;
   if (done) {
     return;

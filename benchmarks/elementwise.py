@@ -38,6 +38,26 @@ def main():
         cpu_t = timed(lambda: (x * 2 + 1).relu(), reps, cpu_sync)
         gbs = 3 * 2 * x.numel() * x.element_size() / tv_t / 1e9
         print(f"  relu(x*2+1), 16M {str(dtype)[6:]:8s}       vk {tv_t * 1e3:7.1f} ms   cpu {cpu_t * 1e3:7.1f} ms   ({gbs:.1f} GB/s on vk)")
+    # Reductions and scans on 16M elements.
+    for dtype in (torch.float32, torch.float64):
+        x = torch.randn(1 << 24, dtype=dtype)
+        xv = x.to("vk")
+        m = x.view(4096, 4096)
+        mv = xv.view(4096, 4096)
+        for label, f in [
+            ("sum()", lambda t: t.sum()),
+            ("var(dim=1) 4096x4096", None),
+            ("amax(dim=0) 4096x4096", None),
+            ("cumsum", lambda t: t.cumsum(0)),
+        ]:
+            if f is None:
+                f = (lambda t: t.var(1)) if label.startswith("var") else (lambda t: t.amax(0))
+                a, b = mv, m
+            else:
+                a, b = xv, x
+            tv_t = timed(lambda: f(a), 5, tv.synchronize)
+            cpu_t = timed(lambda: f(b), 5, cpu_sync)
+            print(f"  {label:22s} 16M {str(dtype)[6:]:8s} vk {tv_t * 1e3:7.1f} ms   cpu {cpu_t * 1e3:7.1f} ms")
     print(f"  CPU fallbacks during benchmark: {tv.fallback_counts() or 'none'}")
 
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/native/CPUFallback.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +78,29 @@ void cpu_out(const char* op, const at::Tensor& out, F&& compute) {
 // the host, one dispatch per outer index.
 void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                     const at::Tensor* b, double alpha, int64_t alpha_i);
+
+inline bool is_vk(const at::Tensor& t) {
+  return t.device().type() == kDevice;
+}
+
+// Runs aten op `name.overload` on the CPU with these arguments (vk tensors
+// are copied over and mutated/out arguments copied back). Returns the stack.
+template <typename... Args>
+torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... args) {
+  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
+  record_fallback(*overload ? std::string(name) + "." + overload : std::string(name));
+  torch::jit::Stack stack;
+  (stack.emplace_back(args), ...);
+  at::native::cpu_fallback(op, &stack);
+  return stack;
+}
+
+// Queues `kernel` with a push-constant struct (at most 128 bytes).
+template <typename P>
+void dispatch(const std::string& kernel, const std::vector<uint32_t>& spec, const P& params, uint32_t groups) {
+  static_assert(sizeof(P) <= 128, "push constants are limited to 128 bytes");
+  check(vkt_dispatch(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params), sizeof(P), groups));
+}
 
 void register_ops();  // ops.cpp
 
