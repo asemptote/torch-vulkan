@@ -16,6 +16,7 @@ pub struct Capabilities {
     pub shader_int64: bool,
     pub shader_int16: bool,
     pub shader_float16: bool,
+    pub shader_int8: bool,
     pub buffer_device_address: bool,
     pub scalar_block_layout: bool,
     pub vulkan_memory_model: bool,
@@ -155,6 +156,7 @@ impl Context {
                 .timeline_semaphore(true)
                 .vulkan_memory_model(caps.vulkan_memory_model)
                 .shader_float16(caps.shader_float16)
+                .shader_int8(caps.shader_int8)
                 .storage_buffer8_bit_access(caps.storage_buffer_8bit);
             let core = vk::PhysicalDeviceFeatures::default()
                 .shader_float64(caps.shader_float64)
@@ -223,6 +225,7 @@ unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, p
         shader_int64: b(core.shader_int64),
         shader_int16: b(core.shader_int16),
         shader_float16: b(f12.shader_float16),
+        shader_int8: b(f12.shader_int8),
         buffer_device_address: b(f12.buffer_device_address),
         scalar_block_layout: b(f12.scalar_block_layout),
         vulkan_memory_model: b(f12.vulkan_memory_model),

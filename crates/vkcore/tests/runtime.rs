@@ -25,7 +25,7 @@ struct Axpy {
 
 fn fill(rt: &Runtime, y: u64, value: f64, n: u32) -> Result<()> {
     let (groups, stride) = rt.grid_1d(n as u64, 64);
-    rt.dispatch("fill_f64", &[], &Fill { y, value, n, stride }, [groups, 1, 1])
+    rt.dispatch("simple_fill_f64", &[], &Fill { y, value, n, stride }, [groups, 1, 1])
 }
 
 fn axpy(rt: &Runtime, accumulate: bool, a: f64, x: u64, y: u64, n: u32) -> Result<()> {

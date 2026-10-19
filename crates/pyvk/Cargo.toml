@@ -1,0 +1,14 @@
+[package]
+name = "pyvk"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Python bindings (torch_vulkan._native) for the vkcore runtime"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+vkcore = { path = "../vkcore" }
+pyo3 = { version = "0.30", features = ["abi3-py310"] }

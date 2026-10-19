@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vkcore"]
+members = ["crates/vkcore", "crates/pyvk"]
 resolver = "2"
 
 [workspace.package]

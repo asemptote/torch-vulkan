@@ -2,3 +2,5 @@ target/
 *.spv
 __pycache__/
 .venv/
+*.pyd
+.pytest_cache/

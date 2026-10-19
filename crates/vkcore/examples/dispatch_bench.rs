@@ -26,7 +26,7 @@ fn main() -> Result<()> {
         let t = Instant::now();
         for i in 0..ops {
             let p = Fill { y: y.address, value: i as f64, n, stride };
-            rt.dispatch("fill_f64", &[], &p, [groups, 1, 1])?;
+            rt.dispatch("simple_fill_f64", &[], &p, [groups, 1, 1])?;
             if sync_each {
                 rt.synchronize()?;
             }

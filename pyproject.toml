@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "torch-vulkan"
+version = "0.0.1"
+description = "Vulkan compute backend for PyTorch aimed at scientific workloads"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6"]
+license = { text = "MIT OR Apache-2.0" }
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[tool.maturin]
+manifest-path = "crates/pyvk/Cargo.toml"
+python-source = "python"
+module-name = "torch_vulkan._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
