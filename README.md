@@ -3,7 +3,8 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M0 — toolchain and core assumptions verified** on an Intel UHD 620.
+Status: **M1 — core runtime done** (memory pool, kernel cache, batched stream),
+tested on an Intel UHD 620 with the validation layer clean.
 
 ## Design decisions
 
@@ -34,14 +35,43 @@ Status: **M0 — toolchain and core assumptions verified** on an Intel UHD 620.
   max error 1.8e-15 vs CPU (FMA contraction), 15 ms GPU vs 22 ms single-thread CPU,
   ~18 GB/s effective bandwidth
 
+## Core runtime (M1)
+
+- **Memory pool** (`memory.rs`): tensors are sub-allocated (256 B aligned,
+  best fit, coalescing) from 64 MiB persistently mapped, device-addressable
+  blocks; larger requests get their own block. Freed memory is cached and
+  reused in stream order, like PyTorch's CUDA allocator; `trim()` returns
+  empty blocks to Vulkan, and allocation retries after trimming when out of memory.
+- **Kernel cache** (`kernels.rs`): one shared pipeline layout (no descriptor
+  sets, 128-byte push-constant block). Pipelines are keyed by
+  (kernel, specialization constants); compiled code persists across runs in
+  `%LOCALAPPDATA%\torch-vulkan\pipelines.bin` (override with `TORCH_VK_CACHE_DIR`).
+- **Stream** (`stream.rs`): in-order like a CUDA stream. Commands are recorded
+  with a full memory barrier between them and submitted in batches of up to
+  256, tracked by a timeline semaphore; command buffers are recycled.
+  The host must `synchronize()` before touching memory that queued work uses.
+- **Validation** (`context.rs`): `TORCH_VK_VALIDATE=1` enables the Khronos
+  validation layer with synchronization and best-practices checks; every
+  message is printed and counted, and the tests fail on any.
+
+Measured on the UHD 620 (`cargo run --release --example dispatch_bench`):
+synchronizing after every small kernel costs **486 µs/op**; batching brings it
+to **5.6 µs/op** (~87× less).
+
 ## Layout
 
 ```
 Cargo.toml                 workspace
 crates/vkcore/             Rust Vulkan core
-  src/lib.rs               Context (device, queue), Buffer (mapped + device address), Kernel, run()
-  shaders/*.slang          compute kernels, compiled to SPIR-V at build time
-  examples/smoke.rs        M0 hardware check
+  src/context.rs           device + queue, capabilities, validation reporting
+  src/memory.rs            caching sub-allocator (Pool, Allocation, RangeAllocator)
+  src/kernels.rs           pipeline cache + embedded SPIR-V table
+  src/stream.rs            batched in-order command stream
+  src/lib.rs               Runtime (all of the above) + helpers
+  shaders/*.slang          compute kernels, compiled to SPIR-V by build.rs
+  tests/runtime.rs         GPU tests (batching, dependencies, reuse, copies, pool, cache)
+  examples/smoke.rs        hardware check
+  examples/dispatch_bench.rs  per-op overhead, synchronized vs batched
 ```
 
 ## Building
@@ -55,22 +85,21 @@ $env:PATH = "$HOME\.cargo\bin;$env:PATH"
 cargo run --release --example smoke
 ```
 
-Run under validation (synchronization and best-practices checks included):
+Tests and examples under validation (synchronization and best-practices checks included):
 
 ```powershell
-$env:VK_INSTANCE_LAYERS = "VK_LAYER_KHRONOS_validation"
-$env:VK_KHRONOS_VALIDATION_VALIDATE_SYNC = "true"
-$env:VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES = "true"
+$env:TORCH_VK_VALIDATE = "1"
+cargo test --release
 cargo run --release --example smoke
 ```
 
-The M0 smoke test produces no validation messages.
+All 10 tests (3 allocator unit tests, 7 GPU tests) and both examples run with
+no validation messages.
 
 ## Roadmap
 
-1. **M1 core runtime**: sub-allocating memory pool, pipeline cache keyed by
-   (kernel, dtype, specialization), batched command recording with timeline
-   semaphores, async copies; validation-layer clean.
+1. ~~**M1 core runtime**~~: done (see above). Deferred: finer-grained barriers
+   (per-allocation dependency tracking) and a separate transfer queue.
 2. **M2 Python prototype**: PyO3 module + `__torch_dispatch__` tensor subclass;
    element-wise ops generated from one Slang template over (dtype, strides).
 3. **M3 C++ shim**: real `PrivateUse1` device `vk` -- allocator, device guard,
