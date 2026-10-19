@@ -42,7 +42,7 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .files(["csrc/backend.cpp", "csrc/ops.cpp", "csrc/reduce.cpp"])
+        .files(["csrc/backend.cpp", "csrc/ops.cpp", "csrc/reduce.cpp", "csrc/linalg.cpp"])
         .include(&include)
         .include(include.join("torch/csrc/api/include"))
         .define("NOMINMAX", None)

@@ -25,7 +25,8 @@ const char* vkt_last_error();
 int vkt_alloc(uint64_t nbytes, VktAlloc* out);
 void vkt_free(void* handle);
 int vkt_synchronize();
-int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush, uint32_t groups);
+int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush, uint32_t gx,
+                 uint32_t gy, uint32_t gz);
 int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
 int vkt_has_float64();
 }
@@ -95,11 +96,14 @@ torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... 
   return stack;
 }
 
-// Queues `kernel` with a push-constant struct (at most 128 bytes).
+// Queues `kernel` with a push-constant struct (at most 128 bytes) over a
+// gx x gy x gz grid of workgroups.
 template <typename P>
-void dispatch(const std::string& kernel, const std::vector<uint32_t>& spec, const P& params, uint32_t groups) {
+void dispatch(const std::string& kernel, const std::vector<uint32_t>& spec, const P& params, uint32_t gx,
+              uint32_t gy = 1, uint32_t gz = 1) {
   static_assert(sizeof(P) <= 128, "push constants are limited to 128 bytes");
-  check(vkt_dispatch(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params), sizeof(P), groups));
+  check(vkt_dispatch(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params), sizeof(P), gx,
+                     gy, gz));
 }
 
 void register_ops();  // ops.cpp

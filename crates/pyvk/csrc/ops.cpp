@@ -142,7 +142,7 @@ void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Te
     p.out = base[0] + offset[0] * itemsize[0];
     p.a = a ? base[1] + offset[1] * itemsize[1] : 0;
     p.b = b ? base[2] + offset[2] * itemsize[2] : 0;
-    check(vkt_dispatch(kernel, spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&p), sizeof(p), groups));
+    check(vkt_dispatch(kernel, spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&p), sizeof(p), groups, 1, 1));
 
     size_t j = 0;
     for (; j < index.size(); ++j) {

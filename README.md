@@ -3,11 +3,11 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M4 — reductions, scans and float64 math**: device `"vk"` is a
-native PyTorch backend (C++ on PrivateUse1). Element-wise ops (float32 and
-float64, including exp/log/sin/cos/tanh/...), reductions (sum, mean, prod,
-max/min, argmax, var/std, norms, any/all) and scans (cumsum, cumprod) run as
-Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
+Status: **M5 — matrix products**: device `"vk"` is a native PyTorch backend
+(C++ on PrivateUse1). Element-wise ops (float32 and float64, including
+exp/log/sin/cos/tanh/...), reductions (sum, mean, prod, max/min, argmax,
+var/std, norms, any/all), scans (cumsum, cumprod) and matrix products (mm,
+bmm, matmul, addmm, baddbmm, addmv, dot, nn.Linear) run as Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
 fallback. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
@@ -18,6 +18,32 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Matrix products (M5)
+
+- `shaders/gemm.slang` + `csrc/linalg.cpp`: one batched GEMM,
+  `C = alpha * A @ B + beta * Cin`, used by `mm`, `bmm`, `addmm`, `baddbmm`
+  and `addmv` (PyTorch composes `matmul`, `mv`, `nn.Linear`, `einsum` from
+  these); `dot` is a product plus a sum reduction. Operands are addressed by
+  (row, column, batch) strides, so transposes (autograd's `A.t() @ grad`),
+  slices and broadcast batches need no copies. `beta = 0` ignores `Cin`
+  entirely (NaNs in it do not leak through), as on the CPU.
+- 64x64 output tiles per 16x16 workgroup, K staged through shared memory in
+  slices of 16, a 4x4 register block per thread. Larger tiles (128x128/8x8,
+  128x64, 64x128) were measured and are slower on the UHD 620.
+- float32 and float64; integer matrix products run on the CPU.
+
+Measured (`python benchmarks/matmul.py`, UHD 620 vs 4-thread CPU with MKL):
+
+| | vk | CPU |
+|---|---|---|
+| float32 1024³ | 55 GFLOP/s | 193 GFLOP/s |
+| float32 2048³ | 87 GFLOP/s | 140 GFLOP/s |
+| float64 2048³ | 23 GFLOP/s | 69 GFLOP/s |
+
+On this integrated GPU, matrix products are still slower than MKL on the
+CPU (the kernel reaches ~20% of the GPU's float32 peak); a subgroup-based
+kernel and per-GPU tuning are future work. On discrete GPUs the balance differs.
 
 ## Reductions, scans, float64 math (M4)
 
@@ -175,12 +201,14 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/backend.cpp         allocator, device guard, hooks, views, resize, copies, CPU fallback
   csrc/ops.cpp             element-wise aten kernels (strided launches)
   csrc/reduce.cpp          reductions, arg-reductions, scans
+  csrc/linalg.cpp          matrix products (batched strided GEMM)
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_vk.py    233 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_vk.py    253 tests: results on "vk" vs CPU, no unexpected fallbacks
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
+benchmarks/matmul.py       matrix multiply GFLOP/s vs CPU
 pyproject.toml             maturin build of the Python package
 ```
 
@@ -217,7 +245,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 233 Python tests pass with no validation messages.
+All 253 Python tests pass with no validation messages.
 
 ## Roadmap
 
@@ -231,7 +259,9 @@ All 233 Python tests pass with no validation messages.
    `logcumsumexp`, `cummax`, `median`/`sort`-based ops, `masked_select`,
    float64 `pow`/`atan2`, the arg-reduction thread-per-output mode, and
    Payne-Hanek reduction for huge sin/cos arguments.
-5. **M5 matmul** (f32/f64, tiled, subgroup ops).
+5. ~~**M5 matrix products**~~: done (see above). Not yet: a faster
+   subgroup/cooperative-matrix kernel, integer and half-precision GEMM,
+   convolutions.
 6. **M6 complex dtypes + FFT** (VkFFT).
 7. **M7 linear algebra**: blocked LU/Cholesky/QR with GPU trailing updates; eigh/svd via CPU initially.
 8. **Testing throughout**: PyTorch OpInfo samples compared against CPU.

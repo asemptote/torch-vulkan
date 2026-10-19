@@ -80,9 +80,18 @@ pub extern "C" fn vkt_synchronize() -> i32 {
 }
 
 /// Queues kernel `name` specialized with `spec[..nspec]`, with `push[..npush]`
-/// as push constants, over `groups` workgroups.
+/// as push constants, over a gx x gy x gz grid of workgroups.
 #[no_mangle]
-pub unsafe extern "C" fn vkt_dispatch(name: *const c_char, spec: *const u32, nspec: usize, push: *const u8, npush: usize, groups: u32) -> i32 {
+pub unsafe extern "C" fn vkt_dispatch(
+    name: *const c_char,
+    spec: *const u32,
+    nspec: usize,
+    push: *const u8,
+    npush: usize,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+) -> i32 {
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(e) => return fail(e),
@@ -94,7 +103,7 @@ pub unsafe extern "C" fn vkt_dispatch(name: *const c_char, spec: *const u32, nsp
         Ok(k) => k,
         Err(e) => return fail(e),
     };
-    let queued = rt.stream.lock().unwrap().dispatch(&kernel, push, [groups, 1, 1]);
+    let queued = rt.stream.lock().unwrap().dispatch(&kernel, push, [gx, gy, gz]);
     status(queued)
 }
 
