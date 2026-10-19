@@ -1,4 +1,4 @@
-"""torch_vulkan M2 tests: results on device "vk" must match the CPU.
+"""torch_vulkan tests: results on device "vk" must match the CPU.
 
 Run with TORCH_VK_VALIDATE=1 to also fail on any Vulkan validation message.
 """
@@ -45,8 +45,7 @@ def make(shape, dtype, seed=0, positive=False):
 
 
 def check(vk_result, cpu_result, **tol):
-    assert isinstance(vk_result, tv.VkTensor), type(vk_result)
-    assert vk_result.device.type == "vk"
+    assert vk_result.device.type == "vk", vk_result.device
     torch.testing.assert_close(vk_result.cpu(), cpu_result, **tol)
 
 
@@ -57,7 +56,7 @@ def check(vk_result, cpu_result, **tol):
 def test_roundtrip(dtype):
     x = torch.arange(24).reshape(4, 6).to(dtype)
     v = x.to("vk")
-    assert isinstance(v, tv.VkTensor) and v.device == torch.device("vk", 0) and v.dtype == dtype
+    assert v.device == torch.device("vk", 0) and v.dtype == dtype
     assert torch.equal(v.cpu(), x)
 
 
@@ -70,11 +69,18 @@ def test_noncontiguous_upload_and_download():
 
 # ---------------------------------------------------------------- element-wise
 
+F32, FLOAT = [torch.float32], [torch.float32, torch.float64]
+UNARY_KINDS = {
+    **{name: NUMERIC for name in ["neg", "abs", "relu", "sign"]},
+    **{name: FLOAT for name in ["reciprocal", "sqrt", "rsqrt", "floor", "ceil", "trunc", "round"]},
+    **{name: F32 for name in ["exp", "log", "sin", "cos", "tanh", "sigmoid", "exp2", "log2", "tan"]},
+}
+
 UNARY_CASES = [
     (name, dtype)
-    for name, (_, kind) in tv._tensor.UNARY.items()
+    for name, kind in UNARY_KINDS.items()
     for dtype in NUMERIC
-    if tv._kernels.kind_allows(kind, dtype)
+    if dtype in kind
 ]
 
 
@@ -196,7 +202,7 @@ def test_inplace_binary_and_slices():
     with on_gpu():
         v[:, 1] += 1
         v[::2] *= 3
-        v.sub_(v[0], alpha=0.5)
+        v.sub_(v[0].clone(), alpha=0.5)  # (an overlapping input is rejected, as on the CPU)
     x[:, 1] += 1
     x[::2] *= 3
     x.sub_(x[0].clone(), alpha=0.5)
@@ -223,11 +229,33 @@ def test_strided_views_share_memory():
     check(e, x[:, :1].expand(4, 3) * 2)
 
 
-def test_many_dims_fall_back_correctly():
-    x = make((2, 3, 2, 3, 2), torch.float32)
-    p = x.permute(4, 2, 0, 3, 1)  # 5 dims that cannot be merged
-    check(x.to("vk").permute(4, 2, 0, 3, 1) + 1, p + 1)
-    assert tv.fallback_counts().get("aten.add.Tensor", 0) > 0
+def test_more_than_four_dims_on_gpu():
+    x = make((2, 3, 2, 3, 2, 2), torch.float32)
+    p = x.permute(5, 4, 2, 0, 3, 1)  # 6 dims that cannot be merged: outer ones loop on the host
+    with on_gpu():
+        got = x.to("vk").permute(5, 4, 2, 0, 3, 1) + 1
+    check(got, p + 1)
+
+
+def test_out_argument_of_wrong_size_is_resized():
+    # torch-directml and pytorch_ocl both return an empty tensor here (eye.m_out
+    # through their CPU fallback); the result must be resized and filled.
+    check(torch.eye(4, device="vk"), torch.eye(4))
+    out = torch.empty(0, device="vk")
+    torch.add(torch.ones(3, device="vk"), 1, out=out)
+    check(out, torch.full((3,), 2.0))
+    r = torch.empty(0, device="vk")
+    torch.arange(5, out=r)
+    check(r, torch.arange(5).float())
+
+
+def test_inplace_metadata_ops():
+    v = make((3, 4), torch.float32).to("vk")
+    x = v.cpu()
+    v.transpose_(0, 1).unsqueeze_(0)
+    check(v, x.t().unsqueeze(0))
+    v.resize_(2, 6)
+    assert v.shape == (2, 6)
 
 
 # ---------------------------------------------------------------- factories, fallback, autograd
@@ -249,11 +277,11 @@ def test_factories():
 
 def test_cpu_fallback_matches_and_is_counted():
     x = make((20,), torch.float64)
-    before = tv.fallback_counts().get("aten.exp.default", 0)
+    before = tv.fallback_counts().get("aten::exp.out", 0)
     with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
         got = x.to("vk").exp()  # float64 exp has no kernel yet
     check(got, x.exp())
-    assert tv.fallback_counts()["aten.exp.default"] == before + 1
+    assert tv.fallback_counts()["aten::exp.out"] == before + 1
     check(x.to("vk").sum(), x.sum())
 
 
@@ -262,7 +290,6 @@ def test_autograd():
     xv = x.detach().to("vk").requires_grad_()
     (xv * xv + 3 * xv).relu().sum().backward()
     (x * x + 3 * x).relu().sum().backward()
-    assert isinstance(xv.grad, tv.VkTensor)
     check(xv.grad, x.grad)
 
 

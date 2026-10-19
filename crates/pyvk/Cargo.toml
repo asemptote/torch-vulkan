@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 vkcore = { path = "../vkcore" }
 pyo3 = { version = "0.30", features = ["abi3-py310"] }
+
+[build-dependencies]
+cc = "1"

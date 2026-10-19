@@ -5,43 +5,54 @@
     y = (x * 2 + 1).relu()
     print(y.cpu())
 
-Prototype (M2): tensors are `VkTensor` subclass instances; element-wise ops,
-casts, copies and fills run as Vulkan kernels, everything else runs on the
-CPU with a one-time warning per op (see `fallback_counts()`).
+Importing this module registers a PyTorch backend on the PrivateUse1 key
+(implemented in C++, see crates/pyvk/csrc) and names it "vk". Element-wise
+ops, casts, copies and fills run as Vulkan kernels; every other op runs on
+the CPU with a one-time warning (see `fallback_counts()`).
 """
 
 import atexit
+import sys
+import types
 
 import torch
-from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
 
-# Device "vk" (PyTorch's built-in "vulkan" device type belongs to its old,
-# unmaintained mobile backend). This also registers the device guard, hooks
-# and device module that autograd and factory functions expect.
-_setup_privateuseone_for_python_backend("vk")
+# "vk" rather than "vulkan": PyTorch's built-in "vulkan" device type belongs
+# to its old, unmaintained mobile backend.
+torch.utils.rename_privateuse1_backend("vk")
 
-from . import _native  # noqa: E402
-from ._tensor import VkTensor, empty, fallback_counts, from_cpu, to_cpu, to_vk  # noqa: E402
+from . import _native  # noqa: E402  (registers the C++ backend)
+
+torch.utils.generate_methods_for_privateuse1_backend()
 
 __all__ = [
-    "VkTensor",
+    "device_count",
     "device_name",
-    "empty",
     "empty_cache",
     "fallback_counts",
-    "from_cpu",
+    "is_available",
     "memory_stats",
     "synchronize",
-    "to_cpu",
-    "to_vk",
 ]
+
+
+def is_available():
+    try:
+        _native.device_name()
+        return True
+    except RuntimeError:
+        return False
+
+
+def device_count():
+    return 1 if is_available() else 0
 
 
 def device_name():
     return _native.device_name()
 
 
-def synchronize():
+def synchronize(device=None):
     """Waits for all queued GPU work."""
     _native.synchronize()
 
@@ -56,58 +67,30 @@ def empty_cache():
     _native.empty_cache()
 
 
-# Factory functions with device="vk" reach PrivateUse1 kernels. `empty` and
-# `empty_strided` create VkTensors directly; ops like zeros/ones/randn are
-# built from them plus in-place ops that VkTensor dispatch handles. Factories
-# that fill an `out=` tensor of unknown size (arange, linspace, eye) are
-# computed on the CPU and uploaded.
-_lib = torch.library.Library("aten", "IMPL")
+def fallback_counts():
+    """{op: count} of aten ops that ran on the CPU instead of the GPU."""
+    return dict(_native.fallback_counts())
 
 
-def _factory_empty(size, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None):
-    return empty(size, dtype)
+def _device_module():
+    # torch.vk: what PyTorch expects of a backend's device module.
+    mod = types.ModuleType("torch.vk")
+    mod.is_available = is_available
+    mod.device_count = device_count
+    mod.current_device = lambda: 0
+    mod.set_device = lambda device: None
+    mod.synchronize = synchronize
+    mod.is_initialized = lambda: True
+    mod._is_in_bad_fork = lambda: False
+    mod.manual_seed = lambda seed: None
+    mod.manual_seed_all = lambda seed: None
+    mod.get_amp_supported_dtype = lambda: [torch.float32]
+    mod._lazy_init = lambda: None
+    return mod
 
 
-def _factory_empty_strided(size, stride, *, dtype=None, layout=None, device=None, pin_memory=None):
-    from ._tensor import empty_strided
-
-    return empty_strided(size, stride, dtype or torch.get_default_dtype())
-
-
-def _via_cpu(op):
-    def factory(*args, **kwargs):
-        kwargs["device"] = torch.device("cpu")
-        return from_cpu(op(*args, **kwargs))
-
-    return factory
-
-
-def _routed(op):
-    # Ops that reach the vk backend key without passing through VkTensor's
-    # Python dispatch (e.g. C++ copy_ calling _copy_from) get the same handling.
-    def kernel(*args, **kwargs):
-        return VkTensor.__torch_dispatch__(op, (), args, kwargs)
-
-    return kernel
-
-
-for _name, _op in [
-    ("_copy_from", torch.ops.aten._copy_from.default),
-    ("_copy_from_and_resize", torch.ops.aten._copy_from_and_resize.default),
-]:
-    _lib.impl(_name, _routed(_op), "PrivateUse1")
-
-_lib.impl("empty.memory_format", _factory_empty, "PrivateUse1")
-_lib.impl("empty_strided", _factory_empty_strided, "PrivateUse1")
-for _name, _op in [
-    ("arange", torch.ops.aten.arange.default),
-    ("arange.start", torch.ops.aten.arange.start),
-    ("arange.start_step", torch.ops.aten.arange.start_step),
-    ("linspace", torch.ops.aten.linspace.default),
-    ("eye", torch.ops.aten.eye.default),
-    ("eye.m", torch.ops.aten.eye.m),
-]:
-    _lib.impl(_name, _via_cpu(_op), "PrivateUse1")
+torch._register_device_module("vk", _device_module())
+sys.modules["torch.vk"] = torch.vk
 
 
 @atexit.register

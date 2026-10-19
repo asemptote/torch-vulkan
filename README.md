@@ -3,9 +3,11 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M2 — Python prototype**: PyTorch tensors on device `"vk"` with
-element-wise ops, casts, copies and fills running as Vulkan kernels; every other
-op falls back to the CPU. Tested on an Intel UHD 620 with the validation layer clean.
+Status: **M3 — native PyTorch backend**: device `"vk"` is a real PyTorch
+backend implemented in C++ on the PrivateUse1 dispatch key. Element-wise ops,
+casts, copies and fills run as Vulkan kernels; every other op runs on the CPU
+through PyTorch's boxed fallback. Tested on an Intel UHD 620 with the
+validation layer clean.
 
 ```python
 import torch, torch_vulkan
@@ -13,43 +15,61 @@ import torch, torch_vulkan
 x = torch.randn(1_000_000, dtype=torch.float64, device="vk")  # random fill runs on the CPU
 y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum runs on the CPU for now (warns once per op)
-torch_vulkan.fallback_counts()  # {'aten.normal_.default': 1, 'aten.sum.default': 1}
+torch_vulkan.fallback_counts()  # {'aten::normal_': 1, 'aten::sum.IntList_out': 1}
 ```
 
-## Python prototype (M2)
+## PyTorch backend (M3)
 
-- `python/torch_vulkan`: `VkTensor`, a `torch.Tensor` wrapper subclass on
-  device `vk:0` holding a pool allocation. All aten ops reach
-  `__torch_dispatch__` (below autograd, so `backward()` works) and are handled by
-  a Vulkan kernel, by meta-tensor shape math for views (they share the buffer),
-  or by a CPU fallback that copies operands and writes back mutated arguments.
-- `torch.utils.backend_registration._setup_privateuseone_for_python_backend`
-  registers the device guard, hooks and device module autograd expects; factory
-  functions (`torch.zeros(..., device="vk")`, `.to("vk")`) reach small
-  `torch.library` kernels on PrivateUse1.
-- `crates/pyvk`: PyO3 module `torch_vulkan._native` (alloc, upload, download,
-  dispatch with a packed push-constant block, synchronize, stats).
-- Kernels are Slang templates compiled per dtype (`// axis T: ...` lines in the
-  shader; see `build.rs`), with the op chosen by a specialization constant:
-  `unary` (20 ops), `binary` (11, with scalar operands and `alpha`), `compare`
-  (6, bool out), `cast` (all 25 pairs of f32/f64/i32/i64/bool; also strided
-  copies), `fill`. Operands are addressed as pointer + up to 4 coalesced
-  (size, stride) dims, so broadcasting, transposes and slices need no copies.
-- Precision: float32 `sin/cos/tan/exp/log/...` use the GPU's built-ins, which
-  Vulkan only requires to be accurate to ~2^-11 absolute (sin/cos) or a few ULP;
-  tests use those bounds. SPIR-V has no 64-bit transcendentals, so float64
-  `exp/log/sin/...` currently fall back to the CPU (a float64 math library is planned).
+- `crates/pyvk/csrc/backend.cpp`: a `c10::Allocator` over the Rust memory pool
+  (`data_ptr()` is the host-mapped address; the GPU address is derived from the
+  allocation context), a device guard, `PrivateUse1HooksInterface`, and aten
+  kernels for `empty`/`empty_strided`, views (`view`, `as_strided`,
+  `_reshape_alias`), `resize_` (grows storage, keeps contents), `set_`,
+  `_copy_from`/`_copy_from_and_resize` (CPU <-> vk and vk <-> vk with
+  broadcasting and dtype conversion), `_local_scalar_dense`, `fill_`, `zero_`.
+- `crates/pyvk/csrc/ops.cpp`: the `.out` overloads of structured ops (PyTorch's
+  generated functional/in-place variants call them): 19 unary ops plus `relu`,
+  11 binary ops (scalar operands, `alpha`, scalar-first `sub`), 6 comparisons
+  (Tensor and Scalar), all with PyTorch's type promotion. Cases without a
+  kernel (e.g. float64 `exp`) run the same overload through
+  `at::native::cpu_fallback`, so results stay correct.
+- Every other op: a boxed PrivateUse1 fallback to the CPU, counted in
+  `torch_vulkan.fallback_counts()` and warned about once per op. Its results
+  are written back with `_copy_from_and_resize`, which resizes `out=`
+  arguments (the empty-result bug of torch-directml and pytorch_ocl is tested).
+- Strided launches merge contiguous dims; tensors with more than 4
+  non-mergeable dims loop over the outer dims on the host (one dispatch each).
+- `crates/pyvk/src/ffi.rs`: the C ABI from C++ to the Rust runtime (alloc, free,
+  dispatch, synchronize); the C++ is compiled by `crates/pyvk/build.rs` against
+  the libtorch of the target Python and linked into the same extension module.
+- `python/torch_vulkan`: names the backend `vk`, registers `torch.vk`, adds
+  `Tensor.vk()`, and exposes `synchronize`, `memory_stats`, `empty_cache`,
+  `fallback_counts`.
+
+The M2 prototype (a `__torch_dispatch__` tensor subclass) is replaced; its
+kernels and tests carry over.
+
+Kernels are Slang templates compiled per dtype (`// axis T: ...` lines in the
+shader; see `build.rs`), with the op chosen by a specialization constant:
+`unary`, `binary`, `compare`, `cast` (all 25 pairs of f32/f64/i32/i64/bool;
+also strided copies) and `fill`. Operands are addressed as pointer + up to 4
+coalesced (size, stride) dims, so broadcasting, transposes and slices need no copies.
+
+Precision: float32 `sin/cos/tan/exp/log/...` use the GPU's built-ins, which
+Vulkan only requires to be accurate to ~2^-11 absolute (sin/cos) or a few ULP;
+tests use those bounds. SPIR-V has no 64-bit transcendentals, so float64
+`exp/log/sin/...` currently run on the CPU (a float64 math library is planned).
 
 Measured (`python benchmarks/elementwise.py`, UHD 620 vs 4-thread CPU, torch 2.14.1):
 
-| | vk | CPU |
-|---|---|---|
-| per-op overhead, 1024 floats | 136 µs | 22 µs |
-| `relu(x*2+1)`, 16M float32 | 29 ms | 33 ms |
-| `relu(x*2+1)`, 16M float64 | 40 ms | 71 ms |
+| | vk (M3, C++) | vk (M2, Python) | CPU |
+|---|---|---|---|
+| per-op overhead, 1024 floats | 9 µs | 136 µs | 7 µs |
+| `relu(x*2+1)`, 16M float32 | 27 ms | 29 ms | 27 ms |
+| `relu(x*2+1)`, 16M float64 | 37 ms | 40 ms | 51 ms |
 
-Large arrays are already faster than the CPU (memory-bound, ~14–20 GB/s);
-small ops are dominated by Python dispatch, which the C++ shim (M3) removes.
+Large arrays are memory-bound (~15–22 GB/s on this integrated GPU); per-op
+overhead is now close to the CPU's.
 
 ## Design decisions
 
@@ -57,7 +77,7 @@ small ops are dominated by Python dispatch, which the C++ shim (M3) removes.
 |---|---|---|
 | GPU API | Vulkan 1.3 via [`ash`](https://crates.io/crates/ash) | float64/int64, raw device pointers, explicit memory types, low dispatch overhead; runs on Intel, AMD, NVIDIA |
 | Core language | Rust (`crates/vkcore`) | Memory/queue/pipeline management; exposed through a C ABI so only a thin layer is tied to PyTorch's C++ ABI |
-| PyTorch integration | Thin C++ shim on `PrivateUse1` (later), with a `__torch_dispatch__` + PyO3 prototype first | PyTorch's backend API is C++-only; the shim is the only part rebuilt per PyTorch release |
+| PyTorch integration | C++ backend on `PrivateUse1` (`crates/pyvk/csrc`), calling the Rust core through a C ABI | PyTorch's backend API is C++-only; only this layer is tied to a PyTorch release |
 | Device name | `vk` | PyTorch already has a built-in `vulkan` device type (its old, unmaintained mobile backend) |
 | Tensor addressing | `VK_KHR_buffer_device_address`: tensors are `(pointer, offset, sizes, strides)` passed in push constants | Views and strides become pointer arithmetic, as in CUDA; no descriptor sets |
 | Memory | Prefer device-local + host-visible + coherent memory | On integrated GPUs (UHD 620, Strix Halo) CPU and GPU share tensors with no copies |
@@ -118,9 +138,14 @@ crates/vkcore/             Rust Vulkan core
   tests/runtime.rs         GPU tests (batching, dependencies, reuse, copies, pool, cache)
   examples/smoke.rs        hardware check
   examples/dispatch_bench.rs  per-op overhead, synchronized vs batched
-crates/pyvk/               PyO3 bindings -> torch_vulkan._native
-python/torch_vulkan/       VkTensor, op dispatch, kernel launch, device registration
-tests/python/test_vk.py    138 tests: results on "vk" vs CPU, no unexpected fallbacks
+crates/pyvk/               extension module torch_vulkan._native
+  csrc/backend.cpp         allocator, device guard, hooks, views, resize, copies, CPU fallback
+  csrc/ops.cpp             element-wise aten kernels (strided launches)
+  src/ffi.rs               C ABI from C++ to the Rust runtime
+  src/lib.rs               Python functions (synchronize, stats, fallback counts)
+  build.rs                 compiles csrc/ against the target Python's libtorch
+python/torch_vulkan/       backend naming and torch.vk device module
+tests/python/test_vk.py    140 tests: results on "vk" vs CPU, no unexpected fallbacks
 benchmarks/elementwise.py  per-op overhead and throughput vs CPU
 pyproject.toml             maturin build of the Python package
 ```
@@ -154,23 +179,20 @@ uv venv .venv --python 3.12
 $env:VIRTUAL_ENV = "$PWD\.venv"
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install numpy pytest maturin
-.\.venv\Scripts\maturin develop --release --uv
+.\.venv\Scripts\maturin develop --release --uv   # compiles csrc/ against this venv's torch
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 138 Python tests pass with no validation messages.
+All 140 Python tests pass with no validation messages.
 
 ## Roadmap
 
 1. ~~**M1 core runtime**~~: done (see above). Deferred: finer-grained barriers
    (per-allocation dependency tracking) and a separate transfer queue.
-2. ~~**M2 Python prototype**~~: done (see above). Known gaps: ops that change a
-   tensor's shape in place (`resize_`, `transpose_`, `out=` arguments of the
-   wrong size) raise `NotImplementedError`; >4 non-mergeable dims, float64
-   transcendentals and everything non-element-wise run on the CPU.
-3. **M3 C++ shim**: real `PrivateUse1` device `vk` -- allocator, device guard,
-   `empty_strided`/`copy_`/`resize_`/`as_strided`/`view`, CPU fallback
-   (and a test for the empty-result bug seen with `out=` fallbacks in other backends).
+2. ~~**M2 Python prototype**~~: done; superseded by M3.
+3. ~~**M3 native backend**~~: done (see above). Not yet: bool binary ops
+   (`&`, `*` on masks), multiple devices, pinned memory, a GPU random-number
+   generator (random fills run on the CPU).
 4. **M4 reductions and scans**: sum/mean/var/norm/min/max, cumsum/cumprod/logcumsumexp;
    float64 math library (exp/log/sin/cos/...) for the element-wise kernels.
 5. **M5 matmul** (f32/f64, tiled, subgroup ops).
