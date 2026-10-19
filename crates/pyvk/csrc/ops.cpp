@@ -219,10 +219,10 @@ constexpr UnaryOp kUnary[] = {
     {"aten::neg", 0, Kind::Numeric},       {"aten::abs", 1, Kind::Numeric},     {"aten::sign", 4, Kind::Numeric},
     {"aten::reciprocal", 10, Kind::Float}, {"aten::sqrt", 11, Kind::Float},     {"aten::rsqrt", 12, Kind::Float},
     {"aten::floor", 13, Kind::Float},      {"aten::ceil", 14, Kind::Float},     {"aten::trunc", 15, Kind::Float},
-    {"aten::round", 16, Kind::Float},      {"aten::exp", 20, Kind::Float32},    {"aten::log", 21, Kind::Float32},
-    {"aten::sin", 22, Kind::Float32},      {"aten::cos", 23, Kind::Float32},    {"aten::tanh", 24, Kind::Float32},
-    {"aten::sigmoid", 25, Kind::Float32},  {"aten::exp2", 26, Kind::Float32},   {"aten::log2", 27, Kind::Float32},
-    {"aten::tan", 28, Kind::Float32},
+    {"aten::round", 16, Kind::Float},      {"aten::exp", 20, Kind::Float},      {"aten::log", 21, Kind::Float},
+    {"aten::sin", 22, Kind::Float},        {"aten::cos", 23, Kind::Float},      {"aten::tanh", 24, Kind::Float},
+    {"aten::sigmoid", 25, Kind::Float},    {"aten::exp2", 26, Kind::Float},     {"aten::log2", 27, Kind::Float},
+    {"aten::tan", 28, Kind::Float},
 };
 
 constexpr uint32_t kRelu = 2;
@@ -234,7 +234,7 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   if (!kind_allows(kind, dtype) || label == nullptr || !is_vk(self) || !is_vk(out)) {
     return false;
   }
-  if (kind == Kind::Float && !at::isFloatingType(self.scalar_type()) && code >= 13 && code <= 16) {
+  if (!at::isFloatingType(self.scalar_type()) && code >= 13 && code <= 16) {
     return false;  // floor/ceil/trunc/round of integers keep the integer dtype
   }
   at::Tensor input = to_dtype(self, dtype);  // e.g. sqrt(int) computes in float

@@ -4,13 +4,15 @@
 // the driver compiles away every other case. Op codes must match
 // python/torch_vulkan/_ops.py.
 //
-// GLSL.std.450 has no 64-bit exp/log/sin/cos/tanh/pow, so the transcendental
-// ops exist only for float32 here; float64 versions need a software math
-// library (planned).
+// GLSL.std.450 has no 64-bit exp/log/sin/cos/tanh, so float64 uses the
+// software implementations in _math64.slang; float32 uses the GPU built-ins.
 
 #define OUT_T T
 #define IN_T T
 #include "_strided.slang"
+#ifdef T_f64
+#include "_math64.slang"
+#endif
 
 [vk::constant_id(0)]
 const int OP = 0;
@@ -47,6 +49,17 @@ T apply(T x)
     case 26: return exp2(x);
     case 27: return log2(x);
     case 28: return tan(x);
+#endif
+#ifdef T_f64
+    case 20: return exp64(x);
+    case 21: return log64(x);
+    case 22: return sin64(x);
+    case 23: return cos64(x);
+    case 24: return tanh64(x);
+    case 25: return sigmoid64(x);
+    case 26: return exp2_64(x);
+    case 27: return log2_64(x);
+    case 28: return tan64(x);
 #endif
     default: return x;
     }

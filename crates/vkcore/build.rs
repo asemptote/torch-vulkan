@@ -100,6 +100,8 @@ fn main() {
             let mut cmd = Command::new(&compiler);
             cmd.arg(src)
                 .args(["-target", "spirv", "-profile", "spirv_1_5", "-entry", "main", "-stage", "compute", "-O2"])
+                // IEEE denormals, like the CPU (GPUs may otherwise flush them to zero).
+                .args(["-denorm-mode-fp32", "preserve", "-denorm-mode-fp64", "preserve"])
                 .arg("-I")
                 .arg("shaders");
             for d in &defines {
