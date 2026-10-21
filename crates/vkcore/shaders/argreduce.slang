@@ -6,6 +6,8 @@
 // reading indices from in_idx. Ties and NaNs resolve to the smallest index,
 // matching PyTorch (NaN counts as the maximum and the minimum).
 
+#include "opcodes.slang"
+
 struct Params
 {
     T* in;              // 0
@@ -28,7 +30,7 @@ struct Params
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
-[vk::constant_id(0)] const int OP = 0;  // 0: max, 1: min
+[vk::constant_id(0)] const int OP = ARGREDUCE_MAX;
 [vk::constant_id(1)] const int LEVEL0 = 1;
 
 static const uint WG = 256;
@@ -49,7 +51,7 @@ bool better(T va, int64_t ia, T vb, int64_t ib)
     if (nan_(va)) return nan_(vb) && ib < ia;
     if (nan_(vb)) return true;
     if (vb == va) return ib < ia;
-    return OP == 0 ? vb > va : vb < va;
+    return OP == ARGREDUCE_MAX ? vb > va : vb < va;
 }
 
 int offset(uint index, uint nd, uint4 sz, int4 st)

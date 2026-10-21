@@ -5,6 +5,8 @@
 //   MODE 1 (scatter): out[idx[i], c] = in[i, c]
 // for i < nrows, c < ncols.
 
+#include "opcodes.slang"
+
 struct Params
 {
     T* in;            // 0
@@ -33,7 +35,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     {
         uint i = t / p.ncols, c = t % p.ncols;
         int r = int(p.idx[i]);
-        if (MODE == 0)
+        if (MODE == ROWS_GATHER)
             p.out[int(i) * p.out_rs + int(c) * p.out_cs] = p.in[r * p.in_rs + int(c) * p.in_cs];
         else
             p.out[r * p.out_rs + int(c) * p.out_cs] = p.in[int(i) * p.in_rs + int(c) * p.in_cs];

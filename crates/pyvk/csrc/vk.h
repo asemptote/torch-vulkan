@@ -76,9 +76,40 @@ void cpu_out(const char* op, const at::Tensor& out, F&& compute) {
 // Strided element-wise launch (shaders/_strided.slang): `out` plus up to two
 // inputs (nullptr = absent) broadcast to out's shape. Dims that are
 // contiguous in every operand are merged; dims beyond 4 are looped over on
-// the host, one dispatch per outer index.
+// the host, one dispatch per outer index. `params` fill the kernel's alpha,
+// beta, gamma slots, converted to its element type T (a's dtype, else
+// out's): int64 for integer/bool kernels, double for float64/complex128,
+// float otherwise. launch.cpp.
 void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
-                    const at::Tensor* b, double alpha, int64_t alpha_i);
+                    const at::Tensor* b, c10::ArrayRef<c10::Scalar> params = {});
+
+// Four-operand variant (shaders/_strided4.slang): out, a, b, c (any may be
+// nullptr except out), up to 3 merged dims per dispatch, parameters alpha
+// and beta converted to out's dtype. launch.cpp.
+void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
+                     const at::Tensor* b, const at::Tensor* c, c10::ArrayRef<c10::Scalar> params = {});
+
+// Runs binary op `code` (shaders/binary.slang) with PyTorch's type promotion;
+// false if it cannot run on the GPU. ops.cpp.
+bool binary_op_gpu(int64_t code, const at::Tensor& self, const at::Tensor* other, const at::Scalar* other_scalar,
+                   const at::Tensor& out);
+
+inline at::Tensor to_dtype(const at::Tensor& t, at::ScalarType dtype) {
+  return t.scalar_type() == dtype ? t : t.to(dtype);
+}
+
+// Runs `body(target)` writing into `out` directly when its dtype is `dtype`,
+// otherwise into a temporary that is then cast into `out`.
+template <typename F>
+void with_output(const at::Tensor& out, at::ScalarType dtype, F&& body) {
+  if (out.scalar_type() == dtype) {
+    body(out);
+  } else {
+    at::Tensor tmp = at::empty(out.sizes(), out.options().dtype(dtype));
+    body(tmp);
+    out.copy_(tmp);
+  }
+}
 
 inline bool is_vk(const at::Tensor& t) {
   return t.device().type() == kDevice;
@@ -105,7 +136,5 @@ void dispatch(const std::string& kernel, const std::vector<uint32_t>& spec, cons
   check(vkt_dispatch(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params), sizeof(P), gx,
                      gy, gz));
 }
-
-void register_ops();  // ops.cpp
 
 }  // namespace vk

@@ -23,6 +23,9 @@ pub struct Capabilities {
     pub timeline_semaphore: bool,
     pub storage_buffer_16bit: bool,
     pub storage_buffer_8bit: bool,
+    /// Shaders can keep float32 / float64 denormals (otherwise they may flush to zero).
+    pub denorm_preserve_f32: bool,
+    pub denorm_preserve_f64: bool,
     pub subgroup_size: u32,
     pub max_shared_memory: u32,
     pub max_workgroup_count_x: u32,
@@ -209,9 +212,10 @@ unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, p
     let core = features.features;
 
     let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
+    let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
     let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut m4 = vk::PhysicalDeviceMaintenance4Properties::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut p11).push_next(&mut m3).push_next(&mut m4);
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut p11).push_next(&mut p12).push_next(&mut m3).push_next(&mut m4);
     instance.get_physical_device_properties2(pd, &mut properties);
 
     let memory = instance.get_physical_device_memory_properties(pd);
@@ -232,6 +236,8 @@ unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, p
         timeline_semaphore: b(f12.timeline_semaphore),
         storage_buffer_16bit: b(f11.storage_buffer16_bit_access),
         storage_buffer_8bit: b(f12.storage_buffer8_bit_access),
+        denorm_preserve_f32: b(p12.shader_denorm_preserve_float32),
+        denorm_preserve_f64: b(p12.shader_denorm_preserve_float64),
         subgroup_size: p11.subgroup_size,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],

@@ -8,6 +8,8 @@
 // A (accumulator and output type) is T for floats and int64 for integers and
 // bool, as in PyTorch's sums. OP codes must match csrc/reduce.cpp.
 
+#include "opcodes.slang"
+
 #if defined(T_f32)
 typedef float A;
 #define A_FLOAT 1
@@ -43,23 +45,23 @@ struct Params
 
 [vk::constant_id(0)] const int OP = 0;
 [vk::constant_id(1)] const int LEVEL0 = 1;
-[vk::constant_id(2)] const int FINAL = 0;  // 0: none, 1: * alpha, 2: sqrt(* alpha)
+[vk::constant_id(2)] const int FINAL = FINAL_NONE;  // FINAL_SCALE: * alpha, FINAL_SQRT_SCALE: sqrt(* alpha)
 // 1: each thread reduces one (output, chunk) alone. Used when the reduced
 // dims are strided and outputs are adjacent in memory (e.g. summing columns):
 // neighbouring threads then read neighbouring addresses.
 [vk::constant_id(3)] const int PER_THREAD = 0;
 
-#define OP_SUM 0
-#define OP_PROD 1
-#define OP_MAX 2
-#define OP_MIN 3
-#define OP_SUMABS 4
-#define OP_SUMSQ 5
-#define OP_MAXABS 6
-#define OP_MINABS 7
-#define OP_SQDEV 8
-#define OP_ANY 9
-#define OP_ALL 10
+#define OP_SUM REDUCE_SUM
+#define OP_PROD REDUCE_PROD
+#define OP_MAX REDUCE_MAX
+#define OP_MIN REDUCE_MIN
+#define OP_SUMABS REDUCE_SUMABS
+#define OP_SUMSQ REDUCE_SUMSQ
+#define OP_MAXABS REDUCE_MAXABS
+#define OP_MINABS REDUCE_MINABS
+#define OP_SQDEV REDUCE_SQDEV
+#define OP_ANY REDUCE_ANY
+#define OP_ALL REDUCE_ALL
 
 static const uint WG = 256;
 groupshared A sdata[WG];
@@ -130,8 +132,8 @@ int offset(uint index, uint nd, uint4 sz, int4 st)
 A finish(A r)
 {
 #ifdef A_FLOAT
-    if (FINAL == 1) return r * A(p.alpha);
-    if (FINAL == 2) return sqrt(r * A(p.alpha));
+    if (FINAL == FINAL_SCALE) return r * A(p.alpha);
+    if (FINAL == FINAL_SQRT_SCALE) return sqrt(r * A(p.alpha));
 #endif
     return r;
 }

@@ -13,6 +13,8 @@
 
 #include "vk.h"
 
+#include "opcodes.h"
+
 #include <ATen/WrapDimUtils.h>
 #include <torch/library.h>
 
@@ -86,7 +88,7 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     p.n = static_cast<uint32_t>(n);
     p.batch = static_cast<uint32_t>(batch);
     p.ngroups = static_cast<uint32_t>(std::min<int64_t>(batch, 65535));
-    dispatch(kernel, {2, inverse ? 1u : 0u}, p, p.ngroups);
+    dispatch(kernel, {op::FFT_LOCAL, inverse ? 1u : 0u}, p, p.ngroups);
     return out;
   }
   at::Tensor src = x, buffers[2] = {at::empty_like(x), at::empty_like(x)};
@@ -101,7 +103,7 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     p.ns = static_cast<uint32_t>(ns);
     p.batch = static_cast<uint32_t>(batch);
     p.ngroups = groups_for(batch * n / 2);
-    dispatch(kernel, {0, inverse ? 1u : 0u}, p, p.ngroups);
+    dispatch(kernel, {op::FFT_STOCKHAM, inverse ? 1u : 0u}, p, p.ngroups);
     src = dst;
     which ^= 1;
   }
@@ -242,7 +244,7 @@ at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
     p.m = static_cast<uint32_t>(m);
     p.batch = static_cast<uint32_t>(batch);
     p.ngroups = groups_for(batch * last_dim_size);
-    dispatch(std::string("fft_") + dtype_label(rows.scalar_type()), {1, 0}, p, p.ngroups);
+    dispatch(std::string("fft_") + dtype_label(rows.scalar_type()), {op::FFT_HERMITIAN, 0}, p, p.ngroups);
   }
   at::Tensor spectrum = fft_rows(full, true);
   std::vector<int64_t> shape = moved.sizes().vec();
@@ -266,6 +268,3 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_fft_r2c", &vk::fft_r2c);
   m.impl("_fft_c2r", &vk::fft_c2r);
 }
-
-// Referenced from backend.cpp so the linker keeps this object file.
-extern "C" void vkt_fft_linked() {}

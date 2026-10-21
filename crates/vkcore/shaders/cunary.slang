@@ -1,6 +1,6 @@
 // axis T: c64=float2 c128=double2
 //
-// Complex out = op(a), strided. OP: 0 neg, 1 conj.
+// Complex out = op(a), strided. OP: CUNARY_NEG or CUNARY_CONJ.
 
 #if defined(T_c64)
 typedef float S;
@@ -13,7 +13,7 @@ typedef double S;
 #include "_strided.slang"
 
 [vk::constant_id(0)]
-const int OP = 0;
+const int OP = CUNARY_NEG;
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -23,6 +23,6 @@ void main(uint3 id: SV_DispatchThreadID)
     {
         Offsets o = offsets(i);
         T a = p.a[o.a];
-        p.out[o.o] = OP == 0 ? -a : T(a.x, -a.y);
+        p.out[o.o] = OP == CUNARY_NEG ? -a : T(a.x, -a.y);  // else CUNARY_CONJ
     }
 }

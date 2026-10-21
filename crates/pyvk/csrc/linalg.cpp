@@ -188,6 +188,3 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("addmv.out", &addmv_out);
   m.impl("dot", &dot);
 }
-
-// Referenced from backend.cpp so the linker keeps this object file.
-extern "C" void vkt_linalg_linked() {}

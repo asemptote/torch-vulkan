@@ -1,8 +1,8 @@
 // axis T: c64=float2 c128=double2
 //
-// Complex out = op(a, b), strided with broadcasting. OP: 0 add (a + alpha*b),
-// 1 sub (a - alpha*b), 2 mul, 10 div; alpha is real. B_SCALAR replaces b
-// with the complex scalar (alpha, bits of the imaginary part in alpha_i), in
+// Complex out = op(a, b), strided with broadcasting. OP: CBINARY_ADD
+// (a + alpha b), CBINARY_SUB (a - alpha b), CBINARY_MUL, CBINARY_DIV; alpha
+// is real. B_SCALAR replaces b with the complex scalar (alpha, beta), in
 // which case the host has already folded alpha into it.
 
 #if defined(T_c64)
@@ -17,7 +17,7 @@ typedef double S;
 #include "_complex.slang"
 
 [vk::constant_id(0)]
-const int OP = 0;
+const int OP = CBINARY_ADD;
 [vk::constant_id(1)]
 const int B_SCALAR = 0;
 
@@ -25,8 +25,8 @@ const int B_SCALAR = 0;
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
-    S alpha = B_SCALAR != 0 ? S(1) : S(p.alpha);
-    T scalar = T(S(p.alpha), S(bit_cast<double>(p.alpha_i)));
+    S mult = B_SCALAR != 0 ? S(1) : S(alpha());
+    T scalar = T(S(alpha()), S(beta()));
     for (uint i = id.x; i < p.n; i += p.stride)
     {
         Offsets o = offsets(i);
@@ -35,10 +35,10 @@ void main(uint3 id: SV_DispatchThreadID)
         T r;
         switch (OP)
         {
-        case 0: r = a + alpha * b; break;
-        case 1: r = a - alpha * b; break;
-        case 2: r = cmul(a, b); break;
-        default: r = cdiv(a, b); break;
+        case CBINARY_ADD: r = a + mult * b; break;
+        case CBINARY_SUB: r = a - mult * b; break;
+        case CBINARY_MUL: r = cmul(a, b); break;
+        default: r = cdiv(a, b); break;  // CBINARY_DIV
         }
         p.out[o.o] = r;
     }

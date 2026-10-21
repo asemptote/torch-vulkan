@@ -75,7 +75,17 @@ impl KernelCache {
             return Ok(k.clone());
         }
         let spirv = SPIRV.iter().find(|(n, _)| *n == name).ok_or_else(|| format!("unknown kernel {name}"))?.1;
-        let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv))?;
+        let mut words = ash::util::read_spv(&mut std::io::Cursor::new(spirv))?;
+        let caps = self.ctx.caps;
+        let declared = declared_capabilities(&words);
+        for (cap, have, what) in [(CAP_FLOAT64, caps.shader_float64, "shaderFloat64"), (CAP_INT64, caps.shader_int64, "shaderInt64"),
+            (CAP_INT8, caps.shader_int8, "shaderInt8")]
+        {
+            if declared.contains(&cap) && !have {
+                return Err(format!("kernel {name} needs {what}, which this device does not support").into());
+            }
+        }
+        strip_denorm_preserve(&mut words, !caps.denorm_preserve_f32, !caps.denorm_preserve_f64);
         let d = &self.ctx.device;
         unsafe {
             let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
@@ -112,6 +122,72 @@ impl KernelCache {
     }
 }
 
+const OP_CAPABILITY: u32 = 17;
+const CAP_FLOAT64: u32 = 10;
+const CAP_INT64: u32 = 11;
+const CAP_INT8: u32 = 39;
+
+/// The capabilities a SPIR-V module declares (its `OpCapability` operands).
+pub fn declared_capabilities(words: &[u32]) -> Vec<u32> {
+    let mut caps = Vec::new();
+    let mut i = 5;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        if words[i] & 0xffff == OP_CAPABILITY && count == 2 {
+            caps.push(words[i + 1]);
+        }
+        i += count.max(1);
+    }
+    caps
+}
+
+/// Removes `OpExecutionMode DenormPreserve` for the given float widths (and
+/// the `DenormPreserve` capability once no such mode remains). The kernels are
+/// compiled to preserve denormals; a device that cannot must not see that
+/// request, and then flushes denormals to zero instead.
+pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool) {
+    const OP_EXECUTION_MODE: u32 = 16;
+    const DENORM_PRESERVE_MODE: u32 = 4459;
+    const DENORM_PRESERVE_CAPABILITY: u32 = 4464;
+    if (!width32 && !width64) || words.len() < 5 {
+        return;
+    }
+    let mut out = words[..5].to_vec();
+    let mut remaining_modes = 0;
+    let mut i = 5;
+    let mut capability_at = None;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        let opcode = words[i] & 0xffff;
+        if count == 0 || i + count > words.len() {
+            return;  // malformed: leave the module untouched
+        }
+        let inst = &words[i..i + count];
+        let drop = if opcode == OP_EXECUTION_MODE && count >= 4 && inst[2] == DENORM_PRESERVE_MODE {
+            let strip = (inst[3] == 32 && width32) || (inst[3] == 64 && width64);
+            if !strip {
+                remaining_modes += 1;
+            }
+            strip
+        } else {
+            false
+        };
+        if opcode == OP_CAPABILITY && count == 2 && inst[1] == DENORM_PRESERVE_CAPABILITY {
+            capability_at = Some(out.len());
+        }
+        if !drop {
+            out.extend_from_slice(inst);
+        }
+        i += count;
+    }
+    if remaining_modes == 0 {
+        if let Some(at) = capability_at {
+            out.drain(at..at + 2);
+        }
+    }
+    *words = out;
+}
+
 impl Drop for KernelCache {
     fn drop(&mut self) {
         self.save();
@@ -122,6 +198,59 @@ impl Drop for KernelCache {
             }
             d.destroy_pipeline_cache(self.cache, None);
             d.destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{declared_capabilities, strip_denorm_preserve, CAP_FLOAT64, SPIRV};
+
+    // Header + OpCapability Shader + OpCapability DenormPreserve +
+    // OpExecutionMode %4 DenormPreserve 32 + ... 64 + OpNop.
+    fn module() -> Vec<u32> {
+        vec![0x0723_0203, 0x0001_0500, 0, 10, 0, (2 << 16) | 17, 1, (2 << 16) | 17, 4464, (4 << 16) | 16, 4, 4459, 32,
+             (4 << 16) | 16, 4, 4459, 64, (1 << 16)]
+    }
+
+    #[test]
+    fn strips_one_width() {
+        let mut w = module();
+        strip_denorm_preserve(&mut w, false, true);
+        assert_eq!(w.len(), module().len() - 4);
+        assert!(w.windows(2).any(|p| p == [(2 << 16) | 17, 4464]), "capability kept for the float32 mode");
+    }
+
+    #[test]
+    fn strips_both_widths_and_the_capability() {
+        let mut w = module();
+        strip_denorm_preserve(&mut w, true, true);
+        assert_eq!(w, vec![0x0723_0203, 0x0001_0500, 0, 10, 0, (2 << 16) | 17, 1, (1 << 16)]);
+    }
+
+    #[test]
+    fn untouched_when_supported() {
+        let mut w = module();
+        strip_denorm_preserve(&mut w, false, false);
+        assert_eq!(w, module());
+    }
+
+    #[test]
+    fn reads_capabilities() {
+        assert_eq!(declared_capabilities(&module()), vec![1, 4464]);
+    }
+
+    /// Element-wise kernels other than float64/complex128 ones must run on
+    /// GPUs without shaderFloat64.
+    #[test]
+    fn elementwise_kernels_need_float64_only_for_double_types() {
+        let families = ["unary_", "binary_", "compare_", "fill_", "where_", "ternary_", "cbinary_", "cunary_", "cabs_"];
+        for (name, spirv) in SPIRV {
+            if !families.iter().any(|f| name.starts_with(f)) || name.ends_with("_f64") || name.ends_with("_c128") {
+                continue;
+            }
+            let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv)).unwrap();
+            assert!(!declared_capabilities(&words).contains(&CAP_FLOAT64), "{name} declares Float64");
         }
     }
 }

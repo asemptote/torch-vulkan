@@ -8,6 +8,7 @@
 // without a kernel (e.g. float64 exp) run the same overload on the CPU via
 // PyTorch's boxed cpu_fallback.
 
+#include "opcodes.h"
 #include "vk.h"
 
 #include <ATen/ExpandUtils.h>
@@ -15,148 +16,9 @@
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
-#include <array>
-#include <cstddef>
-#include <cstring>
 #include <utility>
 
 namespace vk {
-
-// ---------------------------------------------------------------- strided launch
-
-namespace {
-
-// Must match the Params struct in shaders/_strided.slang.
-struct Params {
-  uint64_t out, a, b;
-  double alpha;
-  int64_t alpha_i;
-  uint32_t n, ndim, stride, pad0;
-  uint64_t pad1;
-  uint32_t size[4];
-  int32_t so[4], sa[4], sb[4];
-};
-static_assert(sizeof(Params) == 128, "push-constant block must be 128 bytes");
-static_assert(offsetof(Params, size) == 64, "size[] must start at byte 64");
-
-constexpr size_t kMaxDims = 4;
-
-// Element strides of `t` broadcast to `shape` (0 where it broadcasts).
-std::vector<int64_t> broadcast_strides(const at::Tensor& t, at::IntArrayRef shape) {
-  int64_t pad = static_cast<int64_t>(shape.size()) - t.dim();
-  TORCH_CHECK(pad >= 0, "torch_vulkan: operand has more dims than the output");
-  std::vector<int64_t> out(shape.size(), 0);
-  for (int64_t d = 0; d < t.dim(); ++d) {
-    int64_t size = t.size(d), target = shape[pad + d];
-    TORCH_CHECK(size == target || size == 1, "torch_vulkan: cannot broadcast ", t.sizes(), " to ", shape);
-    out[pad + d] = (size == target && size != 1) ? t.stride(d) : 0;
-  }
-  return out;
-}
-
-struct Dim {
-  int64_t size;
-  std::array<int64_t, 3> stride;  // out, a, b
-};
-
-}  // namespace
-
-void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
-                    const at::Tensor* b, double alpha, int64_t alpha_i) {
-  int64_t n = out.numel();
-  if (n == 0) {
-    return;
-  }
-  at::IntArrayRef shape = out.sizes();
-  std::array<std::vector<int64_t>, 3> strides = {
-      out.strides().vec(),
-      a ? broadcast_strides(*a, shape) : std::vector<int64_t>(shape.size(), 0),
-      b ? broadcast_strides(*b, shape) : std::vector<int64_t>(shape.size(), 0),
-  };
-
-  // Merge dims that are contiguous in every operand, innermost first.
-  std::vector<Dim> dims;
-  for (int64_t d = static_cast<int64_t>(shape.size()) - 1; d >= 0; --d) {
-    if (shape[d] == 1) {
-      continue;
-    }
-    Dim dim{shape[d], {strides[0][d], strides[1][d], strides[2][d]}};
-    if (!dims.empty()) {
-      Dim& prev = dims.back();
-      bool mergeable = true;
-      for (size_t k = 0; k < 3; ++k) {
-        mergeable = mergeable && dim.stride[k] == prev.stride[k] * prev.size;
-      }
-      if (mergeable) {
-        prev.size *= dim.size;
-        continue;
-      }
-    }
-    dims.push_back(dim);
-  }
-  if (dims.empty()) {
-    dims.push_back({1, {0, 0, 0}});
-  }
-
-  // The innermost (up to) 4 dims go to the kernel; the rest are looped here.
-  size_t inner = std::min(dims.size(), kMaxDims);
-  int64_t inner_n = 1;
-  std::array<int64_t, 3> max_offset = {0, 0, 0};
-  for (size_t i = 0; i < inner; ++i) {
-    inner_n *= dims[i].size;
-    for (size_t k = 0; k < 3; ++k) {
-      max_offset[k] += (dims[i].size - 1) * dims[i].stride[k];
-    }
-  }
-  TORCH_CHECK(inner_n < (int64_t(1) << 32), "torch_vulkan: more than 2^32 elements per launch");
-  for (size_t k = 0; k < 3; ++k) {
-    TORCH_CHECK(max_offset[k] < (int64_t(1) << 31), "torch_vulkan: element offsets beyond 2^31");
-  }
-
-  std::array<uint64_t, 3> base = {gpu_address(out), a ? gpu_address(*a) : 0, b ? gpu_address(*b) : 0};
-  std::array<int64_t, 3> itemsize = {out.itemsize(), a ? a->itemsize() : 0, b ? b->itemsize() : 0};
-
-  Params p{};
-  p.alpha = alpha;
-  p.alpha_i = alpha_i;
-  p.n = static_cast<uint32_t>(inner_n);
-  p.ndim = static_cast<uint32_t>(inner);
-  uint32_t groups = 0;
-  check(vkt_grid_1d(static_cast<uint64_t>(inner_n), &groups, &p.stride));
-  for (size_t i = 0; i < kMaxDims; ++i) {
-    bool used = i < inner;
-    p.size[i] = used ? static_cast<uint32_t>(dims[i].size) : 1;
-    p.so[i] = used ? static_cast<int32_t>(dims[i].stride[0]) : 0;
-    p.sa[i] = used ? static_cast<int32_t>(dims[i].stride[1]) : 0;
-    p.sb[i] = used ? static_cast<int32_t>(dims[i].stride[2]) : 0;
-  }
-
-  // One dispatch per index of the outer dims (odometer order).
-  std::vector<int64_t> index(dims.size() - inner, 0);
-  while (true) {
-    std::array<int64_t, 3> offset = {0, 0, 0};
-    for (size_t j = 0; j < index.size(); ++j) {
-      for (size_t k = 0; k < 3; ++k) {
-        offset[k] += index[j] * dims[inner + j].stride[k];
-      }
-    }
-    p.out = base[0] + offset[0] * itemsize[0];
-    p.a = a ? base[1] + offset[1] * itemsize[1] : 0;
-    p.b = b ? base[2] + offset[2] * itemsize[2] : 0;
-    check(vkt_dispatch(kernel, spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&p), sizeof(p), groups, 1, 1));
-
-    size_t j = 0;
-    for (; j < index.size(); ++j) {
-      if (++index[j] < dims[inner + j].size) {
-        break;
-      }
-      index[j] = 0;
-    }
-    if (j == index.size()) {
-      break;
-    }
-  }
-}
 
 // ---------------------------------------------------------------- helpers
 
@@ -174,26 +36,8 @@ bool kind_allows(Kind kind, at::ScalarType t) {
   return false;
 }
 
-at::Tensor to_dtype(const at::Tensor& t, at::ScalarType dtype) {
-  return t.scalar_type() == dtype ? t : t.to(dtype);
-}
-
-// Runs `body(target)` writing into `out` directly when its dtype is `dtype`,
-// otherwise into a temporary that is then cast into `out`.
-template <typename F>
-void with_output(const at::Tensor& out, at::ScalarType dtype, F&& body) {
-  if (out.scalar_type() == dtype) {
-    body(out);
-  } else {
-    at::Tensor tmp = at::empty(out.sizes(), out.options().dtype(dtype));
-    body(tmp);
-    out.copy_(tmp);
-  }
-}
-
 // ---------------------------------------------------------------- unary
 
-// Codes must match shaders/unary.slang.
 struct UnaryOp {
   const char* name;
   uint32_t code;
@@ -201,29 +45,63 @@ struct UnaryOp {
 };
 
 constexpr UnaryOp kUnary[] = {
-    {"aten::neg", 0, Kind::Numeric},       {"aten::abs", 1, Kind::Numeric},     {"aten::sign", 4, Kind::Numeric},
-    {"aten::reciprocal", 10, Kind::Float}, {"aten::sqrt", 11, Kind::Float},     {"aten::rsqrt", 12, Kind::Float},
-    {"aten::floor", 13, Kind::Float},      {"aten::ceil", 14, Kind::Float},     {"aten::trunc", 15, Kind::Float},
-    {"aten::round", 16, Kind::Float},      {"aten::exp", 20, Kind::Float},      {"aten::log", 21, Kind::Float},
-    {"aten::sin", 22, Kind::Float},        {"aten::cos", 23, Kind::Float},      {"aten::tanh", 24, Kind::Float},
-    {"aten::sigmoid", 25, Kind::Float},    {"aten::exp2", 26, Kind::Float},     {"aten::log2", 27, Kind::Float},
-    {"aten::tan", 28, Kind::Float},
+    {"aten::neg", op::UNARY_NEG, Kind::Numeric},
+    {"aten::abs", op::UNARY_ABS, Kind::Numeric},
+    {"aten::sign", op::UNARY_SIGN, Kind::Numeric},
+    {"aten::reciprocal", op::UNARY_RECIPROCAL, Kind::Float},
+    {"aten::sqrt", op::UNARY_SQRT, Kind::Float},
+    {"aten::rsqrt", op::UNARY_RSQRT, Kind::Float},
+    {"aten::floor", op::UNARY_FLOOR, Kind::Float},
+    {"aten::ceil", op::UNARY_CEIL, Kind::Float},
+    {"aten::trunc", op::UNARY_TRUNC, Kind::Float},
+    {"aten::round", op::UNARY_ROUND, Kind::Float},
+    {"aten::exp", op::UNARY_EXP, Kind::Float},
+    {"aten::log", op::UNARY_LOG, Kind::Float},
+    {"aten::sin", op::UNARY_SIN, Kind::Float},
+    {"aten::cos", op::UNARY_COS, Kind::Float},
+    {"aten::tanh", op::UNARY_TANH, Kind::Float},
+    {"aten::sigmoid", op::UNARY_SIGMOID, Kind::Float},
+    {"aten::exp2", op::UNARY_EXP2, Kind::Float},
+    {"aten::log2", op::UNARY_LOG2, Kind::Float},
+    {"aten::tan", op::UNARY_TAN, Kind::Float},
+    {"aten::asin", op::UNARY_ASIN, Kind::Float},
+    {"aten::acos", op::UNARY_ACOS, Kind::Float},
+    {"aten::atan", op::UNARY_ATAN, Kind::Float},
+    {"aten::sinh", op::UNARY_SINH, Kind::Float},
+    {"aten::cosh", op::UNARY_COSH, Kind::Float},
+    {"aten::asinh", op::UNARY_ASINH, Kind::Float},
+    {"aten::acosh", op::UNARY_ACOSH, Kind::Float},
+    {"aten::atanh", op::UNARY_ATANH, Kind::Float},
+    {"aten::log10", op::UNARY_LOG10, Kind::Float},
+    {"aten::log1p", op::UNARY_LOG1P, Kind::Float},
+    {"aten::expm1", op::UNARY_EXPM1, Kind::Float},
+    {"aten::erf", op::UNARY_ERF, Kind::Float},
+    {"aten::erfc", op::UNARY_ERFC, Kind::Float},
+    {"aten::erfinv", op::UNARY_ERFINV, Kind::Float},
+    {"aten::lgamma", op::UNARY_LGAMMA, Kind::Float},
+    {"aten::digamma", op::UNARY_DIGAMMA, Kind::Float},
+    {"aten::sinc", op::UNARY_SINC, Kind::Float},
+    {"aten::frac", op::UNARY_FRAC, Kind::Float},
+    {"aten::silu", op::UNARY_SILU, Kind::Float},
+    {"aten::mish", op::UNARY_MISH, Kind::Float},
+    {"aten::hardswish", op::UNARY_HARDSWISH, Kind::Float},
+    {"aten::hardsigmoid", op::UNARY_HARDSIGMOID, Kind::Float},
+    {"aten::bitwise_not", op::UNARY_BITWISE_NOT, Kind::Integer},
 };
 
-constexpr uint32_t kRelu = 2;
-
-// Complex unary ops: neg (code 0) and abs (code 1, real output).
+// Complex unary ops: neg and abs (real output).
 bool complex_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out) {
   const char* label = dtype_label(self.scalar_type());
-  if (label == nullptr || !is_vk(self) || !is_vk(out) || (code != 0 && code != 1)) {
+  if (label == nullptr || !is_vk(self) || !is_vk(out) || (code != op::UNARY_NEG && code != op::UNARY_ABS)) {
     return false;
   }
-  at::ScalarType want = code == 1 ? c10::toRealValueType(self.scalar_type()) : self.scalar_type();
+  bool abs = code == op::UNARY_ABS;
+  at::ScalarType want = abs ? c10::toRealValueType(self.scalar_type()) : self.scalar_type();
   with_output(out, want, [&](const at::Tensor& target) {
-    if (code == 1) {
-      launch_strided((std::string("cabs_") + label).c_str(), {}, target, &self, nullptr, 0.0, 0);
+    if (abs) {
+      launch_strided((std::string("cabs_") + label).c_str(), {}, target, &self, nullptr);
     } else {
-      launch_strided((std::string("cunary_") + label).c_str(), {0}, target, &self, nullptr, 0.0, 0);
+      launch_strided((std::string("cunary_") + label).c_str(), {op::CUNARY_NEG}, target, &self, nullptr);
     }
   });
   return true;
@@ -234,17 +112,24 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   if (at::isComplexType(self.scalar_type())) {
     return complex_unary_gpu(code, self, out);
   }
+  if (self.scalar_type() == at::kBool && code == op::UNARY_BITWISE_NOT && is_vk(self) && is_vk(out) &&
+      out.scalar_type() == at::kBool) {
+    launch_strided("compare_b8", {op::COMPARE_LOGICAL_NOT, 0}, out, &self, nullptr);  // logical_not on bools
+    return true;
+  }
   at::ScalarType dtype = out.scalar_type();
   const char* label = dtype_label(dtype);
   if (!kind_allows(kind, dtype) || label == nullptr || !is_vk(self) || !is_vk(out)) {
     return false;
   }
-  if (!at::isFloatingType(self.scalar_type()) && code >= 13 && code <= 16) {
-    return false;  // floor/ceil/trunc/round of integers keep the integer dtype
+  bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
+                  code == op::UNARY_ROUND || code == op::UNARY_FRAC;
+  if (!at::isFloatingType(self.scalar_type()) && rounding) {
+    return false;  // floor/ceil/trunc/round/frac of integers keep the integer dtype
   }
   at::Tensor input = to_dtype(self, dtype);  // e.g. sqrt(int) computes in float
   std::string kernel = std::string("unary_") + label;
-  launch_strided(kernel.c_str(), {code}, out, &input, nullptr, 0.0, 0);
+  launch_strided(kernel.c_str(), {code}, out, &input, nullptr);
   return true;
 }
 
@@ -258,14 +143,14 @@ at::Tensor& unary_out(const at::Tensor& self, at::Tensor& out) {
 
 at::Tensor relu(const at::Tensor& self) {
   at::Tensor out = at::empty_like(self);
-  if (!unary_gpu(kRelu, Kind::Numeric, self, out)) {
+  if (!unary_gpu(op::UNARY_RELU, Kind::Numeric, self, out)) {
     return on_cpu("aten::relu", "", self)[0].toTensor();
   }
   return out;
 }
 
 at::Tensor& relu_(at::Tensor& self) {
-  if (!unary_gpu(kRelu, Kind::Numeric, self, self)) {
+  if (!unary_gpu(op::UNARY_RELU, Kind::Numeric, self, self)) {
     on_cpu("aten::relu_", "", self);
   }
   return self;
@@ -277,7 +162,7 @@ at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
   if (!at::isComplexType(self.scalar_type())) {
     out.copy_(self);  // conj of a real tensor is itself
   } else if (label != nullptr && is_vk(self) && is_vk(out) && out.scalar_type() == self.scalar_type()) {
-    launch_strided((std::string("cunary_") + label).c_str(), {1}, out, &self, nullptr, 0.0, 0);
+    launch_strided((std::string("cunary_") + label).c_str(), {op::CUNARY_CONJ}, out, &self, nullptr);
   } else {
     on_cpu("aten::conj_physical", "out", self, out);
   }
@@ -286,7 +171,6 @@ at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
 
 // ---------------------------------------------------------------- binary
 
-// Codes must match shaders/binary.slang.
 struct BinaryOp {
   const char* name;
   const char* overload;  // Tensor-other out overload
@@ -297,19 +181,36 @@ struct BinaryOp {
 };
 
 constexpr BinaryOp kBinary[] = {
-    {"aten::add", "out", 0, Kind::Numeric, false, true},
-    {"aten::sub", "out", 1, Kind::Numeric, false, false},
-    {"aten::mul", "out", 2, Kind::Numeric, false, true},
-    {"aten::maximum", "out", 3, Kind::Numeric, false, true},
-    {"aten::minimum", "out", 4, Kind::Numeric, false, true},
-    {"aten::div", "out", 10, Kind::Float, true, false},
-    {"aten::pow", "Tensor_Tensor_out", 20, Kind::Float32, false, false},
-    {"aten::atan2", "out", 21, Kind::Float32, false, false},
-    {"aten::bitwise_and", "Tensor_out", 30, Kind::Integer, false, true},
-    {"aten::bitwise_or", "Tensor_out", 31, Kind::Integer, false, true},
-    {"aten::bitwise_xor", "Tensor_out", 32, Kind::Integer, false, true},
+    {"aten::add", "out", op::BINARY_ADD, Kind::Numeric, false, true},
+    {"aten::sub", "out", op::BINARY_SUB, Kind::Numeric, false, false},
+    {"aten::mul", "out", op::BINARY_MUL, Kind::Numeric, false, true},
+    {"aten::maximum", "out", op::BINARY_MAXIMUM, Kind::Numeric, false, true},
+    {"aten::minimum", "out", op::BINARY_MINIMUM, Kind::Numeric, false, true},
+    {"aten::div", "out", op::BINARY_DIV, Kind::Float, true, false},
+    {"aten::pow", "Tensor_Tensor_out", op::BINARY_POW, Kind::Numeric, false, false},
+    {"aten::atan2", "out", op::BINARY_ATAN2, Kind::Float, true, false},
+    {"aten::bitwise_and", "Tensor_out", op::BINARY_BITWISE_AND, Kind::Integer, false, true},
+    {"aten::bitwise_or", "Tensor_out", op::BINARY_BITWISE_OR, Kind::Integer, false, true},
+    {"aten::bitwise_xor", "Tensor_out", op::BINARY_BITWISE_XOR, Kind::Integer, false, true},
+    {"aten::remainder", "Tensor_out", op::BINARY_REMAINDER, Kind::Numeric, false, false},
+    {"aten::fmod", "Tensor_out", op::BINARY_FMOD, Kind::Numeric, false, false},
+    {"aten::floor_divide", "out", op::BINARY_FLOOR_DIVIDE, Kind::Numeric, false, false},
+    {"aten::copysign", "out", op::BINARY_COPYSIGN, Kind::Float, true, false},
+    {"aten::hypot", "out", op::BINARY_HYPOT, Kind::Float, false, true},
+    {"aten::nextafter", "out", op::BINARY_NEXTAFTER, Kind::Float, false, false},
+    {"aten::logaddexp", "out", op::BINARY_LOGADDEXP, Kind::Float, false, true},
+    {"aten::logaddexp2", "out", op::BINARY_LOGADDEXP2, Kind::Float, false, true},
+    {"aten::xlogy", "OutTensor", op::BINARY_XLOGY, Kind::Float, true, false},
+    {"aten::special_xlog1py", "out", op::BINARY_XLOG1PY, Kind::Float, true, false},
+    {"aten::heaviside", "out", op::BINARY_HEAVISIDE, Kind::Float, false, false},
+    {"aten::fmax", "out", op::BINARY_FMAX, Kind::Float, false, true},
+    {"aten::fmin", "out", op::BINARY_FMIN, Kind::Float, false, true},
+    {"aten::bitwise_left_shift", "Tensor_out", op::BINARY_SHIFT_LEFT, Kind::Integer, false, false},
+    {"aten::bitwise_right_shift", "Tensor_out", op::BINARY_SHIFT_RIGHT, Kind::Integer, false, false},
+    {"aten::gcd", "out", op::BINARY_GCD, Kind::Integer, false, true},
+    {"aten::lcm", "out", op::BINARY_LCM, Kind::Integer, false, true},
 };
-constexpr size_t kAdd = 0, kSub = 1, kPow = 6;
+constexpr size_t kSub = 1, kPow = 6;
 
 at::ScalarType compute_dtype(const BinaryOp& op, at::ScalarType promoted) {
   if (op.true_div && !at::isFloatingType(promoted) && !at::isComplexType(promoted)) {
@@ -323,31 +224,27 @@ bool complex_binary_gpu(const BinaryOp& op, const at::Tensor& lhs, const at::Ten
                         const std::optional<at::Scalar>& scalar, const at::Scalar& alpha, const at::Tensor& out,
                         at::ScalarType dtype) {
   uint32_t code;
-  if (op.code == 0 || op.code == 1 || op.code == 2) {
-    code = op.code;
-  } else if (op.code == 10) {
-    code = 10;
-  } else {
-    return false;
+  switch (op.code) {
+    case op::BINARY_ADD: code = op::CBINARY_ADD; break;
+    case op::BINARY_SUB: code = op::CBINARY_SUB; break;
+    case op::BINARY_MUL: code = op::CBINARY_MUL; break;
+    case op::BINARY_DIV: code = op::CBINARY_DIV; break;
+    default: return false;
   }
   const char* label = dtype_label(dtype);
   if (label == nullptr || alpha.isComplex()) {
     return false;
   }
-  bool uses_alpha = code == 0 || code == 1;
+  bool uses_alpha = code == op::CBINARY_ADD || code == op::CBINARY_SUB;
   at::Tensor a = to_dtype(lhs, dtype);
   std::string kernel = std::string("cbinary_") + label;
   with_output(out, dtype, [&](const at::Tensor& target) {
     if (scalar) {
-      // Complex scalar: real part in alpha, the bits of the imaginary part in alpha_i.
       c10::complex<double> v = scalar->toComplexDouble() * (uses_alpha ? alpha.toDouble() : 1.0);
-      double imag = v.imag();
-      int64_t imag_bits;
-      std::memcpy(&imag_bits, &imag, sizeof(imag_bits));
-      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, v.real(), imag_bits);
+      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, {v.real(), v.imag()});
     } else {
       at::Tensor b = to_dtype(*other, dtype);
-      launch_strided(kernel.c_str(), {code, 0}, target, &a, &b, alpha.toDouble(), 0);
+      launch_strided(kernel.c_str(), {code, 0}, target, &a, &b, {alpha});
     }
   });
   return true;
@@ -381,15 +278,12 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       if (!kind_allows(op.kind, dtype) || label == nullptr) {
         return false;  // (complex dtypes fail kind_allows and fall back)
       }
-      bool floating = at::isFloatingType(dtype);
       at::Tensor b = to_dtype(*other, dtype);
       std::string kernel = std::string("binary_") + label;
       at::Scalar s = self.item();
       with_output(out, dtype, [&](const at::Tensor& target) {
-        launch_strided(kernel.c_str(), {kBinary[2].code, 1}, target, &b, nullptr, floating ? -alpha.toDouble() : 0.0,
-                       floating ? 0 : -alpha.toLong());
-        launch_strided(kernel.c_str(), {kBinary[kAdd].code, 1}, target, &target, nullptr, floating ? s.toDouble() : 0.0,
-                       floating ? 0 : s.toLong());
+        launch_strided(kernel.c_str(), {op::BINARY_MUL, 1}, target, &b, nullptr, {-alpha});
+        launch_strided(kernel.c_str(), {op::BINARY_ADD, 1}, target, &target, nullptr, {s});
       });
       return true;
     }
@@ -402,6 +296,21 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   at::ScalarType promoted = scalar ? at::result_type(*lhs, *scalar) : at::result_type(*lhs, *other);
   at::ScalarType dtype = compute_dtype(op, promoted);
   const char* label = dtype_label(dtype);
+  if (dtype == at::kBool && !scalar && alpha.equal(1)) {
+    // On bools: add, maximum, bitwise_or are logical or; mul, minimum, bitwise_and are logical and.
+    uint32_t logical;
+    switch (op.code) {
+      case op::BINARY_ADD: case op::BINARY_MAXIMUM: case op::BINARY_BITWISE_OR: logical = op::COMPARE_LOGICAL_OR; break;
+      case op::BINARY_MUL: case op::BINARY_MINIMUM: case op::BINARY_BITWISE_AND: logical = op::COMPARE_LOGICAL_AND; break;
+      case op::BINARY_BITWISE_XOR: logical = op::COMPARE_LOGICAL_XOR; break;
+      default: return false;
+    }
+    at::Tensor a = to_dtype(*lhs, at::kBool), b = to_dtype(*other, at::kBool);
+    with_output(out, at::kBool, [&](const at::Tensor& target) {
+      launch_strided("compare_b8", {logical, 0}, target, &a, &b);
+    });
+    return true;
+  }
   if (at::isComplexType(dtype)) {
     return complex_binary_gpu(op, *lhs, scalar ? nullptr : other, scalar, alpha, out, dtype);
   }
@@ -409,23 +318,39 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
     return false;
   }
   bool floating = at::isFloatingType(dtype);
-  bool uses_alpha = &op == &kBinary[kAdd] || &op == &kBinary[kSub];
+  bool uses_alpha = op.code == op::BINARY_ADD || op.code == op::BINARY_SUB;
   at::Tensor a = to_dtype(*lhs, dtype);
   std::string kernel = std::string("binary_") + label;
   with_output(out, dtype, [&](const at::Tensor& target) {
     if (scalar) {
       // Fold alpha into the scalar: a + alpha * s.
-      double v = scalar->toDouble() * (uses_alpha ? alpha.toDouble() : 1.0);
-      int64_t vi = floating ? 0 : scalar->toLong() * (uses_alpha ? alpha.toLong() : 1);
-      launch_strided(kernel.c_str(), {op.code, 1}, target, &a, nullptr, floating ? v : 0.0, vi);
+      at::Scalar v = !uses_alpha ? *scalar
+                     : floating  ? at::Scalar(scalar->toDouble() * alpha.toDouble())
+                                 : at::Scalar(scalar->toLong() * alpha.toLong());
+      launch_strided(kernel.c_str(), {op.code, 1}, target, &a, nullptr, {v});
     } else {
       at::Tensor b = to_dtype(*other, dtype);
-      launch_strided(kernel.c_str(), {op.code, 0}, target, &a, &b, floating ? alpha.toDouble() : 0.0,
-                     floating ? 0 : alpha.toLong());
+      launch_strided(kernel.c_str(), {op.code, 0}, target, &a, &b, {alpha});
     }
   });
   return true;
 }
+
+}  // namespace
+
+bool binary_op_gpu(int64_t code, const at::Tensor& self, const at::Tensor* other, const at::Scalar* other_scalar,
+                   const at::Tensor& out) {
+  for (const BinaryOp& op : kBinary) {
+    if (op.code == static_cast<uint32_t>(code)) {
+      return binary_gpu(op, self, other, other_scalar, 1, out);
+    }
+  }
+  // Codes without an aten op of their own (e.g. BINARY_DIV_TRUNC).
+  BinaryOp extra{"", "", static_cast<uint32_t>(code), Kind::Numeric, false, false};
+  return binary_gpu(extra, self, other, other_scalar, 1, out);
+}
+
+namespace {
 
 template <size_t I>
 at::Tensor& binary_alpha_out(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha, at::Tensor& out) {
@@ -452,8 +377,9 @@ at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, a
 
 // ---------------------------------------------------------------- comparisons
 
-// Codes must match shaders/compare.slang.
+// Indexed by COMPARE_EQ ... COMPARE_GE.
 constexpr const char* kCompare[] = {"aten::eq", "aten::ne", "aten::lt", "aten::le", "aten::gt", "aten::ge"};
+static_assert(op::COMPARE_EQ == 0 && op::COMPARE_GE == 5);
 
 bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other, const at::Scalar* other_scalar,
                  const at::Tensor& out) {
@@ -471,19 +397,22 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
   }
   at::ScalarType dtype = scalar ? at::result_type(self, *scalar) : at::result_type(self, *other);
   const char* label = dtype_label(dtype);
-  if (!kind_allows(Kind::Numeric, dtype) || label == nullptr) {
+  bool complex = at::isComplexType(dtype);
+  bool complex_ok = complex && (code == op::COMPARE_EQ || code == op::COMPARE_NE);
+  if (label == nullptr || !(kind_allows(Kind::Numeric, dtype) || dtype == at::kBool || complex_ok)) {
     return false;
   }
-  bool floating = at::isFloatingType(dtype);
   at::Tensor a = to_dtype(self, dtype);
   std::string kernel = std::string("compare_") + label;
   with_output(out, at::kBool, [&](const at::Tensor& target) {
-    if (scalar) {
-      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, floating ? scalar->toDouble() : 0.0,
-                     floating ? 0 : scalar->toLong());
+    if (scalar && complex) {
+      c10::complex<double> c = scalar->toComplexDouble();
+      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, {c.real(), c.imag()});
+    } else if (scalar) {
+      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, {*scalar});
     } else {
       at::Tensor b = to_dtype(*other, dtype);
-      launch_strided(kernel.c_str(), {code, 0}, target, &a, &b, 0.0, 0);
+      launch_strided(kernel.c_str(), {code, 0}, target, &a, &b);
     }
   });
   return true;
@@ -524,11 +453,6 @@ void register_compare(torch::Library& m, std::index_sequence<I...>) {
 
 }  // namespace
 
-void register_ops() {
-  // Registration happens in the TORCH_LIBRARY_IMPL block below when this
-  // object file is loaded; this function exists so the linker keeps it.
-}
-
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -550,6 +474,23 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("bitwise_or.Tensor_out", &binary_out<9>);
   m.impl("bitwise_xor.Tensor_out", &binary_out<10>);
   m.impl("pow.Tensor_Scalar_out", &pow_scalar_out);
+  m.impl("remainder.Tensor_out", &binary_out<11>);
+  m.impl("fmod.Tensor_out", &binary_out<12>);
+  m.impl("floor_divide.out", &binary_out<13>);
+  m.impl("copysign.out", &binary_out<14>);
+  m.impl("hypot.out", &binary_out<15>);
+  m.impl("nextafter.out", &binary_out<16>);
+  m.impl("logaddexp.out", &binary_out<17>);
+  m.impl("logaddexp2.out", &binary_out<18>);
+  m.impl("xlogy.OutTensor", &binary_out<19>);
+  m.impl("special_xlog1py.out", &binary_out<20>);
+  m.impl("heaviside.out", &binary_out<21>);
+  m.impl("fmax.out", &binary_out<22>);
+  m.impl("fmin.out", &binary_out<23>);
+  m.impl("bitwise_left_shift.Tensor_out", &binary_out<24>);
+  m.impl("bitwise_right_shift.Tensor_out", &binary_out<25>);
+  m.impl("gcd.out", &binary_out<26>);
+  m.impl("lcm.out", &binary_out<27>);
 
   register_compare(m, std::make_index_sequence<std::size(kCompare)>());
 }

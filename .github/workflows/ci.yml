@@ -1,0 +1,70 @@
+# Builds torch-vulkan on Linux and runs every test on lavapipe, Mesa's CPU
+# implementation of Vulkan, with the validation layer on.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  SLANG_VERSION: "2026.20"
+  TORCH_VK_VALIDATE: "1"
+  # Use lavapipe even if the runner exposes another Vulkan driver.
+  VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan (lavapipe, loader, validation layers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
+          vulkaninfo --summary
+
+      - name: Slang
+        run: |
+          curl -sSL -o slang.tar.gz "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz"
+          mkdir -p "$HOME/slang" && tar -xzf slang.tar.gz -C "$HOME/slang"
+          echo "SLANGC=$HOME/slang/bin/slangc" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python environment
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/pip install --quiet numpy pytest maturin expecttest hypothesis
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Rust tests and lint
+        run: |
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release -p vkcore
+
+      - name: Build the extension
+        run: maturin develop --release
+
+      - name: Python tests
+        run: python -m pytest -q
+
+      - name: Op coverage sweep
+        run: python tools/opinfo_coverage.py --jobs 4 | tail -50
+        env:
+          TORCH_VK_VALIDATE: "0"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opinfo-coverage
+          path: tools/opinfo_coverage.json

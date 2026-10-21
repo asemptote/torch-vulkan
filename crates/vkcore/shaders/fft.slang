@@ -20,6 +20,8 @@
 //   shared buffers, so the row is read and written once instead of log2(n)
 //   times.
 
+#include "opcodes.slang"
+
 #if defined(T_c64)
 typedef float S;
 #else
@@ -58,7 +60,7 @@ groupshared T sbuf[2][LOCAL_MAX];
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
     uint stride = p.ngroups * 256;
-    if (PHASE == 0)
+    if (PHASE == FFT_STOCKHAM)
     {
         uint half_n = p.n / 2;
         uint total = p.batch * half_n;
@@ -77,7 +79,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             p.out[base + idx + p.ns] = v0 - v1;
         }
     }
-    else if (PHASE == 2)
+    else if (PHASE == FFT_LOCAL)
     {
         uint half_n = p.n / 2;
         for (uint row = gid.x; row < p.batch; row += p.ngroups)  // uniform per workgroup

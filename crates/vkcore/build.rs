@@ -1,30 +1,52 @@
 //! Compiles `shaders/*.slang` to SPIR-V in OUT_DIR with slangc and generates
 //! `kernels.rs`, a table of (kernel name, SPIR-V bytes).
 //!
-//! Files starting with `_` are include files and are not compiled on their own.
-//! A shader can declare template axes in its leading comment lines:
+//! - Files starting with `_` are include files, not kernels.
+//! - `shaders/opcodes.txt` becomes `opcodes.slang` (included by the shaders);
+//!   crates/pyvk/build.rs turns the same file into a C++ header.
+//! - A shader can declare template axes in its leading comment lines:
 //!
-//!     // axis T: f32=float f64=double i32=int i64=int64_t
+//!       // axis T: f32=float f64=double i32=int i64=int64_t
 //!
-//! and is then compiled once per combination of axis values, as kernel
-//! `<stem>_<label>[_<label>...]` with `-D T=<type> -D T_<label>`.
+//!   and is then compiled once per combination of axis values, as kernel
+//!   `<stem>_<label>[_<label>...]` with `-D T=<type> -D T_<label>`.
+//! - `shaders/test/*.slang` (kernels used only by vkcore's own tests and
+//!   examples) are compiled only with the `test-kernels` feature.
+//! - Each variant is recompiled only when its inputs change: a hash of the
+//!   source, every include file, the defines and the compiler is stored next
+//!   to the SPIR-V.
 //!
 //! slangc is found via the SLANGC env var, then the Vulkan SDK (which bundles
 //! Slang), then PATH.
 
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Flags for every kernel.
+const SLANGC_FLAGS: &[&str] = &[
+    "-target", "spirv", "-profile", "spirv_1_5", "-entry", "main", "-stage", "compute", "-O2",
+    // Plain C-like layout for push constants and buffers (scalarBlockLayout,
+    // required by vkcore), so host structs match field for field.
+    "-fvk-use-scalar-layout",
+    // IEEE denormals like the CPU; vkcore strips these execution modes at
+    // load time on devices that cannot preserve denormals.
+    "-denorm-mode-fp32", "preserve", "-denorm-mode-fp64", "preserve",
+];
 
 fn slangc() -> PathBuf {
     if let Ok(p) = env::var("SLANGC") {
         return p.into();
     }
     if let Ok(sdk) = env::var("VULKAN_SDK") {
-        let p = Path::new(&sdk).join("Bin").join("slangc.exe");
-        if p.exists() {
-            return p;
+        // Windows SDK layout, then Linux/macOS.
+        for p in [Path::new(&sdk).join("Bin").join("slangc.exe"), Path::new(&sdk).join("bin").join("slangc")] {
+            if p.exists() {
+                return p;
+            }
         }
     }
     "slangc".into()
@@ -69,6 +91,29 @@ fn variants(axes: &[(String, Vec<(String, String)>)]) -> Vec<(String, Vec<String
     out
 }
 
+/// `opcodes.txt` lines as (FAMILY_NAME, code).
+fn opcodes(text: &str) -> Vec<(String, u32)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            assert!(parts.len() == 3, "opcodes.txt: expected `FAMILY NAME CODE`, got `{l}`");
+            (format!("{}_{}", parts[0], parts[1]), parts[2].parse().expect("opcodes.txt: code must be a number"))
+        })
+        .collect()
+}
+
+fn slang_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("slang"))
+        .collect();
+    files.sort();
+    files
+}
+
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let compiler = slangc();
@@ -76,15 +121,34 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-changed=shaders");
 
-    let mut sources: Vec<PathBuf> = std::fs::read_dir("shaders")
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("slang"))
-        .collect();
-    sources.sort();
+    // Shared op codes.
+    let codes_text = std::fs::read_to_string("shaders/opcodes.txt").unwrap();
+    let mut slang_codes = String::from("// Generated from shaders/opcodes.txt by crates/vkcore/build.rs.\n");
+    let mut seen = std::collections::HashSet::new();
+    for (name, code) in opcodes(&codes_text) {
+        assert!(seen.insert(name.clone()), "opcodes.txt: {name} defined twice");
+        writeln!(slang_codes, "static const int {name} = {code};").unwrap();
+    }
+    std::fs::write(out.join("opcodes.slang"), &slang_codes).unwrap();
 
-    // Launch every compilation at once, then collect.
+    let mut sources = slang_files(Path::new("shaders"));
+    if env::var_os("CARGO_FEATURE_TEST_KERNELS").is_some() {
+        sources.extend(slang_files(Path::new("shaders/test")));
+    }
+
+    // Everything a kernel can include: hashed into every variant's key.
+    let mut includes = DefaultHasher::new();
+    for f in slang_files(Path::new("shaders")).iter().filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('_')) {
+        std::fs::read(f).unwrap().hash(&mut includes);
+    }
+    slang_codes.hash(&mut includes);
+    compiler.hash(&mut includes);
+    SLANGC_FLAGS.hash(&mut includes);
+    let includes = includes.finish();
+
+    // Launch every compilation that is out of date at once, then collect.
     let mut jobs = Vec::new();
+    let mut table = String::from("pub static SPIRV: &[(&str, &[u8])] = &[\n");
     let mut names = std::collections::HashSet::new();
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
@@ -97,36 +161,39 @@ fn main() {
             let name = format!("{stem}{suffix}");
             assert!(names.insert(name.clone()), "two shaders produce kernel {name}; rename one");
             let spv = out.join(format!("{name}.spv"));
+            writeln!(table, "    ({name:?}, include_bytes!({:?})),", spv.display().to_string()).unwrap();
+
+            let mut key = DefaultHasher::new();
+            (includes, &text, &defines).hash(&mut key);
+            let key = format!("{:016x}", key.finish());
+            let stamp = out.join(format!("{name}.hash"));
+            if spv.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str()) {
+                continue;  // up to date
+            }
             let mut cmd = Command::new(&compiler);
-            cmd.arg(src)
-                .args(["-target", "spirv", "-profile", "spirv_1_5", "-entry", "main", "-stage", "compute", "-O2"])
-                // IEEE denormals, like the CPU (GPUs may otherwise flush them to zero).
-                .args(["-denorm-mode-fp32", "preserve", "-denorm-mode-fp64", "preserve"])
-                .arg("-I")
-                .arg("shaders");
+            cmd.arg(src).args(SLANGC_FLAGS).arg("-I").arg("shaders").arg("-I").arg(&out);
             for d in &defines {
                 cmd.arg(format!("-D{d}"));
             }
             cmd.arg("-o").arg(&spv).stdout(Stdio::piped()).stderr(Stdio::piped());
             let child = cmd.spawn().unwrap_or_else(|e| panic!("could not run slangc ({}): {e}. Set SLANGC to its path.", compiler.display()));
-            jobs.push((name, spv, defines, child));
+            jobs.push((name, defines, child, stamp, key));
         }
     }
 
-    let mut table = String::from("pub static SPIRV: &[(&str, &[u8])] = &[\n");
     let mut failures = Vec::new();
-    for (name, spv, defines, child) in jobs {
+    for (name, defines, child, stamp, key) in jobs {
         let result = child.wait_with_output().unwrap();
-        if !result.status.success() {
+        if result.status.success() {
+            std::fs::write(stamp, key).unwrap();
+        } else {
             failures.push(format!(
                 "slangc failed for {name} ({}):\n{}{}",
                 defines.join(" "),
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             ));
-            continue;
         }
-        writeln!(table, "    ({name:?}, include_bytes!({:?})),", spv.display().to_string()).unwrap();
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     table.push_str("];\n");

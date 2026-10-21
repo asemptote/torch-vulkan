@@ -9,6 +9,8 @@
 // A is T for floats and int64 for integers and bool (PyTorch's cumsum
 // dtype). OP: 0 sum, 1 prod.
 
+#include "opcodes.slang"
+
 #if defined(T_f32)
 typedef float A;
 #elif defined(T_f64)
@@ -48,8 +50,8 @@ static const uint ITEMS = 4;
 static const uint CHUNK = WG * ITEMS;
 groupshared A s[2][WG];
 
-A identity() { return OP == 1 ? A(1) : A(0); }
-A combine(A a, A b) { return OP == 1 ? a * b : a + b; }
+A identity() { return OP == SCAN_PROD ? A(1) : A(0); }
+A combine(A a, A b) { return OP == SCAN_PROD ? a * b : a + b; }
 
 int row_offset(uint row)
 {
@@ -76,7 +78,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         uint c = w % p.nchunks;
         uint first = c * CHUNK + tid.x * ITEMS;
 
-        if (PHASE == 1)
+        if (PHASE == 1)  // add the scanned chunk totals
         {
             if (c > 0)
             {

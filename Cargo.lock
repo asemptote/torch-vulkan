@@ -185,6 +185,7 @@ name = "vkcore"
 version = "0.0.1"
 dependencies = [
  "ash",
+ "vkcore",
 ]
 
 [[package]]

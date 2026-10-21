@@ -15,6 +15,8 @@
 
 #include "vk.h"
 
+#include "opcodes.h"
+
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
@@ -71,7 +73,7 @@ at::Tensor to_vk(const at::Tensor& host, const at::Tensor& like) {
   return host.to(like.options());
 }
 
-// MODE 0: out[i, :] = in[idx[i], :];  MODE 1: out[idx[i], :] = in[i, :].
+// ROWS_GATHER: out[i, :] = in[idx[i], :];  ROWS_SCATTER: out[idx[i], :] = in[i, :].
 void rows_kernel(const at::Tensor& in, const at::Tensor& out, const std::vector<int64_t>& idx, uint32_t mode) {
   if (idx.empty() || in.size(1) == 0) {
     return;
@@ -105,8 +107,8 @@ void permute_rows(const at::Tensor& m, const std::vector<int64_t>& perm) {
     return;
   }
   at::Tensor moved = at::empty({static_cast<int64_t>(dst.size()), m.size(1)}, m.options());
-  rows_kernel(m, moved, src, 0);
-  rows_kernel(moved, m, dst, 1);
+  rows_kernel(m, moved, src, op::ROWS_GATHER);
+  rows_kernel(moved, m, dst, op::ROWS_SCATTER);
 }
 
 // Inverse of a small triangular block (on the CPU, in float64 for accuracy).
@@ -439,6 +441,3 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("tril.out", &triangle_out<false>);
   m.impl("triu.out", &triangle_out<true>);
 }
-
-// Referenced from backend.cpp so the linker keeps this object file.
-extern "C" void vkt_dense_linked() {}

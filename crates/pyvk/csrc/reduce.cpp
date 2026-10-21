@@ -9,6 +9,9 @@
 
 #include "vk.h"
 
+#include "opcodes.h"
+#include "strided.h"
+
 #include <ATen/WrapDimUtils.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
@@ -22,11 +25,13 @@ namespace vk {
 namespace {
 
 // Op codes; must match shaders/reduce.slang.
+// Shorthands for the generated codes (shaders/opcodes.txt).
 enum ROp : uint32_t {
-  kSum = 0, kProd = 1, kMax = 2, kMin = 3, kSumAbs = 4, kSumSq = 5,
-  kMaxAbs = 6, kMinAbs = 7, kSqDev = 8, kAny = 9, kAll = 10,
+  kSum = op::REDUCE_SUM, kProd = op::REDUCE_PROD, kMax = op::REDUCE_MAX, kMin = op::REDUCE_MIN,
+  kSumAbs = op::REDUCE_SUMABS, kSumSq = op::REDUCE_SUMSQ, kMaxAbs = op::REDUCE_MAXABS, kMinAbs = op::REDUCE_MINABS,
+  kSqDev = op::REDUCE_SQDEV, kAny = op::REDUCE_ANY, kAll = op::REDUCE_ALL,
 };
-enum Final : uint32_t { kNone = 0, kScale = 1, kSqrtScale = 2 };
+enum Final : uint32_t { kNone = op::FINAL_NONE, kScale = op::FINAL_SCALE, kSqrtScale = op::FINAL_SQRT_SCALE };
 
 struct ReduceParams {
   uint64_t in, out, mean;
@@ -70,28 +75,18 @@ struct Dims {
   std::array<int32_t, 4> stride = {0, 0, 0, 0};
 };
 
-// Merges dims given outermost-first into innermost-first Dims; false if more
-// than 4 remain.
+// Merges dims given outermost-first into innermost-first Dims (strided.h);
+// false if more than 4 remain.
 bool coalesce(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, Dims& out) {
-  std::vector<std::pair<int64_t, int64_t>> dims;
-  for (int64_t d = static_cast<int64_t>(sizes.size()) - 1; d >= 0; --d) {
-    if (sizes[d] == 1) {
-      continue;
-    }
-    if (!dims.empty() && strides[d] == dims.back().second * dims.back().first) {
-      dims.back().first *= sizes[d];
-      continue;
-    }
-    dims.push_back({sizes[d], strides[d]});
-  }
-  if (dims.size() > 4) {
+  StridedDims<1> d = merge_dims<1>(sizes, {strides});
+  if (d.ndim() > 4) {
     return false;
   }
   out = Dims{};
-  out.n = static_cast<uint32_t>(dims.size());
-  for (size_t i = 0; i < dims.size(); ++i) {
-    out.size[i] = static_cast<uint32_t>(dims[i].first);
-    out.stride[i] = static_cast<int32_t>(dims[i].second);
+  out.n = static_cast<uint32_t>(d.ndim());
+  for (size_t i = 0; i < d.ndim(); ++i) {
+    out.size[i] = static_cast<uint32_t>(d.size[i]);
+    out.stride[i] = static_cast<int32_t>(d.stride[i][0]);
   }
   return true;
 }
@@ -578,6 +573,3 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("cumsum.out", &cumulative_out<0>);
   m.impl("cumprod.out", &cumulative_out<1>);
 }
-
-// Referenced from backend.cpp so the linker keeps this object file.
-extern "C" void vkt_reduce_linked() {}

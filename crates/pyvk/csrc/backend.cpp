@@ -1,6 +1,7 @@
 // Backend plumbing for device "vk" (PrivateUse1): allocator, device guard,
 // hooks, tensor creation/views/resizing, copies, and the CPU fallback.
 
+#include "opcodes.h"
 #include "vk.h"
 
 #include <ATen/EmptyTensor.h>
@@ -192,7 +193,7 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
     return;
   }
   std::string kernel = std::string("cast_") + from + "_" + to;
-  launch_strided(kernel.c_str(), {}, dst, &src, nullptr, 0.0, 0);
+  launch_strided(kernel.c_str(), {}, dst, &src, nullptr);
 }
 
 at::Tensor host_view(const at::Tensor& vk_tensor);
@@ -242,10 +243,10 @@ void fix_up_in_place(const at::Tensor& t, bool conj, bool neg) {
   }
   if (complex) {
     std::string kernel = std::string("cunary_") + label;
-    if (conj) launch_strided(kernel.c_str(), {1}, t, &t, nullptr, 0.0, 0);
-    if (neg) launch_strided(kernel.c_str(), {0}, t, &t, nullptr, 0.0, 0);
+    if (conj) launch_strided(kernel.c_str(), {op::CUNARY_CONJ}, t, &t, nullptr);
+    if (neg) launch_strided(kernel.c_str(), {op::CUNARY_NEG}, t, &t, nullptr);
   } else {
-    launch_strided((std::string("unary_") + label).c_str(), {0}, t, &t, nullptr, 0.0, 0);
+    launch_strided((std::string("unary_") + label).c_str(), {op::UNARY_NEG}, t, &t, nullptr);
   }
 }
 
@@ -300,18 +301,19 @@ at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
   }
   std::string kernel = std::string("fill_") + label;
   if (at::isComplexType(self.scalar_type())) {
-    // Real part in alpha, the bits of the (double) imaginary part in alpha_i.
     c10::complex<double> c = value.toComplexDouble();
-    double imag = c.imag();
-    int64_t imag_bits;
-    std::memcpy(&imag_bits, &imag, sizeof(imag_bits));
-    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, c.real(), imag_bits);
-    return self;
+    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, {c.real(), c.imag()});
+  } else {
+    bool is_bool = self.scalar_type() == at::kBool;
+    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, {is_bool ? at::Scalar(value.toBool()) : value});
   }
-  bool floating = at::isFloatingType(self.scalar_type());
-  launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, floating ? value.toDouble() : 0.0,
-                 floating ? 0 : value.toLong());
   return self;
+}
+
+at::Tensor& fill_tensor(at::Tensor& self, const at::Tensor& value) {
+  TORCH_CHECK(value.dim() == 0, "fill_ only supports 0-dimension value tensor but got tensor with ", value.dim(),
+              " dimensions.");
+  return fill_scalar(self, value.item());
 }
 
 at::Tensor& zero_(at::Tensor& self) {
@@ -368,20 +370,11 @@ extern "C" size_t vkt_fallback_counts(char* buf, size_t len) {
   return text.size() + 1;
 }
 
-// Called once from the Python module's init: registers everything. Kept as
-// an explicit call (rather than only static initializers) so the linker
-// cannot drop this object file from the extension.
-extern "C" void vkt_reduce_linked();
-extern "C" void vkt_linalg_linked();
-extern "C" void vkt_fft_linked();
-extern "C" void vkt_dense_linked();
-
+// Called once from the Python module's init: installs the allocator and
+// hooks. The aten kernels register themselves through the
+// TORCH_LIBRARY_IMPL blocks of each file (the library is linked whole, so
+// none are dropped).
 extern "C" void vkt_register_backend() {
-  // Keep reduce.cpp and linalg.cpp (and their kernel registrations) in the link.
-  vkt_reduce_linked();
-  vkt_linalg_linked();
-  vkt_fft_linked();
-  vkt_dense_linked();
   static bool done = false;
   if (done) {
     return;
@@ -389,7 +382,6 @@ extern "C" void vkt_register_backend() {
   done = true;
   c10::SetAllocator(vk::kDevice, vk::allocator());
   at::RegisterPrivateUse1HooksInterface(new vk::VkHooks());
-  vk::register_ops();
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -407,6 +399,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_copy_from_and_resize", vk::copy_from_and_resize);
   m.impl("_local_scalar_dense", vk::local_scalar_dense);
   m.impl("fill_.Scalar", vk::fill_scalar);
+  m.impl("fill_.Tensor", vk::fill_tensor);
   m.impl("zero_", vk::zero_);
 }
 

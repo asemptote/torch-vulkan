@@ -1,30 +1,37 @@
 // Shared parameter block and index math for strided element-wise kernels.
 //
 // The including file defines OUT_T (output element type) and IN_T (input
-// element type) before including this file.
+// element type); PARAM_T comes from _types.slang (the kernel's T axis).
+// Kernels other than float64 ones never touch a double, so they run on GPUs
+// without float64 support.
 //
-// Layout (128 bytes, every field naturally aligned, so std430 and scalar
-// layouts agree; the host packs it as `<QQQdqIIII8x4I4i4i4i`):
-//   0  out, a, b      element pointers (storage offset already applied)
-//   24 alpha          float scalar (alpha multiplier, scalar operand, fill value)
-//   32 alpha_i        integer version of the same scalar
-//   40 n              number of output elements
-//   44 ndim           number of (coalesced) dims, <= 4; dim 0 is innermost
-//   48 stride         grid stride (total threads launched)
-//   64 size[4]        dim sizes
-//   80 so/sa/sb[4]    element strides of out, a, b (0 = broadcast)
+// Layout (128 bytes; csrc/launch.cpp packs it as StridedLayout<3>). Sizes and
+// strides are 4-vectors rather than arrays: Intel's Windows driver misreads
+// dynamically indexed arrays in push constants.
+//   0   out, a, b               element pointers (storage offset applied)
+//   24  alpha, beta, gamma      raw 64-bit parameter slots, packed by the
+//                               host per T: an int64 for integer and bool
+//                               kernels, double bits for float64/complex128,
+//                               float bits in the low word otherwise
+//   48  n, ndim, stride, _pad   element count, merged dims (<= 4), grid stride
+//   64  size                    dim sizes, innermost first
+//   80  so, sa, sb              element strides of out, a, b (0 = broadcast)
+
+#include "_types.slang"
+#include "opcodes.slang"
 
 struct Params
 {
     OUT_T* out;
     IN_T* a;
     IN_T* b;
-    double alpha;
-    int64_t alpha_i;
+    uint64_t alpha_bits;
+    uint64_t beta_bits;
+    uint64_t gamma_bits;
     uint n;
     uint ndim;
     uint stride;
-    uint _pad0;
+    uint _pad;
     uint4 size;
     int4 so;
     int4 sa;
@@ -32,6 +39,21 @@ struct Params
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
+
+PARAM_T param(uint64_t bits)
+{
+#if defined(PARAM_DOUBLE)
+    return bit_cast<double>(bits);
+#else
+    return bit_cast<float>(uint(bits));
+#endif
+}
+
+PARAM_T alpha() { return param(p.alpha_bits); }
+PARAM_T beta() { return param(p.beta_bits); }
+PARAM_T gamma() { return param(p.gamma_bits); }
+int64_t alpha_int() { return int64_t(p.alpha_bits); }
+int64_t beta_int() { return int64_t(p.beta_bits); }
 
 struct Offsets
 {
