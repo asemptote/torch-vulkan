@@ -363,12 +363,14 @@ extern "C" size_t vkt_fallback_counts(char* buf, size_t len) {
 extern "C" void vkt_reduce_linked();
 extern "C" void vkt_linalg_linked();
 extern "C" void vkt_fft_linked();
+extern "C" void vkt_dense_linked();
 
 extern "C" void vkt_register_backend() {
   // Keep reduce.cpp and linalg.cpp (and their kernel registrations) in the link.
   vkt_reduce_linked();
   vkt_linalg_linked();
   vkt_fft_linked();
+  vkt_dense_linked();
   static bool done = false;
   if (done) {
     return;

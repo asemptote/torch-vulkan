@@ -3,12 +3,14 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M6 — complex numbers and FFT**: device `"vk"` is a native PyTorch
+Status: **M7 — dense linear algebra**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128, including float64 exp/log/sin/cos/tanh/...), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
-nn.Linear) and FFTs (all of `torch.fft`, any length) run as Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
+nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
+(solve, inv, det, slogdet, lu_factor/lu_solve, cholesky, solve_triangular,
+tril/triu) run on the GPU; every other op runs on the CPU through PyTorch's boxed
 fallback. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
@@ -19,6 +21,39 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Dense linear algebra (M7)
+
+- `csrc/dense.cpp`: blocked right-looking LU with partial pivoting and
+  Cholesky, panels of 64 columns. Each panel / diagonal block is factored by
+  LAPACK on the CPU (memory is shared: a copy plus a sync); the O(n³)
+  trailing updates run on the GPU as GEMMs. Triangular solves apply inverses
+  of the 64×64 diagonal blocks (computed on the CPU in float64) with GEMMs.
+  Row interchanges are applied by a gather/scatter kernel
+  (`shaders/rows.slang`) to the rows that move.
+- Ops: `linalg.lu_factor(_ex)`, `linalg.solve(_ex)` (vector or matrix right-hand
+  side), `linalg.inv(_ex)`, `linalg.det`, `linalg.slogdet`, `linalg.lu_solve`,
+  `linalg.cholesky(_ex)` (lower/upper), `linalg.solve_triangular`, plus
+  `tril`/`triu` kernels (`shaders/triangle.slang`, any dtype, batched).
+  Pivots match LAPACK's exactly; `info` and `check_errors` behave as on the
+  CPU (singular / not positive-definite matrices raise `LinAlgError`).
+- The GPU path takes single float32/float64 matrices with n ≥ 128; smaller or
+  batched inputs, right-side solves, QR, eigh and SVD run on the CPU.
+  `TORCH_VK_LINALG=cpu` sends everything to LAPACK.
+
+Measured (`python benchmarks/linalg.py`, UHD 620 vs 4-thread CPU with MKL):
+
+| n = 2048 | vk float32 | CPU | vk float64 | CPU |
+|---|---|---|---|---|
+| `solve` (8 right-hand sides) | 494 ms | 112 ms | 636 ms | 216 ms |
+| `cholesky` | 283 ms | 64 ms | 458 ms | 101 ms |
+| `inv` | 587 ms | 305 ms | 1640 ms | 572 ms |
+
+Correct, but slower than MKL on this machine: the trailing updates use the
+M5 GEMM (itself slower than MKL here), and each panel synchronizes, leaving
+the GPU idle while the CPU factors it. Look-ahead (factoring panel k+1 while
+the GPU updates the rest) and a faster GEMM are the next steps; on an
+integrated GPU like this one, `TORCH_VK_LINALG=cpu` is the faster choice.
 
 ## Complex numbers and FFT (M6)
 
@@ -239,14 +274,16 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
+  csrc/dense.cpp           blocked LU / Cholesky / triangular solves, tril/triu
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_vk.py    289 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_vk.py    327 tests: results on "vk" vs CPU, no unexpected fallbacks
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
 benchmarks/matmul.py       matrix multiply GFLOP/s vs CPU
 benchmarks/fft.py          FFT timings vs CPU
+benchmarks/linalg.py       solve / cholesky / inv timings vs CPU
 pyproject.toml             maturin build of the Python package
 ```
 
@@ -283,7 +320,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 289 Python tests pass with no validation messages.
+All 327 Python tests pass with no validation messages.
 
 ## Roadmap
 
@@ -304,5 +341,6 @@ All 289 Python tests pass with no validation messages.
    rather than VkFFT (VkFFT's Vulkan backend needs the raw device/queue
    handles and runtime glslang). Not yet: complex reductions, complex
    matmul, complex transcendentals, faster FFT kernels.
-7. **M7 linear algebra**: blocked LU/Cholesky/QR with GPU trailing updates; eigh/svd via CPU initially.
+7. ~~**M7 dense linear algebra**~~: done (see above). Not yet: blocked QR
+   (compact-WY updates), batched GPU paths, look-ahead, eigh/SVD on the GPU.
 8. **Testing throughout**: PyTorch OpInfo samples compared against CPU.
