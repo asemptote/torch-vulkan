@@ -29,6 +29,7 @@ fn py_runtime() -> PyResult<Arc<Runtime>> {
 
 extern "C" {
     fn vkt_register_backend();
+    fn vkt_clear_fft_caches();
     fn vkt_fallback_counts(buf: *mut std::ffi::c_char, len: usize) -> usize;
 }
 
@@ -87,6 +88,8 @@ fn fallback_counts() -> Vec<(String, u64)> {
 /// Finishes queued work and destroys the runtime (saving the pipeline cache).
 #[pyfunction]
 fn shutdown() {
+    // Cached device tables must be freed while the memory pool still exists.
+    unsafe { vkt_clear_fft_caches() };
     let rt = RUNTIME.lock().unwrap().take();
     if let Some(rt) = &rt {
         let _ = rt.synchronize();

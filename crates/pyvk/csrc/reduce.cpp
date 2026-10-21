@@ -260,7 +260,8 @@ std::pair<at::Tensor, at::Tensor> run_argreduce(const at::Tensor& self, const Pl
 
 bool reducible(const at::Tensor& self, bool allow_bool = true) {
   const char* label = dtype_label(self.scalar_type());
-  return is_vk(self) && label != nullptr && (allow_bool || self.scalar_type() != at::kBool);
+  return is_vk(self) && label != nullptr && !at::isComplexType(self.scalar_type()) &&
+         (allow_bool || self.scalar_type() != at::kBool);
 }
 
 void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {

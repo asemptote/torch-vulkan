@@ -3,11 +3,12 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M5 — matrix products**: device `"vk"` is a native PyTorch backend
-(C++ on PrivateUse1). Element-wise ops (float32 and float64, including
-exp/log/sin/cos/tanh/...), reductions (sum, mean, prod, max/min, argmax,
-var/std, norms, any/all), scans (cumsum, cumprod) and matrix products (mm,
-bmm, matmul, addmm, baddbmm, addmv, dot, nn.Linear) run as Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
+Status: **M6 — complex numbers and FFT**: device `"vk"` is a native PyTorch
+backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
+complex128, including float64 exp/log/sin/cos/tanh/...), reductions (sum,
+mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
+cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
+nn.Linear) and FFTs (all of `torch.fft`, any length) run as Vulkan kernels; every other op runs on the CPU through PyTorch's boxed
 fallback. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
@@ -18,6 +19,41 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Complex numbers and FFT (M6)
+
+- complex64 / complex128 tensors (stored as float2 / double2): casts to and
+  from every real dtype, fills, `+ - * /` (with complex scalars and real
+  `alpha`; division uses Smith's algorithm), `neg`, `abs` (overflow-safe),
+  `conj` / `conj_physical`, and the views `real`, `imag`, `view_as_real`,
+  `view_as_complex` (they alias: `x.real += 1` updates `x`).
+- Lazy conjugate/negative bits: `_copy_from` passes through PyTorch's
+  Conjugate/Negative layers and applies the bits itself (otherwise
+  materializing them recursed forever). The CPU fallback now refuses view
+  ops (`error_on_views`) instead of silently returning copies.
+- `shaders/fft.slang` + `csrc/fft.cpp`: `_fft_c2c`, `_fft_r2c`, `_fft_c2r`,
+  which every `torch.fft` function reduces to. Power-of-two lengths use
+  radix-2 Stockham passes (rows up to 2048 complex64 / 1024 complex128 run
+  all passes in shared memory in one dispatch); other lengths use
+  Bluestein's algorithm. Twiddle and chirp tables are computed on the host in
+  float64 (the GPU's float32 sin/cos would be far too inaccurate) and cached.
+  r2c transforms as complex and keeps n/2+1 bins; c2r rebuilds the Hermitian
+  spectrum and keeps the real part. Error vs PyTorch's CPU FFT is a few ULP x
+  log2(n); a 65536-point complex128 FFT agrees to < 1e-11.
+
+Measured (`python benchmarks/fft.py`, UHD 620 vs 4-thread CPU):
+
+| | vk complex64 | CPU | vk complex128 | CPU |
+|---|---|---|---|---|
+| fft 2^20 | 33 ms | 14 ms | 49 ms | 25 ms |
+| fft2 1024×1024 | 12 ms | 6 ms | 27 ms | 12 ms |
+| fft 1,000,003 (prime, Bluestein) | 119 ms | 212 ms | 249 ms | 345 ms |
+| rfft 2^22 | 127 ms | 62 ms | 273 ms | 104 ms |
+
+The FFTs are memory-bound radix-2 passes plus transposes between dims; on
+this integrated GPU only long prime-length transforms beat the CPU so far.
+Radix-4/8 passes, a shared-memory four-step FFT for long rows, and a real
+r2c (half-length complex) path are the next steps.
 
 ## Matrix products (M5)
 
@@ -202,13 +238,15 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/ops.cpp             element-wise aten kernels (strided launches)
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
+  csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_vk.py    253 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_vk.py    289 tests: results on "vk" vs CPU, no unexpected fallbacks
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
 benchmarks/matmul.py       matrix multiply GFLOP/s vs CPU
+benchmarks/fft.py          FFT timings vs CPU
 pyproject.toml             maturin build of the Python package
 ```
 
@@ -245,7 +283,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 253 Python tests pass with no validation messages.
+All 289 Python tests pass with no validation messages.
 
 ## Roadmap
 
@@ -262,6 +300,9 @@ All 253 Python tests pass with no validation messages.
 5. ~~**M5 matrix products**~~: done (see above). Not yet: a faster
    subgroup/cooperative-matrix kernel, integer and half-precision GEMM,
    convolutions.
-6. **M6 complex dtypes + FFT** (VkFFT).
+6. ~~**M6 complex numbers + FFT**~~: done (see above), with an own FFT
+   rather than VkFFT (VkFFT's Vulkan backend needs the raw device/queue
+   handles and runtime glslang). Not yet: complex reductions, complex
+   matmul, complex transcendentals, faster FFT kernels.
 7. **M7 linear algebra**: blocked LU/Cholesky/QR with GPU trailing updates; eigh/svd via CPU initially.
 8. **Testing throughout**: PyTorch OpInfo samples compared against CPU.

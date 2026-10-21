@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <utility>
 
 namespace vk {
@@ -211,8 +212,28 @@ constexpr UnaryOp kUnary[] = {
 
 constexpr uint32_t kRelu = 2;
 
+// Complex unary ops: neg (code 0) and abs (code 1, real output).
+bool complex_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out) {
+  const char* label = dtype_label(self.scalar_type());
+  if (label == nullptr || !is_vk(self) || !is_vk(out) || (code != 0 && code != 1)) {
+    return false;
+  }
+  at::ScalarType want = code == 1 ? c10::toRealValueType(self.scalar_type()) : self.scalar_type();
+  with_output(out, want, [&](const at::Tensor& target) {
+    if (code == 1) {
+      launch_strided((std::string("cabs_") + label).c_str(), {}, target, &self, nullptr, 0.0, 0);
+    } else {
+      launch_strided((std::string("cunary_") + label).c_str(), {0}, target, &self, nullptr, 0.0, 0);
+    }
+  });
+  return true;
+}
+
 bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tensor& out) {
   at::native::resize_output(out, self.sizes());
+  if (at::isComplexType(self.scalar_type())) {
+    return complex_unary_gpu(code, self, out);
+  }
   at::ScalarType dtype = out.scalar_type();
   const char* label = dtype_label(dtype);
   if (!kind_allows(kind, dtype) || label == nullptr || !is_vk(self) || !is_vk(out)) {
@@ -250,6 +271,19 @@ at::Tensor& relu_(at::Tensor& self) {
   return self;
 }
 
+at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
+  at::native::resize_output(out, self.sizes());
+  const char* label = dtype_label(self.scalar_type());
+  if (!at::isComplexType(self.scalar_type())) {
+    out.copy_(self);  // conj of a real tensor is itself
+  } else if (label != nullptr && is_vk(self) && is_vk(out) && out.scalar_type() == self.scalar_type()) {
+    launch_strided((std::string("cunary_") + label).c_str(), {1}, out, &self, nullptr, 0.0, 0);
+  } else {
+    on_cpu("aten::conj_physical", "out", self, out);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- binary
 
 // Codes must match shaders/binary.slang.
@@ -278,10 +312,45 @@ constexpr BinaryOp kBinary[] = {
 constexpr size_t kAdd = 0, kSub = 1, kPow = 6;
 
 at::ScalarType compute_dtype(const BinaryOp& op, at::ScalarType promoted) {
-  if (op.true_div && !at::isFloatingType(promoted)) {
+  if (op.true_div && !at::isFloatingType(promoted) && !at::isComplexType(promoted)) {
     return c10::typeMetaToScalarType(at::get_default_dtype());
   }
   return promoted;
+}
+
+// Complex add/sub (real alpha), mul and div; shaders/cbinary.slang.
+bool complex_binary_gpu(const BinaryOp& op, const at::Tensor& lhs, const at::Tensor* other,
+                        const std::optional<at::Scalar>& scalar, const at::Scalar& alpha, const at::Tensor& out,
+                        at::ScalarType dtype) {
+  uint32_t code;
+  if (op.code == 0 || op.code == 1 || op.code == 2) {
+    code = op.code;
+  } else if (op.code == 10) {
+    code = 10;
+  } else {
+    return false;
+  }
+  const char* label = dtype_label(dtype);
+  if (label == nullptr || alpha.isComplex()) {
+    return false;
+  }
+  bool uses_alpha = code == 0 || code == 1;
+  at::Tensor a = to_dtype(lhs, dtype);
+  std::string kernel = std::string("cbinary_") + label;
+  with_output(out, dtype, [&](const at::Tensor& target) {
+    if (scalar) {
+      // Complex scalar: real part in alpha, the bits of the imaginary part in alpha_i.
+      c10::complex<double> v = scalar->toComplexDouble() * (uses_alpha ? alpha.toDouble() : 1.0);
+      double imag = v.imag();
+      int64_t imag_bits;
+      std::memcpy(&imag_bits, &imag, sizeof(imag_bits));
+      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, v.real(), imag_bits);
+    } else {
+      at::Tensor b = to_dtype(*other, dtype);
+      launch_strided(kernel.c_str(), {code, 0}, target, &a, &b, alpha.toDouble(), 0);
+    }
+  });
+  return true;
 }
 
 // out = op(self, other) with other a vk tensor, a 0-dim CPU tensor, or a scalar.
@@ -310,7 +379,7 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       at::ScalarType dtype = at::result_type(self, *other);
       const char* label = dtype_label(dtype);
       if (!kind_allows(op.kind, dtype) || label == nullptr) {
-        return false;
+        return false;  // (complex dtypes fail kind_allows and fall back)
       }
       bool floating = at::isFloatingType(dtype);
       at::Tensor b = to_dtype(*other, dtype);
@@ -333,6 +402,9 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   at::ScalarType promoted = scalar ? at::result_type(*lhs, *scalar) : at::result_type(*lhs, *other);
   at::ScalarType dtype = compute_dtype(op, promoted);
   const char* label = dtype_label(dtype);
+  if (at::isComplexType(dtype)) {
+    return complex_binary_gpu(op, *lhs, scalar ? nullptr : other, scalar, alpha, out, dtype);
+  }
   if (!kind_allows(op.kind, dtype) || label == nullptr) {
     return false;
   }
@@ -464,6 +536,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   register_unary(m, std::make_index_sequence<std::size(kUnary)>());
   m.impl("relu", &relu);
   m.impl("relu_", &relu_);
+  m.impl("conj_physical.out", &conj_physical_out);
 
   m.impl("add.out", &binary_alpha_out<0>);
   m.impl("sub.out", &binary_alpha_out<1>);

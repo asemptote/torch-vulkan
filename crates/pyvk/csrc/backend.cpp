@@ -9,6 +9,9 @@
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/set_native.h>
+#include <ATen/ops/unfold_native.h>
+#include <ATen/ops/view_as_complex_native.h>
+#include <ATen/ops/view_as_real_native.h>
 #include <ATen/ops/view_native.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <torch/library.h>
@@ -80,6 +83,8 @@ const char* dtype_label(at::ScalarType t) {
     case at::kInt: return "i32";
     case at::kLong: return "i64";
     case at::kBool: return "b8";
+    case at::kComplexFloat: return "c64";
+    case at::kComplexDouble: return vkt_has_float64() ? "c128" : nullptr;
     default: return nullptr;
   }
 }
@@ -219,20 +224,56 @@ at::Tensor host_view(const at::Tensor& t) {
   return at::from_blob(t.data_ptr(), t.sizes(), t.strides(), at::TensorOptions().dtype(t.scalar_type()));
 }
 
+// Applies conj (complex) and/or negation in place to vk tensor `t`'s data.
+void fix_up_in_place(const at::Tensor& t, bool conj, bool neg) {
+  const char* label = dtype_label(t.scalar_type());
+  bool complex = at::isComplexType(t.scalar_type());
+  conj = conj && complex;
+  if (!conj && !neg) {
+    return;
+  }
+  if (label == nullptr) {
+    record_fallback("aten::copy_ (conj/neg bit, dtype " + std::string(c10::toString(t.scalar_type())) + ")");
+    at::Tensor host = t.cpu();
+    if (conj) host = host.conj_physical();
+    if (neg) host = host.neg();
+    t.copy_(host);
+    return;
+  }
+  if (complex) {
+    std::string kernel = std::string("cunary_") + label;
+    if (conj) launch_strided(kernel.c_str(), {1}, t, &t, nullptr, 0.0, 0);
+    if (neg) launch_strided(kernel.c_str(), {0}, t, &t, nullptr, 0.0, 0);
+  } else {
+    launch_strided((std::string("unary_") + label).c_str(), {0}, t, &t, nullptr, 0.0, 0);
+  }
+}
+
+// Copies are conj/neg-aware (registered as fallthrough for the Conjugate and
+// Negative keys): data is copied as stored, then the difference between the
+// source's and destination's lazy conj/neg bits is applied.
 at::Tensor copy_from(const at::Tensor& self, const at::Tensor& dst, bool /*non_blocking*/) {
   if (self.numel() == 0 && dst.numel() == 0) {
     return dst;
   }
+  bool conj = self.is_conj() != dst.is_conj();
+  bool neg = self.is_neg() != dst.is_neg();
   bool src_vk = self.device().type() == kDevice;
   bool dst_vk = dst.device().type() == kDevice;
   if (src_vk && dst_vk) {
     copy_vk_to_vk(dst, self);
+    fix_up_in_place(dst, conj, neg);
   } else if (dst_vk) {
-    copy_cpu_to_vk(dst, self);
+    copy_cpu_to_vk(dst, self.resolve_conj().resolve_neg());  // cheap on the CPU
+    // The source is resolved; dst's own lazy bits mean its stored data is their inverse.
+    fix_up_in_place(dst, dst.is_conj(), dst.is_neg());
   } else {
     TORCH_CHECK(src_vk && dst.is_cpu(), "torch_vulkan: unsupported copy from ", self.device(), " to ", dst.device());
     synchronize();
-    dst.copy_(host_view(self));
+    at::Tensor host = host_view(self);
+    if (self.is_conj()) host = host.conj();
+    if (self.is_neg()) host = host._neg_view();
+    dst.copy_(host);
   }
   return dst;
 }
@@ -258,6 +299,15 @@ at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
     return self;
   }
   std::string kernel = std::string("fill_") + label;
+  if (at::isComplexType(self.scalar_type())) {
+    // Real part in alpha, the bits of the (double) imaginary part in alpha_i.
+    c10::complex<double> c = value.toComplexDouble();
+    double imag = c.imag();
+    int64_t imag_bits;
+    std::memcpy(&imag_bits, &imag, sizeof(imag_bits));
+    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, c.real(), imag_bits);
+    return self;
+  }
   bool floating = at::isFloatingType(self.scalar_type());
   launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, floating ? value.toDouble() : 0.0,
                  floating ? 0 : value.toLong());
@@ -276,7 +326,9 @@ std::map<std::string, int64_t> g_fallbacks;
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   const auto& name = op.schema().operator_name();
   record_fallback(name.overload_name.empty() ? name.name : name.name + "." + name.overload_name);
-  at::native::cpu_fallback(op, stack);
+  // A view op run on the CPU would return a copy, silently breaking aliasing
+  // (e.g. `x.real += 1`); error out instead so a missing view kernel is caught.
+  at::native::cpu_fallback(op, stack, /*error_on_views=*/true);
 }
 
 }  // namespace
@@ -310,11 +362,13 @@ extern "C" size_t vkt_fallback_counts(char* buf, size_t len) {
 // cannot drop this object file from the extension.
 extern "C" void vkt_reduce_linked();
 extern "C" void vkt_linalg_linked();
+extern "C" void vkt_fft_linked();
 
 extern "C" void vkt_register_backend() {
   // Keep reduce.cpp and linalg.cpp (and their kernel registrations) in the link.
   vkt_reduce_linked();
   vkt_linalg_linked();
+  vkt_fft_linked();
   static bool done = false;
   if (done) {
     return;
@@ -331,6 +385,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", at::native::view);
   m.impl("as_strided", at::native::as_strided_tensorimpl);
   m.impl("_reshape_alias", at::native::_reshape_alias);
+  m.impl("view_as_real", at::native::view_as_real);
+  m.impl("view_as_complex", at::native::view_as_complex);
+  m.impl("unfold", at::native::unfold);
   m.impl("resize_", vk::resize_);
   m.impl("set_.source_Storage_storage_offset", at::native::set_storage_cpu_);
   m.impl("_copy_from", vk::copy_from);
@@ -338,6 +395,17 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_local_scalar_dense", vk::local_scalar_dense);
   m.impl("fill_.Scalar", vk::fill_scalar);
   m.impl("zero_", vk::zero_);
+}
+
+// The Conjugate/Negative fallbacks would materialize lazy bits by copying,
+// which reaches _copy_from again; copy_from handles the bits itself.
+TORCH_LIBRARY_IMPL(aten, Conjugate, m) {
+  m.impl("_copy_from", torch::CppFunction::makeFallthrough());
+  m.impl("_copy_from_and_resize", torch::CppFunction::makeFallthrough());
+}
+TORCH_LIBRARY_IMPL(aten, Negative, m) {
+  m.impl("_copy_from", torch::CppFunction::makeFallthrough());
+  m.impl("_copy_from_and_resize", torch::CppFunction::makeFallthrough());
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
