@@ -333,7 +333,18 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 
 }  // namespace
 
+// TORCH_VK_STRICT=1: every op must run on Vulkan; a CPU fallback raises.
+bool strict_mode() {
+  static const bool strict = [] {
+    const char* v = std::getenv("TORCH_VK_STRICT");
+    return v != nullptr && *v != '\0' && std::string(v) != "0";
+  }();
+  return strict;
+}
+
 void record_fallback(const std::string& op) {
+  TORCH_CHECK_NOT_IMPLEMENTED(!strict_mode(), "torch_vulkan: ", op,
+                              " has no Vulkan kernel (TORCH_VK_STRICT forbids running it on the CPU)");
   std::lock_guard<std::mutex> lock(g_fallback_mutex);
   if (g_fallbacks[op]++ == 0) {
     TORCH_WARN("torch_vulkan: ", op, " has no Vulkan kernel yet; running it on the CPU");

@@ -123,7 +123,10 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
   std::vector<bool> reduced(ndim, !dims.has_value() || dims->empty());
   if (dims.has_value()) {
     for (int64_t d : *dims) {
-      reduced[at::maybe_wrap_dim(d, ndim)] = true;
+      int64_t w = at::maybe_wrap_dim(d, ndim);  // validates; a 0-dim tensor accepts dim 0 / -1
+      if (ndim > 0) {
+        reduced[w] = true;
+      }
     }
   }
   std::vector<int64_t> kept_size, kept_stride, red_size, red_stride;
@@ -438,7 +441,8 @@ at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, con
 template <bool Std>
 at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const std::optional<at::Scalar>& correction,
                    bool keepdim) {
-  at::Tensor out = at::empty({0}, self.options());
+  // var/std of complex input are real.
+  at::Tensor out = at::empty({0}, self.options().dtype(c10::toRealValueType(self.scalar_type())));
   return var_std_out<Std>(self, dim, correction, keepdim, out);
 }
 

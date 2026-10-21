@@ -5,3 +5,6 @@ __pycache__/
 *.pyd
 .pytest_cache/
 *.pdb
+tools/opinfo_coverage.json
+tools/opinfo_coverage.log
+tools/*.part*.jsonl

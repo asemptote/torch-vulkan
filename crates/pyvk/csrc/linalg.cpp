@@ -122,7 +122,7 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
   int64_t m = mat1.size(0), n = mat2.size(1);
   at::native::resize_output(out, {m, n});
   bool done = false;
-  if (self.dim() <= 2 && is_vk(self)) {
+  if (self.dim() <= 2 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
     at::Tensor cin = self.expand({m, n}).unsqueeze(0);
     done = gemm(mat1.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), &cin, alpha.toDouble(), beta.toDouble());
   }
@@ -137,7 +137,7 @@ at::Tensor& baddbmm_out(const at::Tensor& self, const at::Tensor& batch1, const 
   std::vector<int64_t> shape = {batch1.size(0), batch1.size(1), batch2.size(2)};
   at::native::resize_output(out, shape);
   bool done = false;
-  if (self.dim() <= 3 && is_vk(self)) {
+  if (self.dim() <= 3 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
     at::Tensor cin = self.expand(shape);
     done = gemm(batch1, batch2, out, &cin, alpha.toDouble(), beta.toDouble());
   }
@@ -152,7 +152,7 @@ at::Tensor& addmv_out(const at::Tensor& self, const at::Tensor& mat, const at::T
   int64_t m = mat.size(0);
   at::native::resize_output(out, {m});
   bool done = false;
-  if (self.dim() <= 1 && is_vk(self)) {
+  if (self.dim() <= 1 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
     // A matrix-vector product is a GEMM with one column.
     at::Tensor cin = self.expand({m}).unsqueeze(1).unsqueeze(0);
     done = gemm(mat.unsqueeze(0), vec.unsqueeze(1).unsqueeze(0), out.unsqueeze(1).unsqueeze(0), &cin,
