@@ -81,6 +81,7 @@ fn main() {
             "csrc/launch.cpp",
             "csrc/ops.cpp",
             "csrc/elementwise.cpp",
+            "csrc/indexing.cpp",
             "csrc/reduce.cpp",
             "csrc/linalg.cpp",
             "csrc/fft.cpp",

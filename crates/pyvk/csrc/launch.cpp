@@ -50,17 +50,15 @@ uint64_t pack_param(const c10::Scalar& s, at::ScalarType t) {
 
 template <size_t K>
 void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::array<const at::Tensor*, K>& ops,
-            at::ScalarType param_type, c10::ArrayRef<c10::Scalar> params) {
+            c10::ArrayRef<uint64_t> bits) {
   const at::Tensor& out = *ops[0];
   if (out.numel() == 0) {
     return;
   }
   StridedLayout<K> p{};
   constexpr size_t D = StridedLayout<K>::D;
-  TORCH_CHECK(params.size() <= std::size(p.param), "torch_vulkan: too many kernel parameters for ", kernel);
-  for (size_t i = 0; i < params.size(); ++i) {
-    p.param[i] = pack_param(params[i], param_type);
-  }
+  TORCH_CHECK(bits.size() <= std::size(p.param), "torch_vulkan: too many kernel parameters for ", kernel);
+  std::copy(bits.begin(), bits.end(), p.param);
   StridedDims<K> dims = plan_operands<K>(out, ops);
   size_t inner = std::min(dims.ndim(), D);
   p.ndim = static_cast<uint32_t>(inner);
@@ -87,17 +85,40 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
   });
 }
 
+std::vector<uint64_t> pack_params(c10::ArrayRef<c10::Scalar> params, at::ScalarType t) {
+  std::vector<uint64_t> bits;
+  for (const c10::Scalar& s : params) {
+    bits.push_back(pack_param(s, t));
+  }
+  return bits;
+}
+
 }  // namespace
 
 void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                     const at::Tensor* b, c10::ArrayRef<c10::Scalar> params) {
-  at::ScalarType t = (a ? *a : out).scalar_type();
-  launch<3>(kernel, spec, {&out, a, b}, t, params);
+  launch<3>(kernel, spec, {&out, a, b}, pack_params(params, (a ? *a : out).scalar_type()));
+}
+
+void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
+                         const at::Tensor* b, c10::ArrayRef<uint64_t> bits) {
+  launch<3>(kernel, spec, {&out, a, b}, bits);
 }
 
 void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                      const at::Tensor* b, const at::Tensor* c, c10::ArrayRef<c10::Scalar> params) {
-  launch<4>(kernel, spec, {&out, a, b, c}, out.scalar_type(), params);
+  launch<4>(kernel, spec, {&out, a, b, c}, pack_params(params, out.scalar_type()));
+}
+
+std::string move_kernel(int64_t itemsize) {
+  switch (itemsize) {
+    case 1: return has_feature(kFeatureInt8) ? "move_b1" : "";
+    case 2: return has_feature(kFeatureInt16) ? "move_b2" : "";
+    case 4: return "move_b4";
+    case 8: return "move_b8";
+    case 16: return "move_b16";
+    default: return "";
+  }
 }
 
 }  // namespace vk

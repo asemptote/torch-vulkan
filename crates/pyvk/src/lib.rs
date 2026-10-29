@@ -8,7 +8,7 @@ mod ffi;
 
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use vkcore::Runtime;
 
@@ -30,13 +30,20 @@ fn py_runtime() -> PyResult<Arc<Runtime>> {
 extern "C" {
     fn vkt_register_backend();
     fn vkt_clear_fft_caches();
+    fn vkt_release_device_error_word();
+    fn vkt_take_device_error() -> i32;
     fn vkt_fallback_counts(buf: *mut std::ffi::c_char, len: usize) -> usize;
 }
 
-/// Waits until all queued GPU work has finished.
+/// Waits until all queued GPU work has finished; raises IndexError if a
+/// kernel met an out-of-range index since the last check.
 #[pyfunction]
 fn synchronize() -> PyResult<()> {
-    py_runtime()?.synchronize().map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    py_runtime()?.synchronize().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    if unsafe { vkt_take_device_error() } != 0 {
+        return Err(PyIndexError::new_err("torch_vulkan: index out of range in an earlier indexing kernel"));
+    }
+    Ok(())
 }
 
 #[pyfunction]
@@ -89,7 +96,10 @@ fn fallback_counts() -> Vec<(String, u64)> {
 #[pyfunction]
 fn shutdown() {
     // Cached device tables must be freed while the memory pool still exists.
-    unsafe { vkt_clear_fft_caches() };
+    unsafe {
+        vkt_clear_fft_caches();
+        vkt_release_device_error_word();
+    }
     let rt = RUNTIME.lock().unwrap().take();
     if let Some(rt) = &rt {
         let _ = rt.synchronize();

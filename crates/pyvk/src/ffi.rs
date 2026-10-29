@@ -126,3 +126,16 @@ pub unsafe extern "C" fn vkt_grid_1d(n: u64, groups: *mut u32, stride: *mut u32)
 pub extern "C" fn vkt_has_float64() -> i32 {
     runtime().map(|rt| rt.ctx.caps.shader_float64 as i32).unwrap_or(0)
 }
+
+/// Optional device features as bits (csrc/vk.h `Feature`): 1 float64,
+/// 2 int16 (with 16-bit storage), 4 float16 (with 16-bit storage), 8 int8
+/// (with 8-bit storage).
+#[no_mangle]
+pub extern "C" fn vkt_capabilities() -> u32 {
+    let Ok(rt) = runtime() else { return 0 };
+    let c = rt.ctx.caps;
+    (c.shader_float64 as u32)
+        | (((c.shader_int16 && c.storage_buffer_16bit) as u32) << 1)
+        | (((c.shader_float16 && c.storage_buffer_16bit) as u32) << 2)
+        | (((c.shader_int8 && c.storage_buffer_8bit) as u32) << 3)
+}

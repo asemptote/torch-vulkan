@@ -3,11 +3,13 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M8 — element-wise completeness**: device `"vk"` is a native PyTorch
+Status: **M9 — data movement and indexing**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
-reductions (sum,
+copies, casts and fills for every dtype, indexing (advanced indexing,
+index_put_, gather, scatter, index_select, take/put_, masked_select, nonzero),
+cat, flip, roll, padding, arange/linspace/eye, reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
 nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
@@ -23,6 +25,40 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Data movement and indexing (M9)
+
+- **Every dtype moves on the GPU.** Copies, `clone`, `contiguous`, fills and
+  all data movement use `shaders/move.slang`, which works on elements by size
+  (1, 2, 4, 8 or 16 bytes), so any dtype is covered. Casts now also cover
+  uint8, int8, int16, float16 and bfloat16 (where the device has 8/16-bit
+  storage; this one does). Float-to-small-integer casts wrap like the CPU's
+  (-3.0 -> 253), and float16 conversions round to nearest even explicitly
+  (Vulkan leaves that rounding to the driver).
+- **Indexing** is two steps: `shaders/index.slang` turns index tensors into
+  element offsets (wrapping negative indices where PyTorch does: `index`,
+  `index_put_`, `take`, `put_`, `index_fill_`; rejecting them where it
+  rejects them: `gather`, `index_select`, `scatter`, `index_copy`), then a
+  gather or scatter in `move.slang` reads or writes the source restrided to
+  the result's shape. Advanced indexing (integer and boolean, adjacent or not)
+  follows PyTorch's `make_info`; boolean masks go through the GPU `nonzero`.
+- **Out-of-range indices** are reported like CUDA's device asserts: the kernel
+  sets an error word, and the next synchronize (`.cpu()`, `.item()`,
+  `torch_vulkan.synchronize()`) raises `IndexError`. Queued work is not
+  stopped, and the result of the bad op is undefined.
+- **nonzero** counts with a GPU running sum (one sync for the result size, as
+  on CUDA) and writes coordinates with `shaders/nonzero.slang`;
+  `masked_select`, `masked_scatter_` and boolean indexing build on it.
+- **cat, flip, roll, reflection/replication padding (1-3d)**, `channel_shuffle`,
+  `equal`, `isin` (by broadcast comparison, up to 2^24 pairs) and
+  **arange, linspace, logspace, eye** (`shaders/iota.slang`, matching
+  PyTorch's formulas and float16 rounding) run on the GPU.
+- Still on the CPU: ops that accumulate into repeated indices (`index_put_`
+  with `accumulate=True`, `index_add`, `scatter_add`, `scatter_reduce`,
+  `put_(accumulate=True)`, `bincount`, `histc`). This GPU has no 64-bit or
+  float atomics, so these will use sorting (M10).
+
+OpInfo sweep: 317 of 659 ops fully on the GPU (272 after M8), no mismatches.
 
 ## Element-wise ops (M8)
 
@@ -327,6 +363,7 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/launch.cpp          strided element-wise launches (csrc/strided.h plans dims)
   csrc/ops.cpp             unary, binary and comparison aten kernels
   csrc/elementwise.cpp     activations, clamp, predicates, where, lerp/addcmul, compositions
+  csrc/indexing.cpp        indexing, nonzero, cat/flip/roll/padding, arange/linspace/eye
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
@@ -335,7 +372,7 @@ crates/pyvk/               extension module torch_vulkan._native
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_*.py     419 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_*.py     565 tests: results on "vk" vs CPU, no unexpected fallbacks
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
@@ -378,7 +415,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 419 Python tests pass with no validation messages. Op coverage:
+All 565 Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
 
 ## Roadmap
@@ -403,20 +440,27 @@ All 419 Python tests pass with no validation messages. Op coverage:
 7. ~~**M7 dense linear algebra**~~: done (see above). Not yet: blocked QR
    (compact-WY updates), batched GPU paths, look-ahead, eigh/SVD on the GPU.
 8. ~~**M8 element-wise completeness**~~ and infrastructure cleanup: done (see
-   above). Not yet: int8/uint8/int16/float16/bfloat16 kernels, complex
-   transcendentals (M14), `polygamma`, Bessel and other `torch.special`
-   functions.
+   above). Not yet: arithmetic on int8/uint8/int16/float16/bfloat16 (they
+   only move and cast so far), complex transcendentals (M14), `polygamma`,
+   Bessel and other `torch.special` functions.
 
 Goal for M9-M14: every dense aten op runs on Vulkan (`TORCH_VK_STRICT=1` with
 no fallbacks in the OpInfo sweep).
 
-9. **M9 data movement and indexing**: cat, flip, roll, gather/scatter,
-   index/index_put, masked_select, nonzero, arange/eye/linspace.
+9. ~~**M9 data movement and indexing**~~: done (see above). Not yet: the
+   accumulating index ops (M10), `repeat_interleave` with a tensor of
+   repeats, `tril_indices`/`triu_indices`.
 10. **M10 sorting, searching and statistics**: sort, topk, median, unique,
-    histc, searchsorted, cummax, logcumsumexp.
+    histc, searchsorted, cummax, logcumsumexp, and the accumulating index
+    ops (index_add, scatter_add/scatter_reduce, index_put_ with accumulate,
+    bincount) built on sorting.
 11. **M11 random numbers**: Philox-based rand/randn/bernoulli/multinomial.
 12. **M12 neural-network ops**: convolution, pooling, softmax, normalization,
     losses, backward kernels.
 13. **M13 linear algebra on the GPU**: no CPU panels; QR, eigh, SVD.
 14. **M14 complex completion and a strict sweep with zero fallbacks**.
-8. **Testing throughout**: PyTorch OpInfo samples compared against CPU.
+15. **M15 PyTorch's own tests**: run PyTorch's device-generic suites
+    (`test_ops.py` and related, via `instantiate_device_type_tests`) on
+    `"vk"`, checking tolerances, error messages, dtype rules and autograd
+    against PyTorch's expectations rather than ours.
+Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

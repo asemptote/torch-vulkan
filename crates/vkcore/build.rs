@@ -24,7 +24,7 @@ use std::env;
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 /// Flags for every kernel.
 const SLANGC_FLAGS: &[&str] = &[
@@ -104,6 +104,14 @@ fn opcodes(text: &str) -> Vec<(String, u32)> {
         .collect()
 }
 
+/// A running slangc job: (kernel name, defines, process, hash stamp path, hash).
+type Job<P> = (String, Vec<String>, P, PathBuf, String);
+
+fn wait(job: Job<Child>) -> Job<Output> {
+    let (name, defines, child, stamp, key) = job;
+    (name, defines, child.wait_with_output().unwrap(), stamp, key)
+}
+
 fn slang_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
@@ -118,6 +126,7 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let compiler = slangc();
     println!("cargo:rerun-if-env-changed=SLANGC");
+    println!("cargo:rerun-if-env-changed=VKCORE_SLANGC_JOBS");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-changed=shaders");
 
@@ -176,14 +185,33 @@ fn main() {
                 cmd.arg(format!("-D{d}"));
             }
             cmd.arg("-o").arg(&spv).stdout(Stdio::piped()).stderr(Stdio::piped());
-            let child = cmd.spawn().unwrap_or_else(|e| panic!("could not run slangc ({}): {e}. Set SLANGC to its path.", compiler.display()));
-            jobs.push((name, defines, child, stamp, key));
+            jobs.push((name, defines, cmd, stamp, key));
         }
     }
 
+    // Run slangc on every stale variant, a bounded number at a time: each
+    // instance peaks near 400 MB, and hundreds at once exhaust memory. Beyond
+    // one per logical CPU the build is no faster (measured: 4 jobs 30 s, 8
+    // jobs 24 s, 12-16 jobs 23-25 s for 233 variants on a 4-core laptop).
+    // VKCORE_SLANGC_JOBS overrides the count.
+    let width = std::env::var("VKCORE_SLANGC_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let mut running = std::collections::VecDeque::new();
+    let mut done = Vec::new();
+    for (name, defines, mut cmd, stamp, key) in jobs {
+        if running.len() >= width {
+            done.push(wait(running.pop_front().unwrap()));
+        }
+        let child = cmd.spawn().unwrap_or_else(|e| panic!("could not run slangc ({}): {e}. Set SLANGC to its path.", compiler.display()));
+        running.push_back((name, defines, child, stamp, key));
+    }
+    done.extend(running.into_iter().map(wait));
+
     let mut failures = Vec::new();
-    for (name, defines, child, stamp, key) in jobs {
-        let result = child.wait_with_output().unwrap();
+    for (name, defines, result, stamp, key) in done {
         if result.status.success() {
             std::fs::write(stamp, key).unwrap();
         } else {

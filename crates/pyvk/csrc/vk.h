@@ -9,6 +9,7 @@
 #include <ATen/ATen.h>
 #include <ATen/native/CPUFallback.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -29,6 +30,7 @@ int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uin
                  uint32_t gy, uint32_t gz);
 int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
 int vkt_has_float64();
+uint32_t vkt_capabilities();
 }
 
 namespace vk {
@@ -39,8 +41,24 @@ inline void check(int rc) {
   TORCH_CHECK(rc == 0, "torch_vulkan: ", vkt_last_error());
 }
 
-inline void synchronize() {
-  check(vkt_synchronize());
+// Waits for queued GPU work; raises IndexError if an indexing kernel met an
+// out-of-range index since the last check (backend.cpp).
+void synchronize();
+
+// GPU address of the 4-byte device error word that indexing kernels set on
+// an out-of-range index (backend.cpp).
+uint64_t device_error_address();
+
+// The bytes of `value` converted to `dtype`, as kernel parameter slots
+// (backend.cpp).
+std::array<uint64_t, 2> fill_bits(const at::Scalar& value, at::ScalarType dtype);
+
+// Optional device features (bits of vkt_capabilities).
+enum Feature : uint32_t { kFeatureFloat64 = 1, kFeatureInt16 = 2, kFeatureFloat16 = 4, kFeatureInt8 = 8 };
+
+inline bool has_feature(Feature f) {
+  static const uint32_t caps = vkt_capabilities();
+  return (caps & f) != 0;
 }
 
 // Per-allocation context stored in each DataPtr: data() is `host + offset`
@@ -58,9 +76,18 @@ uint64_t gpu_address(const at::TensorBase& t, const void* data);
 
 c10::Allocator* allocator();
 
-// Kernel name suffix for a dtype ("f32", "f64", "i32", "i64", "b8"), or
-// nullptr if no kernels exist for it.
+// Kernel name suffix for a dtype with compute kernels ("f32", "f64", "i32",
+// "i64", "b8", "c64", "c128"), or nullptr.
 const char* dtype_label(at::ScalarType t);
+
+// Kernel name suffix for a dtype that cast kernels can read and write: the
+// dtype_label types plus "u8", "i8", "i16", "f16", "bf16" where the device
+// supports them; nullptr otherwise.
+const char* storage_label(at::ScalarType t);
+
+// The data-movement kernel (shaders/move.slang) for elements of `itemsize`
+// bytes, or "" if the device cannot address elements of that size.
+std::string move_kernel(int64_t itemsize);
 
 // Records that `op` ran on the CPU instead of the GPU (warns once per op).
 void record_fallback(const std::string& op);
@@ -88,6 +115,11 @@ void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Te
 // and beta converted to out's dtype. launch.cpp.
 void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                      const at::Tensor* b, const at::Tensor* c, c10::ArrayRef<c10::Scalar> params = {});
+
+// launch_strided with the parameter slots given as raw bits (e.g. a fill
+// value's bytes).
+void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
+                         const at::Tensor* b, c10::ArrayRef<uint64_t> bits);
 
 // Runs binary op `code` (shaders/binary.slang) with PyTorch's type promotion;
 // false if it cannot run on the GPU. ops.cpp.

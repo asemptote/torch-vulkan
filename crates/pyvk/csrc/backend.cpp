@@ -90,6 +90,70 @@ const char* dtype_label(at::ScalarType t) {
   }
 }
 
+const char* storage_label(at::ScalarType t) {
+  switch (t) {
+    case at::kByte: return has_feature(kFeatureInt8) ? "u8" : nullptr;
+    case at::kChar: return has_feature(kFeatureInt8) ? "i8" : nullptr;
+    case at::kShort: return has_feature(kFeatureInt16) ? "i16" : nullptr;
+    case at::kHalf: return has_feature(kFeatureFloat16) ? "f16" : nullptr;
+    case at::kBFloat16: return has_feature(kFeatureInt16) ? "bf16" : nullptr;
+    default: return dtype_label(t);
+  }
+}
+
+// ---------------------------------------------------------------- device error word
+
+// Allocated on first use, released by vkt_release_device_error_word at
+// shutdown (the runtime that owns the memory goes away).
+VktAlloc* g_error_word = nullptr;
+
+namespace {
+
+VktAlloc& error_word() {
+  if (g_error_word == nullptr) {
+    auto* a = new VktAlloc{};
+    check(vkt_alloc(16, a));
+    // Pool memory is reused in stream order: kernels still queued may write
+    // its previous contents, so wait before the host clears it.
+    check(vkt_synchronize());
+    std::memset(a->host, 0, 16);
+    g_error_word = a;
+  }
+  return *g_error_word;
+}
+
+}  // namespace
+
+// The bytes of `value` converted to `dtype`, as parameter slots for a fill
+// (declared in vk.h).
+std::array<uint64_t, 2> fill_bits(const at::Scalar& value, at::ScalarType dtype) {
+  at::Tensor v = at::scalar_tensor(value, at::TensorOptions().dtype(dtype));
+  std::array<uint64_t, 2> bits{};
+  std::memcpy(bits.data(), v.const_data_ptr(), v.itemsize());
+  return bits;
+}
+
+uint64_t device_error_address() {
+  return error_word().address;
+}
+
+// 1 (and clears it) if an indexing kernel has flagged an out-of-range index.
+// Call after synchronizing.
+int take_device_error() {
+  if (g_error_word == nullptr) {
+    return 0;
+  }
+  auto* word = reinterpret_cast<uint32_t*>(g_error_word->host);
+  int flagged = *word != 0;
+  *word = 0;
+  return flagged;
+}
+
+void synchronize() {
+  check(vkt_synchronize());
+  TORCH_CHECK_INDEX(!take_device_error(), "torch_vulkan: index out of range in an earlier indexing kernel");
+}
+
 // ---------------------------------------------------------------- device guard and hooks
 
 namespace {
@@ -184,9 +248,16 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
 
 // dst (vk) <- src (vk), with broadcasting and dtype conversion.
 void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
-  const char* from = dtype_label(src.scalar_type());
-  const char* to = dtype_label(dst.scalar_type());
-  if (from == nullptr || to == nullptr) {
+  if (src.scalar_type() == dst.scalar_type()) {
+    std::string kernel = move_kernel(src.itemsize());
+    if (!kernel.empty()) {
+      launch_strided(kernel.c_str(), {op::MOVE_COPY}, dst, &src, nullptr);
+      return;
+    }
+  }
+  const char* from = storage_label(src.scalar_type());
+  const char* to = storage_label(dst.scalar_type());
+  if (from == nullptr || to == nullptr || src.scalar_type() == dst.scalar_type()) {
     // No kernel for this dtype: round-trip through the CPU.
     record_fallback("aten::copy_ (dtype " + std::string(c10::toString(src.scalar_type())) + ")");
     dst.copy_(src.cpu());
@@ -208,7 +279,7 @@ void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
     }
     return;
   }
-  if (dtype_label(dst.scalar_type()) != nullptr) {
+  if (!move_kernel(dst.itemsize()).empty()) {
     // Upload contiguously, then scatter with a strided copy kernel.
     at::Tensor staging = empty_memory_format(dst.sizes(), dst.scalar_type(), {}, {}, {}, {});
     copy_cpu_to_vk(staging, host.contiguous());
@@ -294,19 +365,13 @@ at::Scalar local_scalar_dense(const at::Tensor& self) {
 }
 
 at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
-  const char* label = dtype_label(self.scalar_type());
-  if (label == nullptr) {
+  std::string kernel = move_kernel(self.itemsize());
+  if (kernel.empty()) {
     cpu_out("aten::fill_.Scalar", self, [&] { return at::full(self.sizes(), value, self.options().device(at::kCPU)); });
     return self;
   }
-  std::string kernel = std::string("fill_") + label;
-  if (at::isComplexType(self.scalar_type())) {
-    c10::complex<double> c = value.toComplexDouble();
-    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, {c.real(), c.imag()});
-  } else {
-    bool is_bool = self.scalar_type() == at::kBool;
-    launch_strided(kernel.c_str(), {}, self, nullptr, nullptr, {is_bool ? at::Scalar(value.toBool()) : value});
-  }
+  std::array<uint64_t, 2> bits = fill_bits(value, self.scalar_type());
+  launch_strided_bits(kernel.c_str(), {op::MOVE_FILL}, self, nullptr, nullptr, bits);
   return self;
 }
 
@@ -354,6 +419,19 @@ void record_fallback(const std::string& op) {
 }
 
 }  // namespace vk
+
+extern "C" int vkt_take_device_error() {
+  return vk::take_device_error();
+}
+
+// Frees the device error word (called before the runtime shuts down).
+extern "C" void vkt_release_device_error_word() {
+  if (vk::g_error_word != nullptr) {
+    vkt_free(vk::g_error_word->handle);
+    delete vk::g_error_word;
+    vk::g_error_word = nullptr;
+  }
+}
 
 extern "C" size_t vkt_fallback_counts(char* buf, size_t len) {
   // "op=count\n" lines; returns the length needed (write only if it fits).

@@ -1,7 +1,8 @@
 // Shared parameter block and index math for strided element-wise kernels.
 //
 // The including file defines OUT_T (output element type) and IN_T (input
-// element type); PARAM_T comes from _types.slang (the kernel's T axis).
+// element type), and optionally B_T (b's element type, default IN_T);
+// PARAM_T comes from _types.slang (the kernel's T axis).
 // Kernels other than float64 ones never touch a double, so they run on GPUs
 // without float64 support.
 //
@@ -20,11 +21,15 @@
 #include "_types.slang"
 #include "opcodes.slang"
 
+#ifndef B_T
+#define B_T IN_T
+#endif
+
 struct Params
 {
     OUT_T* out;
     IN_T* a;
-    IN_T* b;
+    B_T* b;
     uint64_t alpha_bits;
     uint64_t beta_bits;
     uint64_t gamma_bits;

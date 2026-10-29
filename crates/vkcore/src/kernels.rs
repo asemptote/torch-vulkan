@@ -78,9 +78,16 @@ impl KernelCache {
         let mut words = ash::util::read_spv(&mut std::io::Cursor::new(spirv))?;
         let caps = self.ctx.caps;
         let declared = declared_capabilities(&words);
-        for (cap, have, what) in [(CAP_FLOAT64, caps.shader_float64, "shaderFloat64"), (CAP_INT64, caps.shader_int64, "shaderInt64"),
-            (CAP_INT8, caps.shader_int8, "shaderInt8")]
-        {
+        let required = [
+            (CAP_FLOAT64, caps.shader_float64, "shaderFloat64"),
+            (CAP_INT64, caps.shader_int64, "shaderInt64"),
+            (CAP_INT16, caps.shader_int16, "shaderInt16"),
+            (CAP_FLOAT16, caps.shader_float16, "shaderFloat16"),
+            (CAP_INT8, caps.shader_int8, "shaderInt8"),
+            (CAP_STORAGE_16BIT, caps.storage_buffer_16bit, "storageBuffer16BitAccess"),
+            (CAP_STORAGE_8BIT, caps.storage_buffer_8bit, "storageBuffer8BitAccess"),
+        ];
+        for (cap, have, what) in required {
             if declared.contains(&cap) && !have {
                 return Err(format!("kernel {name} needs {what}, which this device does not support").into());
             }
@@ -123,9 +130,13 @@ impl KernelCache {
 }
 
 const OP_CAPABILITY: u32 = 17;
+const CAP_FLOAT16: u32 = 9;
 const CAP_FLOAT64: u32 = 10;
 const CAP_INT64: u32 = 11;
+const CAP_INT16: u32 = 22;
 const CAP_INT8: u32 = 39;
+const CAP_STORAGE_16BIT: u32 = 4433;
+const CAP_STORAGE_8BIT: u32 = 4448;
 
 /// The capabilities a SPIR-V module declares (its `OpCapability` operands).
 pub fn declared_capabilities(words: &[u32]) -> Vec<u32> {
@@ -244,7 +255,7 @@ mod tests {
     /// GPUs without shaderFloat64.
     #[test]
     fn elementwise_kernels_need_float64_only_for_double_types() {
-        let families = ["unary_", "binary_", "compare_", "fill_", "where_", "ternary_", "cbinary_", "cunary_", "cabs_"];
+        let families = ["unary_", "binary_", "compare_", "move_", "where_", "ternary_", "cbinary_", "cunary_", "cabs_", "iota_"];
         for (name, spirv) in SPIRV {
             if !families.iter().any(|f| name.starts_with(f)) || name.ends_with("_f64") || name.ends_with("_c128") {
                 continue;
