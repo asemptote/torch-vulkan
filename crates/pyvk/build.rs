@@ -84,6 +84,8 @@ fn main() {
             "csrc/indexing.cpp",
             "csrc/sorting.cpp",
             "csrc/random.cpp",
+            "csrc/convolution.cpp",
+            "csrc/normalization.cpp",
             "csrc/reduce.cpp",
             "csrc/linalg.cpp",
             "csrc/fft.cpp",

@@ -7,8 +7,9 @@
 
 Importing this module registers a PyTorch backend on the PrivateUse1 key
 (implemented in C++, see crates/pyvk/csrc) and names it "vk". Element-wise
-ops, casts, copies and fills run as Vulkan kernels; every other op runs on
-the CPU with a one-time warning (see `fallback_counts()`).
+op with a Vulkan kernel runs on the GPU, many others through PyTorch's
+decompositions into such ops (see _decomp.py); the rest run on the CPU with
+a one-time warning (see `fallback_counts()`).
 """
 
 import atexit
@@ -24,6 +25,18 @@ torch.utils.rename_privateuse1_backend("vk")
 from . import _native  # noqa: E402  (registers the C++ backend)
 
 torch.utils.generate_methods_for_privateuse1_backend()
+
+from . import _decomp  # noqa: E402
+
+# Ops with no Vulkan kernel of their own run through PyTorch's decompositions
+# (as sequences of Vulkan kernels) rather than on the CPU.
+_decomposed = _decomp.register()
+
+from . import _kernels  # noqa: E402
+
+# Python kernels (from Vulkan ops) for ops with neither a C++ kernel nor a
+# decomposition: average pooling, adaptive pooling, upsampling backward.
+_python_kernels = _kernels.register()
 
 __all__ = [
     "device_count",

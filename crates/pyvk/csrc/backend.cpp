@@ -101,6 +101,17 @@ const char* storage_label(at::ScalarType t) {
   }
 }
 
+at::ScalarType widened(at::ScalarType t) {
+  switch (t) {
+    case at::kByte:
+    case at::kChar:
+    case at::kShort: return storage_label(t) != nullptr ? at::kInt : t;
+    case at::kHalf:
+    case at::kBFloat16: return storage_label(t) != nullptr ? at::kFloat : t;
+    default: return t;
+  }
+}
+
 // ---------------------------------------------------------------- device error word
 
 // Allocated on first use, released by vkt_release_device_error_word at
@@ -421,6 +432,18 @@ void record_fallback(const std::string& op) {
 }
 
 }  // namespace vk
+
+// For Python-registered kernels (torch_vulkan/_decomp.py) that hand an op
+// to the CPU: counted and warned about like the C++ fallbacks. Returns 1 in
+// strict mode (TORCH_VK_STRICT), where the caller raises instead.
+extern "C" int vkt_record_fallback(const char* op) {
+  try {
+    vk::record_fallback(op);
+    return 0;
+  } catch (const std::exception&) {
+    return 1;
+  }
+}
 
 extern "C" int vkt_take_device_error() {
   return vk::take_device_error();

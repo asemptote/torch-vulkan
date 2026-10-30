@@ -85,6 +85,11 @@ const char* dtype_label(at::ScalarType t);
 // supports them; nullptr otherwise.
 const char* storage_label(at::ScalarType t);
 
+// The dtype element-wise kernels compute `t` in: 8- and 16-bit integers in
+// int32, float16 and bfloat16 in float32 (then cast back, which wraps
+// integers and rounds to nearest even, as on the CPU); others unchanged.
+at::ScalarType widened(at::ScalarType t);
+
 // The data-movement kernel (shaders/move.slang) for elements of `itemsize`
 // bytes, or "" if the device cannot address elements of that size.
 std::string move_kernel(int64_t itemsize);

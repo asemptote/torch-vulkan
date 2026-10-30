@@ -117,7 +117,7 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
     launch_strided("compare_b8", {op::COMPARE_LOGICAL_NOT, 0}, out, &self, nullptr);  // logical_not on bools
     return true;
   }
-  at::ScalarType dtype = out.scalar_type();
+  at::ScalarType dtype = widened(out.scalar_type());
   const char* label = dtype_label(dtype);
   if (!kind_allows(kind, dtype) || label == nullptr || !is_vk(self) || !is_vk(out)) {
     return false;
@@ -129,7 +129,9 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   }
   at::Tensor input = to_dtype(self, dtype);  // e.g. sqrt(int) computes in float
   std::string kernel = std::string("unary_") + label;
-  launch_strided(kernel.c_str(), {code}, out, &input, nullptr);
+  with_output(out, dtype, [&](const at::Tensor& target) {
+    launch_strided(kernel.c_str(), {code}, target, &input, nullptr);
+  });
   return true;
 }
 
@@ -314,6 +316,8 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   if (at::isComplexType(dtype)) {
     return complex_binary_gpu(op, *lhs, scalar ? nullptr : other, scalar, alpha, out, dtype);
   }
+  dtype = widened(dtype);
+  label = dtype_label(dtype);
   if (!kind_allows(op.kind, dtype) || label == nullptr) {
     return false;
   }
@@ -395,7 +399,7 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
   } else if (!is_vk(*other)) {
     return false;
   }
-  at::ScalarType dtype = scalar ? at::result_type(self, *scalar) : at::result_type(self, *other);
+  at::ScalarType dtype = widened(scalar ? at::result_type(self, *scalar) : at::result_type(self, *other));
   const char* label = dtype_label(dtype);
   bool complex = at::isComplexType(dtype);
   bool complex_ok = complex && (code == op::COMPARE_EQ || code == op::COMPARE_NE);

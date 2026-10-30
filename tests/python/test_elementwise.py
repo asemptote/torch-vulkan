@@ -157,3 +157,29 @@ def test_casts(src, dst):
     with on_gpu():
         got = x.to("vk").to(dst)
     check(got, x.to(dst))
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.int16, torch.float16, torch.bfloat16])
+def test_small_dtypes_compute_widened(dtype):
+    """8/16-bit types compute in int32/float32 and cast back: integers wrap,
+    16-bit floats round to nearest even, as on the CPU."""
+    g = torch.Generator().manual_seed(0)
+    if dtype.is_floating_point:
+        a, b = (torch.randn(50, generator=g) * 30).to(dtype), (torch.randn(50, generator=g) * 30).to(dtype)
+    else:
+        lo = 0 if dtype == torch.uint8 else -100
+        a, b = torch.randint(lo, 100, (50,), generator=g).to(dtype), torch.randint(1, 100, (50,), generator=g).to(dtype)
+    va, vb = a.to("vk"), b.to("vk")
+    with on_gpu():
+        got = [va + vb, va * vb, va - vb, -va, va.abs(), torch.maximum(va, vb), va == vb, va < vb]
+        if not dtype.is_floating_point:
+            got += [va & vb, va ^ vb, ~va, va // vb, va % vb]
+        else:
+            got += [va / vb, va.exp(), torch.sqrt(va.abs())]
+    want = [a + b, a * b, a - b, -a, a.abs(), torch.maximum(a, b), a == b, a < b]
+    if not dtype.is_floating_point:
+        want += [a & b, a ^ b, ~a, a // b, a % b]
+    else:
+        want += [a / b, a.exp(), torch.sqrt(a.abs())]
+    for gv, w in zip(got, want):
+        check(gv, w)

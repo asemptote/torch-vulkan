@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M11 — random numbers**: device `"vk"` is a native PyTorch
+Status: **M12 — neural-network ops**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -13,7 +13,9 @@ cat, flip, roll, padding, arange/linspace/eye, sorting and order statistics
 (sort, topk, kthvalue, median, mode, unique, searchsorted, cummax/cummin),
 accumulation into repeated indices (index_add, scatter_add/scatter_reduce,
 index_put_ with accumulate, bincount, histc), random numbers (rand, randn,
-randint, bernoulli, multinomial, randperm, dropout, ...), reductions (sum,
+randint, bernoulli, multinomial, randperm, dropout, ...), neural-network ops
+(convolution, pooling, normalization, softmax, losses, upsampling, grid
+sampling, embeddings, attention, with their backward passes), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
 nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
@@ -30,6 +32,42 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## Neural-network ops (M12)
+
+A small CNN trains on `"vk"` with every op on the GPU (`tests/python/test_nn.py`
+checks forward results and gradients against the CPU).
+
+- **Convolution** (`csrc/convolution.cpp`): 1-3 spatial dims, groups,
+  stride, padding, dilation, transposed. Forward is im2col (one copy of a
+  strided view of the padded input) and a batched GEMM; a transposed
+  convolution is a plain one of the zero-inserted input with the flipped
+  kernel; grad_input is a transposed convolution and grad_weight a GEMM.
+  Integer convolutions run on the CPU.
+- **Batch norm** (all entry points, with running-statistics updates) and
+  the attention path (`_scaled_dot_product_flash_attention_for_cpu`, chosen by
+  PyTorch for non-CUDA devices) compose existing kernels
+  (`csrc/normalization.cpp`).
+- **PyTorch's decompositions** (`python/torch_vulkan/_decomp.py`): ops with
+  no Vulkan kernel but a decomposition in `torch._decomp` (~170: softmax and
+  log-softmax, layer and group norm, losses, max pooling, upsampling,
+  `grid_sampler_2d`, `im2col`/`col2im`, most activation backward ops, ...) are
+  registered as "vk" kernels written in terms of ops that run on Vulkan.
+  Only functional and out= overloads are registered, never over an existing
+  kernel; a decomposition that calls itself or declines its arguments runs
+  on the CPU (counted in `fallback_counts()`).
+- **Python kernels from Vulkan ops** (`python/torch_vulkan/_kernels.py`) for
+  ops with neither: average pooling (a depthwise convolution with a ones
+  kernel over window sizes), adaptive pooling, upsampling backward and
+  antialiased upsampling (separable per-dim matrices: interpolation weights
+  from PyTorch's formulas, applied with matmul; the backward pass applies the
+  transposes), grid sampling backward and 3-D forward, fractional max
+  pooling, `cdist`/`pdist`, `rrelu` noise, `embedding_bag`.
+- 8- and 16-bit types (uint8, int8, int16, float16, bfloat16) now compute in
+  element-wise ops, in int32/float32 and cast back as on the CPU.
+
+OpInfo sweep: 446 of 689 ops fully on the GPU (371 after M11), no
+mismatches.
 
 ## Random numbers (M11)
 
@@ -431,6 +469,8 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/indexing.cpp        indexing, accumulation, nonzero, cat/flip/roll/padding, arange/linspace/eye
   csrc/sorting.cpp         sort and order statistics, unique, searchsorted, cummax/cummin
   csrc/random.cpp          Philox generator and random fills, multinomial, randperm, dropout
+  csrc/convolution.cpp     convolution (im2col + GEMM), transposed, backward
+  csrc/normalization.cpp   batch norm entry points, attention math path
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
@@ -438,8 +478,9 @@ crates/pyvk/               extension module torch_vulkan._native
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
-python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_*.py     625 tests: results on "vk" vs CPU (statistics for random ops)
+python/torch_vulkan/       backend naming, torch.vk device module, _decomp.py (PyTorch
+                           decompositions as kernels), _kernels.py (Python kernels)
+tests/python/test_*.py     651 tests: results on "vk" vs CPU (statistics for random ops)
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
@@ -482,7 +523,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 625 Python tests pass with no validation messages. Op coverage:
+All 651 Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
 
 ## Roadmap
@@ -524,8 +565,10 @@ no fallbacks in the OpInfo sweep).
 11. ~~**M11 random numbers**~~: done (see above). Not yet: `poisson`,
     `_standard_gamma`, `binomial`, `_sample_dirichlet`, `rrelu` noise, and
     `random_` on complex dtypes (rand/randn on complex do run on the GPU).
-12. **M12 neural-network ops**: convolution, pooling, softmax, normalization,
-    losses, backward kernels.
+12. ~~**M12 neural-network ops**~~: done (see above). Not yet: CTC loss,
+    `segment_reduce`, bicubic `grid_sample` backward, integer convolution and
+    pooling on the GPU, native (non-composed) kernels for the hottest
+    composed ops (softmax, layer norm, pooling).
 13. **M13 linear algebra on the GPU**: no CPU panels; QR, eigh, SVD.
 14. **M14 complex completion and a strict sweep with zero fallbacks**.
 15. **M15 PyTorch's own tests**: run PyTorch's device-generic suites

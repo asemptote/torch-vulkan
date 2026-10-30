@@ -45,11 +45,12 @@ def test_factories():
 
 def test_cpu_fallback_matches_and_is_counted():
     x = make((20,), torch.float64)
-    before = tv.fallback_counts().get("aten::i0.out", 0)
+    x = x.abs() + 0.5
+    before = tv.fallback_counts().get("aten::polygamma.out", 0)
     with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
-        got = x.to("vk").i0()  # no i0 kernel yet
-    check(got, x.i0())
-    assert tv.fallback_counts()["aten::i0.out"] == before + 1
+        got = torch.polygamma(2, x.to("vk"))  # no polygamma kernel yet
+    check(got, torch.polygamma(2, x))
+    assert tv.fallback_counts()["aten::polygamma.out"] == before + 1
     check(x.to("vk").sum(), x.sum())
 
 
@@ -114,3 +115,14 @@ def test_inplace_metadata_ops():
     check(v, x.t().unsqueeze(0))
     v.resize_(2, 6)
     assert v.shape == (2, 6)
+
+
+def test_fallback_with_several_outputs_writes_them_back():
+    # frexp has no Vulkan kernel; its CPU results must reach the vk outputs.
+    x = torch.tensor([0.0, 1.0, 0.75, -3.5, 1e-40, float("inf"), 1024.0])
+    m, e = torch.frexp(x.to("vk"))
+    wm, we = torch.frexp(x)
+    assert torch.equal(m.cpu(), wm) and torch.equal(e.cpu(), we)
+    mo, eo = torch.empty(7, device="vk"), torch.empty(7, dtype=torch.int32, device="vk")
+    torch.frexp(x.to("vk"), out=(mo, eo))
+    assert torch.equal(mo.cpu(), wm) and torch.equal(eo.cpu(), we)
