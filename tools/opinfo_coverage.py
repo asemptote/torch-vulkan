@@ -52,6 +52,9 @@ SKIP_ENTIRELY = ("sparse.", "to_sparse", "tensor_split")
 # values unspecified (the CPU uses unstable partial sorts): the values must
 # match, and the indices must point at them.
 TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk")
+# Ops whose vector outputs are unique only up to sign (eigenvectors,
+# singular vectors): compared by absolute value.
+SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
 
 
 def op_name(info):
@@ -105,6 +108,10 @@ def is_random(op, sample):
         return compare(run(0), run(1)) is not None
     except Exception:
         return False
+
+
+def _abs(x):
+    return x.abs() if isinstance(x, torch.Tensor) and x.is_floating_point() else x
 
 
 def compare_tied(name, sample, expected, actual):
@@ -169,6 +176,8 @@ def check_op(info, dtypes, nsamples):
             name = op_name(info)
             if name in TIED_INDICES and isinstance(expected, tuple):
                 problem = compare_tied(name, sample, expected, actual)
+            elif name in SIGN_AMBIGUOUS:
+                problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:
                 problem = compare(expected, actual)
             if problem:

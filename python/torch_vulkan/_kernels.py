@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch._decomp import decomposition_table
 
-from . import _decomp
+from . import _decomp, _native
 
 aten = torch.ops.aten
 _lib = None
@@ -625,6 +625,47 @@ def _embedding_bag_per_sample_weights_backward(grad, weight, indices, offsets, o
     return out
 
 
+# ---------------------------------------------------------------- matrix exponential
+
+# Higham (2005), "The scaling and squaring method for the matrix exponential
+# revisited": degree-13 Pade approximant after scaling by 2^-s.
+def _native_has_float64():
+    return bool(_native.capabilities() & 1)
+
+
+_PADE13 = (64764752532480000.0, 32382376266240000.0, 7771770303897600.0, 1187353796428800.0,
+           129060195264000.0, 10559470521600.0, 670442572800.0, 33522128640.0, 1323241920.0,
+           40840800.0, 960960.0, 16380.0, 182.0, 1.0)
+_THETA13 = 5.371920351148152
+
+
+def _matrix_exp(a):
+    if not a.is_floating_point() or a.shape[-1] == 0:
+        return _on_cpu("linalg_matrix_exp", a)
+    if a.dtype == torch.float32 and _native_has_float64():
+        # The solve and the squarings lose ~4 bits in float32; float64 keeps
+        # the result as accurate as float32 storage allows.
+        return _matrix_exp(a.double()).float()
+    shape = a.shape
+    x = a.reshape(-1, shape[-2], shape[-1])
+    norm = x.abs().sum(-2).amax(-1)  # 1-norm of each matrix
+    s = torch.clamp(torch.ceil(torch.log2(norm / _THETA13)), min=0)
+    s = torch.where(torch.isfinite(s), s, torch.zeros_like(s))
+    x = x / torch.pow(2.0, s).to(x.dtype).view(-1, 1, 1)
+    b = _PADE13
+    eye = torch.eye(shape[-1], device=x.device, dtype=x.dtype).expand_as(x)
+    x2 = x @ x
+    x4 = x2 @ x2
+    x6 = x4 @ x2
+    u = x @ (x6 @ (b[13] * x6 + b[11] * x4 + b[9] * x2) + b[7] * x6 + b[5] * x4 + b[3] * x2 + b[1] * eye)
+    v = x6 @ (b[12] * x6 + b[10] * x4 + b[8] * x2) + b[6] * x6 + b[4] * x4 + b[2] * x2 + b[0] * eye
+    r = torch.linalg.solve(v - u, v + u)
+    steps = int(s.max().item()) if s.numel() else 0
+    for i in range(steps):
+        r = torch.where((s > i).view(-1, 1, 1), r @ r, r)
+    return r.reshape(shape)
+
+
 # ---------------------------------------------------------------- registration
 
 def _kernels():
@@ -681,6 +722,7 @@ def _kernels():
         "_embedding_bag_forward_only": _embedding_bag_forward_only,
         "_embedding_bag_dense_backward": _embedding_bag_dense_backward,
         "_embedding_bag_backward": _embedding_bag_backward,
+        "linalg_matrix_exp": _matrix_exp,
         "_embedding_bag_per_sample_weights_backward": _embedding_bag_per_sample_weights_backward,
         **upsample,
     }

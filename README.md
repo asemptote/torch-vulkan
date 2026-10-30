@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M12 — neural-network ops**: device `"vk"` is a native PyTorch
+Status: **M13 — linear algebra on the GPU**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -19,8 +19,8 @@ sampling, embeddings, attention, with their backward passes), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
 nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
-(solve, inv, det, slogdet, lu_factor/lu_solve, cholesky, solve_triangular,
-tril/triu) run on the GPU; every other op runs on the CPU through PyTorch's boxed
+(solve, inv, det, slogdet, LU, Cholesky, QR, eigh, SVD, least squares,
+matrix_exp, triangular solves, any size and batch, no LAPACK) run on the GPU; every other op runs on the CPU through PyTorch's boxed
 fallback. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
@@ -32,6 +32,31 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## Linear algebra on the GPU (M13)
+
+No LAPACK anywhere: every size and batch of float32/float64 matrices runs on
+the GPU (`csrc/dense.cpp`, `shaders/factor.slang`).
+
+- Blocked LU (rectangular too), Cholesky and Householder QR: the column-by-
+  column steps LAPACK would do (panel factorization with partial pivoting
+  and whole-row interchanges, Cholesky diagonal blocks, Householder panels
+  and the compact-WY `T` factor, inverses of small triangular blocks, row
+  interchanges) run in `factor.slang` with one workgroup per matrix; the
+  trailing updates are batched GEMMs. Pivots, Householder signs and
+  reflector storage follow LAPACK, so `lu_factor`, `geqrf`, `qr`,
+  `householder_product` and `ormqr` match the CPU's outputs.
+- `eigh`/`eigvalsh`: cyclic Jacobi with round-robin ordering (all disjoint
+  index pairs rotated in parallel), converged to working precision.
+- `svd`/`svdvals`: one-sided (Hestenes) Jacobi; left vectors of zero
+  singular values and `full_matrices` are completed with Householder QR.
+- `lstsq` (minimum-norm solution through the SVD, as LAPACK's gelsy/gelsd
+  return), `matrix_exp` (Pade 13 with scaling and squaring; float32
+  computed in float64), `cholesky_solve`, `cholesky_inverse`, `lu_unpack`,
+  `linalg.lu`, right-side and batched triangular solves.
+- `TORCH_VK_LINALG=cpu` still sends these ops to LAPACK.
+- Eigenvectors and singular vectors are unique only up to sign: tests check
+  reconstruction and orthonormality, the OpInfo sweep compares magnitudes.
 
 ## Neural-network ops (M12)
 
@@ -474,13 +499,14 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
-  csrc/dense.cpp           blocked LU / Cholesky / triangular solves, tril/triu
+  csrc/dense.cpp           LU, Cholesky, QR, Jacobi eigh/SVD, lstsq, triangular solves, tril/triu
+  shaders/factor.slang     factorization panels and Jacobi rotations (one workgroup per matrix)
   src/ffi.rs               C ABI from C++ to the Rust runtime
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming, torch.vk device module, _decomp.py (PyTorch
                            decompositions as kernels), _kernels.py (Python kernels)
-tests/python/test_*.py     651 tests: results on "vk" vs CPU (statistics for random ops)
+tests/python/test_*.py     713 tests: results on "vk" vs CPU (statistics for random ops)
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
@@ -523,7 +549,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 651 Python tests pass with no validation messages. Op coverage:
+All 713 Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
 
 ## Roadmap
@@ -569,7 +595,9 @@ no fallbacks in the OpInfo sweep).
     `segment_reduce`, bicubic `grid_sample` backward, integer convolution and
     pooling on the GPU, native (non-composed) kernels for the hottest
     composed ops (softmax, layer norm, pooling).
-13. **M13 linear algebra on the GPU**: no CPU panels; QR, eigh, SVD.
+13. ~~**M13 linear algebra on the GPU**~~: done (see above). Not yet:
+    general (nonsymmetric) `eig`/`eigvals`, `ldl_factor`/`ldl_solve`
+    (Bunch-Kaufman pivoting), complex matrices (M14).
 14. **M14 complex completion and a strict sweep with zero fallbacks**.
 15. **M15 PyTorch's own tests**: run PyTorch's device-generic suites
     (`test_ops.py` and related, via `instantiate_device_type_tests`) on

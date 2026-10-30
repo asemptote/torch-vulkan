@@ -20,6 +20,9 @@ pub struct Capabilities {
     pub buffer_device_address: bool,
     pub scalar_block_layout: bool,
     pub vulkan_memory_model: bool,
+    /// Device-scope barriers (factorization kernels order global memory
+    /// between a workgroup's threads with them).
+    pub vulkan_memory_model_device_scope: bool,
     pub timeline_semaphore: bool,
     pub storage_buffer_16bit: bool,
     pub storage_buffer_8bit: bool,
@@ -158,6 +161,7 @@ impl Context {
                 .scalar_block_layout(true)
                 .timeline_semaphore(true)
                 .vulkan_memory_model(caps.vulkan_memory_model)
+                .vulkan_memory_model_device_scope(caps.vulkan_memory_model_device_scope)
                 .shader_float16(caps.shader_float16)
                 .shader_int8(caps.shader_int8)
                 .storage_buffer8_bit_access(caps.storage_buffer_8bit);
@@ -233,6 +237,7 @@ unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, p
         buffer_device_address: b(f12.buffer_device_address),
         scalar_block_layout: b(f12.scalar_block_layout),
         vulkan_memory_model: b(f12.vulkan_memory_model),
+        vulkan_memory_model_device_scope: b(f12.vulkan_memory_model_device_scope),
         timeline_semaphore: b(f12.timeline_semaphore),
         storage_buffer_16bit: b(f11.storage_buffer16_bit_access),
         storage_buffer_8bit: b(f12.storage_buffer8_bit_access),
