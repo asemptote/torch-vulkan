@@ -3,13 +3,16 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M9 — data movement and indexing**: device `"vk"` is a native PyTorch
+Status: **M10 — sorting, searching and statistics**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
 copies, casts and fills for every dtype, indexing (advanced indexing,
 index_put_, gather, scatter, index_select, take/put_, masked_select, nonzero),
-cat, flip, roll, padding, arange/linspace/eye, reductions (sum,
+cat, flip, roll, padding, arange/linspace/eye, sorting and order statistics
+(sort, topk, kthvalue, median, mode, unique, searchsorted, cummax/cummin),
+accumulation into repeated indices (index_add, scatter_add/scatter_reduce,
+index_put_ with accumulate, bincount, histc), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
 nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
@@ -25,6 +28,42 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
 ```
+
+## Sorting, searching and statistics (M10)
+
+- **Sort** (`shaders/sort_keys.slang`, `shaders/sort.slang`): values become
+  unsigned keys in PyTorch's order (NaN largest, -0 equal to +0, inverted
+  for descending), then a bitonic sort of (key, index) pairs runs over all
+  rows at once, in shared memory for 1024-element blocks. Breaking ties by
+  index makes the result exactly the stable sort, for every real dtype
+  including the 8- and 16-bit ones.
+- Built on it: `sort`, `argsort`, `msort`, `topk`, `kthvalue`, `median`,
+  `nanmedian`, `mode` (`shaders/rowscan.slang` finds the longest run),
+  `unique` (with inverse and counts) and `unique_consecutive`.
+- `searchsorted` and `bucketize` (`shaders/searchsorted.slang`, a binary
+  search per value with PyTorch's comparisons), `cummax`, `cummin` and
+  `logcumsumexp` (sequential per row, matching the CPU's NaN and tie rules).
+- **Accumulation into repeated indices** without atomics (this GPU has no
+  64-bit or float atomics): source elements are sorted by destination and
+  `shaders/segreduce.slang` folds each run in source order, the same order as
+  the CPU's loop, so float sums agree bit for bit. Used by `index_add`,
+  `index_reduce`, `scatter_add`, `scatter_reduce` (sum/prod/mean/amax/amin,
+  with or without self), `scatter(reduce=...)`, `index_put_`/`put_` with
+  `accumulate=True`, `bincount` and `histc`.
+- Small reductions from existing kernels: `aminmax`, `var_mean`,
+  `std_mean`, `nansum`, `trace`.
+- Which of several equal elements `topk`, `kthvalue`, `median` and `mode`
+  report is unspecified in PyTorch (the CPU uses unstable partial sorts); we
+  return the stable-order one, and tests check values plus that the indices
+  select them.
+
+| sort, float32 | vk (UHD 620) | CPU (stable, 4 threads) |
+|---|---|---|
+| 1 x 2^20 | 78 ms | 533 ms |
+| 64 x 2^16 | 145 ms | 546 ms |
+| 4096 x 1000 | 61 ms | 326 ms |
+
+OpInfo sweep: 346 of 659 ops fully on the GPU (317 after M9), no mismatches.
 
 ## Data movement and indexing (M9)
 
@@ -363,7 +402,8 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/launch.cpp          strided element-wise launches (csrc/strided.h plans dims)
   csrc/ops.cpp             unary, binary and comparison aten kernels
   csrc/elementwise.cpp     activations, clamp, predicates, where, lerp/addcmul, compositions
-  csrc/indexing.cpp        indexing, nonzero, cat/flip/roll/padding, arange/linspace/eye
+  csrc/indexing.cpp        indexing, accumulation, nonzero, cat/flip/roll/padding, arange/linspace/eye
+  csrc/sorting.cpp         sort and order statistics, unique, searchsorted, cummax/cummin
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
@@ -372,7 +412,7 @@ crates/pyvk/               extension module torch_vulkan._native
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_*.py     565 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_*.py     606 tests: results on "vk" vs CPU, no unexpected fallbacks
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
@@ -415,7 +455,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 565 Python tests pass with no validation messages. Op coverage:
+All 606 Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
 
 ## Roadmap
@@ -447,13 +487,13 @@ All 565 Python tests pass with no validation messages. Op coverage:
 Goal for M9-M14: every dense aten op runs on Vulkan (`TORCH_VK_STRICT=1` with
 no fallbacks in the OpInfo sweep).
 
-9. ~~**M9 data movement and indexing**~~: done (see above). Not yet: the
-   accumulating index ops (M10), `repeat_interleave` with a tensor of
-   repeats, `tril_indices`/`triu_indices`.
-10. **M10 sorting, searching and statistics**: sort, topk, median, unique,
-    histc, searchsorted, cummax, logcumsumexp, and the accumulating index
-    ops (index_add, scatter_add/scatter_reduce, index_put_ with accumulate,
-    bincount) built on sorting.
+9. ~~**M9 data movement and indexing**~~: done (see above). Not yet:
+   `repeat_interleave` with a tensor of repeats, `tril_indices`/`triu_indices`.
+10. ~~**M10 sorting, searching and statistics**~~: done (see above). Not
+    yet: `unique(dim=...)`, `histogram`/`histogramdd`, `segment_reduce`,
+    accumulation for 8/16-bit and complex dtypes, a radix sort for very long
+    rows (bitonic is O(n log^2 n)), parallel scans for single long rows in
+    cummax/cummin/logcumsumexp.
 11. **M11 random numbers**: Philox-based rand/randn/bernoulli/multinomial.
 12. **M12 neural-network ops**: convolution, pooling, softmax, normalization,
     losses, backward kernels.

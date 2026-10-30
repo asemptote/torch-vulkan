@@ -48,6 +48,10 @@ DTYPES = {
 SKIP_COMPARE = ("empty", "new_empty", "rand", "normal", "bernoulli", "multinomial", "dropout", "uniform",
                 "exponential", "geometric", "cauchy", "log_normal", "as_strided.partial_views")
 SKIP_ENTIRELY = ("sparse.", "to_sparse", "tensor_split")
+# Ops returning (values, indices) where PyTorch leaves the index among equal
+# values unspecified (the CPU uses unstable partial sorts): the values must
+# match, and the indices must point at them.
+TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk")
 
 
 def op_name(info):
@@ -71,6 +75,22 @@ def run_sample(op, sample):
     after = tv.fallback_counts()
     used = sorted(k for k, v in after.items() if v != before.get(k, 0))
     return cpu_out, vk_out, used
+
+
+def compare_tied(name, sample, expected, actual):
+    """compare() for TIED_INDICES ops: values, plus indices that select them."""
+    problem = compare(expected[0], actual[0])
+    if problem:
+        return problem
+    pos = 1 if name in ("kthvalue", "topk") else 0  # where dim sits among the positional args
+    dim = sample.args[pos] if len(sample.args) > pos else sample.kwargs.get("dim", -1)
+    x, values, indices = sample.input, actual[0], actual[1]
+    if x.dim() == 0:
+        return None if indices.item() == 0 else "index of a 0-dim input must be 0"
+    if values.dim() < x.dim():
+        values, indices = values.unsqueeze(dim), indices.unsqueeze(dim)
+    picked = torch.gather(x, dim, indices)
+    return compare(values, picked)
 
 
 def compare(expected, actual):
@@ -116,7 +136,11 @@ def check_op(info, dtypes, nsamples):
             fallbacks.update(used)
             if any(s in op_name(info) for s in SKIP_COMPARE):
                 continue
-            problem = compare(expected, actual)
+            name = op_name(info)
+            if name in TIED_INDICES and isinstance(expected, tuple):
+                problem = compare_tied(name, sample, expected, actual)
+            else:
+                problem = compare(expected, actual)
             if problem:
                 return {"status": "mismatch", "detail": f"{dtype}: {problem}", "fallbacks": sorted(fallbacks)}
     if tried == 0:

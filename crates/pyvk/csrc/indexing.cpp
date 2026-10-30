@@ -297,10 +297,15 @@ at::Tensor index(const at::Tensor& self, const c10::List<std::optional<at::Tenso
   return index_out(self, indices, out);
 }
 
+// Defined with the accumulating ops below.
+const char* accum_label(at::ScalarType t);
+void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, const at::Tensor& values);
+
 at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
                            const at::Tensor& values, bool accumulate, bool unsafe) {
   bool values_ok = is_vk(values) || (values.dim() == 0 && values.device().is_cpu());
-  if (accumulate || !movable(self) || !values_ok || !indices_on_vk(indices)) {
+  if (!movable(self) || !values_ok || !indices_on_vk(indices) ||
+      (accumulate && accum_label(self.scalar_type()) == nullptr)) {
     on_cpu("aten::_index_put_impl_", "", self, indices, values, accumulate, unsafe);
     return self;
   }
@@ -309,11 +314,17 @@ at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::T
     return self;
   }
   at::Tensor v = values.to(self.device(), self.scalar_type());
-  scatter(info.src, v, index_offsets(info.src.sizes(), info.terms, self.options()));
+  at::Tensor offsets = index_offsets(info.src.sizes(), info.terms, self.options());
+  if (accumulate) {
+    accumulate_into(info.src, offsets, v);
+  } else {
+    scatter(info.src, v, offsets);
+  }
   return self;
 }
 
 // ---------------------------------------------------------------- scatter, index_copy, index_fill_, put_
+
 
 // The destination restrided to the index's shape (index sizes may be
 // smaller than the destination's in every dim but `dim`).
@@ -418,7 +429,8 @@ at::Tensor& index_fill_tensor(at::Tensor& self, int64_t dim, const at::Tensor& i
 }
 
 at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& source, bool accumulate) {
-  if (accumulate || !movable(self) || !is_vk(index) || !is_vk(source) || index.scalar_type() != at::kLong) {
+  if (!movable(self) || !is_vk(index) || !is_vk(source) || index.scalar_type() != at::kLong ||
+      (accumulate && accum_label(self.scalar_type()) == nullptr)) {
     on_cpu("aten::put_", "", self, index, source, accumulate);
     return self;
   }
@@ -428,9 +440,253 @@ at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& so
   }
   at::Tensor offsets = linear_to_offsets(checked_linear(index, self.numel()), self);
   at::Tensor dst_view = self.as_strided(index.sizes(), std::vector<int64_t>(index.dim(), 0), self.storage_offset());
-  scatter(dst_view, source.reshape(index.sizes()).to(self.scalar_type()), offsets);
+  at::Tensor values = source.reshape(index.sizes()).to(self.scalar_type());
+  if (accumulate) {
+    accumulate_into(dst_view, offsets, values);
+  } else {
+    scatter(dst_view, values, offsets);
+  }
   return self;
 }
+
+// ---------------------------------------------------------------- accumulation into repeated indices
+
+// No atomics: the source elements are sorted (stably) by destination
+// offset, and shaders/segreduce.slang folds each run of equal offsets in
+// source order, like the CPU's sequential loop (so float sums agree).
+
+struct SegReduceParams {
+  uint64_t dst, offs, vals, order;
+  uint32_t n, stride;
+};
+static_assert(sizeof(SegReduceParams) == 40, "must match shaders/segreduce.slang");
+
+const char* accum_label(at::ScalarType t) {
+  switch (t) {
+    case at::kFloat: return "f32";
+    case at::kDouble: return has_feature(kFeatureFloat64) ? "f64" : nullptr;
+    case at::kInt: return "i32";
+    case at::kLong: return "i64";
+    default: return nullptr;
+  }
+}
+
+uint32_t reduce_code(c10::string_view reduce) {
+  if (reduce == "sum" || reduce == "add") return op::SEGREDUCE_SUM;
+  if (reduce == "prod" || reduce == "multiply") return op::SEGREDUCE_PROD;
+  if (reduce == "amax") return op::SEGREDUCE_MAX;
+  if (reduce == "amin") return op::SEGREDUCE_MIN;
+  if (reduce == "mean") return op::SEGREDUCE_MEAN;
+  TORCH_CHECK(false, "reduce argument must be either sum, prod, mean, amax or amin, got ", reduce);
+}
+
+// Element offsets of every position of `view` (its own strides; stride-0
+// dims contribute nothing), as an int64 tensor of its shape.
+at::Tensor view_positions(const at::Tensor& view) {
+  std::vector<IndexTerm> terms;
+  for (int64_t d = 0; d < view.dim(); ++d) {
+    if (view.stride(d) != 0 && view.size(d) > 1) {
+      at::Tensor i = at::arange(view.size(d), view.options().dtype(at::kLong));
+      terms.push_back({index_along(i, d, view.dim()), view.size(d), view.stride(d)});
+    }
+  }
+  return index_offsets(view.sizes(), terms, view.options());
+}
+
+// dst_view[offsets] = op(dst_view[offsets] (if include_self), values...),
+// values broadcast to the offsets' shape. As for MOVE_SCATTER, offsets are
+// added to each element's own position in dst_view.
+void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at::Tensor& values, uint32_t op,
+                bool include_self) {
+  int64_t n = offsets.numel();
+  if (n == 0) {
+    return;
+  }
+  TORCH_CHECK(n < (int64_t(1) << 31), "torch_vulkan: accumulation of more than 2^31 elements");
+  at::Tensor offs = (offsets + view_positions(dst_view)).reshape({1, n}).contiguous();
+  at::Tensor vals = values.to(dst_view.scalar_type()).expand(offsets.sizes()).contiguous();
+  at::Tensor order = sort_rows(offs, false);
+  SegReduceParams p{};
+  p.dst = gpu_address(dst_view);
+  p.offs = gpu_address(offs);
+  p.vals = gpu_address(vals);
+  p.order = gpu_address(order);
+  p.n = static_cast<uint32_t>(n);
+  uint32_t groups = 0;
+  check(vkt_grid_1d(p.n, &groups, &p.stride));
+  dispatch(std::string("segreduce_") + accum_label(dst_view.scalar_type()), {op, include_self ? 1u : 0u}, p, groups);
+}
+
+// out = self, then out[index along dim] op= src (scatter_add, scatter_reduce, scatter(reduce=...)).
+bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
+                        uint32_t op, bool include_self, at::Tensor& out) {
+  dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+  if (!scatter_ok(self, index, dim) || !is_vk(src) || !is_vk(out) || accum_label(self.scalar_type()) == nullptr ||
+      out.scalar_type() != self.scalar_type()) {
+    return false;
+  }
+  if (!out.is_same(self)) {
+    at::native::resize_output(out, self.sizes());
+    out.copy_(self);
+  }
+  if (index.numel() == 0) {
+    return true;
+  }
+  at::Tensor dst_view = restride_without(out, index.sizes(), dim);
+  at::Tensor offsets =
+      index_offsets(index.sizes(), {{index, size_at(out, dim), stride_at(out, dim)}}, out.options(), /*wrap=*/false);
+  at::Tensor values = src.dim() == 0 ? src : src.as_strided(index.sizes(), src.strides(), src.storage_offset());
+  accumulate(dst_view, offsets, values, op, include_self);
+  return true;
+}
+
+// out = self, then out[index[i] along dim] op= source[i along dim] (index_add, index_reduce).
+bool index_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& source,
+                      uint32_t op, bool include_self, at::Tensor& out) {
+  dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+  if (!movable(self) || !is_vk(index) || !is_vk(source) || !is_vk(out) || index.dim() > 1 ||
+      !index_dtype_ok(index) || accum_label(self.scalar_type()) == nullptr || out.scalar_type() != self.scalar_type()) {
+    return false;
+  }
+  if (!out.is_same(self)) {
+    at::native::resize_output(out, self.sizes());
+    out.copy_(self);
+  }
+  if (source.numel() == 0) {
+    return true;
+  }
+  at::Tensor dst_view = restride_without(out, source.sizes(), dim);
+  at::Tensor offsets = index_offsets(
+      source.sizes(), {{index_along(index, dim, source.dim()), size_at(out, dim), stride_at(out, dim)}}, out.options(),
+      /*wrap=*/false);
+  accumulate(dst_view, offsets, source, op, include_self);
+  return true;
+}
+
+void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, const at::Tensor& values) {
+  accumulate(dst_view, offsets, values, op::SEGREDUCE_SUM, true);
+}
+
+at::Tensor& scatter_add_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
+                            at::Tensor& out) {
+  if (!scatter_accumulate(self, dim, index, src, op::SEGREDUCE_SUM, true, out)) {
+    on_cpu("aten::scatter_add", "out", self, dim, index, src, out);
+  }
+  return out;
+}
+
+at::Tensor& scatter_reduce_two_out(const at::Tensor& self, int64_t dim, const at::Tensor& index,
+                                   const at::Tensor& src, c10::string_view reduce, bool include_self,
+                                   at::Tensor& out) {
+  if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), include_self, out)) {
+    on_cpu("aten::scatter_reduce", "two_out", self, dim, index, src, reduce, include_self, out);
+  }
+  return out;
+}
+
+at::Tensor& scatter_reduce_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
+                               c10::string_view reduce, at::Tensor& out) {
+  if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), true, out)) {
+    on_cpu("aten::scatter", "reduce_out", self, dim, index, src, reduce, out);
+  }
+  return out;
+}
+
+at::Tensor& scatter_value_reduce_out(const at::Tensor& self, int64_t dim, const at::Tensor& index,
+                                     const at::Scalar& value, c10::string_view reduce, at::Tensor& out) {
+  at::Tensor src = at::scalar_tensor(value, self.options());
+  if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), true, out)) {
+    on_cpu("aten::scatter", "value_reduce_out", self, dim, index, value, reduce, out);
+  }
+  return out;
+}
+
+at::Tensor& index_add_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& source,
+                          const at::Scalar& alpha, at::Tensor& out) {
+  at::Tensor scaled = alpha.equal(1) ? source : source * alpha;
+  if (!index_accumulate(self, dim, index, scaled, op::SEGREDUCE_SUM, true, out)) {
+    on_cpu("aten::index_add", "out", self, dim, index, source, alpha, out);
+  }
+  return out;
+}
+
+at::Tensor& index_reduce_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& source,
+                             c10::string_view reduce, bool include_self, at::Tensor& out) {
+  TORCH_CHECK(reduce == "prod" || reduce == "mean" || reduce == "amax" || reduce == "amin",
+              "index_reduce(): Expected reduce to be one of prod, mean, amax or amin but got ", reduce, ".");
+  if (!index_accumulate(self, dim, index, source, reduce_code(reduce), include_self, out)) {
+    on_cpu("aten::index_reduce", "out", self, dim, index, source, reduce, include_self, out);
+  }
+  return out;
+}
+
+at::Tensor bincount(const at::Tensor& self, const std::optional<at::Tensor>& weights, int64_t minlength) {
+  TORCH_CHECK(minlength >= 0, "minlength should be >= 0");
+  TORCH_CHECK(self.dim() == 1 && !at::isFloatingType(self.scalar_type()) && self.scalar_type() != at::kBool,
+              "bincount only supports 1-d non-negative integral inputs.");
+  bool has_w = weights.has_value() && weights->defined();
+  at::ScalarType dtype = !has_w ? at::kLong : at::isFloatingType(weights->scalar_type()) ? weights->scalar_type()
+                                                                                         : at::kDouble;
+  if (!is_vk(self) || (has_w && !is_vk(*weights)) || accum_label(dtype) == nullptr) {
+    return on_cpu("aten::bincount", "", self, weights, minlength)[0].toTensor();
+  }
+  TORCH_CHECK(!has_w || weights->sizes() == self.sizes(), "weights should be 1-d and have the same length as input");
+  if (self.numel() == 0) {
+    return at::zeros({minlength}, self.options().dtype(dtype));
+  }
+  at::Tensor bounds = at::stack({self.min(), self.max()}).to(at::kLong).cpu();
+  TORCH_CHECK(bounds[0].item<int64_t>() >= 0, "bincount only supports 1-d non-negative integral inputs.");
+  int64_t size = std::max(bounds[1].item<int64_t>() + 1, minlength);
+  at::Tensor out = at::zeros({size}, self.options().dtype(dtype));
+  at::Tensor values = has_w ? *weights : at::ones({self.numel()}, self.options().dtype(dtype));
+  at::Tensor dst_view = out.as_strided({self.numel()}, {0});
+  accumulate(dst_view, self.to(at::kLong), values, op::SEGREDUCE_SUM, true);
+  return out;
+}
+
+at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& min, const at::Scalar& max,
+                      at::Tensor& out) {
+  TORCH_CHECK(bins > 0, "torch.histc(): bins must be > 0, but got ", bins);
+  at::ScalarType t = self.scalar_type();
+  if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(t) || accum_label(t) == nullptr) {
+    on_cpu("aten::histc", "out", self, bins, min, max, out);
+    return out;
+  }
+  double lo = min.toDouble(), hi = max.toDouble();
+  if (lo == hi && self.numel() > 0) {
+    at::Tensor bounds = at::stack({self.min(), self.max()}).to(at::kDouble).cpu();
+    lo = bounds[0].item<double>();
+    hi = bounds[1].item<double>();
+  }
+  if (lo == hi) {
+    lo -= 1;
+    hi += 1;
+  }
+  TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc(): range of [", lo, ", ", hi, "] is not finite");
+  TORCH_CHECK(lo < hi, "torch.histc(): max must be larger than min");
+  at::native::resize_output(out, {bins});
+  out.zero_();
+  if (self.numel() == 0) {
+    return out;
+  }
+  // Bin b holds edges[b] <= x < edges[b + 1]; x == max goes in the last bin.
+  at::Tensor edges = at::linspace(lo, hi, bins + 1, self.options());
+  at::Tensor x = self.reshape({-1});
+  at::Tensor last = edges.narrow(0, bins, 1), first = edges.narrow(0, 0, 1);
+  at::Tensor bucket = at::searchsorted(edges, x, false, /*right=*/true) - 1;
+  bucket = at::where(at::eq(x, last), at::full_like(bucket, bins - 1), bucket);
+  at::Tensor keep = at::logical_and(at::ge(x, first), at::le(x, last));
+  at::Tensor offsets = at::masked_select(bucket, keep);
+  at::Tensor dst_view = out.as_strided({offsets.numel()}, {0});
+  accumulate(dst_view, offsets, at::ones({offsets.numel()}, out.options()), op::SEGREDUCE_SUM, true);
+  return out;
+}
+
+at::Tensor histc(const at::Tensor& self, int64_t bins, const at::Scalar& min, const at::Scalar& max) {
+  at::Tensor out = at::empty({0}, self.options());
+  return histc_out(self, bins, min, max, out);
+}
+
 
 // ---------------------------------------------------------------- nonzero, masked_select, masked_scatter_
 
@@ -887,6 +1143,15 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("index_fill_.int_Scalar", &index_fill_scalar);
   m.impl("index_fill_.int_Tensor", &index_fill_tensor);
   m.impl("put_", &vk::put_);
+  m.impl("scatter_add.out", &scatter_add_out);
+  m.impl("scatter_reduce.two_out", &scatter_reduce_two_out);
+  m.impl("scatter.reduce_out", &scatter_reduce_out);
+  m.impl("scatter.value_reduce_out", &scatter_value_reduce_out);
+  m.impl("index_add.out", &index_add_out);
+  m.impl("index_reduce.out", &index_reduce_out);
+  m.impl("bincount", &vk::bincount);
+  m.impl("histc", &vk::histc);
+  m.impl("histc.out", &histc_out);
   m.impl("nonzero", &vk::nonzero_vk);
   m.impl("nonzero.out", &nonzero_out);
   m.impl("nonzero_static", &vk::nonzero_static);

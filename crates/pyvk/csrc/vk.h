@@ -116,6 +116,11 @@ void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Te
 void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                      const at::Tensor* b, const at::Tensor* c, c10::ArrayRef<c10::Scalar> params = {});
 
+// Stable sort of each row of `x` (contiguous [rows, n], any real dtype with
+// a storage_label): the int32 indices [rows, n] that order each row
+// ascending (descending: largest first), ties in original order. sorting.cpp.
+at::Tensor sort_rows(const at::Tensor& x, bool descending);
+
 // launch_strided with the parameter slots given as raw bits (e.g. a fill
 // value's bytes).
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
