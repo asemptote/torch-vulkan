@@ -1,5 +1,6 @@
-// Float math on the kernel's element type T under one set of names (m_exp,
-// m_log, ...), for kernels with T = float or double.
+// Float math on a scalar type FT under one set of names (m_exp, m_log, ...):
+// float for kernels with T_f32 (or FMATH_F32, e.g. complex64 kernels),
+// double for T_f64 (or FMATH_F64).
 //
 // float32 uses the GPU's GLSL.std.450 built-ins where they are accurate
 // enough, _math32.slang where there is no built-in, and short wrappers where
@@ -8,15 +9,17 @@
 // _math64*.slang, since SPIR-V has no 64-bit transcendentals. A float32
 // module never contains a double, so it runs on GPUs without float64.
 
-// LIT(c): the constant c at T's precision (a bare literal is float32).
-#if defined(T_f64)
+// LIT(c): the constant c at FT's precision (a bare literal is float32).
+#if defined(T_f64) || defined(FMATH_F64)
 #define LIT(c) c##l
 #else
 #define LIT(c) c##f
 #endif
 
-#if defined(T_f32)
+#if defined(T_f32) || defined(FMATH_F32)
 #include "_math32.slang"
+
+typedef float FT;  // the scalar type of these functions
 
 typedef uint UBITS;
 static const float M_PI = 3.14159265358979f;
@@ -35,17 +38,38 @@ float m_log(float x) { return log(x); }
 float m_log2(float x) { return log2(x); }
 float m_log10(float x) { return log(x) * M_INV_LN10; }
 float m_log1p(float x) { return log1p32(x); }
-float m_sin(float x) { return sin(x); }
-float m_cos(float x) { return cos(x); }
-// tan by Cody-Waite reduction to [-pi/4, pi/4] and the _math32 polynomials
-// (the built-in tan can be off by ~1e-4); the built-in beyond |x| ~ 800.
+// sin, cos and tan by Cody-Waite reduction to [-pi/4, pi/4] (r, quadrant n)
+// and the _math32 polynomials: the built-ins can be off by ~1e-5 for
+// moderate arguments (sin, cos) or ~1e-4 (tan). The built-ins beyond |x| ~ 800.
+float reduce_pio2_32(float x, out int n)
+{
+    float k = round(x * 0.636619772367581f);
+    n = int(k);
+    return ((x - k * 1.5707855225e+00f) - k * 1.0804273188e-05f) - k * 6.0770943833e-11f;
+}
+float m_sin(float x)
+{
+    if (!(abs(x) < 800.0f)) return sin(x);
+    int n;
+    float r = reduce_pio2_32(x, n);
+    float v = (n & 1) == 0 ? sin_poly32(r) : cos_poly32(r);
+    return (n & 2) == 0 ? v : -v;
+}
+float m_cos(float x)
+{
+    if (!(abs(x) < 800.0f)) return cos(x);
+    int n;
+    float r = reduce_pio2_32(x, n);
+    float v = (n & 1) == 0 ? cos_poly32(r) : sin_poly32(r);
+    return ((n + 1) & 2) == 0 ? v : -v;
+}
 float m_tan(float x)
 {
     if (!(abs(x) < 800.0f)) return tan(x);
-    float n = round(x * 0.636619772367581f);
-    float r = ((x - n * 1.5707855225e+00f) - n * 1.0804273188e-05f) - n * 6.0770943833e-11f;
+    int n;
+    float r = reduce_pio2_32(x, n);
     float s = sin_poly32(r), c = cos_poly32(r);
-    return (int(n) & 1) == 0 ? s / c : -c / s;
+    return (n & 1) == 0 ? s / c : -c / s;
 }
 float m_asin(float x) { return asin(x); }
 // acos via asin, keeping relative accuracy near x = 1 (the built-in acos is
@@ -145,11 +169,12 @@ int m_ilogb(float x)
     return e != 0 ? e - 127 : firstbithigh(bits) - 149;
 }
 
-#elif defined(T_f64)
+#elif defined(T_f64) || defined(FMATH_F64)
 #include "_math64.slang"
 #include "_math64_ext.slang"
 
 typedef uint64_t UBITS;
+typedef double FT;
 static const double M_LN2 = LN2;
 static const double M_INV_LN2 = INV_LN2;
 
@@ -207,73 +232,73 @@ int m_ilogb(double x)
 #endif
 
 // log(1 + e^x) without overflow.
-T m_softplus(T x)
+FT m_softplus(FT x)
 {
-    return x > T(0) ? x + m_log1p(m_exp(-x)) : m_log1p(m_exp(x));
+    return x > FT(0) ? x + m_log1p(m_exp(-x)) : m_log1p(m_exp(x));
 }
 
 // fmod(a, b) exactly: subtract b scaled by powers of two (each step is exact by Sterbenz).
-T m_fmod(T a, T b)
+FT m_fmod(FT a, FT b)
 {
-    if (isnan(a) || isnan(b) || isinf(a) || b == T(0)) return m_nan();
+    if (isnan(a) || isnan(b) || isinf(a) || b == FT(0)) return m_nan();
     if (isinf(b)) return a;
-    T r = abs(a), d = abs(b);
+    FT r = abs(a), d = abs(b);
     int ed = m_ilogb(d);
     while (r >= d)
     {
-        T t = m_scale2(d, m_ilogb(r) - ed);
-        if (t > r) t *= T(0.5);
+        FT t = m_scale2(d, m_ilogb(r) - ed);
+        if (t > r) t *= FT(0.5);
         r -= t;
     }
     return m_signbit(a) ? -r : r;
 }
 
 // Python-style floor division, as PyTorch's div_floor for floats.
-T m_floor_div(T a, T b)
+FT m_floor_div(FT a, FT b)
 {
-    if (b == T(0)) return a / b;
-    T mod = m_fmod(a, b);
-    T div = (a - mod) / b;
-    if (mod != T(0) && (b < T(0)) != (mod < T(0))) div -= T(1);
-    if (div == T(0)) return T(0) * (a / b);  // keeps the sign of zero
-    T fl = floor(div);
-    if (div - fl > T(0.5)) fl += T(1);
+    if (b == FT(0)) return a / b;
+    FT mod = m_fmod(a, b);
+    FT div = (a - mod) / b;
+    if (mod != FT(0) && (b < FT(0)) != (mod < FT(0))) div -= FT(1);
+    if (div == FT(0)) return FT(0) * (a / b);  // keeps the sign of zero
+    FT fl = floor(div);
+    if (div - fl > FT(0.5)) fl += FT(1);
     return fl;
 }
 
-bool m_is_odd_integer(T y)
+bool m_is_odd_integer(FT y)
 {
-    return y == floor(y) && abs(y) < T(9007199254740992.0) && floor(y * T(0.5)) != y * T(0.5);
+    return y == floor(y) && abs(y) < FT(9007199254740992.0) && floor(y * FT(0.5)) != y * FT(0.5);
 }
 
 // x^y with C99 special cases. Integer exponents up to 64 use exact squaring;
 // float64 recovers the rounding error of y log x with an FMA.
-T m_pow(T x, T y)
+FT m_pow(FT x, FT y)
 {
-    if (y == T(0) || x == T(1)) return T(1);
+    if (y == FT(0) || x == FT(1)) return FT(1);
     if (isnan(x) || isnan(y)) return m_nan();
     bool neg = false;
-    if (x < T(0) || (x == T(0) && m_signbit(x)))
+    if (x < FT(0) || (x == FT(0) && m_signbit(x)))
     {
-        if (!isinf(x) && x != T(0) && y != floor(y) && !isinf(y)) return m_nan();
+        if (!isinf(x) && x != FT(0) && y != floor(y) && !isinf(y)) return m_nan();
         neg = m_is_odd_integer(y);
         x = -x;
     }
     if (isinf(y))
     {
-        if (x == T(1)) return T(1);
-        return (x > T(1)) == (y > T(0)) ? m_inf() : T(0);
+        if (x == FT(1)) return FT(1);
+        return (x > FT(1)) == (y > FT(0)) ? m_inf() : FT(0);
     }
-    T r;
-    if (x == T(0))
-        r = y > T(0) ? T(0) : m_inf();
+    FT r;
+    if (x == FT(0))
+        r = y > FT(0) ? FT(0) : m_inf();
     else if (isinf(x))
-        r = y > T(0) ? m_inf() : T(0);
-    else if (y == floor(y) && abs(y) <= T(64))
+        r = y > FT(0) ? m_inf() : FT(0);
+    else if (y == floor(y) && abs(y) <= FT(64))
     {
-        T base = y > T(0) ? x : T(1) / x;
+        FT base = y > FT(0) ? x : FT(1) / x;
         int e = int(abs(y));
-        r = T(1);
+        r = FT(1);
         while (e > 0)
         {
             if ((e & 1) != 0) r *= base;
@@ -283,7 +308,7 @@ T m_pow(T x, T y)
     }
     else
     {
-#if defined(T_f64)
+#if defined(T_f64) || defined(FMATH_F64)
         double l = log64(x);
         double t = y * l;
         double tl = fma(y, l, -t);

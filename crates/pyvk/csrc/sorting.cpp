@@ -335,6 +335,23 @@ void cum_helper(const at::Tensor& self, at::Tensor& values, at::Tensor& indices,
 
 at::Tensor logcumsumexp_vk(const at::Tensor& self, int64_t dim) {
   at::ScalarType t = self.scalar_type();
+  if (is_vk(self) && at::isComplexType(t) && dtype_label(t) != nullptr && self.dim() == 0) {
+    at::maybe_wrap_dim(dim, 1);
+    return self.clone();  // of one element: the element
+  }
+  if (is_vk(self) && at::isComplexType(t) && dtype_label(t) != nullptr && self.dim() > 0) {
+    // Complex: a Hillis-Steele scan with logaddexp (complex logaddexp runs on the GPU).
+    dim = at::maybe_wrap_dim(dim, self.dim());
+    at::Tensor x = self.movedim(dim, -1).resolve_conj().contiguous();
+    int64_t n = x.size(-1);
+    for (int64_t offset = 1; offset < n; offset *= 2) {
+      at::Tensor next = x.clone();
+      next.narrow(-1, offset, n - offset).copy_(at::logaddexp(x.narrow(-1, offset, n - offset),
+                                                              x.narrow(-1, 0, n - offset)));
+      x = next;
+    }
+    return x.movedim(-1, dim).contiguous();
+  }
   if (!is_vk(self) || !(t == at::kFloat || (t == at::kDouble && has_feature(kFeatureFloat64)))) {
     return on_cpu("aten::_logcumsumexp", "", self, dim)[0].toTensor();
   }

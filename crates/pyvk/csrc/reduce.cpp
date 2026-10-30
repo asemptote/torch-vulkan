@@ -267,11 +267,72 @@ void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int6
   out.copy_(flat.view(shape));
 }
 
+// ---------------------------------------------------------------- complex inputs
+
+// Complex reductions from real ones: sum and mean act on the real view (parts
+// as a last dim); products are log-depth trees of complex multiplications.
+
+bool complex_vk(const at::Tensor& t) {
+  return is_vk(t) && at::isComplexType(t.scalar_type()) && dtype_label(t.scalar_type()) != nullptr;
+}
+
+std::vector<int64_t> reduce_dims_of(const at::Tensor& self, at::OptionalIntArrayRef dim) {
+  std::vector<int64_t> dims;
+  if (!dim.has_value() || dim->empty()) {
+    for (int64_t d = 0; d < self.dim(); ++d) dims.push_back(d);
+  } else {
+    for (int64_t d : *dim) dims.push_back(at::maybe_wrap_dim(d, std::max<int64_t>(self.dim(), 1)));
+  }
+  return dims;
+}
+
+// sum or mean of complex `self` over dims, through its real view.
+at::Tensor complex_sum(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim, bool mean) {
+  at::Tensor real = at::view_as_real(self.resolve_conj());
+  std::vector<int64_t> dims = self.dim() == 0 ? std::vector<int64_t>{} : reduce_dims_of(self, dim);
+  at::Tensor r = dims.empty() ? real.clone() : (mean ? real.mean(dims, keepdim) : real.sum(dims, keepdim));
+  return at::view_as_complex(r.contiguous());
+}
+
+// Product along the last dim of x [..., n] by pairwise multiplication.
+at::Tensor complex_prod_last(at::Tensor x) {
+  if (x.size(-1) == 0) {
+    return at::ones(x.sizes().slice(0, x.dim() - 1), x.options());
+  }
+  while (x.size(-1) > 1) {
+    int64_t n = x.size(-1);
+    if (n % 2 == 1) {
+      std::vector<int64_t> shape = x.sizes().vec();
+      shape.back() = 1;
+      x = at::cat({x, at::ones(shape, x.options())}, -1);
+      n += 1;
+    }
+    x = at::mul(x.slice(-1, 0, n, 2), x.slice(-1, 1, n, 2));
+  }
+  return x.squeeze(-1);
+}
+
+// Inclusive scan with complex multiplication along the last dim (Hillis-Steele).
+at::Tensor complex_cumprod_last(at::Tensor x) {
+  int64_t n = x.size(-1);
+  for (int64_t offset = 1; offset < n; offset *= 2) {
+    at::Tensor next = x.clone();
+    next.narrow(-1, offset, n - offset).copy_(at::mul(x.narrow(-1, offset, n - offset), x.narrow(-1, 0, n - offset)));
+    x = next;
+  }
+  return x;
+}
+
 // ---------------------------------------------------------------- sum / mean / prod / any / all
 
 at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                     std::optional<at::ScalarType> dtype, at::Tensor& out) {
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  if (complex_vk(input) && is_vk(out)) {
+    at::Tensor r = complex_sum(input, dim, keepdim, false);
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   Plan plan;
   if (!reducible(input) || !is_vk(out) || !plan_reduce(input, dim, keepdim, plan)) {
     on_cpu("aten::sum", "IntList_out", self, dim, keepdim, dtype, out);
@@ -284,6 +345,11 @@ at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool ke
 at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                      std::optional<at::ScalarType> dtype, at::Tensor& out) {
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  if (complex_vk(input) && is_vk(out)) {
+    at::Tensor r = complex_sum(input, dim, keepdim, true);
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   Plan plan;
   if (!reducible(input) || !at::isFloatingType(input.scalar_type()) || !is_vk(out) ||
       !plan_reduce(input, dim, keepdim, plan)) {
@@ -298,6 +364,13 @@ at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool k
 at::Tensor& prod_out(const at::Tensor& self, int64_t dim, bool keepdim, std::optional<at::ScalarType> dtype,
                      at::Tensor& out) {
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  if (complex_vk(input) && is_vk(out)) {
+    int64_t d = at::maybe_wrap_dim(dim, std::max<int64_t>(input.dim(), 1));
+    at::Tensor r = input.dim() == 0 ? input.clone() : complex_prod_last(input.movedim(d, -1).resolve_conj());
+    if (keepdim && input.dim() > 0) r = r.unsqueeze(d);
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   Plan plan;
   int64_t dims[] = {dim};
   if (!reducible(input) || !is_vk(out) || !plan_reduce(input, dims, keepdim, plan)) {
@@ -310,6 +383,9 @@ at::Tensor& prod_out(const at::Tensor& self, int64_t dim, bool keepdim, std::opt
 
 at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
   at::Tensor input = dtype.has_value() ? self.to(*dtype) : self;
+  if (complex_vk(input)) {
+    return complex_prod_last(input.resolve_conj().reshape({-1}));
+  }
   Plan plan;
   if (!reducible(input) || !plan_reduce(input, std::nullopt, false, plan)) {
     return on_cpu("aten::prod", "", self, dtype)[0].toTensor();
@@ -320,6 +396,9 @@ at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
 
 template <ROp Op>
 at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim, at::Tensor& out) {
+  if (complex_vk(self) && is_vk(out)) {
+    return any_all_dims_out<Op>(at::ne(self, 0), dim, keepdim, out);
+  }
   Plan plan;
   if (!reducible(self) || !is_vk(out) || !plan_reduce(self, dim, keepdim, plan)) {
     on_cpu(Op == kAny ? "aten::any" : "aten::all", "dims_out", self, dim, keepdim, out);
@@ -384,6 +463,22 @@ std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int
                                                      at::Tensor& values, at::Tensor& indices) {
   Plan plan;
   int64_t dims[] = {dim};
+  if (self.dim() == 0 && is_vk(self) && is_vk(values) && is_vk(indices)) {
+    at::maybe_wrap_dim(dim, 1);  // checks the dim
+    at::native::resize_output(values, {});
+    at::native::resize_output(indices, {});
+    values.copy_(self);
+    indices.zero_();
+    return {values, indices};
+  }
+  if (self.scalar_type() == at::kBool && is_vk(self) && is_vk(values) && is_vk(indices)) {
+    // max is "any", min is "all"; through int32.
+    at::Tensor wide = at::empty({0}, values.options().dtype(at::kInt));
+    max_min_dim_out<Op>(self.to(at::kInt), dim, keepdim, wide, indices);
+    at::native::resize_output(values, wide.sizes());
+    values.copy_(wide);
+    return {values, indices};
+  }
   if (!arg_reducible(self) || !is_vk(values) || !is_vk(indices) || self.dim() == 0 ||
       !plan_reduce(self, dims, keepdim, plan)) {
     on_cpu(Op == 0 ? "aten::max" : "aten::min", Op == 0 ? "dim_max" : "dim_min", self, dim, keepdim, values, indices);
@@ -419,6 +514,15 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
 template <bool Std>
 at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, const std::optional<at::Scalar>& correction,
                         bool keepdim, at::Tensor& out) {
+  if (complex_vk(self) && is_vk(out)) {
+    // var(z) = var(Re z) + var(Im z)
+    at::Tensor real = at::view_as_real(self.resolve_conj());
+    at::Tensor v = at::var(real.select(-1, 0), dim, correction, keepdim) +
+                   at::var(real.select(-1, 1), dim, correction, keepdim);
+    at::Tensor r = Std ? v.sqrt() : v;
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   Plan plan;
   if (!reducible(self) || !at::isFloatingType(self.scalar_type()) || !is_vk(out) ||
       !plan_reduce(self, dim, keepdim, plan)) {
@@ -444,6 +548,11 @@ at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const st
 at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                             std::optional<at::ScalarType> dtype, at::Tensor& out) {
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  if (complex_vk(input) && is_vk(out)) {  // the norm of |z|
+    at::Tensor r = at::linalg_vector_norm(at::abs(input), ord, dim, keepdim);
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   double p = ord.toDouble();
   ROp op = kSum;
   Final final = kNone;
@@ -456,6 +565,15 @@ at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::O
     op = kMaxAbs;
   } else if (p == -std::numeric_limits<double>::infinity()) {
     op = kMinAbs;
+  }
+  if (op == kSum && at::isFloatingType(input.scalar_type()) && is_vk(input) && is_vk(out)) {
+    // Other orders: (sum |x|^p)^(1/p); p = 0 counts the nonzeros.
+    std::vector<int64_t> dims = reduce_dims_of(input, dim);
+    at::Tensor a = at::abs(input);
+    at::Tensor r = p == 0.0 ? at::ne(a, 0).to(input.scalar_type()).sum(dims, keepdim)
+                            : at::pow(at::pow(a, p).sum(dims, keepdim), 1.0 / p);
+    store(out, r, r.sizes().vec());
+    return out;
   }
   Plan plan;
   if (op == kSum || !reducible(input) || !at::isFloatingType(input.scalar_type()) || !is_vk(out) ||
@@ -507,6 +625,20 @@ template <uint32_t Op>  // 0 sum, 1 prod
 at::Tensor& cumulative_out(const at::Tensor& self, int64_t dim, std::optional<at::ScalarType> dtype, at::Tensor& out) {
   const char* name = Op == 0 ? "aten::cumsum" : "aten::cumprod";
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  if (complex_vk(input) && is_vk(out) && input.dim() > 0) {
+    int64_t d = at::maybe_wrap_dim(dim, input.dim());
+    at::Tensor r = Op == 0 ? at::view_as_complex(at::view_as_real(input.resolve_conj()).cumsum(d).contiguous())
+                           : complex_cumprod_last(input.movedim(d, -1).resolve_conj().contiguous()).movedim(-1, d);
+    at::native::resize_output(out, input.sizes());
+    out.copy_(r);
+    return out;
+  }
+  if (input.dim() == 0 && is_vk(input) && is_vk(out)) {
+    at::maybe_wrap_dim(dim, 1);
+    at::native::resize_output(out, {});
+    out.copy_(input);
+    return out;
+  }
   if (!reducible(input) || !is_vk(out) || input.dim() == 0) {
     on_cpu(name, "out", self, dim, dtype, out);
     return out;

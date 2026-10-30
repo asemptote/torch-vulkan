@@ -1,20 +1,24 @@
 // axis T: c64=float2 c128=double2
 //
 // Complex out = op(a, b), strided with broadcasting. OP: CBINARY_ADD
-// (a + alpha b), CBINARY_SUB (a - alpha b), CBINARY_MUL, CBINARY_DIV; alpha
-// is real. B_SCALAR replaces b with the complex scalar (alpha, beta), in
-// which case the host has already folded alpha into it.
+// (a + alpha b), CBINARY_SUB (a - alpha b), CBINARY_MUL, CBINARY_DIV,
+// CBINARY_POW (a^b, principal branch); alpha is real. B_SCALAR replaces b
+// with the complex scalar (alpha, beta), in which case the host has already
+// folded alpha into it.
 
 #if defined(T_c64)
 typedef float S;
+#define FMATH_F32 1
 #else
 typedef double S;
+#define FMATH_F64 1
 #endif
 
 #define OUT_T T
 #define IN_T T
 #include "_strided.slang"
-#include "_complex.slang"
+#include "_fmath.slang"
+#include "_cmath.slang"
 
 [vk::constant_id(0)]
 const int OP = CBINARY_ADD;
@@ -38,6 +42,7 @@ void main(uint3 id: SV_DispatchThreadID)
         case CBINARY_ADD: r = a + mult * b; break;
         case CBINARY_SUB: r = a - mult * b; break;
         case CBINARY_MUL: r = cmul(a, b); break;
+        case CBINARY_POW: r = c_pow(a, b); break;
         default: r = cdiv(a, b); break;  // CBINARY_DIV
         }
         p.out[o.o] = r;

@@ -42,11 +42,9 @@ DTYPES = {
 }
 
 
-# Not comparable with the CPU: uninitialized or random outputs, outputs that
-# depend on aliasing a larger storage (a view moved to another device loses
-# it, on any backend), and arguments that must stay on the CPU.
+# Not comparable with the CPU: uninitialized or random outputs.
 SKIP_COMPARE = ("empty", "new_empty", "rand", "normal", "bernoulli", "multinomial", "dropout", "uniform",
-                "exponential", "geometric", "cauchy", "log_normal", "as_strided.partial_views")
+                "exponential", "geometric", "cauchy", "log_normal")
 SKIP_ENTIRELY = ("sparse.", "to_sparse", "tensor_split")
 # Ops returning (values, indices) where PyTorch leaves the index among equal
 # values unspecified (the CPU uses unstable partial sorts): the values must
@@ -55,6 +53,9 @@ TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk")
 # Ops whose vector outputs are unique only up to sign (eigenvectors,
 # singular vectors): compared by absolute value.
 SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
+# General eigendecompositions: eigenvalues in no particular order, vectors up
+# to a phase; compared as sorted eigenvalues and by A V = V diag(w).
+EIG = ("linalg.eig", "linalg.eigvals")
 
 
 def op_name(info):
@@ -62,7 +63,15 @@ def op_name(info):
 
 
 def to_vk(x):
-    return x.to("vk") if isinstance(x, torch.Tensor) else x
+    """x on "vk" with the same storage layout: views keep their strides and
+    offset into a copy of the whole storage (as_strided samples rely on it)."""
+    if not isinstance(x, torch.Tensor):
+        return x
+    if x.layout != torch.strided or x.is_conj() or x.is_neg() or x.numel() == 0:
+        return x.to("vk")
+    nelem = x.untyped_storage().nbytes() // x.element_size()
+    flat = x.new_empty(0).set_(x.untyped_storage(), 0, (nelem,), (1,))
+    return flat.to("vk").as_strided(x.size(), x.stride(), x.storage_offset())
 
 
 def to_cpu(x):
@@ -111,7 +120,7 @@ def is_random(op, sample):
 
 
 def _abs(x):
-    return x.abs() if isinstance(x, torch.Tensor) and x.is_floating_point() else x
+    return x.abs() if isinstance(x, torch.Tensor) and (x.is_floating_point() or x.is_complex()) else x
 
 
 def compare_tied(name, sample, expected, actual):
@@ -128,6 +137,21 @@ def compare_tied(name, sample, expected, actual):
         values, indices = values.unsqueeze(dim), indices.unsqueeze(dim)
     picked = torch.gather(x, dim, indices)
     return compare(values, picked)
+
+
+def compare_eig(sample, expected, actual):
+    def ordered(w):
+        key = torch.round(w.real, decimals=3) * 1e6 + torch.round(w.imag, decimals=3)
+        return torch.gather(w, -1, torch.argsort(key, -1))
+
+    exp_w = expected[0] if isinstance(expected, tuple) else expected
+    act_w = actual[0] if isinstance(actual, tuple) else actual
+    problem = compare(ordered(exp_w), ordered(act_w))
+    if problem or not isinstance(actual, tuple):
+        return problem
+    a = sample.input.to(act_w.dtype)
+    w, v = actual
+    return compare(a @ v, v * w.unsqueeze(-2))
 
 
 def compare(expected, actual):
@@ -176,6 +200,8 @@ def check_op(info, dtypes, nsamples):
             name = op_name(info)
             if name in TIED_INDICES and isinstance(expected, tuple):
                 problem = compare_tied(name, sample, expected, actual)
+            elif name in EIG:
+                problem = compare_eig(sample, expected, actual)
             elif name in SIGN_AMBIGUOUS:
                 problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:

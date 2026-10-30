@@ -150,7 +150,8 @@ std::vector<int64_t> per_dim(at::IntArrayRef v, int64_t s) {
 bool conv_ok(const at::Tensor& x, const at::Tensor& w) {
   at::ScalarType t = x.scalar_type();
   return is_vk(x) && is_vk(w) && x.dim() >= 3 && x.dim() <= 5 && w.dim() == x.dim() &&
-         (t == at::kFloat || (t == at::kDouble && has_feature(kFeatureFloat64))) && w.scalar_type() == t;
+         (t == at::kFloat || t == at::kInt || t == at::kLong || (t == at::kDouble && has_feature(kFeatureFloat64))) &&
+         w.scalar_type() == t;
 }
 
 at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,

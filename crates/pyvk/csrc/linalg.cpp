@@ -30,7 +30,7 @@ constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
 constexpr int64_t kMaxGroups = 65535;
 
 bool gemm_dtype(at::ScalarType t) {
-  return t == at::kFloat || (t == at::kDouble && vkt_has_float64());
+  return t == at::kFloat || (t == at::kDouble && vkt_has_float64()) || t == at::kInt || t == at::kLong;
 }
 
 // Largest element offset reachable through a 3-D view, or -1 if a stride is
@@ -101,9 +101,51 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   return true;
 }
 
+// Complex c = alpha a @ b (+ beta cin): four real GEMMs on the real and
+// imaginary parts (strided views, no copies), then complex element-wise ops
+// for alpha and beta.
+bool complex_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+                  const at::Scalar& alpha, const at::Scalar& beta) {
+  at::ScalarType t = c.scalar_type();
+  if (!at::isComplexType(t) || dtype_label(t) == nullptr || a.scalar_type() != t || b.scalar_type() != t ||
+      !is_vk(a) || !is_vk(b) || !is_vk(c)) {
+    return false;
+  }
+  at::Tensor ar = at::view_as_real(a.resolve_conj()), br = at::view_as_real(b.resolve_conj());
+  at::Tensor a_re = ar.select(-1, 0), a_im = ar.select(-1, 1), b_re = br.select(-1, 0), b_im = br.select(-1, 1);
+  at::TensorOptions real = c.options().dtype(c10::toRealValueType(t));
+  at::Tensor pr = at::empty(c.sizes(), real), pi = at::empty(c.sizes(), real);
+  bool ok = gemm(a_re, b_re, pr, nullptr, 1.0, 0.0) && gemm(a_im, b_im, pr, &pr, -1.0, 1.0) &&
+            gemm(a_re, b_im, pi, nullptr, 1.0, 0.0) && gemm(a_im, b_re, pi, &pi, 1.0, 1.0);
+  if (!ok) {
+    return false;
+  }
+  at::Tensor result = at::complex(pr, pi);
+  if (!alpha.equal(1)) {
+    result = result * alpha;
+  }
+  if (cin != nullptr && !beta.equal(0)) {
+    result = result + *cin * beta;
+  }
+  c.copy_(result);
+  return true;
+}
+
+// c = alpha a @ b (+ beta cin) for real or complex 3-D views.
+bool any_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+              const at::Scalar& alpha, const at::Scalar& beta) {
+  if (at::isComplexType(c.scalar_type())) {
+    return complex_gemm(a, b, c, cin, alpha, beta);
+  }
+  if (alpha.isComplex() || beta.isComplex()) {
+    return false;
+  }
+  return gemm(a, b, c, cin, alpha.toDouble(), beta.toDouble());
+}
+
 at::Tensor& mm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
   at::native::resize_output(out, {self.size(0), mat2.size(1)});
-  if (!gemm(self.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), nullptr, 1.0, 0.0)) {
+  if (!any_gemm(self.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), nullptr, 1, 0)) {
     on_cpu("aten::mm", "out", self, mat2, out);
   }
   return out;
@@ -111,7 +153,7 @@ at::Tensor& mm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& o
 
 at::Tensor& bmm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
   at::native::resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
-  if (!gemm(self, mat2, out, nullptr, 1.0, 0.0)) {
+  if (!any_gemm(self, mat2, out, nullptr, 1, 0)) {
     on_cpu("aten::bmm", "out", self, mat2, out);
   }
   return out;
@@ -122,9 +164,9 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
   int64_t m = mat1.size(0), n = mat2.size(1);
   at::native::resize_output(out, {m, n});
   bool done = false;
-  if (self.dim() <= 2 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
+  if (self.dim() <= 2 && is_vk(self)) {
     at::Tensor cin = self.expand({m, n}).unsqueeze(0);
-    done = gemm(mat1.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), &cin, alpha.toDouble(), beta.toDouble());
+    done = any_gemm(mat1.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), &cin, alpha, beta);
   }
   if (!done) {
     on_cpu("aten::addmm", "out", self, mat1, mat2, beta, alpha, out);
@@ -137,9 +179,9 @@ at::Tensor& baddbmm_out(const at::Tensor& self, const at::Tensor& batch1, const 
   std::vector<int64_t> shape = {batch1.size(0), batch1.size(1), batch2.size(2)};
   at::native::resize_output(out, shape);
   bool done = false;
-  if (self.dim() <= 3 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
+  if (self.dim() <= 3 && is_vk(self)) {
     at::Tensor cin = self.expand(shape);
-    done = gemm(batch1, batch2, out, &cin, alpha.toDouble(), beta.toDouble());
+    done = any_gemm(batch1, batch2, out, &cin, alpha, beta);
   }
   if (!done) {
     on_cpu("aten::baddbmm", "out", self, batch1, batch2, beta, alpha, out);
@@ -152,16 +194,33 @@ at::Tensor& addmv_out(const at::Tensor& self, const at::Tensor& mat, const at::T
   int64_t m = mat.size(0);
   at::native::resize_output(out, {m});
   bool done = false;
-  if (self.dim() <= 1 && is_vk(self) && !alpha.isComplex() && !beta.isComplex()) {
+  if (self.dim() <= 1 && is_vk(self)) {
     // A matrix-vector product is a GEMM with one column.
     at::Tensor cin = self.expand({m}).unsqueeze(1).unsqueeze(0);
-    done = gemm(mat.unsqueeze(0), vec.unsqueeze(1).unsqueeze(0), out.unsqueeze(1).unsqueeze(0), &cin,
-                alpha.toDouble(), beta.toDouble());
+    done = any_gemm(mat.unsqueeze(0), vec.unsqueeze(1).unsqueeze(0), out.unsqueeze(1).unsqueeze(0), &cin, alpha,
+                    beta);
   }
   if (!done) {
     on_cpu("aten::addmv", "out", self, mat, vec, beta, alpha, out);
   }
   return out;
+}
+
+// sum_i batch1[i] @ batch2[i] is one GEMM over the concatenated inner dims:
+// [n, B k] @ [B k, m].
+at::Tensor& addbmm_out(const at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2,
+                       const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
+  TORCH_CHECK(batch1.dim() == 3 && batch2.dim() == 3, "batch1 and batch2 must be 3D tensors");
+  int64_t B = batch1.size(0), n = batch1.size(1), k = batch1.size(2), m = batch2.size(2);
+  at::Tensor a = batch1.permute({1, 0, 2}).reshape({n, B * k});
+  at::Tensor b = batch2.reshape({B * k, m});
+  return at::addmm_out(out, self, a, b, beta, alpha);
+}
+
+at::Tensor addbmm(const at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2, const at::Scalar& beta,
+                  const at::Scalar& alpha) {
+  at::Tensor out = at::empty({0}, self.options().dtype(at::result_type(batch1, batch2)));
+  return addbmm_out(self, batch1, batch2, beta, alpha, out);
 }
 
 at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
@@ -186,5 +245,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("addmm.out", &addmm_out);
   m.impl("baddbmm.out", &baddbmm_out);
   m.impl("addmv.out", &addmv_out);
+  m.impl("addbmm.out", &addbmm_out);
+  m.impl("addbmm", &vk::addbmm);
   m.impl("dot", &dot);
 }

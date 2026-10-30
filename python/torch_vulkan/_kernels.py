@@ -127,7 +127,7 @@ def _make_avg_pool(k):
 
     def forward(x, kernel_size, stride=(), padding=0, ceil_mode=False, count_include_pad=True,
                 divisor_override=None):
-        if not x.is_floating_point():  # integer pooling: the convolution below is float-only
+        if x.dtype not in (torch.float32, torch.float64, torch.int32, torch.int64):
             return _on_cpu(f"avg_pool{k}d", x, kernel_size, stride, padding, ceil_mode, count_include_pad,
                            divisor_override)
         padding = [padding] if isinstance(padding, int) else padding
@@ -138,7 +138,11 @@ def _make_avg_pool(k):
         xp = F.pad(xb, pad)
         w = torch.ones((c, 1, *ks), device=x.device, dtype=x.dtype)
         sums = conv(xp, w, None, st, 0, 1, c)
-        y = sums / _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, x.dtype)
+        if x.is_floating_point():
+            y = sums / _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, x.dtype)
+        else:  # integer division truncates, as on the CPU
+            d = _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, torch.float32)
+            y = torch.div(sums, d.round().to(x.dtype), rounding_mode="trunc")
         return y if batched else y.squeeze(0)
 
     def backward(grad_output, x, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override):
@@ -640,12 +644,13 @@ _THETA13 = 5.371920351148152
 
 
 def _matrix_exp(a):
-    if not a.is_floating_point() or a.shape[-1] == 0:
+    if not (a.is_floating_point() or a.is_complex()) or a.shape[-1] == 0:
         return _on_cpu("linalg_matrix_exp", a)
-    if a.dtype == torch.float32 and _native_has_float64():
-        # The solve and the squarings lose ~4 bits in float32; float64 keeps
-        # the result as accurate as float32 storage allows.
-        return _matrix_exp(a.double()).float()
+    if a.dtype in (torch.float32, torch.complex64) and _native_has_float64():
+        # The solve and the squarings lose ~4 bits in single precision; double
+        # keeps the result as accurate as single-precision storage allows.
+        wide = torch.float64 if a.dtype == torch.float32 else torch.complex128
+        return _matrix_exp(a.to(wide)).to(a.dtype)
     shape = a.shape
     x = a.reshape(-1, shape[-2], shape[-1])
     norm = x.abs().sum(-2).amax(-1)  # 1-norm of each matrix
@@ -664,6 +669,351 @@ def _matrix_exp(a):
     for i in range(steps):
         r = torch.where((s > i).view(-1, 1, 1), r @ r, r)
     return r.reshape(shape)
+
+
+# ---------------------------------------------------------------- hashing, frexp
+
+def _xor_last(x):
+    """XOR of x [..., n] (int64) over its last dim, as a log-depth tree."""
+    if x.shape[-1] == 0:
+        return torch.zeros(x.shape[:-1], dtype=x.dtype, device=x.device)
+    while x.shape[-1] > 1:
+        if x.shape[-1] % 2:
+            x = torch.cat([x, torch.zeros_like(x[..., :1])], -1)
+        x = torch.bitwise_xor(x[..., 0::2], x[..., 1::2])
+    return x[..., 0]
+
+
+def _hash_tensor(self, dim=(), *, keepdim=False, mode=0):
+    if mode != 0:
+        return _on_cpu("hash_tensor", self, dim, keepdim=keepdim, mode=mode)
+    # Elements as 64-bit floats or integers, their bits XOR-reduced.
+    wide = self.to(torch.float64) if self.is_floating_point() else self.to(torch.int64)
+    bits = wide.view(torch.int64)
+    dims = sorted(d % max(self.dim(), 1) for d in dim) if dim else list(range(self.dim()))
+    if self.dim() == 0:
+        return bits.clone().view(torch.uint64)
+    keep = [d for d in range(self.dim()) if d not in dims]
+    moved = bits.permute(keep + dims).reshape([self.shape[d] for d in keep] + [-1])
+    out = _xor_last(moved)
+    if keepdim:
+        for d in dims:
+            out = out.unsqueeze(d)
+    return out.view(torch.uint64)
+
+
+def _hash_tensor_out(self, dim=(), *, keepdim=False, mode=0, out):
+    r = _hash_tensor(self, dim, keepdim=keepdim, mode=mode)
+    out.resize_(r.shape)
+    return out.copy_(r)
+
+
+# Per float dtype: integer view, mantissa bits, exponent mask, exponent of
+# [0.5, 1), and the power of two that makes subnormals normal.
+_FREXP = {torch.float32: (torch.int32, 23, 0xFF, 126, 24), torch.float64: (torch.int64, 52, 0x7FF, 1022, 54)}
+
+
+def _frexp_nonfinite_exponent():
+    # C leaves frexp's exponent for inf/NaN unspecified (0 with glibc, -1 with
+    # the MSVC runtime): use whatever the CPU kernel gives on this platform.
+    global _FREXP_NONFINITE
+    if _FREXP_NONFINITE is None:
+        _FREXP_NONFINITE = int(torch.frexp(torch.tensor(float("inf"))).exponent)
+    return _FREXP_NONFINITE
+
+
+_FREXP_NONFINITE = None
+
+
+def _frexp_out(self, *, mantissa, exponent):
+    x = self
+    if x.dtype not in _FREXP:
+        m, e = _frexp_out(x.float(), mantissa=torch.empty(0, device=x.device), exponent=exponent)
+        mantissa.resize_(x.shape)
+        mantissa.copy_(m)
+        return mantissa, exponent
+    itype, mbits, mask, bias, k = _FREXP[x.dtype]
+    field = (x.view(itype) >> mbits) & mask
+    sub = (field == 0) & (x != 0)
+    a = torch.where(sub, x * 2.0 ** k, x)
+    bits = a.view(itype)
+    e = ((bits >> mbits) & mask) - bias - torch.where(sub, k, 0)
+    m = ((bits & ~(mask << mbits)) | (bias << mbits)).view(x.dtype)
+    nonfinite = ~torch.isfinite(x)
+    special = (x == 0) | nonfinite
+    mantissa.resize_(x.shape)
+    exponent.resize_(x.shape)
+    mantissa.copy_(torch.where(special, x, m))
+    exponent.copy_(torch.where(nonfinite, _frexp_nonfinite_exponent(), torch.where(special, 0, e)))
+    return mantissa, exponent
+
+
+# ---------------------------------------------------------------- histograms
+
+def _outer_edges(points, ranges):
+    """(left, right) per dim of points [N, D], as the CPU picks them."""
+    D = points.shape[-1]
+    if ranges is not None:
+        lr = [(float(ranges[2 * d]), float(ranges[2 * d + 1])) for d in range(D)]
+    elif points.shape[0] == 0:
+        lr = [(0.0, 0.0)] * D
+    else:
+        lo, hi = points.amin(0).tolist(), points.amax(0).tolist()
+        lr = list(zip(lo, hi))
+    out = []
+    for left, right in lr:
+        if left == right:  # widen an empty range, as the CPU does
+            left, right = left - 0.5, right + 0.5
+        out.append((left, right))
+    return out
+
+
+def _bin_index(x, edges):
+    """Bin of each x along edges (None-like: len(edges) - 1 for outside)."""
+    nbins = edges.shape[0] - 1
+    idx = torch.searchsorted(edges, x.contiguous(), right=True) - 1
+    idx = torch.where(x == edges[-1], nbins - 1, idx)
+    valid = (x >= edges[0]) & (x <= edges[-1])
+    return idx, valid
+
+
+def _histogramdd_counts(points, edges, weight, density):
+    """Histogram [*bins] of points [N, D] with per-dim bin edges."""
+    nb = [e.shape[0] - 1 for e in edges]
+    flat = torch.zeros((), dtype=torch.int64, device=points.device).expand(points.shape[0])
+    valid = torch.ones(points.shape[0], dtype=torch.bool, device=points.device)
+    stride = 1
+    for d in reversed(range(len(edges))):
+        idx, ok = _bin_index(points[:, d], edges[d])
+        flat = flat + idx * stride
+        valid = valid & ok
+        stride *= nb[d]
+    total = stride
+    flat = torch.where(valid, flat, total)  # an extra bin for outside points, dropped below
+    w = weight.reshape(-1).to(points.dtype) if weight is not None else torch.ones(points.shape[0], dtype=points.dtype,
+                                                                                    device=points.device)
+    hist = torch.zeros(total + 1, dtype=points.dtype, device=points.device).index_add(0, flat, w)[:total]
+    hist = hist.reshape(nb)
+    if density:
+        widths = None
+        for d in range(len(edges)):
+            w_d = (edges[d][1:] - edges[d][:-1]).reshape([-1 if i == d else 1 for i in range(len(edges))])
+            widths = w_d if widths is None else widths * w_d
+        hist = hist / (hist.sum() * widths)
+    return hist
+
+
+def _points(self):
+    return self.reshape(-1, self.shape[-1])
+
+
+def _histogramdd_bin_edges(self, bins, *, range=None, weight=None, density=False):
+    pts = _points(self)
+    return [torch.linspace(left, right, b + 1, dtype=self.dtype, device=self.device)
+            for (left, right), b in zip(_outer_edges(pts, range), bins)]
+
+
+def _histogramdd_from_bin_cts(self, bins, *, range=None, weight=None, density=False):
+    edges = _histogramdd_bin_edges(self, bins, range=range, weight=weight, density=density)
+    return _histogramdd_counts(_points(self), edges, weight, density)
+
+
+def _histogramdd_from_bin_tensors(self, bins, *, weight=None, density=False):
+    return _histogramdd_counts(_points(self), [b.to(self.dtype) for b in bins], weight, density)
+
+
+def _histogram_bin_ct(self, bins=100, *, range=None, weight=None, density=False):
+    pts = self.reshape(-1, 1)
+    edges = _histogramdd_bin_edges(pts, [bins], range=range)
+    return _histogramdd_counts(pts, edges, weight, density), edges[0]
+
+
+def _histogram_bins_tensor(self, bins, *, weight=None, density=False):
+    pts = self.reshape(-1, 1)
+    return _histogramdd_counts(pts, [bins.to(self.dtype)], weight, density), bins.clone()
+
+
+# ---------------------------------------------------------------- segment_reduce
+
+def _segment_reduce(data, reduce, *, lengths=None, indices=None, offsets=None, axis=0, unsafe=False, initial=None):
+    if indices is not None or reduce not in ("sum", "mean", "max", "min", "prod"):
+        return _on_cpu("segment_reduce", data, reduce, lengths=lengths, indices=indices, offsets=offsets, axis=axis,
+                       unsafe=unsafe, initial=initial)
+    axis = axis % data.dim()
+    if offsets is None:
+        offsets = torch.cat([torch.zeros_like(lengths[..., :1]), torch.cumsum(lengths, -1)], -1)
+    offsets = offsets.to(torch.int64)
+    S = offsets.shape[-1] - 1
+    L = data.shape[axis]
+    lead = data.shape[:axis]
+    # Segment of each position along axis (S for positions after the last segment).
+    pos = torch.arange(L, device=data.device).expand(*offsets.shape[:-1], L).contiguous()
+    seg = torch.searchsorted(offsets[..., 1:].contiguous(), pos, right=True)  # [*lead, L]
+    seg = seg.reshape(*seg.shape, *([1] * (data.dim() - axis - 1))).expand(data.shape)
+    shape = list(data.shape)
+    shape[axis] = S + 1
+    if reduce == "mean":
+        sums = torch.zeros(shape, dtype=data.dtype, device=data.device).scatter_add(axis, seg, data)
+        counts = torch.zeros(shape, dtype=data.dtype, device=data.device).scatter_add(axis, seg, torch.ones_like(data))
+        if initial is not None:
+            sums = sums + initial
+        out = torch.where(counts > 0, sums / counts.clamp(min=1), sums if initial is not None else float("nan"))
+    else:
+        empty = {"sum": 0.0, "prod": 1.0, "max": -math.inf, "min": math.inf}[reduce]
+        start = torch.full(shape, empty if initial is None else initial, dtype=data.dtype, device=data.device)
+        out = start.scatter_reduce(axis, seg, data, {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin"}[reduce],
+                                   include_self=True)
+    return out.narrow(axis, 0, S)
+
+
+# ---------------------------------------------------------------- CTC loss
+
+def _ctc_setup(log_probs, targets, input_lengths, target_lengths, blank):
+    unbatched = log_probs.dim() == 2
+    lp = log_probs.unsqueeze(1) if unbatched else log_probs  # [T, N, C]
+    T, N, C = lp.shape
+    dev = lp.device
+    il = torch.as_tensor(input_lengths, device="cpu").reshape(-1).tolist()
+    tl = torch.as_tensor(target_lengths, device="cpu").reshape(-1).tolist()
+    S = max(tl) if tl else 0
+    if targets.dim() == 1 and not unbatched or (unbatched and targets.dim() == 1 and N > 1):
+        starts = [0]
+        for n in tl[:-1]:
+            starts.append(starts[-1] + n)
+        tg = torch.full((N, max(S, 1)), blank, dtype=torch.int64, device=dev)
+        for n in range(N):
+            if tl[n]:
+                tg[n, :tl[n]] = targets[starts[n]:starts[n] + tl[n]]
+    else:
+        tg = targets.reshape(N, -1).to(torch.int64)
+        if tg.shape[1] < max(S, 1):
+            tg = torch.cat([tg, torch.full((N, max(S, 1) - tg.shape[1]), blank, dtype=torch.int64, device=dev)], 1)
+    tg = tg[:, :max(S, 1)]
+    # Extended labels l' = (blank, t1, blank, t2, ..., blank).
+    W = 2 * S + 1
+    ext = torch.full((N, W), blank, dtype=torch.int64, device=dev)
+    if S:
+        ext[:, 1::2] = tg[:, :S]
+    # Where the skip transition s-2 -> s is allowed.
+    skip = torch.zeros((N, W), dtype=torch.bool, device=dev)
+    if W > 2:
+        skip[:, 2:] = (ext[:, 2:] != blank) & (ext[:, 2:] != ext[:, :-2])
+    width = torch.tensor([2 * n + 1 for n in tl], device=dev).view(N, 1)
+    inside = torch.arange(W, device=dev).view(1, W) < width  # s within this sample's labels
+    return lp, ext, skip, inside, il, tl, T, N, W, unbatched
+
+
+def _lse3(a, b, c):
+    m = torch.maximum(torch.maximum(a, b), c)
+    m = torch.where(m == -math.inf, 0.0, m)
+    return torch.log(torch.exp(a - m) + torch.exp(b - m) + torch.exp(c - m)) + m
+
+
+def _shift(x, k):
+    """x [N, W] shifted right by k along W, filled with -inf."""
+    pad = torch.full_like(x[:, :k], -math.inf)
+    return torch.cat([pad, x[:, :-k]], 1) if x.shape[1] > k else torch.full_like(x, -math.inf)
+
+
+def _ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, zero_infinity=False):
+    lp, ext, skip, inside, il, tl, T, N, W, unbatched = _ctc_setup(log_probs, targets, input_lengths, target_lengths,
+                                                                   blank)
+    ninf = -math.inf
+    # CPU layout: zeros where never computed; the t = 0 row is -inf beyond the start.
+    log_alpha = torch.zeros((N, T, W), dtype=lp.dtype, device=lp.device)
+    emit = lp.gather(2, ext.unsqueeze(0).expand(T, N, W))  # [T, N, W]
+    la = torch.full((N, W), ninf, dtype=lp.dtype, device=lp.device)
+    la[:, 0] = emit[0, :, 0]
+    if W > 1:
+        la[:, 1] = torch.where(torch.tensor([n > 0 for n in tl], device=lp.device), emit[0, :, 1], ninf)
+    if T:
+        log_alpha[:, 0] = la
+    il_t = torch.tensor(il, device=lp.device).view(N, 1)
+    for t in range(1, T):
+        nxt = _lse3(la, _shift(la, 1), torch.where(skip, _shift(la, 2), ninf)) + emit[t]
+        nxt = torch.where(inside, nxt, ninf)
+        la = nxt
+        log_alpha[:, t] = torch.where(inside & (t < il_t), la, 0.0)
+    # -log p = -logsumexp of the last two positions at each sample's last step.
+    last = torch.tensor([max(n - 1, 0) for n in il], device=lp.device)
+    final = log_alpha[torch.arange(N, device=lp.device), last]  # [N, W]
+    ends = torch.tensor([2 * n for n in tl], device=lp.device)
+    a = final.gather(1, ends.view(N, 1)).squeeze(1)
+    b = torch.where(ends > 0, final.gather(1, (ends - 1).clamp(min=0).view(N, 1)).squeeze(1), ninf)
+    m = torch.maximum(a, b)
+    m = torch.where(m == ninf, 0.0, m)
+    nll = -(torch.log(torch.exp(a - m) + torch.exp(b - m)) + m)
+    nll = torch.where(torch.tensor(il, device=lp.device) == 0, torch.where(ends == 0, 0.0, math.inf), nll)
+    if zero_infinity:
+        nll = torch.where(torch.isinf(nll), 0.0, nll)
+    if unbatched:
+        return nll.squeeze(0), log_alpha.squeeze(0)
+    return nll, log_alpha
+
+
+def _ctc_loss_tensor(log_probs, targets, input_lengths, target_lengths, blank=0, zero_infinity=False):
+    return _ctc_loss(log_probs, targets, input_lengths.tolist(), target_lengths.tolist(), blank, zero_infinity)
+
+
+def _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank,
+                       zero_infinity=False):
+    lp, ext, skip, inside, il, tl, T, N, W, unbatched = _ctc_setup(log_probs, targets, input_lengths, target_lengths,
+                                                                   blank)
+    ninf = -math.inf
+    la_all = (log_alpha.unsqueeze(0) if unbatched else log_alpha).transpose(0, 1)  # [T, N, W]
+    nll = neg_log_likelihood.reshape(N)
+    emit = lp.gather(2, ext.unsqueeze(0).expand(T, N, W))
+    il_t = torch.tensor(il, device=lp.device).view(N, 1)
+    ends = torch.tensor([2 * n for n in tl], device=lp.device).view(N, 1)
+    pos = torch.arange(W, device=lp.device).view(1, W)
+    # skip into s from s + 2 (backward): allowed where skip[s + 2].
+    skip_back = torch.cat([skip[:, 2:], torch.zeros_like(skip[:, :2])], 1) if W > 2 else torch.zeros_like(skip)
+    lb = torch.full((N, W), ninf, dtype=lp.dtype, device=lp.device)
+    lbs = [None] * T
+    for t in reversed(range(T)):
+        start = (pos == ends) | ((pos == ends - 1) & (ends > 0))
+        init = torch.where(start, emit[t], ninf)
+        up1 = torch.cat([lb[:, 1:], torch.full_like(lb[:, :1], ninf)], 1)
+        up2 = torch.cat([lb[:, 2:], torch.full_like(lb[:, :2], ninf)], 1) if W > 2 else torch.full_like(lb, ninf)
+        rec = _lse3(lb, up1, torch.where(skip_back, up2, ninf)) + emit[t]
+        lb = torch.where(t == il_t - 1, init, torch.where(t < il_t - 1, rec, ninf))
+        lb = torch.where(inside, lb, ninf)
+        lbs[t] = lb
+    lbeta = torch.stack(lbs) if T else torch.empty((0, N, W), dtype=lp.dtype, device=lp.device)
+    valid_t = (torch.arange(T, device=lp.device).view(T, 1) < il_t.view(1, N)).unsqueeze(2)  # [T, N, 1]
+    lab = torch.where(valid_t & inside.unsqueeze(0), la_all + lbeta, ninf)
+    m = lab.amax(2, keepdim=True)
+    m = torch.where(m == ninf, 0.0, m)
+    acc = torch.zeros_like(lp).scatter_add(2, ext.unsqueeze(0).expand(T, N, W), torch.exp(lab - m))
+    lcab = torch.log(acc) + m
+    g = torch.exp(lp) - torch.exp(lcab + nll.view(1, N, 1) - lp)
+    g = g * grad.reshape(1, N, 1)
+    g = torch.where(valid_t, g, 0.0)
+    if zero_infinity:
+        g = torch.where(torch.isinf(nll).view(1, N, 1), 0.0, g)
+    return g.squeeze(1) if unbatched else g
+
+
+def _ctc_loss_backward_tensor(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha,
+                              blank, zero_infinity=False):
+    return _ctc_loss_backward(grad, log_probs, targets, input_lengths.tolist(), target_lengths.tolist(),
+                              neg_log_likelihood, log_alpha, blank, zero_infinity)
+
+
+# ---------------------------------------------------------------- matrix functions
+
+def _matrix_sqrth(a):
+    # Square root of a Hermitian matrix: V sqrt(max(w, 0)) V^H.
+    w, v = torch.linalg.eigh(a)
+    return (v * w.clamp(min=0).sqrt().unsqueeze(-2).to(v.dtype)) @ v.mH
+
+
+def _linalg_polar(a):
+    # A = U H from A = W S V^H: U = W V^H, H = V S V^H.
+    w, s, vh = torch.linalg.svd(a, full_matrices=False)
+    u = w @ vh
+    h = (vh.mH * s.unsqueeze(-2).to(vh.dtype)) @ vh
+    return u, h
 
 
 # ---------------------------------------------------------------- registration
@@ -724,6 +1074,21 @@ def _kernels():
         "_embedding_bag_backward": _embedding_bag_backward,
         "linalg_matrix_exp": _matrix_exp,
         "_embedding_bag_per_sample_weights_backward": _embedding_bag_per_sample_weights_backward,
+        "hash_tensor": _hash_tensor,
+        "hash_tensor.out": _hash_tensor_out,
+        "frexp.Tensor_out": _frexp_out,
+        "histogram.bin_ct": _histogram_bin_ct,
+        "histogram.bins_tensor": _histogram_bins_tensor,
+        "_histogramdd_bin_edges": _histogramdd_bin_edges,
+        "_histogramdd_from_bin_cts": _histogramdd_from_bin_cts,
+        "_histogramdd_from_bin_tensors": _histogramdd_from_bin_tensors,
+        "segment_reduce": _segment_reduce,
+        "_ctc_loss": _ctc_loss,
+        "_ctc_loss.Tensor": _ctc_loss_tensor,
+        "_ctc_loss_backward": _ctc_loss_backward,
+        "_ctc_loss_backward.Tensor": _ctc_loss_backward_tensor,
+        "linalg_matrix_sqrth": _matrix_sqrth,
+        "linalg_polar": _linalg_polar,
         **upsample,
     }
 

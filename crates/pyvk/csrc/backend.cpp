@@ -261,6 +261,28 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
 
 // dst (vk) <- src (vk), with broadcasting and dtype conversion.
 void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
+  bool chalf_src = src.scalar_type() == at::kComplexHalf, chalf_dst = dst.scalar_type() == at::kComplexHalf;
+  if (chalf_src != chalf_dst && storage_label(at::kHalf) != nullptr) {
+    // complex32 holds two halves: convert its parts.
+    at::Tensor s = src.expand(dst.sizes());
+    if (chalf_dst) {
+      at::Tensor parts = at::view_as_real(dst);
+      parts.select(-1, 0).copy_(s.is_complex() ? at::real(s) : s);
+      if (s.is_complex()) {
+        parts.select(-1, 1).copy_(at::imag(s));
+      } else {
+        parts.select(-1, 1).zero_();
+      }
+    } else {
+      at::Tensor parts = at::view_as_real(s);
+      if (dst.is_complex()) {
+        at::view_as_real(dst).copy_(parts);
+      } else {
+        dst.copy_(parts.select(-1, 0));
+      }
+    }
+    return;
+  }
   if (src.scalar_type() == dst.scalar_type()) {
     std::string kernel = move_kernel(src.itemsize());
     if (!kernel.empty()) {

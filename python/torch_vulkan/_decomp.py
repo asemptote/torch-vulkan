@@ -95,6 +95,12 @@ def _make_kernel(op, decomp, name):
     return kernel
 
 
+def _python_kernels():
+    """Ops with a kernel in _kernels.py, which take precedence over decompositions."""
+    from . import _kernels
+    return {"aten::" + name for name in _kernels._kernels()}
+
+
 def candidates():
     """(OpOverload, decomposition, name) for every functional aten op that has
     a decomposition, a CPU kernel and no kernel for "vk" yet."""
@@ -104,7 +110,7 @@ def candidates():
             continue
         name = op.name()
         schema = op._schema
-        if name in DENYLIST or not _functional_or_out(schema):
+        if name in DENYLIST or name in _python_kernels() or not _functional_or_out(schema):
             continue
         if not schema.returns:
             continue

@@ -90,18 +90,43 @@ constexpr UnaryOp kUnary[] = {
 };
 
 // Complex unary ops: neg and abs (real output).
+// Unary codes shaders/cunary.slang implements for complex inputs (with the
+// same code values), besides abs (shaders/cabs.slang).
+bool complex_unary_supported(uint32_t code) {
+  switch (code) {
+    case op::UNARY_NEG: case op::UNARY_SQUARE: case op::UNARY_RECIPROCAL: case op::UNARY_SQRT:
+    case op::UNARY_RSQRT: case op::UNARY_EXP: case op::UNARY_LOG: case op::UNARY_SIN: case op::UNARY_COS:
+    case op::UNARY_TANH: case op::UNARY_SIGMOID: case op::UNARY_EXP2: case op::UNARY_LOG2: case op::UNARY_TAN:
+    case op::UNARY_ASIN: case op::UNARY_ACOS: case op::UNARY_ATAN: case op::UNARY_SINH: case op::UNARY_COSH:
+    case op::UNARY_ASINH: case op::UNARY_ACOSH: case op::UNARY_ATANH: case op::UNARY_LOG10: case op::UNARY_LOG1P:
+    case op::UNARY_EXPM1: return true;
+    default: return false;
+  }
+}
+static_assert(op::CUNARY_EXP == op::UNARY_EXP && op::CUNARY_EXPM1 == op::UNARY_EXPM1 && op::CUNARY_NEG == op::UNARY_NEG,
+              "complex unary codes mirror the real ones");
+
 bool complex_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out) {
   const char* label = dtype_label(self.scalar_type());
-  if (label == nullptr || !is_vk(self) || !is_vk(out) || (code != op::UNARY_NEG && code != op::UNARY_ABS)) {
-    return false;
+  if (label != nullptr && is_vk(self) && is_vk(out) && (code == op::UNARY_SILU || code == op::UNARY_SINC)) {
+    if (code == op::UNARY_SILU) {
+      out.copy_(at::mul(self, at::sigmoid(self)));
+    } else {  // sin(pi z) / (pi z), 1 at 0
+      at::Tensor pz = at::mul(self, 3.141592653589793);
+      out.copy_(at::where(at::eq(self, 0), at::ones_like(self), at::div(at::sin(pz), pz)));
+    }
+    return true;
   }
   bool abs = code == op::UNARY_ABS;
+  if (label == nullptr || !is_vk(self) || !is_vk(out) || !(abs || complex_unary_supported(code))) {
+    return false;
+  }
   at::ScalarType want = abs ? c10::toRealValueType(self.scalar_type()) : self.scalar_type();
   with_output(out, want, [&](const at::Tensor& target) {
     if (abs) {
       launch_strided((std::string("cabs_") + label).c_str(), {}, target, &self, nullptr);
     } else {
-      launch_strided((std::string("cunary_") + label).c_str(), {op::CUNARY_NEG}, target, &self, nullptr);
+      launch_strided((std::string("cunary_") + label).c_str(), {code}, target, &self, nullptr);
     }
   });
   return true;
@@ -112,9 +137,19 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   if (at::isComplexType(self.scalar_type())) {
     return complex_unary_gpu(code, self, out);
   }
+  if (self.scalar_type() == at::kBool && code == op::UNARY_SIGN && is_vk(self) && is_vk(out)) {
+    out.copy_(self);  // sign of a bool is itself
+    return true;
+  }
   if (self.scalar_type() == at::kBool && code == op::UNARY_BITWISE_NOT && is_vk(self) && is_vk(out) &&
       out.scalar_type() == at::kBool) {
     launch_strided("compare_b8", {op::COMPARE_LOGICAL_NOT, 0}, out, &self, nullptr);  // logical_not on bools
+    return true;
+  }
+  bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
+                  code == op::UNARY_ROUND;
+  if (!at::isFloatingType(self.scalar_type()) && rounding && is_vk(self) && is_vk(out)) {
+    out.copy_(self);  // floor/ceil/trunc/round of integers: the integers themselves
     return true;
   }
   at::ScalarType dtype = widened(out.scalar_type());
@@ -122,10 +157,8 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   if (!kind_allows(kind, dtype) || label == nullptr || !is_vk(self) || !is_vk(out)) {
     return false;
   }
-  bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
-                  code == op::UNARY_ROUND || code == op::UNARY_FRAC;
-  if (!at::isFloatingType(self.scalar_type()) && rounding) {
-    return false;  // floor/ceil/trunc/round/frac of integers keep the integer dtype
+  if (!at::isFloatingType(self.scalar_type()) && code == op::UNARY_FRAC) {
+    return false;
   }
   at::Tensor input = to_dtype(self, dtype);  // e.g. sqrt(int) computes in float
   std::string kernel = std::string("unary_") + label;
@@ -231,6 +264,7 @@ bool complex_binary_gpu(const BinaryOp& op, const at::Tensor& lhs, const at::Ten
     case op::BINARY_SUB: code = op::CBINARY_SUB; break;
     case op::BINARY_MUL: code = op::CBINARY_MUL; break;
     case op::BINARY_DIV: code = op::CBINARY_DIV; break;
+    case op::BINARY_POW: code = op::CBINARY_POW; break;
     default: return false;
   }
   const char* label = dtype_label(dtype);
@@ -296,6 +330,28 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
     lhs = other;
   }
   at::ScalarType promoted = scalar ? at::result_type(*lhs, *scalar) : at::result_type(*lhs, *other);
+  if (!at::isFloatingType(promoted) && !at::isComplexType(promoted) &&
+      (op.code == op::BINARY_FMAX || op.code == op::BINARY_FMIN)) {
+    // No NaNs to ignore: fmax and fmin are maximum and minimum.
+    return binary_gpu(kBinary[op.code == op::BINARY_FMAX ? 3 : 4], *lhs, scalar ? nullptr : other,
+                      scalar ? &*scalar : nullptr, alpha, out);
+  }
+  if (!at::isFloatingType(promoted) && !at::isComplexType(promoted) && op.code == op::BINARY_HEAVISIDE &&
+      lhs == &self && !scalar) {
+    // heaviside(x, v) = v where x == 0, else x > 0.
+    at::Tensor x = to_dtype(self, promoted), v = to_dtype(*other, promoted);
+    out.copy_(at::where(at::eq(x, 0), v, at::gt(x, 0).to(promoted)));
+    return true;
+  }
+  if (at::isComplexType(promoted) && op.code == op::BINARY_LOGADDEXP && lhs == &self && !scalar &&
+      dtype_label(promoted) != nullptr) {
+    // log(e^a + e^b) = max + log1p(e^(min - max)), max and min by real part (as the CPU).
+    at::Tensor a = to_dtype(self, promoted), b = to_dtype(*other, promoted);
+    at::Tensor a_big = at::ge(at::real(a), at::real(b));
+    at::Tensor hi = at::where(a_big, a, b), lo = at::where(a_big, b, a);
+    out.copy_(at::add(at::log1p(at::exp(at::sub(lo, hi))), hi));
+    return true;
+  }
   at::ScalarType dtype = compute_dtype(op, promoted);
   const char* label = dtype_label(dtype);
   if (dtype == at::kBool && !scalar && alpha.equal(1)) {
@@ -377,6 +433,28 @@ at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, a
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);
   }
   return out;
+}
+
+// ---------------------------------------------------------------- Python's << and >>
+
+template <bool Left>
+at::Tensor shift_scalar(const at::Tensor& self, const at::Scalar& other) {
+  return Left ? at::bitwise_left_shift(self, other) : at::bitwise_right_shift(self, other);
+}
+
+template <bool Left>
+at::Tensor shift_tensor(const at::Tensor& self, const at::Tensor& other) {
+  return Left ? at::bitwise_left_shift(self, other) : at::bitwise_right_shift(self, other);
+}
+
+template <bool Left>
+at::Tensor& shift_scalar_(at::Tensor& self, const at::Scalar& other) {
+  return Left ? self.bitwise_left_shift_(other) : self.bitwise_right_shift_(other);
+}
+
+template <bool Left>
+at::Tensor& shift_tensor_(at::Tensor& self, const at::Tensor& other) {
+  return Left ? self.bitwise_left_shift_(other) : self.bitwise_right_shift_(other);
 }
 
 // ---------------------------------------------------------------- comparisons
@@ -497,4 +575,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("lcm.out", &binary_out<27>);
 
   register_compare(m, std::make_index_sequence<std::size(kCompare)>());
+  m.impl("__lshift__.Scalar", &shift_scalar<true>);
+  m.impl("__rshift__.Scalar", &shift_scalar<false>);
+  m.impl("__lshift__.Tensor", &shift_tensor<true>);
+  m.impl("__rshift__.Tensor", &shift_tensor<false>);
+  m.impl("__ilshift__.Scalar", &shift_scalar_<true>);
+  m.impl("__irshift__.Scalar", &shift_scalar_<false>);
+  m.impl("__ilshift__.Tensor", &shift_tensor_<true>);
+  m.impl("__irshift__.Tensor", &shift_tensor_<false>);
 }

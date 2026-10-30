@@ -12,6 +12,10 @@
 // SVD use Jacobi methods (rotations of disjoint index pairs in parallel,
 // round-robin ordering), which are accurate to working precision and suit
 // the GPU. TORCH_VK_LINALG=cpu sends these ops to LAPACK on the CPU instead.
+//
+// Complex matrices (M14) run through the same code: factor.slang has complex
+// variants following LAPACK's z* routines, and transposes that stand for
+// adjoints here are conjugate transposes (adj()).
 
 #include "vk.h"
 
@@ -62,10 +66,23 @@ bool linalg_on_cpu() {
 }
 
 bool float_dtype(at::ScalarType s) {
-  return s == at::kFloat || (s == at::kDouble && has_feature(kFeatureFloat64));
+  bool f64 = has_feature(kFeatureFloat64);
+  return s == at::kFloat || s == at::kComplexFloat || (f64 && (s == at::kDouble || s == at::kComplexDouble));
 }
 
-// A batch of matrices this file handles: vk, float32/64, at least 2-D, and
+// Conjugate transpose of the last two dims (a plain transpose for real t),
+// materialized for complex t: the kernels here read raw memory, which a lazy
+// conjugate view would not change.
+at::Tensor adj(const at::Tensor& t) {
+  return t.is_complex() ? t.transpose(-2, -1).conj().resolve_conj() : t.transpose(-2, -1);
+}
+
+// |t|^2 element-wise, real.
+at::Tensor abs2(const at::Tensor& t) {
+  return t.is_complex() ? at::view_as_real(t.resolve_conj()).square().sum(-1) : t.square();
+}
+
+// A batch of matrices this file handles: vk, float32/64 (or complex), at least 2-D, and
 // at most kMaxBatch matrices.
 bool gpu_matrices(const at::Tensor& t) {
   if (linalg_on_cpu() || !is_vk(t) || t.dim() < 2 || !float_dtype(t.scalar_type())) {
@@ -239,8 +256,8 @@ at::Tensor lu_solve(const at::Tensor& lu3, const at::Tensor& piv, const at::Tens
     triangular_solve_inplace(lu3, x, /*upper=*/false, /*unit=*/true);
     triangular_solve_inplace(lu3, x, /*upper=*/true, /*unit=*/false);
   } else {
-    // A^T = U^T L^T P^T:  X = P L^{-T} U^{-T} B.
-    at::Tensor lut = lu3.transpose(1, 2).contiguous();
+    // A^H = U^H L^H P^T:  X = P L^{-H} U^{-H} B.
+    at::Tensor lut = adj(lu3).contiguous();
     triangular_solve_inplace(lut, x, /*upper=*/false, /*unit=*/false);
     triangular_solve_inplace(lut, x, /*upper=*/true, /*unit=*/true);
     apply_pivots(x, piv, true);
@@ -252,7 +269,7 @@ at::Tensor lu_solve(const at::Tensor& lu3, const at::Tensor& piv, const at::Tens
 at::Tensor pivot_sign(const at::Tensor& piv, const at::TensorOptions& opts) {
   at::Tensor ids = at::arange(1, piv.size(1) + 1, piv.options());
   at::Tensor swaps = at::ne(piv, ids).sum(1);
-  return 1 - 2 * at::remainder(swaps, 2).to(opts.dtype());
+  return (1 - 2 * at::remainder(swaps, 2)).to(opts.dtype());
 }
 
 void check_errors(const at::Tensor& info, const char* api, bool is_matrix) {
@@ -306,11 +323,11 @@ at::Tensor geqrf_inplace(const at::Tensor& a3) {
     p.b = static_cast<uint32_t>(b);
     factor(op::FACTOR_QR_PANEL, p, B, a3.scalar_type());
     if (k + b < n) {
-      // A2 <- H^T A2 = A2 - V T^T (V^T A2)
+      // A2 <- H^H A2 = A2 - V T^H (V^H A2)
       at::Tensor v = reflectors(a3, k, b);
       at::Tensor t = block_t(a3, tau, k, b);
       at::Tensor a2 = a3.narrow(1, k, m - k).narrow(2, k + b, n - k - b);
-      at::Tensor w = at::bmm(t.transpose(1, 2), at::bmm(v.transpose(1, 2), a2));
+      at::Tensor w = at::bmm(adj(t), at::bmm(adj(v), a2));
       a2.baddbmm_(v, w, 1.0, -1.0);
     }
   }
@@ -323,7 +340,7 @@ void apply_q(const at::Tensor& a3, const at::Tensor& tau, const at::Tensor& c3, 
   int64_t kmax = tau.size(1);
   std::vector<int64_t> starts;
   for (int64_t k = 0; k < kmax; k += kBlock) starts.push_back(k);
-  // Q C applies the last panel first; Q^T C the first; on the right the reverse.
+  // Q C applies the last panel first; Q^H C the first; on the right the reverse.
   bool forward = left == transpose;
   if (!forward) std::reverse(starts.begin(), starts.end());
   int64_t m = a3.size(1);
@@ -331,13 +348,13 @@ void apply_q(const at::Tensor& a3, const at::Tensor& tau, const at::Tensor& c3, 
     int64_t b = std::min(kBlock, kmax - k);
     at::Tensor v = reflectors(a3, k, b);
     at::Tensor t = block_t(a3, tau, k, b);
-    at::Tensor tt = transpose ? t.transpose(1, 2) : t;
+    at::Tensor tt = transpose ? adj(t) : t;
     if (left) {
       at::Tensor c = c3.narrow(1, k, m - k);
-      c.baddbmm_(v, at::bmm(tt, at::bmm(v.transpose(1, 2), c)), 1.0, -1.0);
+      c.baddbmm_(v, at::bmm(tt, at::bmm(adj(v), c)), 1.0, -1.0);
     } else {
       at::Tensor c = c3.narrow(2, k, m - k);
-      c.baddbmm_(at::bmm(at::bmm(c, v), tt), v.transpose(1, 2), 1.0, -1.0);
+      c.baddbmm_(at::bmm(at::bmm(c, v), tt), adj(v), 1.0, -1.0);
     }
   }
 }
@@ -380,8 +397,8 @@ double epsilon(at::ScalarType t) {
   return t == at::kDouble ? std::numeric_limits<double>::epsilon() : std::numeric_limits<float>::epsilon();
 }
 
-// Symmetric eigendecomposition of a3 [B, n, n] (symmetric, overwritten):
-// (eigenvalues ascending [B, n], eigenvectors [B, n, n]).
+// Symmetric (Hermitian) eigendecomposition of a3 [B, n, n] (overwritten):
+// (eigenvalues ascending [B, n], real; eigenvectors [B, n, n]).
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_vectors) {
   int64_t B = a3.size(0), n = a3.size(2);
   at::Tensor v = at::zeros({B, n, n}, a3.options());
@@ -397,7 +414,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
     p.saux2 = static_cast<uint32_t>(per_round * 2);
     p.npairs = static_cast<uint32_t>(per_round);
     double tol = epsilon(a3.scalar_type());
-    at::Tensor norm2 = a3.square().sum({1, 2});
+    at::Tensor norm2 = abs2(a3).sum({1, 2});
     for (int sweep = 0; sweep < 40; ++sweep) {
       for (int64_t r = 0; r < rounds; ++r) {
         p.pairs = gpu_address(pairs) + static_cast<uint64_t>(r * per_round * 2 * sizeof(int32_t));
@@ -405,14 +422,14 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
         factor(op::FACTOR_EIG_ROWS, p, B, a3.scalar_type(), false, false, static_cast<uint32_t>(per_round));
       }
       // (Summed directly: "total minus diagonal" cancels and can stop early.)
-      at::Tensor off2 = (a3 - at::diag_embed(a3.diagonal(0, 1, 2))).square().sum({1, 2});
+      at::Tensor off2 = abs2(a3 - at::diag_embed(a3.diagonal(0, 1, 2))).sum({1, 2});
       // Converged when the off-diagonal part is negligible in every matrix.
       if (at::le(off2, norm2 * (tol * tol)).all().item<bool>()) {
         break;
       }
     }
   }
-  at::Tensor diag = a3.diagonal(0, 1, 2);
+  at::Tensor diag = at::real(a3.diagonal(0, 1, 2)).contiguous();
   auto [values, order] = at::sort(diag, /*stable=*/true, 1, false);
   at::Tensor vectors = want_vectors ? at::gather(v, 2, order.unsqueeze(1).expand({B, n, n})) : at::Tensor();
   return {values, vectors};
@@ -427,7 +444,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(const at::Tensor& a3) 
   if (n > 1 && B > 0 && m > 0) {
     int64_t rounds = 0, per_round = 0;
     at::Tensor pairs = jacobi_pairs(n, a3.options(), rounds, per_round);
-    at::Tensor off = at::empty({B, per_round}, a3.options());
+    at::Tensor off = at::empty({B, per_round}, a3.options());  // real parts used
     FactorParams p = params_for(a3);
     p.aux = gpu_address(v);
     p.saux = static_cast<uint32_t>(n * n);
@@ -436,18 +453,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(const at::Tensor& a3) 
     p.npairs = static_cast<uint32_t>(per_round);
     double tol = epsilon(a3.scalar_type()) * std::sqrt(static_cast<double>(m));
     for (int sweep = 0; sweep < 40; ++sweep) {
-      at::Tensor worst = at::zeros({}, a3.options());
+      at::Tensor worst = at::zeros({}, a3.options().dtype(c10::toRealValueType(a3.scalar_type())));
       for (int64_t r = 0; r < rounds; ++r) {
         p.pairs = gpu_address(pairs) + static_cast<uint64_t>(r * per_round * 2 * sizeof(int32_t));
         factor(op::FACTOR_SVD_ROUND, p, B, a3.scalar_type(), false, false, static_cast<uint32_t>(per_round));
-        worst = at::maximum(worst, off.amax());
+        worst = at::maximum(worst, at::real(off).amax());
       }
       if (worst.item<double>() <= tol) {
         break;
       }
     }
   }
-  at::Tensor sigma = a3.square().sum(1).sqrt();  // [B, n]
+  at::Tensor sigma = abs2(a3).sum(1).sqrt();  // [B, n], real
   auto [values, order] = at::sort(sigma, /*stable=*/true, 1, /*descending=*/true);
   at::Tensor w = at::gather(a3, 2, order.unsqueeze(1).expand({B, m, n}));
   at::Tensor vs = at::gather(v, 2, order.unsqueeze(1).expand({B, n, n}));
@@ -460,8 +477,8 @@ at::Tensor left_vectors(const at::Tensor& w, const at::Tensor& sigma, int64_t co
   int64_t B = w.size(0), m = w.size(1), n = w.size(2);
   double tol = epsilon(w.scalar_type()) * static_cast<double>(std::max(m, n));
   at::Tensor big = at::gt(sigma, sigma.narrow(1, 0, std::min<int64_t>(n, 1)) * tol).unsqueeze(1);  // [B, 1, n]
-  at::Tensor u = at::where(big, w / at::where(big, sigma.unsqueeze(1), at::ones_like(sigma.unsqueeze(1))),
-                           at::zeros_like(w));
+  at::Tensor safe = at::where(big, sigma.unsqueeze(1), at::ones_like(sigma.unsqueeze(1))).to(w.scalar_type());
+  at::Tensor u = at::where(big, w / safe, at::zeros_like(w));
   bool full_rank = big.all().item<bool>();
   if (full_rank && cols == n) {
     return u;
@@ -647,7 +664,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> slogdet_out(const
   auto bs = batch_shape(a);
   at::Tensor diag = r.lu.diagonal(0, 1, 2);
   assign(logabsdet, diag.abs().log().sum(1).view(bs));
-  assign(sign, (diag.sign().prod(1) * pivot_sign(r.piv, a.options())).view(bs));
+  assign(sign, (diag.sgn().prod(1) * pivot_sign(r.piv, a.options())).view(bs));
   assign(lu, r.lu.view(a.sizes()));
   assign(pivots, r.piv.view(with_tail(bs, {r.piv.size(1)})));
   return {sign, logabsdet, lu, pivots};
@@ -660,8 +677,10 @@ at::Tensor& lu_solve_out(const at::Tensor& lu, const at::Tensor& pivots, const a
     on_cpu("aten::linalg_lu_solve", "out", lu, pivots, b, left, adjoint, out);
     return out;
   }
-  at::Tensor bb = left ? b : b.transpose(-2, -1);
-  bool tr = left ? adjoint : !adjoint;  // X A = B  <=>  A^T X^T = B^T
+  // X op(A) = B  <=>  op(A)^H X^H = B^H: solve with the other adjoint flag,
+  // on conjugated transposes.
+  at::Tensor bb = left ? b : adj(b);
+  bool tr = left ? adjoint : !adjoint;
   auto bs = at::infer_size(batch_shape(lu), batch_shape(bb));
   int64_t n = lu.size(-1);
   at::Tensor lu3 = flat3(lu.expand(with_tail(bs, {n, n}))).contiguous();
@@ -670,7 +689,7 @@ at::Tensor& lu_solve_out(const at::Tensor& lu, const at::Tensor& pivots, const a
   at::Tensor b3 = flat3(bb.expand(with_tail(bs, {bb.size(-2), bb.size(-1)})))
                       .contiguous();
   at::Tensor x = lu_solve(lu3, piv, b3, tr).view(with_tail(bs, {bb.size(-2), bb.size(-1)}));
-  assign(out, left ? x : x.transpose(-2, -1));
+  assign(out, left ? x : adj(x));
   return out;
 }
 
@@ -725,11 +744,11 @@ at::Tensor cholesky_inplace(const at::Tensor& a3) {
     p.b = static_cast<uint32_t>(b);
     factor(op::FACTOR_CHOL_BLOCK, p, B, a3.scalar_type());
     if (k + b < n) {
-      // L21 = A21 L11^{-T};  A22 -= L21 L21^T.
+      // L21 = A21 L11^{-H};  A22 -= L21 L21^H.
       at::Tensor inv = block_inverse(a3, k, b, /*upper=*/false, /*unit=*/false);
       at::Tensor a21 = a3.narrow(1, k + b, n - k - b).narrow(2, k, b);
-      a21.copy_(at::bmm(a21, inv.transpose(1, 2)));
-      a3.narrow(1, k + b, n - k - b).narrow(2, k + b, n - k - b).baddbmm_(a21, a21.transpose(1, 2), 1.0, -1.0);
+      a21.copy_(at::bmm(a21, adj(inv)));
+      a3.narrow(1, k + b, n - k - b).narrow(2, k + b, n - k - b).baddbmm_(a21, adj(a21), 1.0, -1.0);
     }
   }
   return info;
@@ -741,11 +760,11 @@ std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, boo
     on_cpu("aten::linalg_cholesky_ex", "L", self, upper, check, l, info);
     return {l, info};
   }
-  // The lower factor of A (upper=True: from A^T's lower triangle, as LAPACK reads it).
-  at::Tensor a3 = batched(upper ? self.transpose(-2, -1) : self);
+  // The lower factor of A (upper=True: from A^H's lower triangle, as LAPACK reads it).
+  at::Tensor a3 = batched(upper ? adj(self) : self);
   at::Tensor status = cholesky_inplace(a3);
   at::Tensor lower = a3.tril();
-  assign(l, (upper ? lower.transpose(1, 2) : lower).reshape(self.sizes()));
+  assign(l, (upper ? adj(lower) : lower).reshape(self.sizes()));
   assign(info, status.view(batch_shape(self)));
   if (check) {
     check_errors(info, "torch.linalg.cholesky_ex", self.dim() == 2);
@@ -753,14 +772,14 @@ std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, boo
   return {l, info};
 }
 
-// cholesky_solve: A X = B with A = L L^T (or U^T U), self = B.
+// cholesky_solve: A X = B with A = L L^H (or U^H U), self = B.
 at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bool upper) {
   if (!gpu_matrices(a) || !is_vk(self)) {
     return on_cpu("aten::_cholesky_solve_helper", "", self, a, upper)[0].toTensor();
   }
-  at::Tensor l = upper ? a.transpose(-2, -1) : a;  // lower factor
+  at::Tensor l = upper ? adj(a) : a;  // lower factor
   at::Tensor y = solve_triangular_vk(l, self, /*upper=*/false, true, false);
-  return solve_triangular_vk(l.transpose(-2, -1), y, /*upper=*/true, true, false);
+  return solve_triangular_vk(adj(l), y, /*upper=*/true, true, false);
 }
 
 at::Tensor& cholesky_inverse_out(const at::Tensor& a, bool upper, at::Tensor& out) {
@@ -867,9 +886,11 @@ std::tuple<at::Tensor&, at::Tensor&> eigh_out(const at::Tensor& a, c10::string_v
     on_cpu("aten::_linalg_eigh", "eigenvalues", a, uplo, compute_v, values, vectors);
     return {values, vectors};
   }
-  // Symmetric matrix from the chosen triangle.
-  at::Tensor tri = uplo == "U" ? a.triu() : a.tril();
-  at::Tensor sym = tri + tri.transpose(-2, -1) - at::diag_embed(a.diagonal(0, -2, -1));
+  // Symmetric (Hermitian) matrix from the chosen triangle and the real part
+  // of the diagonal.
+  at::Tensor strict = uplo == "U" ? a.triu(1) : a.tril(-1);
+  at::Tensor diag = at::real(a.diagonal(0, -2, -1)).to(a.scalar_type());
+  at::Tensor sym = strict + adj(strict) + at::diag_embed(diag);
   at::Tensor a3 = batched(sym);
   auto [w, v] = jacobi_eigh(a3, compute_v);
   auto bs = batch_shape(a);
@@ -898,8 +919,8 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
     return {U, S, Vh};
   }
   int64_t m = a.size(-2), n = a.size(-1), k = std::min(m, n);
-  bool wide = m < n;  // work with A^T (tall): A = U S V^T  <=>  A^T = V S U^T
-  at::Tensor a3 = batched(wide ? a.transpose(-2, -1) : a);
+  bool wide = m < n;  // work with A^H (tall): A = U S V^H  <=>  A^H = V S U^H
+  at::Tensor a3 = batched(wide ? adj(a) : a);
   int64_t tm = a3.size(1), tn = a3.size(2);  // tm >= tn = k
   auto [sigma, w, v] = jacobi_svd(a3);
   auto bs = batch_shape(a);
@@ -915,7 +936,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
   at::Tensor v_out = wide ? left : v;
   int64_t ucols = full_matrices ? m : k, vrows = full_matrices ? n : k;
   assign(U, u_out.reshape(with_tail(bs, {m, ucols})));
-  assign(Vh, v_out.transpose(1, 2).reshape(with_tail(bs, {vrows, n})));
+  assign(Vh, adj(v_out).reshape(with_tail(bs, {vrows, n})));
   return {U, S, Vh};
 }
 
@@ -948,7 +969,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
   at::Tensor smax = S.narrow(-1, 0, std::min<int64_t>(S.size(-1), 1));
   at::Tensor keep = at::gt(S, smax * rc);
   at::Tensor inv = at::where(keep, 1.0 / at::where(keep, S, at::ones_like(S)), at::zeros_like(S));
-  at::Tensor x = at::matmul(Vh.transpose(-2, -1), inv.unsqueeze(-1) * at::matmul(U.transpose(-2, -1), be));
+  at::Tensor x = at::matmul(adj(Vh), inv.unsqueeze(-1).to(a.scalar_type()) * at::matmul(adj(U), be));
   at::Tensor r = keep.sum(-1);
   assign(solution, vector ? x.squeeze(-1) : x);
   assign(rank, drv == "gels" ? at::empty({0}, r.options()) : r);
@@ -960,12 +981,176 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
   // Residuals for tall, full-rank systems (as LAPACK reports them).
   bool full = m > n && at::eq(r, n).all().item<bool>();
   if (full && drv != "gelsy") {
-    at::Tensor res = (at::matmul(ae, x) - be).square().sum(-2);
+    at::Tensor res = abs2(at::matmul(ae, x) - be).sum(-2);
     assign(residuals, vector ? res.squeeze(-1) : res);
   } else {
     at::native::resize_output(residuals, {0});
   }
   return {solution, residuals, rank, singular_values};
+}
+
+// ---------------------------------------------------------------- LDL (Bunch-Kaufman)
+
+std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> ldl_factor_ex_out(const at::Tensor& self, bool hermitian,
+                                                                    bool check, at::Tensor& LD, at::Tensor& pivots,
+                                                                    at::Tensor& info) {
+  if (!gpu_matrices(self) || !is_square(self) || !is_vk(LD)) {
+    on_cpu("aten::linalg_ldl_factor_ex", "out", self, hermitian, check, LD, pivots, info);
+    return {LD, pivots, info};
+  }
+  at::Tensor a3 = batched(self);
+  int64_t B = a3.size(0), n = a3.size(1);
+  at::Tensor piv = at::zeros({B, n}, a3.options().dtype(at::kInt));
+  at::Tensor status = at::zeros({B}, a3.options().dtype(at::kInt));
+  at::Tensor scratch = at::empty({B, 2 * std::max<int64_t>(n, 1)}, a3.options());
+  FactorParams p = params_for(a3);
+  p.piv = gpu_address(piv);
+  p.spiv = static_cast<uint32_t>(n);
+  p.info = gpu_address(status);
+  p.aux = gpu_address(scratch);
+  p.saux = static_cast<uint32_t>(scratch.size(1));
+  if (n > 0) {
+    factor(op::FACTOR_LDL, p, B, a3.scalar_type(), /*upper=hermitian*/ hermitian && a3.is_complex());
+  }
+  auto bs = batch_shape(self);
+  assign(LD, a3.tril().view(self.sizes()));
+  assign(pivots, piv.view(with_tail(bs, {n})));
+  assign(info, status.view(bs));
+  if (check) {
+    check_errors(info, "torch.linalg.ldl_factor_ex", self.dim() == 2);
+  }
+  return {LD, pivots, info};
+}
+
+at::Tensor& ldl_solve_out(const at::Tensor& LD, const at::Tensor& pivots, const at::Tensor& b, bool hermitian,
+                          at::Tensor& out) {
+  if (!gpu_matrices(LD) || !is_square(LD) || !is_vk(b) || !is_vk(pivots) || b.scalar_type() != LD.scalar_type() ||
+      b.dim() < 2 || !is_vk(out)) {
+    on_cpu("aten::linalg_ldl_solve", "out", LD, pivots, b, hermitian, out);
+    return out;
+  }
+  auto bs = at::infer_size(batch_shape(LD), batch_shape(b));
+  int64_t n = LD.size(-1), k = b.size(-1);
+  at::Tensor a3 = flat3(LD.expand(with_tail(bs, {n, n}))).contiguous();
+  at::Tensor piv = flat2(pivots.expand(with_tail(bs, {n}))).to(at::kInt).contiguous();
+  at::Tensor x = flat3(b.expand(with_tail(bs, {n, k}))).clone(at::MemoryFormat::Contiguous);
+  FactorParams p = params_for(a3);
+  p.cols = static_cast<uint32_t>(k);
+  p.piv = gpu_address(piv);
+  p.spiv = static_cast<uint32_t>(n);
+  p.aux = gpu_address(x);
+  p.saux = static_cast<uint32_t>(n * k);
+  if (n > 0 && k > 0) {
+    factor(op::FACTOR_LDL_SOLVE, p, a3.size(0), a3.scalar_type(), hermitian && a3.is_complex());
+  }
+  assign(out, x.view(with_tail(bs, {n, k})));
+  return out;
+}
+
+// ---------------------------------------------------------------- general eigendecomposition
+
+struct EigParams {
+  uint64_t a, z, aux, aux2, state;
+  uint32_t n, budget;
+};
+static_assert(sizeof(EigParams) == 48, "must match shaders/eig.slang");
+
+at::ScalarType complex_of(at::ScalarType t) {
+  return t == at::kFloat || t == at::kComplexFloat ? at::kComplexFloat : at::kComplexDouble;
+}
+
+// Eigenvalues [B, n] and (want_vectors) unit eigenvectors [B, n, n] of a's
+// matrices, complex: Hessenberg reduction, shifted QR to the complex Schur
+// form T = Z^H A Z, eigenvectors of T by back substitution, times Z. Each
+// vector has unit norm and its largest component real, as LAPACK's geev.
+std::tuple<at::Tensor, at::Tensor> general_eig(const at::Tensor& a, bool want_vectors) {
+  at::ScalarType ct = complex_of(a.scalar_type());
+  at::Tensor h = flat3(a).to(ct).clone(at::MemoryFormat::Contiguous);
+  int64_t B = h.size(0), n = h.size(1);
+  at::Tensor z = at::empty({B, n, n}, h.options());
+  at::Tensor aux = at::empty({B, std::max<int64_t>(n * n, 1)}, h.options());
+  at::Tensor state = at::zeros({B, 2}, h.options().dtype(at::kInt));
+  state.select(1, 0).fill_(n - 1);
+  std::string kernel = std::string("eig_") + dtype_label(ct);
+  EigParams p{};
+  p.a = gpu_address(h);
+  p.z = gpu_address(z);
+  p.aux = gpu_address(aux);
+  p.state = gpu_address(state);
+  p.n = static_cast<uint32_t>(n);
+  if (B > 0 && n > 0) {
+    dispatch(kernel, {op::EIG_HESSENBERG}, p, static_cast<uint32_t>(B));
+    // A few sweeps per dispatch keeps each dispatch short; QR needs ~2-3
+    // sweeps per eigenvalue, 30 per eigenvalue at most.
+    p.budget = 8;
+    for (int64_t round = 0; round < (30 * n) / 8 + 2; ++round) {
+      dispatch(kernel, {op::EIG_QR}, p, static_cast<uint32_t>(B));
+      if (at::lt(state.select(1, 0), 0).all().item<bool>()) {
+        break;
+      }
+    }
+  }
+  at::Tensor values = h.diagonal(0, 1, 2).clone();
+  if (!want_vectors) {
+    return {values, at::Tensor()};
+  }
+  if (B == 0 || n == 0) {
+    return {values, z};
+  }
+  // Pivots below smin = eps |T| are replaced by smin (ztrevc).
+  at::Tensor tabs = at::view_as_real(h).abs().sum(-1).amax({1, 2});
+  at::Tensor smin = at::clamp_min(tabs * epsilon(c10::toRealValueType(ct)),
+                                  std::numeric_limits<float>::min()).to(ct);
+  p.aux2 = gpu_address(smin);
+  dispatch(kernel, {op::EIG_VECTORS}, p, static_cast<uint32_t>(B));
+  at::Tensor v = at::bmm(z, aux.narrow(1, 0, n * n).view({B, n, n}));
+  at::Tensor norms = abs2(v).sum(1, true).sqrt();
+  v = v / norms.to(ct);
+  at::Tensor big = at::gather(v, 1, abs2(v).argmax(1, true));  // [B, 1, n]
+  at::Tensor phase = at::conj_physical(big) / at::abs(big).to(ct);
+  return {values, v * phase};
+}
+
+bool eig_ok(const at::Tensor& a) {
+  return gpu_matrices(a) && is_square(a);
+}
+
+std::tuple<at::Tensor&, at::Tensor&> eig_out(const at::Tensor& a, at::Tensor& values, at::Tensor& vectors) {
+  if (!eig_ok(a) || !is_vk(values) || !is_vk(vectors)) {
+    on_cpu("aten::linalg_eig", "out", a, values, vectors);
+    return {values, vectors};
+  }
+  auto [w, v] = general_eig(a, true);
+  auto bs = batch_shape(a);
+  int64_t n = a.size(-1);
+  assign(values, w.view(with_tail(bs, {n})));
+  assign(vectors, v.view(with_tail(bs, {n, n})));
+  return {values, vectors};
+}
+
+std::tuple<at::Tensor, at::Tensor> eig_vk(const at::Tensor& a) {
+  at::ScalarType ct = complex_of(a.scalar_type());
+  at::Tensor w = at::empty({0}, a.options().dtype(ct)), v = at::empty({0}, a.options().dtype(ct));
+  eig_out(a, w, v);
+  return {w, v};
+}
+
+at::Tensor& eigvals_out(const at::Tensor& a, at::Tensor& out) {
+  if (!eig_ok(a) || !is_vk(out)) {
+    on_cpu("aten::linalg_eigvals", "out", a, out);
+    return out;
+  }
+  auto [w, v] = general_eig(a, false);
+  assign(out, w.view(with_tail(batch_shape(a), {a.size(-1)})));
+  return out;
+}
+
+at::Tensor eigvals_vk(const at::Tensor& a) {
+  if (!eig_ok(a)) {
+    return on_cpu("aten::_linalg_eigvals", "", a)[0].toTensor();
+  }
+  at::Tensor out = at::empty({0}, a.options().dtype(complex_of(a.scalar_type())));
+  return eigvals_out(a, out);
 }
 
 // ---------------------------------------------------------------- tril / triu
@@ -1038,6 +1223,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_linalg_svd", &vk::svd_vk);
   m.impl("_linalg_svd.U", &svd_out);
   m.impl("linalg_lstsq.out", &lstsq_out);
+  m.impl("linalg_ldl_factor_ex.out", &ldl_factor_ex_out);
+  m.impl("linalg_ldl_solve.out", &ldl_solve_out);
+  m.impl("linalg_eig", &vk::eig_vk);
+  m.impl("linalg_eig.out", &eig_out);
+  m.impl("_linalg_eigvals", &vk::eigvals_vk);
+  m.impl("linalg_eigvals.out", &eigvals_out);
   m.impl("tril.out", &triangle_out<false>);
   m.impl("triu.out", &triangle_out<true>);
 }

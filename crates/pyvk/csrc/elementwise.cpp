@@ -76,6 +76,9 @@ at::Tensor& elu_out(const at::Tensor& self, const at::Scalar& alpha, const at::S
 }
 
 at::Tensor& hardtanh_out(const at::Tensor& self, const at::Scalar& min, const at::Scalar& max, at::Tensor& out) {
+  if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
+    return at::clamp_out(out, self, min, max);
+  }
   if (!param_unary_gpu(op::UNARY_HARDTANH, self, out, min.toDouble(), max.toDouble())) {
     on_cpu("aten::hardtanh", "out", self, min, max, out);
   }
@@ -105,6 +108,11 @@ at::Tensor& hardshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::
 
 at::Tensor& threshold_out(const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value,
                           at::Tensor& out) {
+  if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
+    at::native::resize_output(out, self.sizes());
+    out.copy_(at::where(at::gt(self, threshold), self, at::scalar_tensor(value, self.options())));
+    return out;
+  }
   if (!param_unary_gpu(op::UNARY_THRESHOLD, self, out, threshold.toDouble(), value.toDouble())) {
     on_cpu("aten::threshold", "out", self, threshold, value, out);
   }
@@ -203,6 +211,15 @@ bool clamp_tensor_gpu(const at::Tensor& self, const std::optional<at::Tensor>& l
   at::native::resize_output(out, shape);
   at::ScalarType dtype = out.scalar_type();
   bool vk_bounds = (!lo || is_vk(*lo)) && (!hi || is_vk(*hi));
+  if (dtype == at::kBool && is_vk(self) && is_vk(out) && vk_bounds) {
+    // On bools: clamp_min is "or", clamp_max is "and" (computed as int32).
+    at::Tensor wide = at::empty(shape, out.options().dtype(at::kInt));
+    std::optional<at::Tensor> wlo = lo ? std::optional<at::Tensor>(lo->to(at::kInt)) : std::nullopt;
+    std::optional<at::Tensor> whi = hi ? std::optional<at::Tensor>(hi->to(at::kInt)) : std::nullopt;
+    if (!clamp_tensor_gpu(self.to(at::kInt), wlo, whi, wide)) return false;
+    out.copy_(wide);
+    return true;
+  }
   if (!is_vk(self) || !is_vk(out) || !vk_bounds || !(is_float(dtype) || is_int(dtype))) {
     return false;
   }
@@ -345,6 +362,15 @@ at::Tensor where_self(const at::Tensor& cond, const at::Tensor& self, const at::
 }
 
 at::Tensor& masked_fill_scalar(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value) {
+  if (at::isComplexType(self.scalar_type()) && is_vk(self) && is_vk(mask) && !self.is_conj() &&
+      dtype_label(self.scalar_type()) != nullptr) {
+    // Fill the real and imaginary parts.
+    c10::complex<double> v = value.toComplexDouble();
+    at::Tensor parts = at::view_as_real(self);
+    parts.select(-1, 0).masked_fill_(mask, v.real());
+    parts.select(-1, 1).masked_fill_(mask, v.imag());
+    return self;
+  }
   bool ok = !value.isComplex() && is_vk(self) && is_vk(mask);
   if (ok) {
     at::Tensor cond = mask;
@@ -381,7 +407,25 @@ bool ternary_gpu(uint32_t code, const at::Tensor& a, const at::Tensor& b, const 
   return true;
 }
 
+// Complex lerp, addcmul, addcdiv from complex element-wise ops.
+bool complex_ternary(const at::Tensor& self, const at::Tensor& a, const at::Tensor& out) {
+  return at::isComplexType(out.scalar_type()) && dtype_label(out.scalar_type()) != nullptr && is_vk(self) &&
+         is_vk(a) && is_vk(out);
+}
+
+// The CPU's lerp: self + w (end - self) for |w| < 0.5, else end - (end - self) (1 - w).
+at::Tensor complex_lerp(const at::Tensor& self, const at::Tensor& end, const at::Tensor& w) {
+  at::Tensor diff = at::sub(end, self);
+  return at::where(at::lt(at::abs(w), 0.5), at::add(self, at::mul(w, diff)),
+                   at::sub(end, at::mul(diff, at::add(at::neg(w), 1))));
+}
+
 at::Tensor& lerp_scalar_out(const at::Tensor& self, const at::Tensor& end, const at::Scalar& weight, at::Tensor& out) {
+  if (complex_ternary(self, end, out)) {
+    at::native::resize_output(out, at::infer_size(self.sizes(), end.sizes()));
+    out.copy_(complex_lerp(self, end, at::scalar_tensor(weight, out.options())));
+    return out;
+  }
   if (weight.isComplex() || !ternary_gpu(op::TERNARY_LERP, self, end, nullptr, weight, 0, out)) {
     on_cpu("aten::lerp", "Scalar_out", self, end, weight, out);
   }
@@ -389,6 +433,11 @@ at::Tensor& lerp_scalar_out(const at::Tensor& self, const at::Tensor& end, const
 }
 
 at::Tensor& lerp_tensor_out(const at::Tensor& self, const at::Tensor& end, const at::Tensor& weight, at::Tensor& out) {
+  if (complex_ternary(self, end, out) && is_vk(weight)) {
+    at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), end.sizes()), weight.sizes()));
+    out.copy_(complex_lerp(self, end, weight));
+    return out;
+  }
   if (!ternary_gpu(op::TERNARY_LERP, self, end, &weight, std::nullopt, 0, out)) {
     on_cpu("aten::lerp", "Tensor_out", self, end, weight, out);
   }
@@ -397,6 +446,11 @@ at::Tensor& lerp_tensor_out(const at::Tensor& self, const at::Tensor& end, const
 
 at::Tensor& addcmul_out(const at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value,
                         at::Tensor& out) {
+  if (complex_ternary(self, t1, out) && is_vk(t2)) {
+    at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), t1.sizes()), t2.sizes()));
+    out.copy_(at::add(self, at::mul(at::mul(t1, t2), value)));
+    return out;
+  }
   if (value.isComplex() || !ternary_gpu(op::TERNARY_ADDCMUL, self, t1, &t2, std::nullopt, value, out)) {
     on_cpu("aten::addcmul", "out", self, t1, t2, value, out);
   }
@@ -405,6 +459,11 @@ at::Tensor& addcmul_out(const at::Tensor& self, const at::Tensor& t1, const at::
 
 at::Tensor& addcdiv_out(const at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value,
                         at::Tensor& out) {
+  if (complex_ternary(self, t1, out) && is_vk(t2)) {
+    at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), t1.sizes()), t2.sizes()));
+    out.copy_(at::add(self, at::mul(at::div(t1, t2), value)));
+    return out;
+  }
   if (value.isComplex() || !ternary_gpu(op::TERNARY_ADDCDIV, self, t1, &t2, std::nullopt, value, out)) {
     on_cpu("aten::addcdiv", "out", self, t1, t2, value, out);
   }

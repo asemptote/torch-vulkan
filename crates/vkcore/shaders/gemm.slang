@@ -1,6 +1,7 @@
-// axis T: f32=float f64=double
+// axis T: f32=float f64=double i32=int i64=int64_t
 //
 // Batched GEMM: C[b] = alpha * A[b] @ B[b] (+ beta * Cin[b] when USE_CIN).
+// Integer variants wrap on overflow, as the CPU's integer matmul does.
 // Every operand is addressed through (row, column, batch) element strides,
 // so transposed or broadcast operands need no copies.
 //

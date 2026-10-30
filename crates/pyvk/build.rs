@@ -90,6 +90,7 @@ fn main() {
             "csrc/linalg.cpp",
             "csrc/fft.cpp",
             "csrc/dense.cpp",
+            "csrc/special.cpp",
         ])
         // Every object file registers aten kernels from static initializers
         // and nothing references them by symbol, so link the archive whole.

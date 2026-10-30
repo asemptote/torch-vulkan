@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double
+// axis T: f32=float f64=double c64=float2 c128=double2
 //
 // Small dense factorization steps for csrc/dense.cpp (M13), the parts of
 // blocked LU, Cholesky, QR and Jacobi eigen/SVD that LAPACK would do on the
@@ -21,17 +21,65 @@
 //               (LAPACK's dlarfg/dlarf: beta = -sign(alpha) |x|, v(0) = 1
 //               implicit, stored below the diagonal), tau into aux[k + j]
 //   LARFT       the b x b upper-triangular T of the panel's block reflector
-//               H = I - V T V^T (forward, columnwise) into aux2
+//               H = I - V T V^H (forward, columnwise) into aux2
 //   SVD_ROUND   one-sided Jacobi: for column pair `pairs[gid.x]` of the
 //               rows x cols matrix W and the cols x cols matrix V (at aux),
 //               rotate the two columns to make them orthogonal; the
-//               pair's |w_p . w_q| / (|w_p| |w_q|) into aux2
+//               pair's |w_p^H w_q| / (|w_p| |w_q|) into aux2
 //   EIG_COLS    Jacobi eigenvalues, first half of a round: the rotation
 //               zeroing A[p, q] for each pair, applied to columns p, q of A
-//               and of V (at aux); (c, s) into aux2
+//               and of V (at aux); the rotation into aux2
 //   EIG_ROWS    second half: the same rotations applied to rows p, q of A
+//   LDL         Bunch-Kaufman LDL^T (LDL^H with UPPER = hermitian) of the
+//               rows x rows matrix's lower triangle in place, as LAPACK's
+//               sytf2 / hetf2 (lower): 1-based pivots into piv, negative
+//               for 2 x 2 blocks; the first zero pivot into info; aux is
+//               scratch (2 rows per matrix)
+//   LDL_SOLVE   solve A X = B from LDL's factors (sytrs / hetrs, lower) for
+//               the rows x cols right-hand sides at aux (row stride cols),
+//               one thread per column
+//
+// Complex matrices (c64, c128) follow LAPACK's z* routines: LU pivots on
+// |re| + |im| (izamax), Cholesky reads the real part of the diagonal and
+// gives A = L L^H, Householder reflectors are H = I - tau v v^H with a real
+// beta (zlarfg) and H^H is applied to the panel. The Jacobi steps first
+// rotate column q by the phase of the (p, q) entry, which turns each 2 x 2
+// problem into the real one.
 
 #include "opcodes.slang"
+
+#if defined(T_c64) || defined(T_c128)
+#define IS_COMPLEX 1
+#if defined(T_c64)
+typedef float S;
+#else
+typedef double S;
+#endif
+#include "_complex.slang"
+typedef S R;  // the real type
+T mul(T a, T b) { return cmul(a, b); }
+T dv(T a, T b) { return cdiv(a, b); }
+T cj(T a) { return cconj(a); }
+R re(T a) { return a.x; }
+R mag(T a) { return cabs(a); }
+R mag1(T a) { return abs(a.x) + abs(a.y); }  // izamax's |re| + |im|
+R norm2(T a) { return a.x * a.x + a.y * a.y; }
+T fromr(R r) { return T(r, R(0)); }
+bool is_zero(T a) { return a.x == R(0) && a.y == R(0); }
+#else
+typedef T R;
+T mul(T a, T b) { return a * b; }
+T dv(T a, T b) { return a / b; }
+T cj(T a) { return a; }
+R re(T a) { return a; }
+R mag(T a) { return abs(a); }
+R mag1(T a) { return abs(a); }
+R norm2(T a) { return a * a; }
+T fromr(R r) { return r; }
+bool is_zero(T a) { return a == T(0); }
+#endif
+#define ONE fromr(R(1))
+#define ZERO fromr(R(0))
 
 struct Params
 {
@@ -65,8 +113,8 @@ const int UNIT = 0;
 #define WG 256
 groupshared T sval[WG];
 groupshared int sidx[WG];
-groupshared T sval2[WG];
-groupshared T sval3[WG];
+groupshared R rval[WG];
+groupshared R rval2[WG];
 
 void barrier()
 {
@@ -89,32 +137,47 @@ T reduce_sum(uint t, T v)
     return r;
 }
 
-// Three sums at once.
-void reduce_sum3(uint t, inout T x, inout T y, inout T z)
+R reduce_sum_real(uint t, R v)
 {
-    sval[t] = x;
-    sval2[t] = y;
-    sval3[t] = z;
+    rval[t] = v;
+    barrier();
+    for (uint s = WG / 2; s > 0; s >>= 1)
+    {
+        if (t < s)
+            rval[t] += rval[t + s];
+        barrier();
+    }
+    R r = rval[0];
+    barrier();
+    return r;
+}
+
+// Two real sums and one T sum at once.
+void reduce_sum3(uint t, inout R x, inout R y, inout T z)
+{
+    rval[t] = x;
+    rval2[t] = y;
+    sval[t] = z;
     barrier();
     for (uint s = WG / 2; s > 0; s >>= 1)
     {
         if (t < s)
         {
+            rval[t] += rval[t + s];
+            rval2[t] += rval2[t + s];
             sval[t] += sval[t + s];
-            sval2[t] += sval2[t + s];
-            sval3[t] += sval3[t + s];
         }
         barrier();
     }
-    x = sval[0];
-    y = sval2[0];
-    z = sval3[0];
+    x = rval[0];
+    y = rval2[0];
+    z = sval[0];
     barrier();
 }
 
-T sign_of(T x)
+R sign_of(R x)
 {
-    return x < T(0) ? T(-1) : T(1);
+    return x < R(0) ? R(-1) : R(1);
 }
 
 // ---------------------------------------------------------------- LU
@@ -126,36 +189,36 @@ void lu_panel(uint t, uint z)
     for (uint j = p.k; j < p.k + p.b; j++)
     {
         // Pivot: the first row with the largest |a[i, j]|, i >= j.
-        T best = T(-1);
+        R best = R(-1);
         int at = int(j);
         for (uint i = j + t; i < n; i += WG)
         {
-            T v = abs(a[i * ld + j]);
+            R v = mag1(a[i * ld + j]);
             if (v > best || (isnan(v) && !isnan(best)))
             {
                 best = v;
                 at = int(i);
             }
         }
-        sval[t] = best;
+        rval[t] = best;
         sidx[t] = at;
         barrier();
         for (uint s = WG / 2; s > 0; s >>= 1)
         {
             if (t < s)
             {
-                T o = sval[t + s];
+                R o = rval[t + s];
                 int oi = sidx[t + s];
-                if (o > sval[t] || (o == sval[t] && oi < sidx[t]))
+                if (o > rval[t] || (o == rval[t] && oi < sidx[t]))
                 {
-                    sval[t] = o;
+                    rval[t] = o;
                     sidx[t] = oi;
                 }
             }
             barrier();
         }
         uint piv = uint(sidx[0]);
-        T pivot_abs = sval[0];
+        R pivot_abs = rval[0];
         barrier();
         if (t == 0)
             p.piv[z * p.spiv + j] = int(piv) + 1;
@@ -169,7 +232,7 @@ void lu_panel(uint t, uint z)
             }
         }
         barrier();
-        if (pivot_abs == T(0))
+        if (pivot_abs == R(0))
         {
             if (t == 0 && p.info[z] == 0)
                 p.info[z] = int(j) + 1;
@@ -177,14 +240,14 @@ void lu_panel(uint t, uint z)
         }
         T d = a[j * ld + j];
         for (uint i = j + 1 + t; i < n; i += WG)
-            a[i * ld + j] = a[i * ld + j] / d;
+            a[i * ld + j] = dv(a[i * ld + j], d);
         barrier();
         uint width = p.k + p.b - j - 1;
         uint height = n - j - 1;
         for (uint e = t; e < width * height; e += WG)
         {
             uint i = j + 1 + e / width, c = j + 1 + e % width;
-            a[i * ld + c] = a[i * ld + c] - a[i * ld + j] * a[j * ld + c];
+            a[i * ld + c] = a[i * ld + c] - mul(a[i * ld + j], a[j * ld + c]);
         }
         barrier();
     }
@@ -225,10 +288,10 @@ void tri_inv(uint t, uint z)
         {
             for (uint i = 0; i < b; i++)
             {
-                T v = i == c ? T(1) : T(0);
+                T v = i == c ? ONE : ZERO;
                 for (uint m = c; m < i; m++)
-                    v -= a[(k + i) * ld + k + m] * x[m * b + c];
-                x[i * b + c] = (UNIT != 0 || i < c) ? v : v / a[(k + i) * ld + k + i];
+                    v -= mul(a[(k + i) * ld + k + m], x[m * b + c]);
+                x[i * b + c] = (UNIT != 0 || i < c) ? v : dv(v, a[(k + i) * ld + k + i]);
             }
         }
         else
@@ -236,10 +299,10 @@ void tri_inv(uint t, uint z)
             for (int ii = int(b) - 1; ii >= 0; ii--)
             {
                 uint i = uint(ii);
-                T v = i == c ? T(1) : T(0);
+                T v = i == c ? ONE : ZERO;
                 for (uint m = i + 1; m <= c; m++)
-                    v -= a[(k + i) * ld + k + m] * x[m * b + c];
-                x[i * b + c] = (UNIT != 0 || i > c) ? v : v / a[(k + i) * ld + k + i];
+                    v -= mul(a[(k + i) * ld + k + m], x[m * b + c]);
+                x[i * b + c] = (UNIT != 0 || i > c) ? v : dv(v, a[(k + i) * ld + k + i]);
             }
         }
     }
@@ -251,28 +314,29 @@ void chol_block(uint t, uint z)
     uint b = p.b, ld = p.ld, k = p.k;
     for (uint j = 0; j < b; j++)
     {
-        T d = a[(k + j) * ld + k + j];
-        bool bad = !(d > T(0));  // also NaN
+        R d = re(a[(k + j) * ld + k + j]);
+        bool bad = !(d > R(0));  // also NaN
         if (bad)
         {
             if (t == 0 && p.info[z] == 0)
                 p.info[z] = int(k + j) + 1;
             return;  // uniform across the workgroup
         }
-        T l = sqrt(d);
+        R l = sqrt(d);
         barrier();
         if (t == 0)
-            a[(k + j) * ld + k + j] = l;
+            a[(k + j) * ld + k + j] = fromr(l);
         for (uint i = j + 1 + t; i < b; i += WG)
             a[(k + i) * ld + k + j] = a[(k + i) * ld + k + j] / l;
         barrier();
-        // Trailing lower triangle of the block: a[i, c] -= l_ij l_cj, j < c <= i.
+        // Trailing lower triangle of the block: a[i, c] -= l_ij conj(l_cj), j < c <= i.
         uint m = b - j - 1;
         for (uint e = t; e < m * m; e += WG)
         {
             uint i = j + 1 + e / m, c = j + 1 + e % m;
             if (c <= i)
-                a[(k + i) * ld + k + c] = a[(k + i) * ld + k + c] - a[(k + i) * ld + k + j] * a[(k + c) * ld + k + j];
+                a[(k + i) * ld + k + c] =
+                    a[(k + i) * ld + k + c] - mul(a[(k + i) * ld + k + j], cj(a[(k + c) * ld + k + j]));
         }
         barrier();
     }
@@ -287,54 +351,57 @@ void qr_panel(uint t, uint z)
     uint m = p.rows, ld = p.ld;
     for (uint j = p.k; j < p.k + p.b; j++)
     {
-        // dlarfg on x = a[j:m, j]
-        T part = T(0);
+        // dlarfg / zlarfg on x = a[j:m, j]
+        R part = R(0);
         for (uint i = j + 1 + t; i < m; i += WG)
-        {
-            T v = a[i * ld + j];
-            part += v * v;
-        }
-        T xnorm2 = reduce_sum(t, part);
+            part += norm2(a[i * ld + j]);
+        R xnorm2 = reduce_sum_real(t, part);
         T alpha = a[j * ld + j];
-        T tj = T(0);
-        if (xnorm2 != T(0))
+        R alphr = re(alpha);
+        T tj = ZERO;
+        if (xnorm2 != R(0) || !is_zero(alpha - fromr(alphr)))
         {
-            T beta = -sign_of(alpha) * sqrt(alpha * alpha + xnorm2);
+            R beta = -sign_of(alphr) * sqrt(norm2(alpha) + xnorm2);
+#ifdef IS_COMPLEX
+            tj = T((beta - alphr) / beta, -alpha.y / beta);
+#else
             tj = (beta - alpha) / beta;
-            T scale = T(1) / (alpha - beta);
+#endif
+            T scale = dv(ONE, alpha - fromr(beta));
             for (uint i = j + 1 + t; i < m; i += WG)
-                a[i * ld + j] = a[i * ld + j] * scale;
+                a[i * ld + j] = mul(a[i * ld + j], scale);
             barrier();
             if (t == 0)
-                a[j * ld + j] = beta;
+                a[j * ld + j] = fromr(beta);
         }
         if (t == 0)
             tau[j] = tj;
         barrier();
-        if (tj == T(0))
+        if (is_zero(tj))
             continue;
-        // Apply H = I - tau v v^T to the panel's later columns.
+        // Apply H^H = I - conj(tau) v v^H to the panel's later columns.
+        T ctj = cj(tj);
         for (uint c = j + 1; c < p.k + p.b; c++)
         {
-            T dot = T(0);
+            T dot = ZERO;
             for (uint i = j + t; i < m; i += WG)
             {
-                T v = i == j ? T(1) : a[i * ld + j];
-                dot += v * a[i * ld + c];
+                T v = i == j ? ONE : a[i * ld + j];
+                dot += mul(cj(v), a[i * ld + c]);
             }
-            T w = reduce_sum(t, dot) * tj;
+            T w = mul(reduce_sum(t, dot), ctj);
             for (uint i = j + t; i < m; i += WG)
             {
-                T v = i == j ? T(1) : a[i * ld + j];
-                a[i * ld + c] = a[i * ld + c] - v * w;
+                T v = i == j ? ONE : a[i * ld + j];
+                a[i * ld + c] = a[i * ld + c] - mul(v, w);
             }
             barrier();
         }
     }
 }
 
-// T (b x b, upper) with H_k ... H_{k+b-1} = I - V T V^T: T[j, j] = tau_j,
-// T[0:j, j] = -tau_j T[0:j, 0:j] (V[:, 0:j]^T v_j).
+// T (b x b, upper) with H_k ... H_{k+b-1} = I - V T V^H: T[j, j] = tau_j,
+// T[0:j, j] = -tau_j T[0:j, 0:j] (V[:, 0:j]^H v_j).
 void larft(uint t, uint z)
 {
     T* a = p.a + z * p.sa;
@@ -344,15 +411,15 @@ void larft(uint t, uint z)
     for (uint j = 0; j < b; j++)
     {
         T tj = tau[k + j];
-        // y[i] = V[:, i] . v_j for i < j, over rows k + j .. m (v_j is zero above).
+        // y[i] = V[:, i]^H v_j for i < j, over rows k + j .. m (v_j is zero above).
         for (uint i = 0; i < j; i++)
         {
-            T part = T(0);
+            T part = ZERO;
             for (uint r = k + j + t; r < m; r += WG)
             {
                 T vi = a[r * ld + k + i];  // r > k + i: below V[:, i]'s unit diagonal
-                T vj = r == k + j ? T(1) : a[r * ld + k + j];
-                part += vi * vj;
+                T vj = r == k + j ? ONE : a[r * ld + k + j];
+                part += mul(cj(vi), vj);
             }
             T y = reduce_sum(t, part);
             if (t == 0)
@@ -364,16 +431,16 @@ void larft(uint t, uint z)
             // T[0:j, j] = -tau_j T[0:j, 0:j] y  (T upper triangular; y in column j)
             for (uint i = 0; i < j; i++)
             {
-                T s = T(0);
+                T s = ZERO;
                 for (uint l = i; l < j; l++)
-                    s += tm[i * b + l] * tm[l * b + j];
-                sval[i] = -tj * s;
+                    s += mul(tm[i * b + l], tm[l * b + j]);
+                sval[i] = -mul(tj, s);
             }
             for (uint i = 0; i < j; i++)
                 tm[i * b + j] = sval[i];
             tm[j * b + j] = tj;
             for (uint i = j + 1; i < b; i++)
-                tm[i * b + j] = T(0);
+                tm[i * b + j] = ZERO;
         }
         barrier();
     }
@@ -391,35 +458,45 @@ void svd_round(uint t, uint pair, uint z)
     if (col_p >= n || col_q >= n)
     {
         if (t == 0)
-            p.aux2[z * p.saux2 + pair] = T(0);
+            p.aux2[z * p.saux2 + pair] = ZERO;
         return;  // the dummy partner of an odd column count
     }
-    T alpha = T(0), beta = T(0), gamma = T(0);
+    R alpha = R(0), beta = R(0);
+    T gamma = ZERO;
     for (uint i = t; i < m; i += WG)
     {
         T x = w[i * ld + col_p], y = w[i * ld + col_q];
-        alpha += x * x;
-        beta += y * y;
-        gamma += x * y;
+        alpha += norm2(x);
+        beta += norm2(y);
+        gamma += mul(cj(x), y);
     }
     reduce_sum3(t, alpha, beta, gamma);
-    T off = (alpha > T(0) && beta > T(0)) ? abs(gamma) / sqrt(alpha * beta) : T(0);
+    R g = mag(gamma);
+    R off = (alpha > R(0) && beta > R(0)) ? g / sqrt(alpha * beta) : R(0);
     if (t == 0)
-        p.aux2[z * p.saux2 + pair] = off;
-    if (gamma == T(0))
+        p.aux2[z * p.saux2 + pair] = fromr(off);
+    if (g == R(0))
         return;
-    T zeta = (beta - alpha) / (T(2) * gamma);
-    T tt = sign_of(zeta) / (abs(zeta) + sqrt(T(1) + zeta * zeta));
-    T c = T(1) / sqrt(T(1) + tt * tt), s = c * tt;
+#ifdef IS_COMPLEX
+    // Column q times conj(phase of gamma): then w_p^H w_q' = |gamma|.
+    T ph = cj(gamma / g);
+    R gr = g;
+#else
+    T ph = T(1);
+    R gr = gamma;
+#endif
+    R zeta = (beta - alpha) / (R(2) * gr);
+    R tt = sign_of(zeta) / (abs(zeta) + sqrt(R(1) + zeta * zeta));
+    R c = R(1) / sqrt(R(1) + tt * tt), s = c * tt;
     for (uint i = t; i < m; i += WG)
     {
-        T x = w[i * ld + col_p], y = w[i * ld + col_q];
+        T x = w[i * ld + col_p], y = mul(ph, w[i * ld + col_q]);
         w[i * ld + col_p] = c * x - s * y;
         w[i * ld + col_q] = s * x + c * y;
     }
     for (uint i = t; i < n; i += WG)
     {
-        T x = v[i * n + col_p], y = v[i * n + col_q];
+        T x = v[i * n + col_p], y = mul(ph, v[i * n + col_q]);
         v[i * n + col_p] = c * x - s * y;
         v[i * n + col_q] = s * x + c * y;
     }
@@ -433,32 +510,46 @@ void eig_cols(uint t, uint pair, uint z)
     uint n = p.cols, ld = p.ld;
     uint2 pq = p.pairs[pair];
     uint i_p = pq.x, i_q = pq.y;
-    T c = T(1), s = T(0);
+    R c = R(1), s = R(0);
+    T ph = ONE;  // A[p, q] / |A[p, q]|
     if (i_p < n && i_q < n)
     {
         T apq = a[i_p * ld + i_q];
-        if (apq != T(0))
+        if (!is_zero(apq))
         {
-            T theta = (a[i_q * ld + i_q] - a[i_p * ld + i_p]) / (T(2) * apq);
-            T tt = sign_of(theta) / (abs(theta) + sqrt(theta * theta + T(1)));
-            c = T(1) / sqrt(tt * tt + T(1));
+#ifdef IS_COMPLEX
+            R g = mag(apq);
+            ph = apq / g;
+#else
+            R g = apq;
+#endif
+            R theta = (re(a[i_q * ld + i_q]) - re(a[i_p * ld + i_p])) / (R(2) * g);
+            R tt = sign_of(theta) / (abs(theta) + sqrt(theta * theta + R(1)));
+            c = R(1) / sqrt(tt * tt + R(1));
             s = tt * c;
         }
     }
     if (t == 0)
     {
+#ifdef IS_COMPLEX
+        rot[2 * pair] = T(c, s);
+        rot[2 * pair + 1] = ph;
+#else
         rot[2 * pair] = c;
         rot[2 * pair + 1] = s;
+#endif
     }
-    if (s == T(0))
+    if (s == R(0))
         return;
-    // A <- A J, V <- V J for J = [[c, s], [-s, c]] in the (p, q) plane.
+    // A <- A J, V <- V J for J = diag(1, conj(ph)) [[c, s], [-s, c]] in the
+    // (p, q) plane.
+    T cph = cj(ph);
     for (uint i = t; i < n; i += WG)
     {
-        T x = a[i * ld + i_p], y = a[i * ld + i_q];
+        T x = a[i * ld + i_p], y = mul(cph, a[i * ld + i_q]);
         a[i * ld + i_p] = c * x - s * y;
         a[i * ld + i_q] = s * x + c * y;
-        T vx = v[i * n + i_p], vy = v[i * n + i_q];
+        T vx = v[i * n + i_p], vy = mul(cph, v[i * n + i_q]);
         v[i * n + i_p] = c * vx - s * vy;
         v[i * n + i_q] = s * vx + c * vy;
     }
@@ -471,15 +562,318 @@ void eig_rows(uint t, uint pair, uint z)
     uint n = p.cols, ld = p.ld;
     uint2 pq = p.pairs[pair];
     uint i_p = pq.x, i_q = pq.y;
-    T c = rot[2 * pair], s = rot[2 * pair + 1];
-    if (s == T(0) || i_p >= n || i_q >= n)
+#ifdef IS_COMPLEX
+    R c = rot[2 * pair].x, s = rot[2 * pair].y;
+    T ph = rot[2 * pair + 1];
+#else
+    R c = rot[2 * pair], s = rot[2 * pair + 1];
+    T ph = ONE;
+#endif
+    if (s == R(0) || i_p >= n || i_q >= n)
         return;
-    // A <- J^T A
+    // A <- J^H A
     for (uint j = t; j < n; j += WG)
     {
-        T x = a[i_p * ld + j], y = a[i_q * ld + j];
+        T x = a[i_p * ld + j], y = mul(ph, a[i_q * ld + j]);
         a[i_p * ld + j] = c * x - s * y;
         a[i_q * ld + j] = s * x + c * y;
+    }
+}
+
+// ---------------------------------------------------------------- LDL (Bunch-Kaufman)
+
+groupshared int g_kp;
+groupshared int g_kstep;
+
+// The diagonal's magnitude as the pivot tests see it (hetf2 reads the real part).
+R diag_mag(T x)
+{
+    return UPPER != 0 ? abs(re(x)) : mag1(x);
+}
+
+// The conjugate for hermitian factorizations, the value for symmetric ones.
+T hc(T x)
+{
+    return UPPER != 0 ? cj(x) : x;
+}
+
+T real_part(T x)
+{
+    return fromr(re(x));
+}
+
+void ldl(uint t, uint z)
+{
+    T* a = p.a + z * p.sa;
+    T* w = p.aux + z * p.saux;
+    uint n = p.rows, ld = p.ld;
+    const R alpha = (R(1) + sqrt(R(17))) / R(8);
+    uint k = 0;
+    while (k < n)
+    {
+        if (t == 0)
+        {
+            int kstep = 1;
+            uint kp = k;
+            R absakk = diag_mag(a[k * ld + k]);
+            uint imax = k;
+            R colmax = R(0);
+            for (uint i = k + 1; i < n; i++)
+            {
+                R v = mag1(a[i * ld + k]);
+                if (v > colmax)
+                {
+                    colmax = v;
+                    imax = i;
+                }
+            }
+            if (max(absakk, colmax) == R(0) || isnan(absakk))
+            {
+                if (p.info[z] == 0)
+                    p.info[z] = int(k) + 1;
+                kstep = 0;  // no update (LAPACK continues with the next column)
+            }
+            else if (!(absakk >= alpha * colmax))
+            {
+                R rowmax = R(0);
+                for (uint j = k; j < imax; j++)
+                    rowmax = max(rowmax, mag1(a[imax * ld + j]));
+                for (uint j = imax + 1; j < n; j++)
+                    rowmax = max(rowmax, mag1(a[j * ld + imax]));
+                if (absakk >= alpha * colmax * (colmax / rowmax))
+                    kp = k;
+                else if (diag_mag(a[imax * ld + imax]) >= alpha * rowmax)
+                    kp = imax;
+                else
+                {
+                    kp = imax;
+                    kstep = 2;
+                }
+            }
+            g_kp = int(kp);
+            g_kstep = kstep;
+            uint steps = kstep == 0 ? 1u : uint(kstep);
+            if (steps == 1)
+                p.piv[z * p.spiv + k] = int(kp) + 1;
+            else
+            {
+                p.piv[z * p.spiv + k] = -(int(kp) + 1);
+                p.piv[z * p.spiv + k + 1] = -(int(kp) + 1);
+            }
+        }
+        barrier();
+        int kstep = g_kstep;
+        uint kp = uint(g_kp);
+        barrier();
+        if (kstep == 0)
+        {
+            k += 1;
+            continue;
+        }
+        uint kk = k + uint(kstep) - 1;
+        if (kp != kk)
+        {
+            // Interchange rows and columns kk and kp of the trailing submatrix.
+            for (uint i = kp + 1 + t; i < n; i += WG)
+            {
+                T tmp = a[i * ld + kk];
+                a[i * ld + kk] = a[i * ld + kp];
+                a[i * ld + kp] = tmp;
+            }
+            for (uint j = kk + 1 + t; j < kp; j += WG)
+            {
+                T tmp = hc(a[j * ld + kk]);
+                a[j * ld + kk] = hc(a[kp * ld + j]);
+                a[kp * ld + j] = tmp;
+            }
+            if (t == 0)
+            {
+                if (UPPER != 0)
+                    a[kp * ld + kk] = cj(a[kp * ld + kk]);
+                T tmp = a[kk * ld + kk];
+                a[kk * ld + kk] = a[kp * ld + kp];
+                a[kp * ld + kp] = tmp;
+                if (kstep == 2)
+                {
+                    tmp = a[(k + 1) * ld + k];
+                    a[(k + 1) * ld + k] = a[kp * ld + k];
+                    a[kp * ld + k] = tmp;
+                }
+            }
+            barrier();
+        }
+        if (UPPER != 0 && t == 0)
+        {
+            a[k * ld + k] = real_part(a[k * ld + k]);
+            if (kstep == 2)
+                a[(k + 1) * ld + k + 1] = real_part(a[(k + 1) * ld + k + 1]);
+        }
+        barrier();
+        if (kstep == 1)
+        {
+            if (k + 1 < n)
+            {
+                // A22 -= d11 x x^T (x^H), then x *= d11, x = A[k+1.., k].
+                T d11 = UPPER != 0 ? fromr(R(1) / re(a[k * ld + k])) : dv(ONE, a[k * ld + k]);
+                uint m = n - k - 1;
+                for (uint e = t; e < m * m; e += WG)
+                {
+                    uint i = k + 1 + e / m, j = k + 1 + e % m;
+                    if (j <= i)
+                    {
+                        T upd = a[i * ld + j] + mul(a[i * ld + k], -mul(d11, hc(a[j * ld + k])));
+                        a[i * ld + j] = (UPPER != 0 && i == j) ? real_part(upd) : upd;
+                    }
+                }
+                barrier();
+                for (uint i = k + 1 + t; i < n; i += WG)
+                    a[i * ld + k] = mul(d11, a[i * ld + k]);
+                barrier();
+            }
+        }
+        else if (k + 2 < n)
+        {
+            T d11, d22, d21, dd, tt;
+            if (UPPER != 0)
+            {
+                R d = mag(a[(k + 1) * ld + k]);
+                d11 = fromr(re(a[(k + 1) * ld + k + 1]) / d);
+                d22 = fromr(re(a[k * ld + k]) / d);
+                tt = fromr(R(1) / (re(d11) * re(d22) - R(1)));
+                d21 = a[(k + 1) * ld + k] / d;
+                dd = fromr(re(tt) / d);
+            }
+            else
+            {
+                T e21 = a[(k + 1) * ld + k];
+                d11 = dv(a[(k + 1) * ld + k + 1], e21);
+                d22 = dv(a[k * ld + k], e21);
+                tt = dv(ONE, mul(d11, d22) - ONE);
+                dd = dv(tt, e21);
+                d21 = ONE;
+            }
+            for (uint j = k + 2 + t; j < n; j += WG)
+            {
+                T ajk = a[j * ld + k], ajk1 = a[j * ld + k + 1];
+                w[j] = mul(dd, mul(d11, ajk) - mul(d21, ajk1));
+                w[n + j] = mul(dd, mul(d22, ajk1) - mul(cj(d21), ajk));
+            }
+            barrier();
+            uint m = n - k - 2;
+            for (uint e = t; e < m * m; e += WG)
+            {
+                uint i = k + 2 + e / m, j = k + 2 + e % m;
+                if (j <= i)
+                {
+                    T upd = a[i * ld + j] - mul(a[i * ld + k], hc(w[j])) - mul(a[i * ld + k + 1], hc(w[n + j]));
+                    a[i * ld + j] = (UPPER != 0 && i == j) ? real_part(upd) : upd;
+                }
+            }
+            barrier();
+            for (uint j = k + 2 + t; j < n; j += WG)
+            {
+                a[j * ld + k] = w[j];
+                a[j * ld + k + 1] = w[n + j];
+            }
+            barrier();
+        }
+        k += uint(kstep);
+    }
+}
+
+void ldl_solve(uint t, uint z)
+{
+    T* a = p.a + z * p.sa;
+    T* b = p.aux + z * p.saux;
+    int* piv = p.piv + z * p.spiv;
+    uint n = p.rows, ld = p.ld, nr = p.cols;
+    for (uint c = t; c < nr; c += WG)
+    {
+        // L D y = P b
+        uint k = 0;
+        while (k < n)
+        {
+            if (piv[k] > 0)
+            {
+                uint kp = uint(piv[k] - 1);
+                if (kp != k)
+                {
+                    T tmp = b[k * nr + c];
+                    b[k * nr + c] = b[kp * nr + c];
+                    b[kp * nr + c] = tmp;
+                }
+                T bk = b[k * nr + c];
+                for (uint i = k + 1; i < n; i++)
+                    b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k], bk);
+                T inv = UPPER != 0 ? fromr(R(1) / re(a[k * ld + k])) : dv(ONE, a[k * ld + k]);
+                b[k * nr + c] = mul(inv, b[k * nr + c]);
+                k += 1;
+            }
+            else
+            {
+                uint kp = uint(-piv[k] - 1);
+                if (kp != k + 1)
+                {
+                    T tmp = b[(k + 1) * nr + c];
+                    b[(k + 1) * nr + c] = b[kp * nr + c];
+                    b[kp * nr + c] = tmp;
+                }
+                T bk0 = b[k * nr + c], bk1 = b[(k + 1) * nr + c];
+                for (uint i = k + 2; i < n; i++)
+                    b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k], bk0);
+                for (uint i = k + 2; i < n; i++)
+                    b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k + 1], bk1);
+                T akm1k = a[(k + 1) * ld + k];
+                T akm1 = dv(a[k * ld + k], hc(akm1k));
+                T ak = dv(a[(k + 1) * ld + k + 1], akm1k);
+                T denom = mul(akm1, ak) - ONE;
+                T bkm1 = dv(b[k * nr + c], hc(akm1k));
+                T bkk = dv(b[(k + 1) * nr + c], akm1k);
+                b[k * nr + c] = dv(mul(ak, bkm1) - bkk, denom);
+                b[(k + 1) * nr + c] = dv(mul(akm1, bkk) - bkm1, denom);
+                k += 2;
+            }
+        }
+        // L^T x = y (L^H for hermitian), then undo the interchanges.
+        int kb = int(n) - 1;
+        while (kb >= 0)
+        {
+            uint k2 = uint(kb);
+            if (piv[k2] > 0)
+            {
+                T s = ZERO;
+                for (uint i = k2 + 1; i < n; i++)
+                    s += mul(hc(a[i * ld + k2]), b[i * nr + c]);
+                b[k2 * nr + c] = b[k2 * nr + c] - s;
+                uint kp = uint(piv[k2] - 1);
+                if (kp != k2)
+                {
+                    T tmp = b[k2 * nr + c];
+                    b[k2 * nr + c] = b[kp * nr + c];
+                    b[kp * nr + c] = tmp;
+                }
+                kb -= 1;
+            }
+            else
+            {
+                T s = ZERO, s1 = ZERO;
+                for (uint i = k2 + 1; i < n; i++)
+                {
+                    s += mul(hc(a[i * ld + k2]), b[i * nr + c]);
+                    s1 += mul(hc(a[i * ld + k2 - 1]), b[i * nr + c]);
+                }
+                b[k2 * nr + c] = b[k2 * nr + c] - s;
+                b[(k2 - 1) * nr + c] = b[(k2 - 1) * nr + c] - s1;
+                uint kp = uint(-piv[k2] - 1);
+                if (kp != k2)
+                {
+                    T tmp = b[k2 * nr + c];
+                    b[k2 * nr + c] = b[kp * nr + c];
+                    b[kp * nr + c] = tmp;
+                }
+                kb -= 2;
+            }
+        }
     }
 }
 
@@ -498,6 +892,8 @@ void main(uint3 gid: SV_GroupID, uint3 lid: SV_GroupThreadID)
     case FACTOR_LARFT: larft(t, gid.x); break;
     case FACTOR_SVD_ROUND: svd_round(t, gid.x, gid.y); break;
     case FACTOR_EIG_COLS: eig_cols(t, gid.x, gid.y); break;
+    case FACTOR_LDL: ldl(t, gid.x); break;
+    case FACTOR_LDL_SOLVE: ldl_solve(t, gid.x); break;
     default: eig_rows(t, gid.x, gid.y); break;  // FACTOR_EIG_ROWS
     }
 }

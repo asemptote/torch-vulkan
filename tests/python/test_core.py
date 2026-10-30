@@ -46,11 +46,12 @@ def test_factories():
 def test_cpu_fallback_matches_and_is_counted():
     x = make((20,), torch.float64)
     x = x.abs() + 0.5
-    before = tv.fallback_counts().get("aten::polygamma.out", 0)
+    x = x.view(4, 5)
+    before = tv.fallback_counts().get("aten::unique_dim", 0)
     with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
-        got = torch.polygamma(2, x.to("vk"))  # no polygamma kernel yet
-    check(got, torch.polygamma(2, x))
-    assert tv.fallback_counts()["aten::polygamma.out"] == before + 1
+        got = torch.unique(x.to("vk"), dim=0)  # no unique(dim=...) kernel yet
+    check(got, torch.unique(x, dim=0))
+    assert tv.fallback_counts()["aten::unique_dim"] == before + 1
     check(x.to("vk").sum(), x.sum())
 
 

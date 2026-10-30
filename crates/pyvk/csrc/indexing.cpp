@@ -168,7 +168,7 @@ at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& in
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   at::native::resize_output(out, index.sizes());
   if (!movable(self) || !is_vk(index) || !is_vk(out) || out.scalar_type() != self.scalar_type() ||
-      index.scalar_type() != at::kLong || std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
+      !index_dtype_ok(index) || std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
     on_cpu("aten::gather", "out", self, dim, index, sparse_grad, out);
     return out;
   }
@@ -298,14 +298,14 @@ at::Tensor index(const at::Tensor& self, const c10::List<std::optional<at::Tenso
 }
 
 // Defined with the accumulating ops below.
-const char* accum_label(at::ScalarType t);
+bool accum_supported(at::ScalarType t, bool sum_only);
 void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, const at::Tensor& values);
 
 at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
                            const at::Tensor& values, bool accumulate, bool unsafe) {
   bool values_ok = is_vk(values) || (values.dim() == 0 && values.device().is_cpu());
   if (!movable(self) || !values_ok || !indices_on_vk(indices) ||
-      (accumulate && accum_label(self.scalar_type()) == nullptr)) {
+      (accumulate && !accum_supported(self.scalar_type(), true))) {
     on_cpu("aten::_index_put_impl_", "", self, indices, values, accumulate, unsafe);
     return self;
   }
@@ -329,7 +329,7 @@ at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::T
 // The destination restrided to the index's shape (index sizes may be
 // smaller than the destination's in every dim but `dim`).
 bool scatter_ok(const at::Tensor& self, const at::Tensor& index, int64_t dim) {
-  return movable(self) && is_vk(index) && index.scalar_type() == at::kLong &&
+  return movable(self) && is_vk(index) && index_dtype_ok(index) &&
          std::max<int64_t>(index.dim(), 1) == std::max<int64_t>(self.dim(), 1);
 }
 
@@ -430,7 +430,7 @@ at::Tensor& index_fill_tensor(at::Tensor& self, int64_t dim, const at::Tensor& i
 
 at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& source, bool accumulate) {
   if (!movable(self) || !is_vk(index) || !is_vk(source) || index.scalar_type() != at::kLong ||
-      (accumulate && accum_label(self.scalar_type()) == nullptr)) {
+      (accumulate && !accum_supported(self.scalar_type(), true))) {
     on_cpu("aten::put_", "", self, index, source, accumulate);
     return self;
   }
@@ -471,6 +471,20 @@ const char* accum_label(at::ScalarType t) {
   }
 }
 
+// Also bool, the small types (through their widened type) and, for sums,
+// complex (through the real and imaginary parts).
+bool accum_supported(at::ScalarType t, bool sum_only) {
+  if (accum_label(t) != nullptr) return true;
+  if (t == at::kBool || widened(t) != t) return accum_label(t == at::kBool ? at::kInt : widened(t)) != nullptr;
+  if (t == at::kComplexFloat) return sum_only;
+  if (t == at::kComplexDouble) return sum_only && has_feature(kFeatureFloat64);
+  return false;
+}
+
+bool sum_like(uint32_t op) {
+  return op == op::SEGREDUCE_SUM || op == op::SEGREDUCE_MEAN;
+}
+
 uint32_t reduce_code(c10::string_view reduce) {
   if (reduce == "sum" || reduce == "add") return op::SEGREDUCE_SUM;
   if (reduce == "prod" || reduce == "multiply") return op::SEGREDUCE_PROD;
@@ -502,6 +516,34 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
   if (n == 0) {
     return;
   }
+  at::ScalarType t = dst_view.scalar_type();
+  if (accum_label(t) == nullptr) {
+    // The whole storage as a flat tensor, so that dst_view's strides and
+    // offset (and the offsets) carry over to a widened or real copy.
+    int64_t itemsize = static_cast<int64_t>(dst_view.element_size());
+    int64_t total = static_cast<int64_t>(dst_view.storage().nbytes()) / itemsize;
+    at::Tensor flat = at::empty({0}, dst_view.options()).set_(dst_view.storage(), 0, {total}, {1});
+    if (at::isComplexType(t)) {
+      // Sums of complex values are sums of their parts.
+      at::Tensor parts = at::view_as_real(flat);  // [total, 2]
+      at::Tensor vals = values.to(t).expand(offsets.sizes());
+      std::vector<int64_t> strides;
+      for (int64_t st : dst_view.strides()) strides.push_back(2 * st);
+      for (int64_t k = 0; k < 2; ++k) {
+        at::Tensor part = parts.as_strided(dst_view.sizes(), strides, 2 * dst_view.storage_offset() + k);
+        at::Tensor v = k == 0 ? at::real(vals) : at::imag(vals);
+        accumulate(part, offsets * 2, v, op, include_self);
+      }
+      return;
+    }
+    // bool (as int32: sums become "or", products "and") and the small types.
+    at::ScalarType wide = t == at::kBool ? at::kInt : widened(t);
+    at::Tensor wflat = flat.to(wide);
+    accumulate(wflat.as_strided(dst_view.sizes(), dst_view.strides(), dst_view.storage_offset()), offsets,
+               values.to(wide), op, include_self);
+    flat.copy_(wflat);
+    return;
+  }
   TORCH_CHECK(n < (int64_t(1) << 31), "torch_vulkan: accumulation of more than 2^31 elements");
   at::Tensor offs = (offsets + view_positions(dst_view)).reshape({1, n}).contiguous();
   at::Tensor vals = values.to(dst_view.scalar_type()).expand(offsets.sizes()).contiguous();
@@ -521,8 +563,8 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
 bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                         uint32_t op, bool include_self, at::Tensor& out) {
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
-  if (!scatter_ok(self, index, dim) || !is_vk(src) || !is_vk(out) || accum_label(self.scalar_type()) == nullptr ||
-      out.scalar_type() != self.scalar_type()) {
+  if (!scatter_ok(self, index, dim) || !is_vk(src) || !is_vk(out) ||
+      !accum_supported(self.scalar_type(), sum_like(op)) || out.scalar_type() != self.scalar_type()) {
     return false;
   }
   if (!out.is_same(self)) {
@@ -545,7 +587,8 @@ bool index_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& ind
                       uint32_t op, bool include_self, at::Tensor& out) {
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   if (!movable(self) || !is_vk(index) || !is_vk(source) || !is_vk(out) || index.dim() > 1 ||
-      !index_dtype_ok(index) || accum_label(self.scalar_type()) == nullptr || out.scalar_type() != self.scalar_type()) {
+      !index_dtype_ok(index) || !accum_supported(self.scalar_type(), sum_like(op)) ||
+      out.scalar_type() != self.scalar_type()) {
     return false;
   }
   if (!out.is_same(self)) {
@@ -603,7 +646,8 @@ at::Tensor& scatter_value_reduce_out(const at::Tensor& self, int64_t dim, const 
 
 at::Tensor& index_add_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& source,
                           const at::Scalar& alpha, at::Tensor& out) {
-  at::Tensor scaled = alpha.equal(1) ? source : source * alpha;
+  bool unit = alpha.equal(1) || (source.scalar_type() == at::kBool && alpha.toBool());
+  at::Tensor scaled = unit ? source : source.scalar_type() == at::kBool ? at::zeros_like(source) : source * alpha;
   if (!index_accumulate(self, dim, index, scaled, op::SEGREDUCE_SUM, true, out)) {
     on_cpu("aten::index_add", "out", self, dim, index, source, alpha, out);
   }
