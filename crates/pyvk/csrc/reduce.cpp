@@ -263,6 +263,9 @@ bool reducible(const at::Tensor& self, bool allow_bool = true) {
 }
 
 void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {
+  if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
+    check_out_cast(flat.scalar_type(), out);
+  }
   at::native::resize_output(out, shape);
   out.copy_(flat.view(shape));
 }
@@ -423,6 +426,8 @@ at::Tensor& any_all_dim_out(const at::Tensor& self, int64_t dim, bool keepdim, a
 
 template <ROp Op>
 at::Tensor& amax_amin_out(const at::Tensor& self, at::IntArrayRef dim, bool keepdim, at::Tensor& out) {
+  TORCH_CHECK(self.scalar_type() == out.scalar_type(), "Expected the dtype for input and out to match, but got ",
+              self.scalar_type(), " for input's dtype and ", out.scalar_type(), " for out's dtype.");
   Plan plan;
   if (!reducible(self) || !is_vk(out) || !plan_reduce(self, dim, keepdim, plan)) {
     on_cpu(Op == kMax ? "aten::amax" : "aten::amin", "out", self, dim, keepdim, out);

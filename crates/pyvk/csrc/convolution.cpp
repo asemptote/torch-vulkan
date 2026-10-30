@@ -154,9 +154,10 @@ bool conv_ok(const at::Tensor& x, const at::Tensor& w) {
          w.scalar_type() == t;
 }
 
-at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
-                       at::IntArrayRef stride_, at::IntArrayRef padding_, at::IntArrayRef dilation_, bool transposed,
-                       at::IntArrayRef output_padding_, int64_t groups) {
+at::Tensor convolution_compute(const at::Tensor& input, const at::Tensor& weight,
+                               const std::optional<at::Tensor>& bias, at::IntArrayRef stride_,
+                               at::IntArrayRef padding_, at::IntArrayRef dilation_, bool transposed,
+                               at::IntArrayRef output_padding_, int64_t groups) {
   if (!conv_ok(input, weight)) {
     // (convolution_overrideable has no CPU kernel; aten::convolution does.)
     return on_cpu("aten::convolution", "", input, weight, bias, stride_, padding_, dilation_, transposed,
@@ -170,6 +171,18 @@ at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const 
     return conv_transpose_forward(input, weight, bias, stride, padding, output_padding, dilation, groups);
   }
   return conv_forward(input, weight, bias, stride, symmetric(padding), dilation, groups);
+}
+
+// The registered kernel: the result laid out as the meta kernel says (e.g.
+// channels-last for channels-last inputs).
+at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
+                       at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed,
+                       at::IntArrayRef output_padding, int64_t groups) {
+  at::Tensor result =
+      convolution_compute(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups);
+  at::Tensor layout = at::convolution(meta_of(input), meta_of(weight), meta_of(bias), stride, padding, dilation,
+                                      transposed, output_padding, groups);
+  return laid_out_like(result, layout);
 }
 
 // grad_weight of a plain convolution: [Co, C/G, *K] = sum over N, L of
@@ -192,7 +205,7 @@ at::Tensor conv_weight_grad(const at::Tensor& x, const at::Tensor& g, at::IntArr
   return at::bmm(gg, cols).reshape(wsize);                                            // [G, Cog, Cg*K]
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward_compute(
     const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride_,
     at::IntArrayRef padding_, at::IntArrayRef dilation_, bool transposed, at::IntArrayRef output_padding_,
     int64_t groups, std::array<bool, 3> mask) {
@@ -223,8 +236,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward(
     }
   } else {
     if (mask[0]) {
-      // The adjoint of a transposed convolution is the plain convolution.
+      // The adjoint of a transposed convolution is the plain convolution;
+      // output_padding can make that longer than the input (positions past
+      // the input's end, which no input element reached): cropped.
       grad_input = conv_forward(g, weight, std::nullopt, stride, symmetric(padding), dilation, groups);
+      for (int64_t d = 0; d < s; ++d) {
+        grad_input = grad_input.narrow(2 + d, 0, input.size(2 + d));
+      }
+      grad_input = grad_input.contiguous();
     }
     if (mask[1]) {
       // y = A_W^T x for the plain convolution A_W using W [Ci, Co/G, *K] as
@@ -239,6 +258,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward(
     grad_bias = g.sum(dims);
   }
   return {grad_input, grad_weight, grad_bias};
+}
+
+// The registered kernel: gradients laid out as the meta kernel says (the
+// input's and weight's memory format).
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward(
+    const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride,
+    at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed, at::IntArrayRef output_padding,
+    int64_t groups, std::array<bool, 3> mask) {
+  auto [gi, gw, gb] = convolution_backward_compute(grad_output, input, weight, stride, padding, dilation, transposed,
+                                                   output_padding, groups, mask);
+  std::vector<int64_t> bias_sizes = {transposed ? weight.size(1) * groups : weight.size(0)};
+  auto [mi, mw, mb] = at::convolution_backward(meta_of(grad_output), meta_of(input), meta_of(weight), bias_sizes,
+                                               stride, padding, dilation, transposed, output_padding, groups, mask);
+  return {gi.defined() ? laid_out_like(gi, mi) : gi, gw.defined() ? laid_out_like(gw, mw) : gw, gb};
 }
 
 }  // namespace

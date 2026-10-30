@@ -22,6 +22,7 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/Resize.h>
+#include <ATen/native/TypeProperties.h>
 #include <torch/library.h>
 
 #include <algorithm>
@@ -351,6 +352,7 @@ void scatter_into(const at::Tensor& out, int64_t dim, const at::Tensor& index, c
 
 at::Tensor& scatter_src_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                             at::Tensor& out) {
+  check_out_cast(self.scalar_type(), out);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   if (!scatter_ok(self, index, dim) || !is_vk(src) || !is_vk(out)) {
     on_cpu("aten::scatter", "src_out", self, dim, index, src, out);
@@ -366,6 +368,7 @@ at::Tensor& scatter_src_out(const at::Tensor& self, int64_t dim, const at::Tenso
 
 at::Tensor& scatter_value_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Scalar& value,
                               at::Tensor& out) {
+  check_out_cast(self.scalar_type(), out);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   if (!scatter_ok(self, index, dim) || !is_vk(out)) {
     on_cpu("aten::scatter", "value_out", self, dim, index, value, out);
@@ -381,6 +384,7 @@ at::Tensor& scatter_value_out(const at::Tensor& self, int64_t dim, const at::Ten
 
 at::Tensor& index_copy_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& source,
                            at::Tensor& out) {
+  check_out_cast(self.scalar_type(), out);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   if (!movable(self) || !is_vk(index) || !is_vk(source) || !is_vk(out) || index.scalar_type() != at::kLong ||
       index.dim() > 1) {
@@ -840,6 +844,12 @@ at::Tensor& masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::
 // ---------------------------------------------------------------- cat, flip, roll, padding
 
 at::Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, at::Tensor& out) {
+  std::vector<at::Tensor> all(tensors.begin(), tensors.end());
+  if (!all.empty()) {
+    // (a TypeError, as on the CPU)
+    TORCH_CHECK_TYPE(at::canCast(at::native::result_type(all), out.scalar_type()),
+                     "torch.cat(): input types can't be cast to the desired output type ", out.scalar_type());
+  }
   std::vector<at::Tensor> inputs;
   for (const at::Tensor& t : tensors) {
     if (!(t.dim() == 1 && t.size(0) == 0)) {  // legacy: 1-D empty tensors are skipped
@@ -1044,8 +1054,13 @@ at::Tensor& arange_out(const at::Scalar& start, const at::Scalar& end, const at:
   TORCH_CHECK(std::isfinite(xstart) && std::isfinite(xend), "unsupported range: ", xstart, " -> ", xend);
   TORCH_CHECK((xstep > 0 && xend >= xstart) || (xstep < 0 && xend <= xstart),
               "upper bound and lower bound inconsistent with step sign");
-  double size_d = floating ? std::ceil((xend - xstart) / xstep)
-                           : std::ceil(static_cast<double>(end.toLong() - start.toLong()) / step.toLong());
+  // Integer arguments count in integers; any float argument makes the CPU
+  // count in double (arange(3.1, dtype=int64) has 4 elements), while the
+  // elements themselves are trunc(start) + i * trunc(step).
+  bool integral_args = !start.isFloatingPoint() && !end.isFloatingPoint() && !step.isFloatingPoint();
+  double size_d = floating || !integral_args
+                      ? std::ceil((xend - xstart) / xstep)
+                      : std::ceil(static_cast<double>(end.toLong() - start.toLong()) / step.toLong());
   TORCH_CHECK(size_d >= 0 && size_d <= static_cast<double>(std::numeric_limits<int64_t>::max()),
               "invalid size, possible overflow?");
   int64_t size = static_cast<int64_t>(size_d);

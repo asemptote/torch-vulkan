@@ -81,7 +81,12 @@ void main(uint3 id: SV_DispatchThreadID)
     for (uint i = id.x; i < p.n; i += p.stride)
     {
         Offsets o = offsets(i);
+        T a = p.a[o.a];
         T b = B_SCALAR != 0 ? scalar() : p.b[o.b];
-        p.out[o.o] = apply(p.a[o.a], b) ? uint8_t(1) : uint8_t(0);
+#if defined(T_b8)
+        a = a != T(0) ? T(1) : T(0);  // any nonzero byte is true
+        b = b != T(0) ? T(1) : T(0);
+#endif
+        p.out[o.o] = apply(a, b) ? uint8_t(1) : uint8_t(0);
     }
 }

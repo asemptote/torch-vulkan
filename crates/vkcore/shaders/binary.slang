@@ -92,7 +92,7 @@ T apply(T a, T b)
         return m * sqrt(u * u + v * v);
     }
     case BINARY_NEXTAFTER: return nextafter_(a, b);
-    case BINARY_HEAVISIDE: return isnan(a) ? a : (a == T(0) ? b : (a > T(0) ? T(1) : T(0)));
+    case BINARY_HEAVISIDE: return a == T(0) ? b : (a > T(0) ? T(1) : T(0));  // NaN gives 0, as the CPU
     case BINARY_FMAX: return isnan(a) ? b : (isnan(b) ? a : max(a, b));
     case BINARY_FMIN: return isnan(a) ? b : (isnan(b) ? a : min(a, b));
     case BINARY_POW: return m_pow(a, b);

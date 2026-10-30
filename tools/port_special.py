@@ -246,6 +246,13 @@ def main():
             code = head + "{" + rest + "\n" + re.sub(r"(?<=[^\w])" + name + r"\((?=-)", name + "_once(", code)
         if name == "trigamma":
             code = code.replace("double", "FT")
+        # Loops whose exit depends on the arguments get an iteration cap: a GPU
+        # kernel that never finishes hangs the device (no watchdog on most
+        # Linux compute drivers), and driver float optimizations may treat
+        # NaN/inf comparisons differently from the CPU.
+        code = code.replace("while ((i < 9) || (a <= FT(LIT(9.0)))) {",
+                            "while (((i < 9) || (a <= FT(LIT(9.0)))) && i < 1000000) {")
+        code = code.replace("while (t > M_EPS) {", "for (int guard = 0; t > M_EPS && guard < 100000; guard++) {")
         if name == "lanczos_sum_expg_scaled":
             code = re.sub(r"return ratevl\(.*?\);", "RATEVL(x, lanczos_sum_expg_scaled_num, 12, "
                           "lanczos_sum_expg_scaled_denom, 12);", code, flags=re.S)

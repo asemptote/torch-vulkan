@@ -186,7 +186,7 @@ bool fft_dtype(const at::Tensor& t) {
   return is_vk(t) && dtype_label(t.scalar_type()) != nullptr;
 }
 
-at::Tensor fft_c2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward) {
+at::Tensor fft_c2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward) {
   if (!fft_dtype(self) || !at::isComplexType(self.scalar_type())) {
     return on_cpu("aten::_fft_c2c", "", self, dim, normalization, forward)[0].toTensor();
   }
@@ -200,7 +200,7 @@ at::Tensor fft_c2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
   return normalize(out, normalization, n);
 }
 
-at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided) {
+at::Tensor fft_r2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided) {
   if (!fft_dtype(self) || !at::isFloatingType(self.scalar_type()) || dim.empty()) {
     return on_cpu("aten::_fft_r2c", "", self, dim, normalization, onesided)[0].toTensor();
   }
@@ -218,7 +218,7 @@ at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
   return normalize(out, normalization, n);
 }
 
-at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
+at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
   int64_t last = dim.empty() ? 0 : at::maybe_wrap_dim(dim.back(), self.dim());
   if (!fft_dtype(self) || !at::isComplexType(self.scalar_type()) || dim.empty() ||
       self.size(last) < last_dim_size / 2 + 1 || last_dim_size < 1) {
@@ -251,6 +251,86 @@ at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
   shape.back() = last_dim_size;
   at::Tensor out = at::real(spectrum).view(shape).movedim(-1, last).contiguous();
   return normalize(out, normalization, n);
+}
+
+// ---------------------------------------------------------------- output layouts
+
+// The CPU's FFT output layouts (MKL's _exec_fft, which PyTorch's meta kernels
+// reproduce for every non-CUDA device, so FakeTensor expects them too): the
+// untransformed dims ordered by the input's strides (largest first), then
+// the transformed dims in `dims` order, contiguous in that permuted order.
+std::vector<int64_t> exec_fft_strides(at::IntArrayRef in_strides, at::IntArrayRef out_sizes,
+                                      const std::vector<int64_t>& dims) {
+  int64_t ndim = static_cast<int64_t>(out_sizes.size());
+  std::vector<bool> transformed(ndim, false);
+  for (int64_t d : dims) transformed[d] = true;
+  std::vector<int64_t> batch;
+  for (int64_t d = 0; d < ndim; ++d) {
+    if (!transformed[d]) batch.push_back(d);
+  }
+  std::stable_sort(batch.begin(), batch.end(), [&](int64_t a, int64_t b) { return in_strides[a] > in_strides[b]; });
+  std::vector<int64_t> strides(ndim);
+  int64_t step = 1;  // contiguous over [batch..., dims...] (sizes of 0 count as 1)
+  for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
+    strides[*it] = step;
+    step *= std::max<int64_t>(out_sizes[*it], 1);
+  }
+  for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+    strides[*it] = step;
+    step *= std::max<int64_t>(out_sizes[*it], 1);
+  }
+  return strides;
+}
+
+// dims sorted by the input's strides, largest first (all but the last with exclude_last).
+std::vector<int64_t> sort_dims(at::IntArrayRef in_strides, at::IntArrayRef dim, bool exclude_last) {
+  std::vector<int64_t> sorted(dim.begin(), dim.end());
+  auto end = sorted.end() - (exclude_last && !sorted.empty() ? 1 : 0);
+  std::stable_sort(sorted.begin(), end, [&](int64_t a, int64_t b) { return in_strides[a] > in_strides[b]; });
+  return sorted;
+}
+
+at::Tensor with_strides(const at::Tensor& result, const std::vector<int64_t>& strides) {
+  if (!at::hasMKL() || result.strides() == at::IntArrayRef(strides)) {
+    // (Without MKL the CPU's outputs are contiguous, as ours.) A result that
+    // is a view of a working buffer (e.g. the onesided half of a full
+    // spectrum) is copied: an op's output must not be a view.
+    return result.is_view() ? result.clone() : result;
+  }
+  at::Tensor out = at::empty_strided(result.sizes(), strides, result.options());
+  out.copy_(result);
+  return out;
+}
+
+// The registered kernels: results in the CPU's layouts.
+at::Tensor fft_c2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward) {
+  at::Tensor result = fft_c2c_compute(self, dim, normalization, forward);
+  if (dim.empty() || !is_vk(result)) {
+    return result;
+  }
+  return with_strides(result, exec_fft_strides(self.strides(), result.sizes(), sort_dims(self.strides(), dim, false)));
+}
+
+at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided) {
+  at::Tensor result = fft_r2c_compute(self, dim, normalization, onesided);
+  if (dim.empty() || !is_vk(result)) {
+    return result;
+  }
+  return with_strides(result, exec_fft_strides(self.strides(), result.sizes(), sort_dims(self.strides(), dim, true)));
+}
+
+at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
+  at::Tensor result = fft_c2r_compute(self, dim, normalization, last_dim_size);
+  if (dim.empty() || !is_vk(result)) {
+    return result;
+  }
+  // The CPU first does the c2c transforms of all but the last dim, then the c2r of the last.
+  std::vector<int64_t> in_strides(self.strides().begin(), self.strides().end());
+  if (dim.size() > 1) {
+    at::IntArrayRef c2c_dims = dim.slice(0, dim.size() - 1);
+    in_strides = exec_fft_strides(self.strides(), self.sizes(), sort_dims(self.strides(), c2c_dims, false));
+  }
+  return with_strides(result, exec_fft_strides(in_strides, result.sizes(), {dim.back()}));
 }
 
 }  // namespace

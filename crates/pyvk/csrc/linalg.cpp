@@ -132,8 +132,13 @@ bool complex_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
 }
 
 // c = alpha a @ b (+ beta cin) for real or complex 3-D views.
-bool any_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+bool any_gemm(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& c, const at::Tensor* cin_in,
               const at::Scalar& alpha, const at::Scalar& beta) {
+  // Matrix products handle lazy conjugate / negative inputs themselves in
+  // PyTorch (they skip the fallbacks that materialize them): resolve them here.
+  at::Tensor a = a_in.resolve_conj().resolve_neg(), b = b_in.resolve_conj().resolve_neg();
+  at::Tensor cin_resolved = cin_in != nullptr ? cin_in->resolve_conj().resolve_neg() : at::Tensor();
+  const at::Tensor* cin = cin_in != nullptr ? &cin_resolved : nullptr;
   if (at::isComplexType(c.scalar_type())) {
     return complex_gemm(a, b, c, cin, alpha, beta);
   }

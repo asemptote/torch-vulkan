@@ -22,7 +22,21 @@ T apply(T x)
     {
     case UNARY_NEG: return -x;
     case UNARY_ABS: return abs(x);
-    case UNARY_RELU: return x > T(0) ? x : T(0);
+#ifdef IS_FLOAT
+    case UNARY_RELU: {
+        // On the bits: drivers turn any `x < 0 ? 0 : x` (even with NaN checks
+        // around it) into a max(), which drops NaN. Negative non-NaN values
+        // become 0; NaN, -0.0 and the rest are kept, as on the CPU.
+        UBITS bits = bit_cast<UBITS>(x);
+        UBITS sign = UBITS(1) << (sizeof(UBITS) * 8 - 1);
+        UBITS magnitude = bits & ~sign;
+        UBITS inf_bits = bit_cast<UBITS>(m_inf());
+        bool negative = (bits & sign) != UBITS(0) && magnitude != UBITS(0) && magnitude <= inf_bits;
+        return negative ? T(0) : x;
+    }
+#else
+    case UNARY_RELU: return x < T(0) ? T(0) : x;
+#endif
     case UNARY_SQUARE: return x * x;
     case UNARY_SIGN: return T(sign(x));
 #ifdef IS_FLOAT
@@ -75,20 +89,21 @@ T apply(T x)
     case UNARY_ELU:  // alpha, scale = beta, input_scale = gamma
         return x > T(0) ? T(beta()) * x : T(beta()) * T(alpha()) * m_expm1(x * T(gamma()));
     case UNARY_LOGIT: {  // eps = alpha, applied when gamma != 0
+        if (isnan(x)) return x;  // explicit: float64 comparisons with NaN are not trusted to be false
         T z = x;
-        if (T(gamma()) != T(0)) z = min(max(z, T(alpha())), T(1) - T(alpha()));
+        if (T(gamma()) != T(0)) z = z < T(alpha()) ? T(alpha()) : (z > T(1) - T(alpha()) ? T(1) - T(alpha()) : z);  // NaN stays
         return m_log(z / (T(1) - z));
     }
-    case UNARY_HARDTANH: return min(max(x, T(alpha())), T(beta()));
-    case UNARY_HARDSWISH: return x * min(max(x + T(3), T(0)), T(6)) / T(6);
-    case UNARY_HARDSIGMOID: return min(max(x + T(3), T(0)), T(6)) / T(6);
+    case UNARY_HARDTANH: return x < T(alpha()) ? T(alpha()) : (x > T(beta()) ? T(beta()) : x);  // NaN stays
+    case UNARY_HARDSWISH: return isnan(x) ? x : x * min(max(x + T(3), T(0)), T(6)) / T(6);
+    case UNARY_HARDSIGMOID: return isnan(x) ? x : min(max(x + T(3), T(0)), T(6)) / T(6);
     case UNARY_LEAKY_RELU: return x > T(0) ? x : x * T(alpha());
     case UNARY_SOFTSHRINK: {
         T l = T(alpha());
-        return x > l ? x - l : (x < -l ? x + l : T(0));
+        return x > l ? x - l : (x < -l ? x + l : x * T(0));  // x * 0 keeps NaN and the sign of zero
     }
-    case UNARY_HARDSHRINK: return abs(x) > T(alpha()) ? x : T(0);
-    case UNARY_THRESHOLD: return x > T(alpha()) ? x : T(beta());
+    case UNARY_HARDSHRINK: return (x >= -T(alpha()) && x <= T(alpha())) ? T(0) : x;  // NaN stays
+    case UNARY_THRESHOLD: return x <= T(alpha()) ? T(beta()) : x;  // NaN stays
     case UNARY_NAN_TO_NUM: {  // nan, posinf, neginf
         if (isnan(x)) return T(alpha());
         if (isinf(x)) return x > T(0) ? T(beta()) : T(gamma());

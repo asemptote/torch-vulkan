@@ -138,7 +138,7 @@ float sinc32(float x)
 {
     if (isnan(x)) return x;
     if (x == 0.0f) return 1.0f;
-    if (isinf(x)) return 0.0f;
+    if (isinf(x)) return f32_nan();  // as sin(inf) / inf on the CPU
     return sinpi32(x) / (M32_PI * x);
 }
 

@@ -133,7 +133,7 @@ bool complex_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& 
 }
 
 bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tensor& out) {
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   if (at::isComplexType(self.scalar_type())) {
     return complex_unary_gpu(code, self, out);
   }
@@ -168,8 +168,23 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   return true;
 }
 
+// The dtype PyTorch computes unary op `code` in for self.
+at::ScalarType unary_result(uint32_t code, Kind kind, const at::Tensor& self) {
+  at::ScalarType t = self.scalar_type();
+  if (at::isComplexType(t)) {
+    return code == op::UNARY_ABS ? c10::toRealValueType(t) : t;
+  }
+  bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
+                  code == op::UNARY_ROUND;
+  if (kind == Kind::Float && !at::isFloatingType(t) && !rounding) {
+    return c10::typeMetaToScalarType(at::get_default_dtype());
+  }
+  return t;
+}
+
 template <size_t I>
 at::Tensor& unary_out(const at::Tensor& self, at::Tensor& out) {
+  check_out_cast(unary_result(kUnary[I].code, kUnary[I].kind, self), out);
   if (!unary_gpu(kUnary[I].code, kUnary[I].kind, self, out)) {
     on_cpu(kUnary[I].name, "out", self, out);
   }
@@ -192,7 +207,7 @@ at::Tensor& relu_(at::Tensor& self) {
 }
 
 at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   const char* label = dtype_label(self.scalar_type());
   if (!at::isComplexType(self.scalar_type())) {
     out.copy_(self);  // conj of a real tensor is itself
@@ -292,7 +307,13 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   if (!is_vk(out)) {
     return false;
   }
-  at::native::resize_output(out, other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec());
+  {
+    std::vector<int64_t> shape =
+        other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec();
+    const at::Tensor* like = self.sizes() == at::IntArrayRef(shape) ? &self
+                             : other != nullptr && other->sizes() == at::IntArrayRef(shape) ? other : nullptr;
+    resize_elementwise_output(out, shape, like);
+  }
   const at::Tensor* lhs = &self;
   std::optional<at::Scalar> scalar;
   if (other_scalar != nullptr) {
@@ -324,12 +345,17 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       return true;
     }
     if (!(op.commutes && alpha.equal(1))) {
-      return false;
+      // Any other op: the scalar as a 0-dim vk tensor, still marked as a
+      // wrapped number so type promotion treats it as the Python number it is.
+      at::Tensor moved = self.to(other->device());
+      moved.unsafeGetTensorImpl()->set_wrapped_number(self.unsafeGetTensorImpl()->is_wrapped_number());
+      return binary_gpu(op, moved, other, nullptr, alpha, out);
     }
     scalar = self.item();
     lhs = other;
   }
   at::ScalarType promoted = scalar ? at::result_type(*lhs, *scalar) : at::result_type(*lhs, *other);
+  check_out_cast(compute_dtype(op, promoted), out);
   if (!at::isFloatingType(promoted) && !at::isComplexType(promoted) &&
       (op.code == op::BINARY_FMAX || op.code == op::BINARY_FMIN)) {
     // No NaNs to ignore: fmax and fmin are maximum and minimum.
@@ -468,7 +494,13 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
   if (!is_vk(self) || !is_vk(out)) {
     return false;
   }
-  at::native::resize_output(out, other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec());
+  {
+    std::vector<int64_t> shape =
+        other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec();
+    const at::Tensor* like = self.sizes() == at::IntArrayRef(shape) ? &self
+                             : other != nullptr && other->sizes() == at::IntArrayRef(shape) ? other : nullptr;
+    resize_elementwise_output(out, shape, like);
+  }
   std::optional<at::Scalar> scalar;
   if (other_scalar != nullptr) {
     scalar = *other_scalar;
@@ -559,6 +591,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("remainder.Tensor_out", &binary_out<11>);
   m.impl("fmod.Tensor_out", &binary_out<12>);
   m.impl("floor_divide.out", &binary_out<13>);
+
   m.impl("copysign.out", &binary_out<14>);
   m.impl("hypot.out", &binary_out<15>);
   m.impl("nextafter.out", &binary_out<16>);

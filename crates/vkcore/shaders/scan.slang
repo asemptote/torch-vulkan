@@ -100,7 +100,11 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         for (uint k = 0; k < ITEMS; k++)
         {
             uint i = first + k;
+#if defined(T_b8)
+            A v = i < p.n ? A(p.in[base + int(i) * p.dstride] != T(0) ? 1 : 0) : identity();  // any nonzero byte is true
+#else
             A v = i < p.n ? A(p.in[base + int(i) * p.dstride]) : identity();
+#endif
             running = combine(running, v);
             items[k] = running;
         }

@@ -126,7 +126,7 @@ FT zeta(FT x, FT q)  {
   a = q;
   int i = 0;
   b = zero;
-  while ((i < 9) || (a <= FT(LIT(9.0)))) {
+  while (((i < 9) || (a <= FT(LIT(9.0)))) && i < 1000000) {
     i += 1;
     a += one;
     b = m_pow(a, -x);
@@ -1202,7 +1202,7 @@ FT airy_ai_forward(FT x) {
     FT t = LIT(1.0);
     FT z = x * x * x;
 
-    while (t > M_EPS) {
+    for (int guard = 0; t > M_EPS && guard < 100000; guard++) {
         m *= z;
         k += FT(LIT(1.0));
         m /= k;

@@ -99,7 +99,11 @@ A combine(A a, A b)
 // First-level transform of an input element.
 A load(T x, uint o)
 {
+#if defined(T_b8)
+    A v = A(x != T(0) ? 1 : 0);  // any nonzero byte is true (as on the CPU)
+#else
     A v = A(x);
+#endif
     if (LEVEL0 == 0) return v;
     switch (OP)
     {

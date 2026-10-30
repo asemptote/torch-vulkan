@@ -50,7 +50,9 @@ K key_of(T v)
     return key_of_float(float(v));
 #elif defined(T_bf16)
     return key_of_float(bit_cast<float>(uint(v) << 16));
-#elif defined(T_b8) || defined(T_u8)
+#elif defined(T_b8)
+    return v != T(0) ? 1u : 0u;  // any nonzero byte is true
+#elif defined(T_u8)
     return uint(v);
 #else  // i32, i8, i16
     return uint(int(v)) ^ 0x80000000u;

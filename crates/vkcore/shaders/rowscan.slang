@@ -42,6 +42,12 @@ bool is_nan(T v)
 #endif
 }
 
+#if defined(T_b8)
+#define LOADX(i) (p.x[i] != T(0) ? T(1) : T(0))  // any nonzero byte is true
+#else
+#define LOADX(i) p.x[i]
+#endif
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -51,13 +57,13 @@ void main(uint3 id: SV_DispatchThreadID)
         uint base = row * p.n;
         if (OP == ROWSCAN_MODE)
         {
-            T best = p.x[base];
+            T best = LOADX(base);
             int64_t best_idx = p.idx[base];
             uint best_count = 0u, count = 0u;
             for (uint j = 0u; j < p.n; j++)
             {
-                T v = p.x[base + j];
-                count = (j > 0u && v == p.x[base + j - 1u]) ? count + 1u : 1u;
+                T v = LOADX(base + j);
+                count = (j > 0u && v == LOADX(base + j - 1u)) ? count + 1u : 1u;
                 if (count > best_count)
                 {
                     best_count = count;
@@ -70,11 +76,11 @@ void main(uint3 id: SV_DispatchThreadID)
             p.out_idx[row] = best_idx;
             continue;
         }
-        T acc = p.x[base];
+        T acc = LOADX(base);
         int64_t at = 0;
         for (uint j = 0u; j < p.n; j++)
         {
-            T v = p.x[base + j];
+            T v = LOADX(base + j);
             if (OP == ROWSCAN_LOGCUMSUMEXP)
             {
 #ifdef IS_FLOAT

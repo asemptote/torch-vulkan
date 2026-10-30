@@ -49,6 +49,9 @@ DST store(DV x) { return x; }
 
 DV convert(SV x)
 {
+#if defined(SRC_b8)
+    x = x != SV(0) ? SV(1) : SV(0);  // any nonzero byte is true (as on the CPU)
+#endif
 #if defined(DST_b8)
 #ifdef SRC_COMPLEX
     return (x.x != 0 || x.y != 0) ? uint8_t(1) : uint8_t(0);

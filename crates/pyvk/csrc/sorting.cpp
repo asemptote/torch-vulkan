@@ -122,6 +122,9 @@ std::tuple<at::Tensor, at::Tensor> sort_along(const at::Tensor& self, int64_t di
 }
 
 void assign_out(at::Tensor& out, const at::Tensor& result) {
+  if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
+    check_out_cast(result.scalar_type(), out);
+  }
   at::native::resize_output(out, result.sizes());
   out.copy_(result);
 }

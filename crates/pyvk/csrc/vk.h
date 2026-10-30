@@ -13,6 +13,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <ATen/native/Resize.h>
+
+#include <algorithm>
 #include <vector>
 
 extern "C" {
@@ -143,6 +146,69 @@ bool binary_op_gpu(int64_t code, const at::Tensor& self, const at::Tensor* other
 
 inline at::Tensor to_dtype(const at::Tensor& t, at::ScalarType dtype) {
   return t.scalar_type() == dtype ? t : t.to(dtype);
+}
+
+// Output layouts as PyTorch's own kernels give them: functional kernels here
+// ask the op's meta kernel (shapes and strides only, no data) and lay their
+// results out the same way, so strides agree with the CPU and with
+// FakeTensor (e.g. column-major linalg outputs, FFT outputs that keep the
+// input's dim order).
+
+// A meta tensor with t's sizes, strides and dtype.
+inline at::Tensor meta_of(const at::Tensor& t) {
+  return at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta));
+}
+
+inline std::optional<at::Tensor> meta_of(const std::optional<at::Tensor>& t) {
+  return t.has_value() && t->defined() ? std::optional<at::Tensor>(meta_of(*t)) : std::nullopt;
+}
+
+// An empty vk tensor shaped and strided like the meta tensor `layout`.
+inline at::Tensor empty_like_meta(const at::Tensor& layout, const at::TensorOptions& vk_options) {
+  return at::empty_strided(layout.sizes(), layout.strides(), vk_options.dtype(layout.scalar_type()));
+}
+
+// `result` laid out like the meta tensor `layout` (result itself if it already is).
+inline at::Tensor laid_out_like(const at::Tensor& result, const at::Tensor& layout) {
+  if (result.sizes() != layout.sizes() || result.strides() == layout.strides()) {
+    return result;
+  }
+  at::Tensor out = empty_like_meta(layout, result.options());
+  out.copy_(result);
+  return out;
+}
+
+// Resizes an element-wise op's output as PyTorch's TensorIterator does: an
+// output that must be resized (e.g. a fresh empty one) takes the dim order
+// of `like` (an input of the output's shape, if any), contiguous in that
+// order, so ops on transposed or channels-last inputs keep their layout.
+inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like) {
+  if (out.sizes() == shape) {
+    return;
+  }
+  at::native::resize_output(out, shape);
+  if (like == nullptr || like->sizes() != shape || like->is_contiguous() || shape.size() < 2) {
+    return;
+  }
+  int64_t n = static_cast<int64_t>(shape.size());
+  std::vector<int64_t> order(n);  // dims from outermost (largest stride) to innermost
+  for (int64_t d = 0; d < n; ++d) order[d] = d;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int64_t a, int64_t b) { return like->stride(a) > like->stride(b); });
+  std::vector<int64_t> strides(n);
+  int64_t step = 1;
+  for (int64_t i = n - 1; i >= 0; --i) {
+    strides[order[i]] = step;
+    step *= std::max<int64_t>(shape[order[i]], 1);
+  }
+  out.as_strided_(shape, strides);
+}
+
+// PyTorch's rule for out= arguments: the result dtype must cast safely to
+// out's (no float -> integer, complex -> real, ...).
+inline void check_out_cast(at::ScalarType result, const at::Tensor& out) {
+  TORCH_CHECK(at::canCast(result, out.scalar_type()), "result type ", result,
+              " can't be cast to the desired output type ", out.scalar_type());
 }
 
 // Runs `body(target)` writing into `out` directly when its dtype is `dtype`,

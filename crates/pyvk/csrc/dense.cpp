@@ -94,18 +94,19 @@ bool gpu_matrices(const at::Tensor& t) {
 }
 
 // [B, rows, cols] view (or copy) of t's matrices; B explicit so empty
-// batches work.
+// batches work. Lazy conjugate / negative views are materialized: the
+// kernels read raw memory (and .contiguous() keeps a contiguous view lazy).
 at::Tensor flat3(const at::Tensor& t) {
   int64_t batch = 1;
   for (int64_t d = 0; d + 2 < t.dim(); ++d) batch *= t.size(d);
-  return t.reshape({batch, t.size(-2), t.size(-1)});
+  return t.resolve_conj().resolve_neg().reshape({batch, t.size(-2), t.size(-1)});
 }
 
 // [B, k] of a batch of vectors t [..., k].
 at::Tensor flat2(const at::Tensor& t) {
   int64_t batch = 1;
   for (int64_t d = 0; d + 1 < t.dim(); ++d) batch *= t.size(d);
-  return t.reshape({batch, t.size(-1)});
+  return t.resolve_conj().resolve_neg().reshape({batch, t.size(-1)});
 }
 
 // [B, rows, cols] contiguous copy of t's matrices.
@@ -145,6 +146,24 @@ FactorParams params_for(const at::Tensor& a3) {
   p.ld = static_cast<uint32_t>(a3.stride(1));
   p.sa = static_cast<uint32_t>(a3.stride(0));
   return p;
+}
+
+// An empty tensor of `sizes` whose matrices (last two dims) are column-major.
+at::Tensor empty_column_major(at::IntArrayRef sizes, const at::TensorOptions& opts) {
+  std::vector<int64_t> strides(sizes.size());
+  int64_t step = 1;
+  int64_t n = static_cast<int64_t>(sizes.size());
+  for (int64_t d : {n - 2, n - 1}) {
+    if (d >= 0) {
+      strides[d] = step;
+      step *= std::max<int64_t>(sizes[d], 1);
+    }
+  }
+  for (int64_t d = n - 3; d >= 0; --d) {
+    strides[d] = step;
+    step *= std::max<int64_t>(sizes[d], 1);
+  }
+  return at::empty_strided(sizes, strides, opts);
 }
 
 // ---------------------------------------------------------------- triangular solves
@@ -278,6 +297,9 @@ void check_errors(const at::Tensor& info, const char* api, bool is_matrix) {
 
 template <typename T>
 void assign(at::Tensor& out, const T& value) {
+  if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
+    check_out_cast(value.scalar_type(), out);
+  }
   at::native::resize_output(out, value.sizes());
   out.copy_(value);
 }
@@ -711,7 +733,9 @@ at::Tensor& solve_triangular_out(const at::Tensor& a, const at::Tensor& b, bool 
 }
 
 at::Tensor solve_triangular_vk(const at::Tensor& a, const at::Tensor& b, bool upper, bool left, bool unit) {
-  at::Tensor out = at::empty({0}, b.options());
+  // Laid out as the meta kernel says (column-major matrices, as LAPACK's).
+  at::Tensor out = empty_like_meta(at::linalg_solve_triangular(meta_of(a), meta_of(b), upper, left, unit),
+                                   b.options());
   return solve_triangular_out(a, b, upper, left, unit, out);
 }
 
@@ -905,8 +929,9 @@ std::tuple<at::Tensor&, at::Tensor&> eigh_out(const at::Tensor& a, c10::string_v
 }
 
 std::tuple<at::Tensor, at::Tensor> eigh_vk(const at::Tensor& a, c10::string_view uplo, bool compute_v) {
-  at::Tensor w = at::empty({0}, a.options().dtype(c10::toRealValueType(a.scalar_type())));
-  at::Tensor v = at::empty({0}, a.options());
+  auto [mw, mv] = at::_linalg_eigh(meta_of(a), uplo, compute_v);
+  at::Tensor w = empty_like_meta(mw, a.options());
+  at::Tensor v = empty_like_meta(mv, a.options());
   eigh_out(a, uplo, compute_v, w, v);
   return {w, v};
 }
@@ -942,8 +967,12 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> svd_vk(const at::Tensor& a, bool full_matrices, bool compute_uv,
                                                    std::optional<c10::string_view> driver) {
-  at::Tensor U = at::empty({0}, a.options()), Vh = at::empty({0}, a.options());
-  at::Tensor S = at::empty({0}, a.options().dtype(c10::toRealValueType(a.scalar_type())));
+  // (PyTorch's meta kernel treats meta tensors as CUDA ones, whose Vh is
+  // row-major; for other devices, as on the CPU, Vh is column-major.)
+  auto [mU, mS, mVh] = at::_linalg_svd(meta_of(a), full_matrices, compute_uv, driver);
+  at::Tensor U = empty_like_meta(mU, a.options());
+  at::Tensor Vh = compute_uv ? empty_column_major(mVh.sizes(), a.options()) : empty_like_meta(mVh, a.options());
+  at::Tensor S = empty_like_meta(mS, a.options());
   svd_out(a, full_matrices, compute_uv, driver, U, S, Vh);
   return {U, S, Vh};
 }
@@ -1130,7 +1159,9 @@ std::tuple<at::Tensor&, at::Tensor&> eig_out(const at::Tensor& a, at::Tensor& va
 
 std::tuple<at::Tensor, at::Tensor> eig_vk(const at::Tensor& a) {
   at::ScalarType ct = complex_of(a.scalar_type());
-  at::Tensor w = at::empty({0}, a.options().dtype(ct)), v = at::empty({0}, a.options().dtype(ct));
+  // Column-major eigenvectors, as LAPACK's geev returns them on the CPU.
+  at::Tensor w = at::empty({0}, a.options().dtype(ct));
+  at::Tensor v = empty_column_major(a.sizes(), a.options().dtype(ct));
   eig_out(a, w, v);
   return {w, v};
 }

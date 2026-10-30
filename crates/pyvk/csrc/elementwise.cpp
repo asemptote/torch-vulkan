@@ -157,6 +157,11 @@ std::tuple<at::Tensor&, at::Tensor&> log_sigmoid_forward_out(const at::Tensor& s
 // Scalar bounds: UNARY_CLAMP with the bounds in alpha and beta.
 bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& lo,
                       const std::optional<at::Scalar>& hi, const at::Tensor& out) {
+  at::ScalarType result = self.scalar_type();
+  for (const auto* bound : {&lo, &hi}) {
+    if (bound->has_value()) result = at::promote_types(result, at::result_type(self, **bound));
+  }
+  check_out_cast(result, out);
   at::native::resize_output(out, self.sizes());
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(self) || !is_vk(out) || !(is_float(dtype) || is_int(dtype))) {
@@ -204,6 +209,10 @@ at::Tensor& clamp_max_out(const at::Tensor& self, const at::Scalar& max, at::Ten
 // Tensor bounds: TERNARY_CLAMP.
 bool clamp_tensor_gpu(const at::Tensor& self, const std::optional<at::Tensor>& lo,
                       const std::optional<at::Tensor>& hi, const at::Tensor& out) {
+  at::ScalarType result = self.scalar_type();
+  if (lo.has_value()) result = at::promote_types(result, at::result_type(self, *lo));
+  if (hi.has_value()) result = at::promote_types(result, at::result_type(self, *hi));
+  check_out_cast(result, out);
   std::vector<int64_t> shape = self.sizes().vec();
   for (const auto* t : {&lo, &hi}) {
     if (t->has_value()) shape = at::infer_size(shape, (*t)->sizes());
@@ -344,6 +353,7 @@ void where_operand(const at::Tensor& t, const at::Tensor*& tensor, std::optional
 }
 
 at::Tensor& where_out(const at::Tensor& cond, const at::Tensor& self, const at::Tensor& other, at::Tensor& out) {
+  check_out_cast(at::result_type(self, other), out);
   const at::Tensor *a = nullptr, *b = nullptr;
   std::optional<at::Scalar> sa, sb;
   where_operand(self, a, sa);
@@ -446,6 +456,7 @@ at::Tensor& lerp_tensor_out(const at::Tensor& self, const at::Tensor& end, const
 
 at::Tensor& addcmul_out(const at::Tensor& self, const at::Tensor& t1, const at::Tensor& t2, const at::Scalar& value,
                         at::Tensor& out) {
+  check_out_cast(at::promote_types(at::result_type(self, t1), at::result_type(t1, t2)), out);
   if (complex_ternary(self, t1, out) && is_vk(t2)) {
     at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), t1.sizes()), t2.sizes()));
     out.copy_(at::add(self, at::mul(at::mul(t1, t2), value)));
@@ -500,6 +511,10 @@ at::Tensor& polar_out(const at::Tensor& abs, const at::Tensor& angle, at::Tensor
 }
 
 at::Tensor& angle_out(const at::Tensor& self, at::Tensor& out) {
+  check_out_cast(at::isComplexType(self.scalar_type()) ? c10::toRealValueType(self.scalar_type())
+                 : at::isFloatingType(self.scalar_type()) ? self.scalar_type()
+                                                          : c10::typeMetaToScalarType(c10::get_default_dtype()),
+                 out);
   if (!is_vk(self) || !is_vk(out)) {
     on_cpu("aten::angle", "out", self, out);
     return out;
@@ -578,7 +593,9 @@ at::Tensor angle(const at::Tensor& self) {
 }
 
 at::Tensor floor_divide(const at::Tensor& self, const at::Tensor& other) {
-  at::Tensor out = at::empty({0}, self.options().dtype(at::result_type(self, other)));
+  // On the vk operand's device (self may be a CPU scalar: floor_divide(2.5, x)).
+  const at::Tensor& like = is_vk(self) ? self : other;
+  at::Tensor out = at::empty({0}, like.options().dtype(at::result_type(self, other)));
   return at::floor_divide_out(out, self, other);
 }
 

@@ -291,7 +291,7 @@ double sinc64(double x)
 {
     if (isnan(x)) return x;
     if (x == 0.0l) return 1.0l;
-    if (isinf(x)) return 0.0l;
+    if (isinf(x)) return f64_nan();  // as sin(inf) / inf on the CPU
     return sinpi64(x) / (PI_HI * x);
 }
 

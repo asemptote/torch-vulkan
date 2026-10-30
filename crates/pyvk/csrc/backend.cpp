@@ -27,27 +27,44 @@ namespace vk {
 
 namespace {
 
-void delete_ctx(void* p) {
-  auto* ctx = static_cast<AllocCtx*>(p);
-  vkt_free(ctx->handle);
-  delete ctx;
+// Live allocations by host address. The DataPtr's context is its data
+// pointer (as PyTorch's copy-on-write storages require: they wrap simple
+// DataPtrs only), so the allocation behind a pointer is looked up here.
+std::mutex g_allocations_mutex;
+std::map<const uint8_t*, AllocCtx> g_allocations;
+
+void delete_allocation(void* p) {
+  if (p == nullptr) {
+    return;
+  }
+  void* handle = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_allocations_mutex);
+    auto it = g_allocations.find(static_cast<const uint8_t*>(p));
+    TORCH_INTERNAL_ASSERT(it != g_allocations.end(), "torch_vulkan: freeing an unknown allocation");
+    handle = it->second.handle;
+    g_allocations.erase(it);
+  }
+  vkt_free(handle);
 }
 
 struct VkAllocator final : c10::Allocator {
   c10::DataPtr allocate(size_t nbytes) override {
     c10::Device device(kDevice, 0);
     if (nbytes == 0) {
-      return {nullptr, nullptr, &delete_ctx, device};
+      return {nullptr, nullptr, &delete_allocation, device};
     }
     VktAlloc a{};
     check(vkt_alloc(nbytes, &a));
-    auto* ctx = new AllocCtx{a.handle, a.host, a.address, a.size};
-    return {a.host, ctx, &delete_ctx, device};
+    {
+      std::lock_guard<std::mutex> lock(g_allocations_mutex);
+      g_allocations[a.host] = AllocCtx{a.handle, a.host, a.address, a.size};
+    }
+    return {a.host, a.host, &delete_allocation, device};
   }
 
-  // data() and context differ, so raw_allocate/raw_deallocate are unsupported.
   c10::DeleterFnPtr raw_deleter() const override {
-    return nullptr;
+    return &delete_allocation;
   }
 
   void copy_data(void* dest, const void* src, std::size_t count) const override {
@@ -68,9 +85,16 @@ uint64_t gpu_address(const at::TensorBase& t, const void* data) {
   if (data == nullptr) {
     return 0;
   }
-  auto* ctx = static_cast<AllocCtx*>(t.storage().data_ptr().get_context());
-  TORCH_CHECK(ctx != nullptr, "torch_vulkan: tensor storage was not allocated by the vk allocator");
-  return ctx->address + (static_cast<const uint8_t*>(data) - ctx->host);
+  // The allocation containing `data` (a view may point anywhere inside it).
+  const auto* p = static_cast<const uint8_t*>(data);
+  std::lock_guard<std::mutex> lock(g_allocations_mutex);
+  auto it = g_allocations.upper_bound(p);
+  TORCH_CHECK(it != g_allocations.begin(), "torch_vulkan: tensor storage was not allocated by the vk allocator");
+  --it;
+  const AllocCtx& a = it->second;
+  TORCH_CHECK(p < a.host + a.size || (p == a.host + a.size && a.size > 0),
+              "torch_vulkan: tensor storage was not allocated by the vk allocator");
+  return a.address + static_cast<uint64_t>(p - a.host);
 }
 
 uint64_t gpu_address(const at::TensorBase& t) {
@@ -303,6 +327,7 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
 }
 
 at::Tensor host_view(const at::Tensor& vk_tensor);
+at::Tensor host_view_const(const at::Tensor& vk_tensor);
 
 // dst (vk) <- src (cpu), with broadcasting and dtype conversion.
 void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
@@ -329,6 +354,13 @@ void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
 // touches it again; callers synchronize first).
 at::Tensor host_view(const at::Tensor& t) {
   return at::from_blob(t.data_ptr(), t.sizes(), t.strides(), at::TensorOptions().dtype(t.scalar_type()));
+}
+
+// A read-only host view: does not materialize a copy-on-write storage (as
+// asking for the mutable data pointer would).
+at::Tensor host_view_const(const at::Tensor& t) {
+  return at::from_blob(const_cast<void*>(t.const_data_ptr()), t.sizes(), t.strides(),
+                       at::TensorOptions().dtype(t.scalar_type()));
 }
 
 // Applies conj (complex) and/or negation in place to vk tensor `t`'s data.
@@ -377,7 +409,7 @@ at::Tensor copy_from(const at::Tensor& self, const at::Tensor& dst, bool /*non_b
   } else {
     TORCH_CHECK(src_vk && dst.is_cpu(), "torch_vulkan: unsupported copy from ", self.device(), " to ", dst.device());
     synchronize();
-    at::Tensor host = host_view(self);
+    at::Tensor host = host_view_const(self);
     if (self.is_conj()) host = host.conj();
     if (self.is_neg()) host = host._neg_view();
     dst.copy_(host);
@@ -396,7 +428,7 @@ at::Tensor copy_from_and_resize(const at::Tensor& self, const at::Tensor& dst) {
 
 at::Scalar local_scalar_dense(const at::Tensor& self) {
   synchronize();
-  return host_view(self).item();
+  return host_view_const(self).item();
 }
 
 at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {
@@ -509,7 +541,37 @@ extern "C" void vkt_register_backend() {
   at::RegisterPrivateUse1HooksInterface(new vk::VkHooks());
 }
 
+namespace vk {
+namespace {
+
+// set_ overloads besides (storage, offset, size, stride): the whole storage
+// as a 1-D tensor, another tensor's view, or a fresh empty storage. (Storage
+// copies, e.g. untyped_storage().clone(), go through these.)
+at::Tensor& set_storage(at::Tensor& self, c10::Storage source) {
+  int64_t numel = static_cast<int64_t>(source.nbytes() / self.dtype().itemsize());
+  return at::native::set_storage_cpu_(self, std::move(source), 0, {numel}, {});
+}
+
+at::Tensor& set_tensor(at::Tensor& self, const at::Tensor& source) {
+  if (self.unsafeGetTensorImpl() == source.unsafeGetTensorImpl()) {
+    return self;
+  }
+  return at::native::set_storage_cpu_(self, source.storage(), source.storage_offset(), source.sizes(),
+                                      source.strides());
+}
+
+at::Tensor& set_empty(at::Tensor& self) {
+  c10::Storage empty(c10::Storage::use_byte_size_t(), 0, allocator(), /*resizable=*/true);
+  return at::native::set_storage_cpu_(self, std::move(empty), 0, {0}, {});
+}
+
+}  // namespace
+}  // namespace vk
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  m.impl("set_.source_Storage", vk::set_storage);
+  m.impl("set_.source_Tensor", vk::set_tensor);
+  m.impl("set_", vk::set_empty);
   m.impl("empty.memory_format", vk::empty_memory_format);
   m.impl("empty_strided", vk::empty_strided);
   m.impl("view", at::native::view);
@@ -541,4 +603,10 @@ TORCH_LIBRARY_IMPL(aten, Negative, m) {
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&vk::cpu_fallback>());
+}
+
+// Autocast on "vk" changes no dtypes (no lower-precision policy for this
+// backend yet): every op passes straight through the AutocastPrivateUse1 key.
+TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
+  m.fallback(torch::CppFunction::makeFallthrough());
 }
