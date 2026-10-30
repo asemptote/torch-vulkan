@@ -32,6 +32,11 @@ extern "C" {
     fn vkt_clear_fft_caches();
     fn vkt_release_device_error_word();
     fn vkt_take_device_error() -> i32;
+    fn vkt_manual_seed(seed: u64);
+    fn vkt_initial_seed() -> u64;
+    fn vkt_seed() -> u64;
+    fn vkt_get_rng_state(seed: *mut u64, offset: *mut u64);
+    fn vkt_set_rng_state(seed: u64, offset: u64);
     fn vkt_fallback_counts(buf: *mut std::ffi::c_char, len: usize) -> usize;
 }
 
@@ -44,6 +49,37 @@ fn synchronize() -> PyResult<()> {
         return Err(PyIndexError::new_err("torch_vulkan: index out of range in an earlier indexing kernel"));
     }
     Ok(())
+}
+
+/// Seeds the default random generator (offset back to 0).
+#[pyfunction]
+fn manual_seed(seed: u64) {
+    unsafe { vkt_manual_seed(seed) }
+}
+
+/// The default generator's seed.
+#[pyfunction]
+fn initial_seed() -> u64 {
+    unsafe { vkt_initial_seed() }
+}
+
+/// Seeds the default generator nondeterministically; returns the seed.
+#[pyfunction]
+fn seed() -> u64 {
+    unsafe { vkt_seed() }
+}
+
+/// (seed, offset) of the default generator.
+#[pyfunction]
+fn get_rng_state() -> (u64, u64) {
+    let (mut s, mut o) = (0u64, 0u64);
+    unsafe { vkt_get_rng_state(&mut s, &mut o) };
+    (s, o)
+}
+
+#[pyfunction]
+fn set_rng_state(seed: u64, offset: u64) {
+    unsafe { vkt_set_rng_state(seed, offset) }
 }
 
 #[pyfunction]
@@ -112,6 +148,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     unsafe { vkt_register_backend() };
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
+    m.add_function(wrap_pyfunction!(manual_seed, m)?)?;
+    m.add_function(wrap_pyfunction!(initial_seed, m)?)?;
+    m.add_function(wrap_pyfunction!(seed, m)?)?;
+    m.add_function(wrap_pyfunction!(get_rng_state, m)?)?;
+    m.add_function(wrap_pyfunction!(set_rng_state, m)?)?;
     m.add_function(wrap_pyfunction!(kernels, m)?)?;
     m.add_function(wrap_pyfunction!(memory_stats, m)?)?;
     m.add_function(wrap_pyfunction!(empty_cache, m)?)?;

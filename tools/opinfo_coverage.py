@@ -77,6 +77,36 @@ def run_sample(op, sample):
     return cpu_out, vk_out, used
 
 
+def is_random(op, sample):
+    """True if the sample's CPU result depends on the RNG seed (dropout,
+    fractional pooling, ...): its vk result comes from the vk generator and
+    can't match, so only its fallbacks are recorded. OpInfo wraps such ops in
+    wrapper_set_seed (fixed seed, RNG state restored afterwards), so that is
+    swapped for one using our seed while we run the op with two seeds."""
+    args = (sample.input, *sample.args)
+    namespace = getattr(op, "__globals__", {})
+
+    def run(seed):
+        def seeded(f, *a, **k):
+            torch.manual_seed(seed)
+            return f(*a, **k)
+
+        original = namespace.get("wrapper_set_seed")
+        if original is not None:
+            namespace["wrapper_set_seed"] = seeded
+        try:
+            torch.manual_seed(seed)
+            return op(*args, **sample.kwargs)
+        finally:
+            if original is not None:
+                namespace["wrapper_set_seed"] = original
+
+    try:
+        return compare(run(0), run(1)) is not None
+    except Exception:
+        return False
+
+
 def compare_tied(name, sample, expected, actual):
     """compare() for TIED_INDICES ops: values, plus indices that select them."""
     problem = compare(expected[0], actual[0])
@@ -134,7 +164,7 @@ def check_op(info, dtypes, nsamples):
                         "fallbacks": sorted(fallbacks)}
             tried += 1
             fallbacks.update(used)
-            if any(s in op_name(info) for s in SKIP_COMPARE):
+            if any(s in op_name(info) for s in SKIP_COMPARE) or is_random(info.op, sample):
                 continue
             name = op_name(info)
             if name in TIED_INDICES and isinstance(expected, tuple):

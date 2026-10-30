@@ -116,6 +116,11 @@ void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Te
 void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                      const at::Tensor* b, const at::Tensor* c, c10::ArrayRef<c10::Scalar> params = {});
 
+// The device's default random generator and fresh generators (Philox;
+// random.cpp).
+const at::Generator& default_generator();
+at::Generator new_generator();
+
 // Stable sort of each row of `x` (contiguous [rows, n], any real dtype with
 // a storage_label): the int32 indices [rows, n] that order each row
 // ascending (descending: largest first), ties in original order. sorting.cpp.

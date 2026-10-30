@@ -72,6 +72,31 @@ def fallback_counts():
     return dict(_native.fallback_counts())
 
 
+def manual_seed(seed):
+    """Seeds the "vk" random generator (torch.manual_seed does this too)."""
+    _native.manual_seed(int(seed) & 0xFFFF_FFFF_FFFF_FFFF)
+
+
+def seed():
+    """Seeds the "vk" generator nondeterministically and returns the seed."""
+    return _native.seed()
+
+
+def initial_seed():
+    return _native.initial_seed()
+
+
+def get_rng_state(device="vk"):
+    """The "vk" generator state as a uint8 tensor (seed, offset)."""
+    s, o = _native.get_rng_state()
+    return torch.tensor(list(s.to_bytes(8, "little") + o.to_bytes(8, "little")), dtype=torch.uint8)
+
+
+def set_rng_state(state, device="vk"):
+    data = bytes(state.to(torch.uint8).tolist())
+    _native.set_rng_state(int.from_bytes(data[:8], "little"), int.from_bytes(data[8:16], "little"))
+
+
 def _device_module():
     # torch.vk: what PyTorch expects of a backend's device module.
     mod = types.ModuleType("torch.vk")
@@ -82,8 +107,15 @@ def _device_module():
     mod.synchronize = synchronize
     mod.is_initialized = lambda: True
     mod._is_in_bad_fork = lambda: False
-    mod.manual_seed = lambda seed: None
-    mod.manual_seed_all = lambda seed: None
+    mod.manual_seed = manual_seed
+    mod.manual_seed_all = manual_seed
+    mod.seed = seed
+    mod.seed_all = seed
+    mod.initial_seed = initial_seed
+    mod.get_rng_state = get_rng_state
+    mod.set_rng_state = set_rng_state
+    mod.get_rng_state_all = lambda: [get_rng_state()]
+    mod.set_rng_state_all = lambda states: set_rng_state(states[0])
     mod.get_amp_supported_dtype = lambda: [torch.float32]
     mod._lazy_init = lambda: None
     return mod

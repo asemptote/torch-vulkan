@@ -190,9 +190,11 @@ struct VkHooks final : at::PrivateUse1HooksInterface {
   bool hasPrimaryContext(c10::DeviceIndex) const override { return true; }
   c10::DeviceIndex deviceCount() const override { return 1; }
   c10::DeviceIndex getCurrentDevice() const override { return 0; }
-  // Random numbers are generated on the CPU for now.
   const at::Generator& getDefaultGenerator(c10::DeviceIndex) const override {
-    return at::detail::getDefaultCPUGenerator();
+    return default_generator();
+  }
+  at::Generator getNewGenerator(c10::DeviceIndex) const override {
+    return new_generator();
   }
   at::Device getDeviceFromPtr(void*) const override { return {kDevice, 0}; }
   bool isPinnedPtr(const void*) const override { return false; }

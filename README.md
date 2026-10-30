@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M10 — sorting, searching and statistics**: device `"vk"` is a native PyTorch
+Status: **M11 — random numbers**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -12,7 +12,8 @@ index_put_, gather, scatter, index_select, take/put_, masked_select, nonzero),
 cat, flip, roll, padding, arange/linspace/eye, sorting and order statistics
 (sort, topk, kthvalue, median, mode, unique, searchsorted, cummax/cummin),
 accumulation into repeated indices (index_add, scatter_add/scatter_reduce,
-index_put_ with accumulate, bincount, histc), reductions (sum,
+index_put_ with accumulate, bincount, histc), random numbers (rand, randn,
+randint, bernoulli, multinomial, randperm, dropout, ...), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
 nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
@@ -23,11 +24,36 @@ fallback. Tested on an Intel UHD 620 with the validation layer clean.
 ```python
 import torch, torch_vulkan
 
-x = torch.randn(1_000_000, dtype=torch.float64, device="vk")  # random fill runs on the CPU
+torch.manual_seed(0)            # seeds the "vk" generator too
+x = torch.randn(1_000_000, dtype=torch.float64, device="vk")  # Philox on the GPU
 y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
-torch_vulkan.fallback_counts()  # {'aten::normal_': 1, ...}  (printing uses a few CPU ops: masked_select, bool &/*)
+torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## Random numbers (M11)
+
+- A Philox4x32-10 generator per device (`csrc/random.cpp`), registered with
+  PyTorch: `torch.manual_seed`, `torch.Generator(device="vk")`,
+  `torch.vk.get_rng_state`/`set_rng_state` and `torch.random.fork_rng`
+  work as for CUDA.
+- `shaders/rng.slang` draws element i's bits from counter (i, offset) under
+  the seed, so results depend only on the seed and the sequence of calls,
+  not on how the work is split across GPU threads.
+- On the GPU: `uniform_` (`rand`), `normal_` (`randn`, Box-Muller, also with
+  tensor mean/std), `random_` (`randint`, every integer and float dtype),
+  `exponential_`, `geometric_`, `cauchy_`, `log_normal_`, `bernoulli`
+  (scalar or tensor probabilities), `multinomial` (with replacement by
+  inverting the running sum, without by Gumbel top-k), `randperm` (sorting
+  random keys) and dropout.
+- The numbers differ from the CPU's for the same seed (the CPU uses a
+  Mersenne Twister), as CUDA's do; tests check reproducibility, ranges and
+  distribution statistics instead. The OpInfo sweep does not compare samples
+  whose CPU result depends on the seed (dropout inside attention, fractional
+  pooling); it still records whether they ran on the GPU.
+
+OpInfo sweep: 371 of 689 ops fully on the GPU (346 after M10; the sweep now
+lists 689 OpInfo entries), no mismatches.
 
 ## Sorting, searching and statistics (M10)
 
@@ -404,6 +430,7 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/elementwise.cpp     activations, clamp, predicates, where, lerp/addcmul, compositions
   csrc/indexing.cpp        indexing, accumulation, nonzero, cat/flip/roll/padding, arange/linspace/eye
   csrc/sorting.cpp         sort and order statistics, unique, searchsorted, cummax/cummin
+  csrc/random.cpp          Philox generator and random fills, multinomial, randperm, dropout
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
@@ -412,7 +439,7 @@ crates/pyvk/               extension module torch_vulkan._native
   src/lib.rs               Python functions (synchronize, stats, fallback counts)
   build.rs                 compiles csrc/ against the target Python's libtorch
 python/torch_vulkan/       backend naming and torch.vk device module
-tests/python/test_*.py     606 tests: results on "vk" vs CPU, no unexpected fallbacks
+tests/python/test_*.py     625 tests: results on "vk" vs CPU (statistics for random ops)
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
@@ -455,7 +482,7 @@ uv pip install numpy pytest maturin
 $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 ```
 
-All 606 Python tests pass with no validation messages. Op coverage:
+All 625 Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
 
 ## Roadmap
@@ -494,7 +521,9 @@ no fallbacks in the OpInfo sweep).
     accumulation for 8/16-bit and complex dtypes, a radix sort for very long
     rows (bitonic is O(n log^2 n)), parallel scans for single long rows in
     cummax/cummin/logcumsumexp.
-11. **M11 random numbers**: Philox-based rand/randn/bernoulli/multinomial.
+11. ~~**M11 random numbers**~~: done (see above). Not yet: `poisson`,
+    `_standard_gamma`, `binomial`, `_sample_dirichlet`, `rrelu` noise, and
+    `random_` on complex dtypes (rand/randn on complex do run on the GPU).
 12. **M12 neural-network ops**: convolution, pooling, softmax, normalization,
     losses, backward kernels.
 13. **M13 linear algebra on the GPU**: no CPU panels; QR, eigh, SVD.
