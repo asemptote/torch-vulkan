@@ -629,6 +629,7 @@ void run_scan(const at::Tensor& in, const Dims& rowdims, int64_t rows, int64_t n
 template <uint32_t Op>  // 0 sum, 1 prod
 at::Tensor& cumulative_out(const at::Tensor& self, int64_t dim, std::optional<at::ScalarType> dtype, at::Tensor& out) {
   const char* name = Op == 0 ? "aten::cumsum" : "aten::cumprod";
+  reject_dtype(name + 6, out.scalar_type(), out.scalar_type() == at::kBool);
   at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
   if (complex_vk(input) && is_vk(out) && input.dim() > 0) {
     int64_t d = at::maybe_wrap_dim(dim, input.dim());

@@ -151,7 +151,8 @@ std::tuple<at::Tensor&, at::Tensor&> sort_values(const at::Tensor& self, int64_t
 
 std::tuple<at::Tensor, at::Tensor> sort_stable(const at::Tensor& self, std::optional<bool> stable, int64_t dim,
                                                bool descending) {
-  at::Tensor values = at::empty({0}, self.options()), indices = at::empty({0}, self.options().dtype(at::kLong));
+  // Outputs laid out like self (as the CPU's and PyTorch's meta kernel).
+  at::Tensor values = at::empty_like(self), indices = at::empty_like(self, self.options().dtype(at::kLong));
   sort_out(self, stable, dim, descending, values, indices);
   return {values, indices};
 }
@@ -199,6 +200,7 @@ std::tuple<at::Tensor, at::Tensor> sorted_rows(const at::Tensor& self, int64_t d
 
 std::tuple<at::Tensor&, at::Tensor&> kthvalue_out(const at::Tensor& self, int64_t k, int64_t dim, bool keepdim,
                                                   at::Tensor& values, at::Tensor& indices) {
+  reject_dtype("kthvalue", self.scalar_type(), self.scalar_type() == at::kBool);
   if (!sortable(self) || !is_vk(values) || !is_vk(indices)) {
     on_cpu("aten::kthvalue", "values", self, k, dim, keepdim, values, indices);
     return {values, indices};
@@ -239,6 +241,7 @@ std::tuple<at::Tensor, at::Tensor> median_dim(const at::Tensor& self, int64_t di
 template <bool IgnoreNan>
 std::tuple<at::Tensor&, at::Tensor&> median_dim_out(const at::Tensor& self, int64_t dim, bool keepdim,
                                                     at::Tensor& values, at::Tensor& indices) {
+  reject_dtype(IgnoreNan ? "nanmedian" : "median", self.scalar_type(), self.scalar_type() == at::kBool);
   if (!sortable(self) || !is_vk(values) || !is_vk(indices)) {
     on_cpu(IgnoreNan ? "aten::nanmedian" : "aten::median", "dim_values", self, dim, keepdim, values, indices);
     return {values, indices};
@@ -251,6 +254,7 @@ std::tuple<at::Tensor&, at::Tensor&> median_dim_out(const at::Tensor& self, int6
 
 template <bool IgnoreNan>
 at::Tensor median_all(const at::Tensor& self) {
+  reject_dtype(IgnoreNan ? "nanmedian" : "median", self.scalar_type(), self.scalar_type() == at::kBool);
   if (!sortable(self)) {
     return on_cpu(IgnoreNan ? "aten::nanmedian" : "aten::median", "", self)[0].toTensor();
   }
@@ -555,6 +559,7 @@ std::tuple<at::Tensor, at::Tensor> std_mean(const at::Tensor& self, at::Optional
 
 at::Tensor nansum_vk(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                   std::optional<at::ScalarType> dtype) {
+  reject_dtype("nansum", self.scalar_type(), at::isComplexType(self.scalar_type()));
   at::Tensor x = at::isFloatingType(self.scalar_type()) ? at::where(at::isnan(self), at::zeros_like(self), self) : self;
   return at::sum(x, dim, keepdim, dtype);
 }
@@ -566,6 +571,7 @@ at::Tensor& nansum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool
 }
 
 at::Tensor trace(const at::Tensor& self) {
+  reject_dtype("trace", self.scalar_type(), self.scalar_type() == at::kBool);
   TORCH_CHECK(self.dim() == 2, "trace: expected a matrix, but got tensor with dim ", self.dim());
   return self.diagonal().sum();
 }

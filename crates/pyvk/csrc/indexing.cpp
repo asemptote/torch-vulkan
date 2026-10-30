@@ -625,6 +625,7 @@ at::Tensor& scatter_add_out(const at::Tensor& self, int64_t dim, const at::Tenso
 at::Tensor& scatter_reduce_two_out(const at::Tensor& self, int64_t dim, const at::Tensor& index,
                                    const at::Tensor& src, c10::string_view reduce, bool include_self,
                                    at::Tensor& out) {
+  reject_dtype("scatter_reduce", self.scalar_type(), self.scalar_type() == at::kBool && reduce == "mean");
   if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), include_self, out)) {
     on_cpu("aten::scatter_reduce", "two_out", self, dim, index, src, reduce, include_self, out);
   }
@@ -662,6 +663,7 @@ at::Tensor& index_reduce_out(const at::Tensor& self, int64_t dim, const at::Tens
                              c10::string_view reduce, bool include_self, at::Tensor& out) {
   TORCH_CHECK(reduce == "prod" || reduce == "mean" || reduce == "amax" || reduce == "amin",
               "index_reduce(): Expected reduce to be one of prod, mean, amax or amin but got ", reduce, ".");
+  reject_dtype("index_reduce", self.scalar_type(), self.scalar_type() == at::kBool);
   if (!index_accumulate(self, dim, index, source, reduce_code(reduce), include_self, out)) {
     on_cpu("aten::index_reduce", "out", self, dim, index, source, reduce, include_self, out);
   }
@@ -1007,6 +1009,7 @@ at::Tensor& pad_kernel_out(const at::Tensor& self, at::IntArrayRef pad, at::Tens
                                       "replication_pad1d", "replication_pad2d", "replication_pad3d"};
   const std::string& name = names[(Reflect ? 0 : 3) + K - 1];
   TORCH_CHECK(pad.size() == 2 * K, name, ": padding size is expected to be ", 2 * K);
+  reject_dtype(name.c_str(), self.scalar_type(), self.scalar_type() == at::kBool);
   if (!movable(self) || !is_vk(out) || out.scalar_type() != self.scalar_type()) {
     on_cpu(("aten::" + name).c_str(), "out", self, pad, out);
     return out;

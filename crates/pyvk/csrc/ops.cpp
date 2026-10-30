@@ -184,6 +184,10 @@ at::ScalarType unary_result(uint32_t code, Kind kind, const at::Tensor& self) {
 
 template <size_t I>
 at::Tensor& unary_out(const at::Tensor& self, at::Tensor& out) {
+  uint32_t code = kUnary[I].code;
+  bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
+                  code == op::UNARY_ROUND;
+  reject_dtype(kUnary[I].name + 6, self.scalar_type(), rounding && self.scalar_type() == at::kBool);
   check_out_cast(unary_result(kUnary[I].code, kUnary[I].kind, self), out);
   if (!unary_gpu(kUnary[I].code, kUnary[I].kind, self, out)) {
     on_cpu(kUnary[I].name, "out", self, out);

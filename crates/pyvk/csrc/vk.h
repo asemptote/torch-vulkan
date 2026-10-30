@@ -204,6 +204,20 @@ inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef sha
   out.as_strided_(shape, strides);
 }
 
+// "vk" rejects the dtypes PyTorch's CPU kernel of an op rejects (with the
+// CPU's kind of message), so code behaves the same on both devices.
+inline void reject_dtype(const char* op, at::ScalarType t, bool rejected) {
+  TORCH_CHECK(!rejected, "\"", op, "\" not implemented for '", c10::toString(t), "'");
+}
+
+inline bool is_half(at::ScalarType t) {
+  return t == at::kHalf || t == at::kBFloat16;
+}
+
+inline bool is_integral_or_bool(at::ScalarType t) {
+  return at::isIntegralType(t, /*includeBool=*/true);
+}
+
 // PyTorch's rule for out= arguments: the result dtype must cast safely to
 // out's (no float -> integer, complex -> real, ...).
 inline void check_out_cast(at::ScalarType result, const at::Tensor& out) {

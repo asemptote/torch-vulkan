@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch._decomp import decomposition_table
 
-from . import _decomp, _native
+from . import _decomp, _dtypes, _layout, _native
 
 aten = torch.ops.aten
 _lib = None
@@ -565,10 +565,12 @@ def _embedding_bag(weight, indices, offsets, scale_grad_by_freq=False, mode=0, s
             max_indices = bag_size.clone()
         else:
             max_indices = torch.zeros(nb, dtype=torch.long, device=device)
-            if forward_only:
-                offset2bag = offset2bag.new_zeros(0)
-                bag_size = torch.zeros(nb, dtype=torch.long, device=device)
-        return out, offset2bag, bag_size, max_indices
+        # The auxiliary outputs as PyTorch predicts them for a non-CPU device
+        # (as CUDA's): bag_size has one entry per offset, max_indices is
+        # empty except in max mode.
+        if include_last_offset:
+            bag_size = torch.cat([bag_size, bag_size.new_zeros(1)])
+        return out, offset2bag, bag_size, max_indices.new_zeros(0)
     # max: per (bag, feature) the first row reaching the maximum.
     neg = torch.finfo(dtype).min
     vals = torch.where(valid.unsqueeze(1), rows, torch.full_like(rows, neg))
@@ -582,6 +584,8 @@ def _embedding_bag(weight, indices, offsets, scale_grad_by_freq=False, mode=0, s
         0, offset2bag.unsqueeze(1).expand(n, dim), pos, "amin", include_self=True)
     max_indices = torch.where(first < n, indices.index_select(0, first.clamp(max=max(n - 1, 0)).flatten()).view(nb, dim)
                               if n else first, torch.zeros_like(first))
+    if include_last_offset:
+        bag_size = torch.cat([bag_size, bag_size.new_zeros(1)])
     return out, offset2bag, bag_size, max_indices
 
 
@@ -593,6 +597,7 @@ def _embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, maximum_i
                                   scale_grad_by_freq, mode, per_sample_weights, padding_idx=-1):
     dim = grad.shape[1]
     gw = torch.zeros((num_weights, dim), device=grad.device, dtype=grad.dtype)
+    bag_size = bag_size[:grad.shape[0]]  # (one entry per offset, with include_last_offset one too many)
     if mode == 2:
         valid = bag_size > 0
         rows = maximum_indices[valid]
@@ -646,6 +651,8 @@ _THETA13 = 5.371920351148152
 def _matrix_exp(a):
     if not (a.is_floating_point() or a.is_complex()) or a.shape[-1] == 0:
         return _on_cpu("linalg_matrix_exp", a)
+    if a.dtype in (torch.float16, torch.bfloat16):
+        return _matrix_exp(a.float()).to(a.dtype)  # (as the CPU: computed in single precision)
     if a.dtype in (torch.float32, torch.complex64) and _native_has_float64():
         # The solve and the squarings lose ~4 bits in single precision; double
         # keeps the result as accurate as single-precision storage allows.
@@ -1103,6 +1110,8 @@ def register():
     for name, fn in _kernels().items():
         if torch._C._dispatch_has_kernel_for_dispatch_key("aten::" + name, "PrivateUse1"):
             continue  # a C++ or decomposed kernel exists
-        _lib.impl(name, fn, "PrivateUse1")
+        base, _, overload = name.partition(".")
+        op = getattr(getattr(torch.ops.aten, base), overload or "default")
+        _lib.impl(name, _layout.with_layout(op, _dtypes.with_cpu_dtypes(base, fn)), "PrivateUse1")
         names.append("aten::" + name)
     return names

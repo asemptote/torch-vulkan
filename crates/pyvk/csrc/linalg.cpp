@@ -229,6 +229,7 @@ at::Tensor addbmm(const at::Tensor& self, const at::Tensor& batch1, const at::Te
 }
 
 at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
+  reject_dtype("dot", self.scalar_type(), self.scalar_type() == at::kBool);
   TORCH_CHECK(self.dim() == 1 && other.dim() == 1, "1D tensors expected, but got ", self.dim(), "D and ", other.dim(),
               "D tensors");
   TORCH_CHECK(self.size(0) == other.size(0), "inconsistent tensor size, expected tensor [", self.size(0),

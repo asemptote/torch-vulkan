@@ -50,8 +50,21 @@ const char* group_of(uint32_t code) {
   }
 }
 
+// The (computation) dtypes the CPU's kernel of special function `code`
+// rejects: complex for all; half precision for all but i0, i0e, i1, i1e,
+// polygamma, igamma and igammac; integers and bools for igamma / igammac.
+void reject_like_cpu(uint32_t code, at::ScalarType t) {
+  bool half_ok = code == op::SPECIAL_I0 || code == op::SPECIAL_I0E || code == op::SPECIAL_I1 ||
+                 code == op::SPECIAL_I1E || code == op::SPECIAL_POLYGAMMA || code == op::SPECIAL_IGAMMA ||
+                 code == op::SPECIAL_IGAMMAC;
+  bool ints_ok = code != op::SPECIAL_IGAMMA && code != op::SPECIAL_IGAMMAC;
+  reject_dtype("special function", t,
+               at::isComplexType(t) || (is_half(t) && !half_ok) || (is_integral_or_bool(t) && !ints_ok));
+}
+
 // out = special function `code` of a (and b), with parameter `param`.
 bool special_gpu(uint32_t code, const at::Tensor& a, const at::Tensor* b, double param, const at::Tensor& out) {
+  reject_like_cpu(code, b != nullptr ? at::result_type(a, *b) : a.scalar_type());
   if (!is_vk(out)) {
     return false;
   }

@@ -458,6 +458,7 @@ at::Tensor& randperm_out(int64_t n, std::optional<at::Generator> gen, at::Tensor
 
 std::tuple<at::Tensor, at::Tensor> native_dropout(const at::Tensor& input, double p, std::optional<bool> train) {
   if (!train.has_value() || *train) {
+    reject_dtype("native_dropout", input.scalar_type(), at::isIntegralType(input.scalar_type(), /*includeBool=*/true));
     TORCH_CHECK(p >= 0 && p <= 1, "dropout probability has to be between 0 and 1, but got ", p);
     at::Tensor mask = at::empty(input.sizes(), input.options().dtype(at::kBool));
     bernoulli_float_(mask, 1 - p, std::nullopt);

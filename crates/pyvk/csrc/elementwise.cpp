@@ -42,7 +42,7 @@ constexpr double kInf = std::numeric_limits<double>::infinity();
 // float dtype, with parameters alpha, beta, gamma.
 bool param_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out, double alpha, double beta,
                      double gamma = 0.0) {
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(self) || !is_vk(out) || !is_float(dtype) || at::isComplexType(self.scalar_type())) {
     return false;
@@ -109,7 +109,7 @@ at::Tensor& hardshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::
 at::Tensor& threshold_out(const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value,
                           at::Tensor& out) {
   if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
-    at::native::resize_output(out, self.sizes());
+    resize_elementwise_output(out, self.sizes(), &self);
     out.copy_(at::where(at::gt(self, threshold), self, at::scalar_tensor(value, self.options())));
     return out;
   }
@@ -130,7 +130,7 @@ at::Tensor& nan_to_num_out(const at::Tensor& self, std::optional<double> nan, st
                            std::optional<double> neginf, at::Tensor& out) {
   if (!at::isFloatingType(self.scalar_type()) && !at::isComplexType(self.scalar_type()) && is_vk(self) &&
       is_vk(out)) {
-    at::native::resize_output(out, self.sizes());
+    resize_elementwise_output(out, self.sizes(), &self);
     out.copy_(self);  // integers and bools have nothing to replace
     return out;
   }
@@ -162,7 +162,7 @@ bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& l
     if (bound->has_value()) result = at::promote_types(result, at::result_type(self, **bound));
   }
   check_out_cast(result, out);
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(self) || !is_vk(out) || !(is_float(dtype) || is_int(dtype))) {
     return false;
@@ -242,6 +242,7 @@ bool clamp_tensor_gpu(const at::Tensor& self, const std::optional<at::Tensor>& l
 
 at::Tensor& clamp_tensor_out(const at::Tensor& self, const std::optional<at::Tensor>& min,
                              const std::optional<at::Tensor>& max, at::Tensor& out) {
+  reject_dtype("clamp", self.scalar_type(), self.scalar_type() == at::kBool);
   if (!clamp_tensor_gpu(self, min, max, out)) {
     on_cpu("aten::clamp", "Tensor_out", self, min, max, out);
   }
@@ -266,7 +267,7 @@ at::Tensor& clamp_max_tensor_out(const at::Tensor& self, const at::Tensor& max, 
 
 // out (bool) = predicate `code` (a COMPARE_* code) of self.
 bool predicate_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out) {
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   const char* label = dtype_label(self.scalar_type());
   if (!is_vk(self) || !is_vk(out) || label == nullptr) {
     return false;
@@ -278,7 +279,8 @@ bool predicate_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out)
 }
 
 at::Tensor isnan(const at::Tensor& self) {
-  at::Tensor out = at::empty(self.sizes(), self.options().dtype(at::kBool));
+  // (empty, so the output takes self's dim order when resized)
+  at::Tensor out = at::empty({0}, self.options().dtype(at::kBool));
   if (!predicate_gpu(op::COMPARE_ISNAN, self, out)) {
     return on_cpu("aten::isnan", "", self)[0].toTensor();
   }
@@ -519,7 +521,7 @@ at::Tensor& angle_out(const at::Tensor& self, at::Tensor& out) {
     on_cpu("aten::angle", "out", self, out);
     return out;
   }
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   if (at::isComplexType(self.scalar_type())) {
     at::atan2_out(out, at::imag(self), at::real(self));
   } else {
@@ -539,7 +541,11 @@ at::Tensor& sgn_out(const at::Tensor& self, at::Tensor& out) {
     on_cpu("aten::sgn", "out", self, out);
     return out;
   }
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
+  if (self.scalar_type() == at::kComplexHalf) {  // (the CPU has a complex32 sgn, used by abs's backward)
+    out.copy_(at::sgn(self.to(at::kComplexFloat)));
+    return out;
+  }
   at::Tensor magnitude = at::abs(self);
   out.copy_(at::where(at::eq(magnitude, 0), at::zeros_like(self), self / magnitude));
   return out;
@@ -643,7 +649,7 @@ at::Tensor remainder_scalar_tensor(const at::Scalar& self, const at::Tensor& oth
 
 // round(x * 10^d) / 10^d (or round(x / 10^-d) * 10^-d), as PyTorch's CPU kernel.
 at::Tensor& round_decimals_out(const at::Tensor& self, int64_t decimals, at::Tensor& out) {
-  at::native::resize_output(out, self.sizes());
+  resize_elementwise_output(out, self.sizes(), &self);
   if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(out.scalar_type())) {
     on_cpu("aten::round", "decimals_out", self, decimals, out);
     return out;

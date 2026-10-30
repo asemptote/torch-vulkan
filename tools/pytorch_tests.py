@@ -166,6 +166,13 @@ EXPECTED = [
      "sparse layouts are out of scope for this backend (dense tensors only)"),
     (r"", r"not implemented for 'ComplexHalf'",
      "complex32 arithmetic: PyTorch's CPU backend has no kernels for it either (only copies and casts)"),
+    (r"test_dtypes_nn_functional_conv", r"",
+     "int32 convolution works on vk as on the CPU, but the OpInfo does not list it"),
+    (r"test_dtypes_nn_functional_max_pool1d_", r"",
+     "integer max_pool1d: vk takes PyTorch's max_pool2d path (integers work, as in max_pool2d on the CPU); "
+     "only the CPU's no-grad shortcut is float-only"),
+    (r"", r"InductorError: KeyError: 'vk'",
+     "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
 ]
 
 
