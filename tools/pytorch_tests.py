@@ -261,6 +261,12 @@ EXPECTED = [
     (r"test_python_ref(_executor|_torch_fallback)?__refs_add(_executor_aten)?_vk_complex32", r"Reference result was farther",
      "complex32 add runs on the CPU (vk has no complex32 arithmetic), whose a + (1 + 0i) b makes the other part NaN "
      "beside an infinity; PyTorch's reference upcasts on vk and does not"),
+    (r"test_python_ref_executor__refs_(geometric|log_normal|nn_functional_alpha_dropout|linspace|linspace_tensor_overload|"
+     r"nn_functional_nll_loss)_executor_aten_vk", r"",
+     "PyTorch skips or expects these traced-reference tests to fail on CUDA and XPU (random numbers drawn in a "
+     "different order, integer linspace, nll_loss's data-dependent indexing); vk fails them the same way"),
+    (r"test_python_ref_executor__refs_mul_executor_aten_vk_complex32", r"Unexpected success",
+     "an expected failure on every device (complex32 multiplication); vk's passes"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
