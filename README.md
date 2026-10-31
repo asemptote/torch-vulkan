@@ -594,6 +594,10 @@ python/torch_vulkan/       backend naming, torch.vk device module, _decomp.py (P
 tests/python/test_*.py     results on "vk" vs CPU (statistics for random ops)
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 tools/port_special.py      regenerates shaders/_special.slang from torch's ATen/native/Math.h
+tools/pytorch_tests.py     runs PyTorch's device-generic test files on "vk" (M15), with a CPU re-check
+tools/cluster/             runs them on a PBS cluster (full-run.sh), and a dev copy there (dev.sh)
+tools/dev/                 pt.py (one test file on "vk", tracebacks), optrace.py (ops differing from
+                           the CPU inside a test), seedsweep.py (a test under shifted seeds)
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
 benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan throughput vs CPU
 benchmarks/matmul.py       matrix multiply GFLOP/s vs CPU
@@ -637,6 +641,39 @@ $env:TORCH_VK_VALIDATE = "1"; .\.venv\Scripts\python -m pytest -q
 
 All Python tests pass with no validation messages. Op coverage:
 `python tools/opinfo_coverage.py --jobs 4` (writes `tools/opinfo_coverage.json`).
+
+## Development workflow
+
+Checks, cheapest first; a change goes on to the next only once it passes:
+
+1. Local: `.\.venv\Scripts\python -m pytest -q` (seconds), and the affected
+   PyTorch tests with `python tools/dev/pt.py test_linalg.py -k "..."`.
+2. Lavapipe, in the dev copy on the cluster (a second checkout with its own
+   venv, rebuildable while a full run uses the main one), from the local
+   repo root:
+
+   ```sh
+   tools/cluster/dev.sh build                  # sync the working tree, rebuild (~1 min for a C++ change)
+   tools/cluster/dev.sh run ID...              # test ids through the runner, CPU re-check included
+   tools/cluster/dev.sh pt test_nn.py -k ...   # pytest with tracebacks
+   tools/cluster/dev.sh rss ID...              # time and peak memory per test
+   tools/cluster/dev.sh py script.py           # any script, on lavapipe
+   ```
+
+   Lavapipe finds what real GPUs hide: races between a workgroup's SIMD
+   chunks, loads on untaken paths, inaccurate built-ins.
+3. Full run, once per batch of changes and before every push: on the head
+   node, after `tools/cluster/sync.sh ws3 --build -J GATEWAY`,
+   `bash tools/cluster/full-run.sh NAME --gpu` (48 lavapipe shards and one
+   H100 job, about an hour; see `tools/cluster/README.md`). Push only if no
+   test that passed in an earlier run fails.
+
+For a failure, `tools/dev/optrace.py` shows which ops differ from the CPU
+inside a test, and `tools/dev/seedsweep.py` whether the CPU passes the same
+test under other seeds. A failure that is not a vk bug (a tolerance tuned to
+one seed or device, a CUDA-specific expectation, a time or memory limit of
+the runner) gets an `EXPECTED` entry in `tools/pytorch_tests.py` with the
+evidence as its reason, rather than a workaround.
 
 ## Roadmap
 

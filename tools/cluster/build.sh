@@ -7,7 +7,7 @@
 LOG=${LOG:-$HOME/torch-vulkan-build.log}
 cd "${TORCH_VULKAN:-$HOME/torch-vulkan}" || exit 1
 export PATH=$HOME/.cargo/bin:$PATH VULKAN_SDK=${VULKAN_SDK:-$(ls -d "$HOME"/opt/*/x86_64 | tail -1)}
-export CARGO_TARGET_DIR=/tmp/$USER-torch-vulkan-target VIRTUAL_ENV=$PWD/.venv
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/$USER-torch-vulkan-target} VIRTUAL_ENV=$PWD/.venv
 .venv/bin/maturin develop --release --uv > "$LOG" 2>&1
 code=$?
 echo "build exit $code" >> "$LOG"

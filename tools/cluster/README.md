@@ -33,6 +33,9 @@ home directory and rebuilds there with `build.sh` (log in
   machine, no GPU) or `nvidia`.
 - `pbs-lavapipe.sh`: a PBS job array, one single-core lavapipe shard per job.
 - `pbs-gpu.sh`: one GPU job running several shards side by side on its GPU.
+- `full-run.sh NAME [--gpu]` (on the head node): the standard full run, all
+  thirteen test files in 48 lavapipe shards, and with `--gpu` one H100 job
+  of 16 shards alongside (a separate queue). Each takes about an hour.
 
 Each script's header has a `qsub` example. Pass several test files in
 `TEST_FILES` to run each one's slice in the same shard. To re-run only the
@@ -68,6 +71,15 @@ shards in `OUT_DIR`, and writes `<run>.failures.txt` (vk-only failures) and
 the reason). Concatenating the `failures.txt` files gives the input for an
 `--ids` re-run.
 
+## The dev copy
+
+`dev.sh` keeps a second checkout (`DEV_DIR`, with its own venv and Cargo
+target directory) for experiments, so it can be rebuilt while a full run
+uses `~/torch-vulkan`. From the local repo root: `dev.sh init` once, then
+`dev.sh build` (sync and rebuild), `dev.sh run ID...`, `dev.sh pt FILE -k
+EXPR`, `dev.sh rss ID...` (peak memory and time per test) and `dev.sh py
+SCRIPT`; the script's header lists the settings.
+
 ## Things learned the hard way
 
 - A kernel that never finishes hangs the GPU (Linux compute drivers have no
@@ -78,3 +90,5 @@ the reason). Concatenating the `failures.txt` files gives the input for an
   jobs; node memory, not CPUs, is often what limits how many shards run.
 - Rebuilding the extension while shards are running can crash them (the
   shared library is replaced under them): wait for runs to finish first.
+- `cc` compiles csrc/ with its `parallel` feature: one file's change rebuilds
+  all fourteen, about 4 minutes one after another and 45 s in parallel.
