@@ -697,18 +697,16 @@ at::Tensor& round_decimals_out(const at::Tensor& self, int64_t decimals, at::Ten
     on_cpu("aten::round", "decimals_out", self, decimals, out);
     return out;
   }
-  at::Tensor x = to_dtype(self, out.scalar_type());
   if (decimals == 0) {
-    return at::round_out(out, x);
+    return at::round_out(out, to_dtype(self, out.scalar_type()));
   }
-  // 10^|d| in double, then rounded to out's dtype, as on the CPU.
-  at::Tensor scale = at::scalar_tensor(std::pow(10.0, static_cast<double>(std::abs(decimals))),
-                                       x.options().device(at::kCPU));
-  if (decimals > 0) {
-    at::div_out(out, at::round(x * scale), scale);
-  } else {
-    at::mul_out(out, at::round(x / scale), scale);
-  }
+  // As the CPU's kernel: in the op math type (float32 for 16-bit floats),
+  // nearbyint(x * 10^d) / 10^d with a true division (a 0-dim "vk" scale,
+  // not a Python number, whose division becomes a multiplication).
+  at::ScalarType math = is_half(out.scalar_type()) ? at::kFloat : out.scalar_type();
+  at::Tensor x = to_dtype(self, math);
+  at::Tensor scale = at::full({}, std::pow(10.0, static_cast<double>(std::abs(decimals))), x.options());
+  out.copy_(decimals > 0 ? at::div(at::round(x * scale), scale) : at::mul(at::round(x / scale), scale));
   return out;
 }
 
