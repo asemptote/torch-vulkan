@@ -20,6 +20,8 @@
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <torch/library.h>
 
+#include <c10/util/safe_numerics.h>
+
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -308,6 +310,13 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
   auto* impl = self.unsafeGetTensorImpl();
   if (self.sizes() == size && !memory_format.has_value()) {
     return self;  // (as PyTorch: the same sizes keep their strides, e.g. a strided out=)
+  }
+  {  // (the CPU's overflow checks)
+    int64_t stride = 1;
+    for (int64_t d = static_cast<int64_t>(size.size()) - 1; d > 0; --d) {
+      TORCH_CHECK(!c10::mul_overflows(stride, std::max<int64_t>(size[d], 1), &stride), "Stride calculation overflowed");
+    }
+    at::detail::computeStorageNbytesContiguous(size, self.itemsize(), self.storage_offset());
   }
   impl->set_sizes_contiguous(size);
   if (memory_format.has_value() && *memory_format != at::MemoryFormat::Preserve) {

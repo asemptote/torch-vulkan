@@ -247,6 +247,8 @@ EXPECTED = [
      "float32 sums compared with NumPy's pairwise sums within tolerances tighter than NumPy's own rounding "
      "error (even the exactly rounded sum misses them in ~0.5% of random inputs); only the CPU's summation "
      "order reliably passes"),
+    (r"test_tensor_storage_type_", r"None mismatch",
+     "the test expects torch.<Type>Storage (the CPU's) for every device but CUDA"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

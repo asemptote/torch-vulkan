@@ -280,6 +280,21 @@ bool random_ok(const at::Tensor& self) {
   return is_vk(self) && storage_label(self.scalar_type()) != nullptr && !at::isComplexType(self.scalar_type());
 }
 
+// As the CPU (DistributionTemplates.h): for floating dtypes, from and to move
+// inward to values that stay inside [from, to) after the cast (a random
+// 32751 is 32752 in float16).
+void update_float_bounds(at::ScalarType t, int64_t& from, int64_t* to) {
+  if (!at::isFloatingType(t)) return;
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, t, "random_update_from_to", [&] {
+    from = at::native::templates::update_from<scalar_t>(from);
+    if (to != nullptr) {
+      *to = at::native::templates::update_to<scalar_t>(*to);
+      TORCH_CHECK(from < *to, "random_ expects 'from' casted to dtype to be less than 'to' casted to dtype, but got "
+                  "from=", from, " >= to=", *to);
+    }
+  });
+}
+
 at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<at::Generator> gen) {
   if (!random_ok(self)) {
     on_cpu("aten::random_", "from", self, from, to, gen);
@@ -288,9 +303,11 @@ at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> t
   int64_t hi = to.has_value() ? *to : random_max(self.scalar_type());
   if (to.has_value()) {
     TORCH_CHECK(from < hi, "random_ expects 'from' to be less than 'to', but got from=", from, " >= to=", hi);
+    update_float_bounds(self.scalar_type(), from, &hi);
     at::native::templates::check_from_to_in_range(from, hi - 1, self.dtype());
     return random_range(self, from, static_cast<uint64_t>(hi) - static_cast<uint64_t>(from), gen);
   }
+  update_float_bounds(self.scalar_type(), from, nullptr);
   TORCH_CHECK(from <= hi, "random_ expects 'from' casted to dtype to be less than or equal to 'to'");
   at::native::templates::check_from_to_in_range(from, hi, self.dtype());
   // Inclusive of the maximum: [from, hi]; the full int64 range wraps to 0 (= 2^64).
@@ -303,6 +320,8 @@ at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator>
     return self;
   }
   TORCH_CHECK(to > 0, "random_ expects 'from' to be less than 'to', but got from=0 >= to=", to);
+  int64_t from = 0;
+  update_float_bounds(self.scalar_type(), from, &to);
   at::native::templates::check_from_to_in_range(0, to - 1, self.dtype());
   return random_range(self, 0, static_cast<uint64_t>(to), gen);
 }
