@@ -238,6 +238,9 @@ EXPECTED = [
     (r"test_grad_scaler_deprecated_warning_|test_grad_scaling_state_dict_", r"",
      "the test assumes a device without torch.<device>.amp.GradScaler is the CPU (torch.cpu.amp, "
      "torch.FloatTensor)"),
+    (r"test_grad_scaling_autocast_.*_Adam(W)?_", r"AssertionError not raised",
+     "the test expects Adam under float16 autocast to diverge from float32; \"vk\" has no lower-precision "
+     "autocast policy (PyTorch registers none for PrivateUse1), so both run in float32 and agree"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

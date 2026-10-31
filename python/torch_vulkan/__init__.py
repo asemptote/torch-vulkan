@@ -143,7 +143,7 @@ def _device_module():
     mod.set_rng_state = set_rng_state
     mod.get_rng_state_all = lambda: [get_rng_state()]
     mod.set_rng_state_all = lambda states: set_rng_state(states[0])
-    mod.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16, torch.float32]
+    mod.get_amp_supported_dtype = lambda: [torch.float32]  # (no lower-precision autocast policy on "vk" yet)
     mod._lazy_init = lambda: None
     return mod
 

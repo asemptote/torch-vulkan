@@ -225,6 +225,7 @@ struct VkGuardImpl final : c10::impl::DeviceGuardImplInterface {
 C10_REGISTER_GUARD_IMPL(PrivateUse1, VkGuardImpl);
 
 void resize_storage(const c10::Storage& storage, size_t nbytes);
+void resize_storage_bytes(const c10::Storage& storage, size_t nbytes);
 
 struct VkHooks final : at::PrivateUse1HooksInterface {
   bool isBuilt() const override { return true; }
@@ -242,7 +243,7 @@ struct VkHooks final : at::PrivateUse1HooksInterface {
   bool isPinnedPtr(const void*) const override { return false; }
   c10::Allocator* getPinnedMemoryAllocator() const override { return at::getCPUAllocator(); }
   void resizePrivateUse1Bytes(const c10::Storage& storage, size_t newsize) const override {
-    resize_storage(storage, newsize);
+    resize_storage_bytes(storage, newsize);
   }
 };
 
@@ -281,6 +282,23 @@ void resize_storage(const c10::Storage& storage, size_t nbytes) {
   if (storage.nbytes() > 0 && storage.data() != nullptr) {
     synchronize();  // queued kernels may still write the old memory
     std::memcpy(fresh.get(), storage.data(), storage.nbytes());
+  }
+  storage.unsafeGetStorageImpl()->set_data_ptr_noswap(std::move(fresh));
+  storage.unsafeGetStorageImpl()->set_nbytes(nbytes);
+}
+
+// untyped_storage().resize_(n): exactly n bytes, shrinking too, as the CPU's
+// resize_bytes_cpu (the first min(old, n) bytes kept).
+void resize_storage_bytes(const c10::Storage& storage, size_t nbytes) {
+  TORCH_CHECK(storage.resizable(), "Trying to resize storage that is not resizable");
+  if (nbytes == storage.nbytes()) {
+    return;
+  }
+  c10::DataPtr fresh = allocator()->allocate(nbytes);
+  size_t keep = std::min(nbytes, storage.nbytes());
+  if (keep > 0 && storage.data() != nullptr) {
+    synchronize();  // queued kernels may still write the old memory
+    std::memcpy(fresh.get(), storage.data(), keep);
   }
   storage.unsafeGetStorageImpl()->set_data_ptr_noswap(std::move(fresh));
   storage.unsafeGetStorageImpl()->set_nbytes(nbytes);

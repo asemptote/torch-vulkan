@@ -16,6 +16,8 @@ vector<S, 2> cdiv(vector<S, 2> a, vector<S, 2> b)
 {
     if (abs(b.x) >= abs(b.y))
     {
+        if (b.x == S(0) && b.y == S(0))  // (as c10::complex: (a.x / 0, a.y / 0), inf or NaN by part)
+            return vector<S, 2>(a.x / abs(b.x), a.y / abs(b.y));
         S r = b.y / b.x;
         S d = b.x + b.y * r;
         return vector<S, 2>((a.x + a.y * r) / d, (a.y - a.x * r) / d);
