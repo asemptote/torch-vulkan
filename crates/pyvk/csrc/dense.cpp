@@ -875,10 +875,9 @@ at::Tensor& ormqr_out(const at::Tensor& a, const at::Tensor& tau, const at::Tens
   TORCH_CHECK(a.dim() >= 2, "torch.ormqr: input must have at least 2 dimensions.");
   TORCH_CHECK(c.dim() >= 2, "torch.ormqr: other must have at least 2 dimensions.");
   int64_t side = left ? -2 : -1;
-  TORCH_CHECK(c.size(side) >= tau.size(-1), "torch.ormqr: other.shape[", side,
-              "] must be greater than or equal to tau.shape[-1]");
   TORCH_CHECK(c.size(side) == a.size(-2), "torch.ormqr: other.shape[", side, "] must be equal to input.shape[-2]");
-  TORCH_CHECK(tau.size(-1) <= a.size(-1), "torch.ormqr: tau.shape[-1] must be less than or equal to input.shape[-1]");
+  TORCH_CHECK(tau.size(-1) == std::min(c.size(side), a.size(-1)), "torch.ormqr: tau.shape[-1] must be equal to "
+              "min(other.shape[", side, "], input.shape[-1])");
   TORCH_CHECK(a.dim() - tau.dim() == 1, "torch.ormqr: Expected tau to have one dimension less than input, but got "
               "tau.ndim equal to ", tau.dim(), " and input.ndim is equal to ", a.dim());
   TORCH_CHECK(a.dim() == c.dim(), "torch.ormqr: Expected other to have the same number of dimensions as input, but "

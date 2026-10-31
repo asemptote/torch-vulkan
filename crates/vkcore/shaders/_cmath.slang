@@ -193,7 +193,7 @@ C c_pow(C a, C b)
 {
     if (b.x == S(0) && b.y == S(0))
         return C(S(1), S(0));
-    if (a.x == S(0) && a.y == S(0))
-        return b.y == S(0) && b.x > S(0) ? C(S(0), S(0)) : C(m_nan(), m_nan());
+    if (a.x == S(0) && a.y == S(0))  // e^(b log 0): 0 for Re b > 0 (as the CPU), else undefined
+        return b.x > S(0) ? C(S(0), S(0)) : C(m_nan(), m_nan());
     return c_exp(cmul(b, c_log(a)));
 }

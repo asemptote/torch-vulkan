@@ -23,9 +23,9 @@ COMPLEX = (torch.complex64, torch.complex128)
 REJECTED = {
     "segment_reduce": INTS + UINT8 + BOOL,
     "_softmax_backward_data": INTS + UINT8,
-    "_upsample_bilinear2d_aa": INTS + HALF,
+    "_upsample_bilinear2d_aa": INTS + BOOL + HALF,
     "_upsample_bilinear2d_aa_backward": HALF,
-    "_upsample_bicubic2d_aa": INTS + HALF,
+    "_upsample_bicubic2d_aa": INTS + BOOL + HALF,
     "_upsample_bicubic2d_aa_backward": HALF,
     "grid_sampler_2d": INTS + UINT8 + BOOL,
     "grid_sampler_3d": INTS + UINT8 + BOOL,

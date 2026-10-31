@@ -1206,10 +1206,10 @@ def _out_overload(op):
     return None
 
 
-def _make_out_kernel(functional, out_names):
+def _make_out_kernel(functional, out_names, exact_dtype):
     """An out= kernel from a functional one: its results resized into and
     copied to the out= tensors (PyTorch's rules for both, as its own
-    decompositions use)."""
+    decompositions use; linalg ops want out='s dtype exact)."""
     from torch._prims_common.wrappers import _maybe_resize_out, _safe_copy_out
 
     def out_kernel(*args, **kwargs):
@@ -1218,7 +1218,7 @@ def _make_out_kernel(functional, out_names):
         results = results if isinstance(results, (tuple, list)) else (results,)
         for out, result in zip(outs, results):
             _maybe_resize_out(out, result.shape)
-            _safe_copy_out(copy_from=result, copy_to=out, exact_dtype=False)
+            _safe_copy_out(copy_from=result, copy_to=out, exact_dtype=exact_dtype)
         return outs[0] if len(outs) == 1 else tuple(outs)
 
     return out_kernel
@@ -1244,7 +1244,7 @@ def register():
         if found is not None:
             out_op, out_names = found
             if not torch._C._dispatch_has_kernel_for_dispatch_key(out_op.name(), "PrivateUse1"):
-                out_fn = _checks.with_cpu_checks(out_op, _make_out_kernel(checked, out_names))
+                out_fn = _checks.with_cpu_checks(out_op, _make_out_kernel(checked, out_names, base.startswith("linalg_")))
                 _lib.impl(out_op._schema.name.split("::", 1)[1] + "." + out_op._overloadname,
                           _layout.with_layout(out_op, out_fn), "PrivateUse1")
                 names.append(out_op.name())

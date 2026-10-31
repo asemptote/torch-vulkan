@@ -434,7 +434,15 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       at::Scalar v = !uses_alpha ? *scalar
                      : floating  ? at::Scalar(scalar->toDouble() * alpha.toDouble())
                                  : at::Scalar(scalar->toLong() * alpha.toLong());
-      launch_strided(kernel.c_str(), {op.code, 1}, target, &a, nullptr, {v});
+      uint32_t code = op.code;
+      if (code == op::BINARY_DIV && floating) {
+        // a / s as a * (1 / s), with 1 / s rounded in the compute type, as
+        // PyTorch's CPU and CUDA kernels (bitwise equal results).
+        double d = scalar->toDouble();
+        code = op::BINARY_MUL;
+        v = dtype == at::kDouble ? at::Scalar(1.0 / d) : at::Scalar(static_cast<double>(1.0f / static_cast<float>(d)));
+      }
+      launch_strided(kernel.c_str(), {code, 1}, target, &a, nullptr, {v});
     } else {
       at::Tensor b = to_dtype(*other, dtype);
       launch_strided(kernel.c_str(), {op.code, 0}, target, &a, &b, {alpha});

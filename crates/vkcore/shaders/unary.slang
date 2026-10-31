@@ -115,8 +115,13 @@ T apply(T x)
     case UNARY_CLAMP: {
         if (isnan(x)) return x;
         T lo = T(alpha()), hi = T(beta());
-        UBITS below = UBITS(0) - UBITS(x < lo ? 1 : 0), above = UBITS(0) - UBITS(x > hi ? 1 : 0);
-        UBITS r = (bit_cast<UBITS>(lo) & below) | (bit_cast<UBITS>(x) & ~below);
+        // min(max(x, lo), hi): the upper bound applies to max(x, lo) (lo > hi gives hi)
+        // (x's bits plus a zero the compiler cannot see, gamma = 0, hide the
+        // select of x: see ternary.slang's clamp)
+        UBITS zero = bit_cast<UBITS>(T(gamma()));
+        UBITS below = UBITS(0) - UBITS(x < lo ? 1 : 0);
+        UBITS r = (bit_cast<UBITS>(lo) & below) | ((bit_cast<UBITS>(x) + zero) & ~below);
+        UBITS above = UBITS(0) - UBITS(bit_cast<T>(r) > hi ? 1 : 0);
         return bit_cast<T>((bit_cast<UBITS>(hi) & above) | (r & ~above));
     }
 #else

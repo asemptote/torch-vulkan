@@ -956,6 +956,9 @@ at::Tensor flip(const at::Tensor& self, at::IntArrayRef dims) {
     return on_cpu("aten::flip", "", self, dims)[0].toTensor();
   }
   at::dim_list_to_bitset(dims, std::max<int64_t>(self.dim(), 1));  // (rejects repeated and out-of-range dims)
+  if (self.dim() == 0) {
+    return self.clone();  // (a scalar flips to itself)
+  }
   std::vector<int64_t> flipped;
   std::vector<at::Tensor> indices;
   for (int64_t d : dims) {

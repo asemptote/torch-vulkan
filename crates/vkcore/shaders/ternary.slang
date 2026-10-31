@@ -55,9 +55,10 @@ T apply(T a, T b, T c)
         // bound on ties, +0 for -0): a's bits plus a zero the compiler cannot
         // see (the scalar parameter, 0 for clamp) hide that it is a select of a.
         TBITS zero = bit_cast<TBITS>(scalar());
+        // min(max(a, b), c): the upper bound applies to max(a, b) (b > c gives c)
         TBITS below = TBITS(0) - TBITS(HAS_LO != 0 && a < b ? 1 : 0);
-        TBITS above = TBITS(0) - TBITS(HAS_HI != 0 && a > c ? 1 : 0);
         TBITS bits = (bit_cast<TBITS>(b) & below) | ((bit_cast<TBITS>(a) + zero) & ~below);
+        TBITS above = TBITS(0) - TBITS(HAS_HI != 0 && bit_cast<T>(bits) > c ? 1 : 0);
         bits = (bit_cast<TBITS>(c) & above) | (bits & ~above);
         return bit_cast<T>(bits);
 #else

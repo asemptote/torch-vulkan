@@ -570,8 +570,9 @@ at::Tensor& sgn_out(const at::Tensor& self, at::Tensor& out) {
 at::Tensor& pow_scalar_base_out(const at::Scalar& self, const at::Tensor& exponent, at::Tensor& out) {
   check_overlap(out, {&exponent});
   at::native::resize_output(out, exponent.sizes());
-  bool ok = is_vk(exponent) && is_vk(out) && !self.isComplex();
+  bool ok = is_vk(exponent) && is_vk(out);
   if (ok) {
+    // (a complex base too: through the same kernel as a tensor base, so both agree)
     at::Tensor base = at::full(exponent.sizes(), self, exponent.options().dtype(out.scalar_type()));
     ok = binary_op_gpu(op::BINARY_POW, base, &exponent, nullptr, out);
   }

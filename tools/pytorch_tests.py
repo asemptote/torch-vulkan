@@ -195,6 +195,8 @@ EXPECTED = [
      "sparse layouts are out of scope for this backend (dense tensors only)"),
     (r"", r"Sparsevk' backend",
      "sparse layouts are out of scope for this backend (dense tensors only)"),
+    (r"", r"Quantizedvk' backend",
+     "quantized tensors are out of scope for this backend (as sparse layouts: dense tensors only)"),
     (r"", r"not implemented for 'ComplexHalf'",
      "complex32 arithmetic: PyTorch's CPU backend has no kernels for it either (only copies and casts)"),
     (r"test_dtypes_nn_functional_conv", r"",
