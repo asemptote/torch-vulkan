@@ -5,7 +5,7 @@
 # (job i runs shard FIRST_SHARD + i).
 #PBS -N torch-vulkan-tests
 #PBS -q workq
-#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -l select=1:ncpus=1:mem=5gb
 #PBS -l walltime=12:00:00
 #PBS -j oe
 SHARD=$((FIRST_SHARD + PBS_ARRAY_INDEX))
