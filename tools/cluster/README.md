@@ -21,6 +21,11 @@ them). Large, rarely read things (the SDK, the Rust toolchain) can live on a
 bigger, slower volume behind symlinks; the venv should stay on the fast one,
 since every test process imports torch from it.
 
+After changing the code locally, `tools/cluster/sync.sh HOST --build -J
+GATEWAY` copies the working tree (uncommitted changes included) to the shared
+home directory and rebuilds there with `build.sh` (log in
+`~/torch-vulkan-build.log`, ending with `build exit N`).
+
 ## Running shards
 
 - `run-shard.sh SHARD SHARD_COUNT DRIVER OUT_DIR TEST_FILE...`: one shard, at
@@ -38,6 +43,18 @@ Outputs (per shard, in `OUT_DIR`): `<run>.jsonl` (each test's outcome, written
 as it finishes, so crashes and hangs lose one test, not the shard),
 `<run>.log`, and after the CPU re-check `<run>.cpu-too.txt` (failures that
 also fail on the CPU).
+
+### Bounds-checked runs
+
+With `TORCH_VK_VALIDATE=gpu` (and `VK_LAYER_PATH` pointing at the SDK's
+`share/vulkan/explicit_layer.d`), the Khronos validation layer checks every
+memory access the kernels make through buffer device addresses against the
+live allocations. The runner then records any test during which the layer
+reported something with the outcome `validation` and the layer's message.
+This catches out-of-bounds and null accesses that real GPUs often survive
+silently. The SDK's layer needs a newer `libstdc++` than some
+distributions have; put one on `LD_LIBRARY_PATH`. Pass all three to
+`qsub -v`.
 
 ## Merging
 

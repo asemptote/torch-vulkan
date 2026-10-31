@@ -44,15 +44,20 @@ import sys
 # pytest with torch_vulkan imported first (it registers "vk" before
 # common_device_type lists the device types), test ids from a file, and a
 # plugin recording each test's start and outcome (flushed, so they survive a
-# crash).
+# crash). With TORCH_VK_VALIDATE set, a test during which the validation
+# layer reported anything gets the outcome "validation" (with the message).
 RUNNER = r"""
-import json, sys
+import json, os, sys
 import torch_vulkan  # noqa: F401
+from torch_vulkan import _native
 import pytest
+
+VALIDATE = os.environ.get("TORCH_VK_VALIDATE", "0") not in ("", "0")
 
 class Recorder:
     def __init__(self, path):
         self.out = open(path, "a", encoding="utf-8")
+        self.issues = 0
 
     def write(self, **entry):
         self.out.write(json.dumps(entry) + "\n")
@@ -60,6 +65,16 @@ class Recorder:
 
     def pytest_runtest_logstart(self, nodeid, location):
         self.write(start=nodeid)
+
+    def pytest_runtest_teardown(self, item):
+        if VALIDATE:
+            _native.synchronize()
+            issues = _native.validation_issues()
+            if issues != self.issues:
+                message = _native.last_validation_message().strip().splitlines()
+                self.write(nodeid=item.nodeid, outcome="validation",
+                           message=f"{issues - self.issues} validation messages, last: {message[0][:200] if message else ''}")
+                self.issues = issues
 
     def pytest_runtest_logreport(self, report):
         failed_outside_call = report.when != "call" and not report.passed
@@ -96,8 +111,9 @@ def read_results(path):
             if "start" in entry:
                 started = entry["start"]
             else:
-                # A test reports once; a failure in teardown after a pass wins.
-                if entry["nodeid"] not in results or entry["outcome"] == "failed":
+                # A test reports once; a failure in teardown (or a validation
+                # report) after a pass wins.
+                if entry["nodeid"] not in results or entry["outcome"] in ("failed", "validation"):
                     results[entry["nodeid"]] = (entry["outcome"], entry["message"])
                 if entry["nodeid"] == started:
                     started = None
@@ -154,7 +170,7 @@ def collect(tests, file, env, extra):
     return sorted(line.strip() for line in out.splitlines() if "::" in line and not line.startswith(" "))
 
 
-FAILING = ("failed", "crashed", "xpassed")
+FAILING = ("failed", "crashed", "xpassed", "validation")
 
 # Failures that are expected on "vk" by design, as (test id pattern, message
 # pattern, reason); counted as "expected", not as failures. Every entry needs
@@ -171,6 +187,8 @@ EXPECTED = [
     (r"test_dtypes_nn_functional_max_pool1d_", r"",
      "integer max_pool1d: vk takes PyTorch's max_pool2d path (integers work, as in max_pool2d on the CPU); "
      "only the CPU's no-grad shortcut is float-only"),
+    (r"test_out_(cholesky_inverse|geqrf|ormqr)_", r"Unexpected success",
+     "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
     (r"", r"InductorError: KeyError: 'vk'",
      "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
 ]
@@ -271,7 +289,14 @@ def main():
     if args.ids:
         listed = [line.split()[0] for line in pathlib.Path(args.ids).read_text(encoding="utf-8").splitlines()
                   if line.strip()]
-        runs = [(args.name or pathlib.Path(args.ids).stem, sorted(set(listed)))]
+        # One run per test file (one pytest process finds the device-generic
+        # tests of only one file).
+        name = args.name or pathlib.Path(args.ids).stem
+        by_file = collections.defaultdict(set)
+        for nodeid in listed:
+            by_file[nodeid.split("::")[0]].add(nodeid)
+        runs = [(name if len(by_file) == 1 else f"{name}-{pathlib.Path(test_file).stem}", sorted(nodeids))
+                for test_file, nodeids in sorted(by_file.items())]
     for test_file, listed in runs:
         ids = listed if listed is not None else collect(tests, test_file, env, extra)
         stem = pathlib.Path(test_file).stem

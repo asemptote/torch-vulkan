@@ -104,7 +104,19 @@ pub unsafe extern "C" fn vkt_dispatch(
         Err(e) => return fail(e),
     };
     let queued = rt.stream.lock().unwrap().dispatch(&kernel, push, [gx, gy, gz]);
+    if queued.is_ok() && trace() {
+        // Each kernel runs to completion before the next is queued, so a
+        // kernel that crashes the driver is the last one printed.
+        eprintln!("[torch_vulkan] {name} {spec:?} grid {gx}x{gy}x{gz}");
+        return status(rt.synchronize());
+    }
     status(queued)
+}
+
+/// `TORCH_VK_TRACE=1`: print every kernel launch and wait for it to finish.
+fn trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("TORCH_VK_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 /// Workgroups and grid stride for a grid-stride kernel over `n` elements.

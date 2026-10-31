@@ -77,7 +77,8 @@ at::Tensor& elu_out(const at::Tensor& self, const at::Scalar& alpha, const at::S
 
 at::Tensor& hardtanh_out(const at::Tensor& self, const at::Scalar& min, const at::Scalar& max, at::Tensor& out) {
   if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
-    return at::clamp_out(out, self, min, max);
+    // (as the CPU: integer bounds, so the result keeps the integer dtype)
+    return at::clamp_out(out, self, at::Scalar(min.toLong()), at::Scalar(max.toLong()));
   }
   if (!param_unary_gpu(op::UNARY_HARDTANH, self, out, min.toDouble(), max.toDouble())) {
     on_cpu("aten::hardtanh", "out", self, min, max, out);
@@ -242,7 +243,8 @@ bool clamp_tensor_gpu(const at::Tensor& self, const std::optional<at::Tensor>& l
 
 at::Tensor& clamp_tensor_out(const at::Tensor& self, const std::optional<at::Tensor>& min,
                              const std::optional<at::Tensor>& max, at::Tensor& out) {
-  reject_dtype("clamp", self.scalar_type(), self.scalar_type() == at::kBool);
+  // (the CPU's clamp kernel has no bool version; with one bound it uses clamp_min / clamp_max's, which do)
+  reject_dtype("clamp", out.scalar_type(), out.scalar_type() == at::kBool && min.has_value() && max.has_value());
   if (!clamp_tensor_gpu(self, min, max, out)) {
     on_cpu("aten::clamp", "Tensor_out", self, min, max, out);
   }

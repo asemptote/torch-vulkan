@@ -74,6 +74,12 @@ bool apply(T a, T b)
     }
 }
 
+bool unary()
+{
+    return OP == COMPARE_ISNAN || OP == COMPARE_ISINF || OP == COMPARE_ISPOSINF || OP == COMPARE_ISNEGINF ||
+           OP == COMPARE_ISFINITE || OP == COMPARE_SIGNBIT || OP == COMPARE_LOGICAL_NOT;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -82,7 +88,8 @@ void main(uint3 id: SV_DispatchThreadID)
     {
         Offsets o = offsets(i);
         T a = p.a[o.a];
-        T b = B_SCALAR != 0 ? scalar() : p.b[o.b];
+        // (predicates of a alone get no b: its address is null)
+        T b = B_SCALAR != 0 || unary() ? scalar() : p.b[o.b];
 #if defined(T_b8)
         a = a != T(0) ? T(1) : T(0);  // any nonzero byte is true
         b = b != T(0) ? T(1) : T(0);

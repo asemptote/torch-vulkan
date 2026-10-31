@@ -3,6 +3,7 @@
 
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use ash::vk;
 
@@ -43,8 +44,11 @@ pub struct Capabilities {
 /// One Vulkan device with one compute queue.
 ///
 /// Set `TORCH_VK_VALIDATE=1` to enable the Khronos validation layer (with
-/// synchronization and best-practices checks). Every warning or error it
-/// reports is printed to stderr and counted in [`validation_issues`].
+/// synchronization and best-practices checks), or `TORCH_VK_VALIDATE=gpu`
+/// for its GPU-assisted checks instead (every shader access through a buffer
+/// device address is checked against the live allocations: much slower).
+/// Every warning or error it reports is printed to stderr and counted in
+/// [`validation_issues`].
 pub struct Context {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -59,15 +63,26 @@ pub struct Context {
 }
 
 static VALIDATION_ISSUES: AtomicUsize = AtomicUsize::new(0);
+static LAST_VALIDATION_MESSAGE: Mutex<String> = Mutex::new(String::new());
 
 /// Number of validation warnings/errors reported so far in this process.
 pub fn validation_issues() -> usize {
     VALIDATION_ISSUES.load(Ordering::Relaxed)
 }
 
+/// The most recent validation warning/error ("" if none yet).
+pub fn last_validation_message() -> String {
+    LAST_VALIDATION_MESSAGE.lock().map(|m| m.clone()).unwrap_or_default()
+}
+
 /// Whether `TORCH_VK_VALIDATE` asks for the validation layer.
 pub fn validation_requested() -> bool {
     std::env::var("TORCH_VK_VALIDATE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether `TORCH_VK_VALIDATE=gpu` asks for GPU-assisted validation.
+fn gpu_validation_requested() -> bool {
+    std::env::var("TORCH_VK_VALIDATE").is_ok_and(|v| v == "gpu")
 }
 
 unsafe extern "system" fn on_validation_message(
@@ -76,12 +91,22 @@ unsafe extern "system" fn on_validation_message(
     data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user: *mut c_void,
 ) -> vk::Bool32 {
-    VALIDATION_ISSUES.fetch_add(1, Ordering::Relaxed);
     let message = if data.is_null() || (*data).p_message.is_null() {
         "<no message>".into()
     } else {
         CStr::from_ptr((*data).p_message).to_string_lossy()
     };
+    // The layer's notes on its own settings (which GPU-assisted checks it
+    // turned off for this device) are not issues.
+    if message.contains("Information with the layer settings provided")
+        || message.contains("validation is adjusting settings")
+    {
+        return vk::FALSE;
+    }
+    VALIDATION_ISSUES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut last) = LAST_VALIDATION_MESSAGE.lock() {
+        *last = message.to_string();
+    }
     eprintln!("[vulkan {severity:?}] {message}");
     vk::FALSE
 }
@@ -106,8 +131,12 @@ impl Context {
             let validate = validation_requested();
             let layers = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
             let extensions = [ash::ext::debug_utils::NAME.as_ptr()];
-            let checks = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION, vk::ValidationFeatureEnableEXT::BEST_PRACTICES];
-            let mut features = vk::ValidationFeaturesEXT::default().enabled_validation_features(&checks);
+            let checks: &[vk::ValidationFeatureEnableEXT] = if gpu_validation_requested() {
+                &[vk::ValidationFeatureEnableEXT::GPU_ASSISTED, vk::ValidationFeatureEnableEXT::GPU_ASSISTED_RESERVE_BINDING_SLOT]
+            } else {
+                &[vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION, vk::ValidationFeatureEnableEXT::BEST_PRACTICES]
+            };
+            let mut features = vk::ValidationFeaturesEXT::default().enabled_validation_features(checks);
             let mut instance_messenger = messenger_info();
             let mut info = vk::InstanceCreateInfo::default().application_info(&app);
             if validate {

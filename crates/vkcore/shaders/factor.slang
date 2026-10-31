@@ -278,32 +278,26 @@ void laswp(uint t, uint z)
 
 void tri_inv(uint t, uint z)
 {
-    // Thread t computes column t of the inverse by substitution.
+    // Thread t computes column t of the inverse by forward substitution. An
+    // upper block U is inverted as the lower J U J (J reverses the order of
+    // rows and columns): inv(U) = J inv(J U J) J. (One loop shape for both:
+    // lavapipe's code for a bottom-up loop here read row -1 of the matrix.)
     T* a = p.a + z * p.sa;
     T* x = p.aux + z * p.saux;
     uint b = p.b, ld = p.ld, k = p.k;
     for (uint c = t; c < b; c += WG)
     {
-        if (UPPER == 0)
+        uint cc = UPPER != 0 ? b - 1 - c : c;
+        for (uint i = 0; i < b; i++)
         {
-            for (uint i = 0; i < b; i++)
+            uint ii = UPPER != 0 ? b - 1 - i : i;
+            T v = i == c ? ONE : ZERO;
+            for (uint m = c; m < i; m++)
             {
-                T v = i == c ? ONE : ZERO;
-                for (uint m = c; m < i; m++)
-                    v -= mul(a[(k + i) * ld + k + m], x[m * b + c]);
-                x[i * b + c] = (UNIT != 0 || i < c) ? v : dv(v, a[(k + i) * ld + k + i]);
+                uint mm = UPPER != 0 ? b - 1 - m : m;
+                v -= mul(a[(k + ii) * ld + k + mm], x[mm * b + cc]);
             }
-        }
-        else
-        {
-            for (int ii = int(b) - 1; ii >= 0; ii--)
-            {
-                uint i = uint(ii);
-                T v = i == c ? ONE : ZERO;
-                for (uint m = i + 1; m <= c; m++)
-                    v -= mul(a[(k + i) * ld + k + m], x[m * b + c]);
-                x[i * b + c] = (UNIT != 0 || i > c) ? v : dv(v, a[(k + i) * ld + k + i]);
-            }
+            x[ii * b + cc] = (UNIT != 0 || i < c) ? v : dv(v, a[(k + ii) * ld + k + ii]);
         }
     }
 }

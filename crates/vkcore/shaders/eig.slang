@@ -211,8 +211,9 @@ void qr(uint t, uint zi)
         int l = 0;
         for (int m = hi; m > 0; m--)
         {
-            T sub = h[m * n + m - 1];
-            S near = abs1(h[(m - 1) * n + m - 1]) + abs1(h[m * n + m]);
+            uint u = uint(max(m, 1));  // (m >= 1; see the note on the shift below)
+            T sub = h[u * n + u - 1];
+            S near = abs1(h[(u - 1) * n + u - 1]) + abs1(h[u * n + u]);
             if (abs1(sub) <= eps * near || abs1(sub) < S(1.17549435e-38))
             {
                 l = m;
@@ -234,7 +235,12 @@ void qr(uint t, uint zi)
         barrier();
         // Wilkinson shift: the eigenvalue of the trailing 2 x 2 nearer h[hi, hi];
         // an exceptional shift every 10 sweeps without deflation.
-        T a = h[(hi - 1) * n + hi - 1], b = h[(hi - 1) * n + hi], cc = h[hi * n + hi - 1], d = h[hi * n + hi];
+        // (hi >= 1 here. But lavapipe's generated code also performs loads on
+        // paths a lane does not take, e.g. these for a lane that deflated
+        // above with hi = 0, and a loop's first loads before its condition:
+        // every index is kept in range even where it is not used.)
+        uint u = uint(max(hi, 1));
+        T a = h[(u - 1) * n + u - 1], b = h[(u - 1) * n + u], cc = h[u * n + u - 1], d = h[u * n + u];
         T mu;
         its++;
         if (its % 10 == 0)
@@ -258,17 +264,13 @@ void qr(uint t, uint zi)
         // One sweep on rows/columns l .. hi.
         for (int k = l; k < hi; k++)
         {
-            T f, g;
-            if (k == l)
-            {
-                f = h[l * n + l] - mu;
-                g = h[(l + 1) * n + l];
-            }
-            else
-            {
-                f = h[k * n + k - 1];
-                g = h[(k + 1) * n + k - 1];
-            }
+            // The column the rotation zeroes: l itself, then the bulge at k - 1.
+            // (Choosing the index, not the loaded value: a compiler may load
+            // both sides of a branch, and h[k * n + k - 1] for k = 0 is out of
+            // bounds.)
+            uint col = k == l ? uint(l) : uint(k - 1);
+            T f = h[uint(k) * n + col] - (k == l ? mu : czero());
+            T g = h[uint(k + 1) * n + col];
             S c;
             T s;
             givens(f, g, c, s);
@@ -306,13 +308,14 @@ void vectors(uint t, uint zi)
         x[k * n + k] = cone();
         for (int j = int(k) - 1; j >= 0; j--)
         {
+            uint u = uint(max(j, 0));  // (j >= 0; see the note in qr)
             T s = czero();
-            for (uint m = uint(j) + 1; m <= k; m++)
-                s += cmul(tm[uint(j) * n + m], x[m * n + k]);
-            T dd = tm[uint(j) * n + uint(j)] - lam;
+            for (uint m = u + 1; m <= k; m++)
+                s += cmul(tm[u * n + m], x[m * n + k]);
+            T dd = tm[u * n + u] - lam;
             if (abs1(dd) < smin)
                 dd = T(smin, S(0));
-            x[uint(j) * n + k] = -cdiv(s, dd);
+            x[u * n + k] = -cdiv(s, dd);
         }
     }
 }
