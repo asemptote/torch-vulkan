@@ -446,6 +446,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
     p.npairs = static_cast<uint32_t>(per_round);
     double tol = epsilon(a3.scalar_type());
     at::Tensor norm2 = abs2(a3).sum({1, 2});
+    bool last = false;
     for (int sweep = 0; sweep < 40; ++sweep) {
       for (int64_t r = 0; r < rounds; ++r) {
         p.pairs = gpu_address(pairs) + static_cast<uint64_t>(r * per_round * 2 * sizeof(int32_t));
@@ -454,10 +455,14 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
       }
       // (Summed directly: "total minus diagonal" cancels and can stop early.)
       at::Tensor off2 = abs2(a3 - at::diag_embed(a3.diagonal(0, 1, 2))).sum({1, 2});
-      // Converged when the off-diagonal part is negligible in every matrix.
-      if (at::le(off2, norm2 * (tol * tol)).all().item<bool>()) {
+      // Converged when the off-diagonal part is negligible in every matrix;
+      // then one more sweep (convergence is quadratic): the small
+      // eigenvalues of a nearly singular matrix (e.g. matrix_rank's) need
+      // the off-diagonal part well below eps |A|.
+      if (last) {
         break;
       }
+      last = at::le(off2, norm2 * (tol * tol)).all().item<bool>();
     }
   }
   at::Tensor diag = at::real(a3.diagonal(0, 1, 2)).contiguous();

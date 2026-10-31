@@ -394,7 +394,8 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
     at::Tensor a = to_dtype(self, promoted), b = to_dtype(*other, promoted);
     at::Tensor a_big = at::ge(at::real(a), at::real(b));
     at::Tensor hi = at::where(a_big, a, b), lo = at::where(a_big, b, a);
-    at::Tensor r = at::add(at::log1p(at::exp(at::sub(lo, hi))), hi);
+    // (lo + -hi, not lo - hi: complex subtraction makes the other part NaN by an infinite part, as the CPU's)
+    at::Tensor r = at::add(at::log1p(at::exp(at::add(lo, at::neg(hi)))), hi);
     // The CPU's special cases: NaNs spread; equal infinite real parts give min
     // (-inf) or log(e^a + e^b) (+inf), where the formula above would give NaN.
     at::Tensor lr = at::real(lo), hr = at::real(hi);
@@ -425,9 +426,13 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   if (at::isComplexType(dtype)) {
     return complex_binary_gpu(op, *lhs, scalar ? nullptr : other, scalar, alpha, out, dtype);
   }
-  if (scalar && is_half(dtype)) {
+  bool opmath_scalar = op.code == op::BINARY_ADD || op.code == op::BINARY_SUB || op.code == op::BINARY_MUL ||
+                       op.code == op::BINARY_DIV || op.code == op::BINARY_POW;
+  if (scalar && is_half(dtype) && !opmath_scalar) {
     // As the CPU: a Python number joins a half-precision op as that dtype
-    // (2.3 as 2.30078125), though the kernel computes in float32.
+    // (fmod(x, 2.3) uses 2.30078125), though the kernel computes in float32;
+    // add, sub, mul, div and pow take it in float32 (their kernels read the
+    // original scalar).
     scalar = at::scalar_tensor(*scalar, at::TensorOptions().dtype(dtype)).item();
   }
   dtype = widened(dtype);

@@ -316,12 +316,22 @@ FT m_fmod(FT a, FT b)
     return m_signbit(a) ? -r : r;
 }
 
+// a / b correctly rounded: Vulkan allows OpFDiv 2.5 ulp, so 6 / 3 can be
+// 1.9999999 (and trunc it 1). One correction with the exact remainder (an
+// FMA) fixes the last bit.
+FT m_div(FT a, FT b)
+{
+    FT q = a / b;
+    if (isnan(q) || isinf(q) || q == FT(0) || isinf(b)) return q;
+    return q + fma(-q, b, a) / b;
+}
+
 // Python-style floor division, as PyTorch's div_floor for floats.
 FT m_floor_div(FT a, FT b)
 {
     if (b == FT(0)) return a / b;
     FT mod = m_fmod(a, b);
-    FT div = (a - mod) / b;
+    FT div = m_div(a - mod, b);
     if (mod != FT(0) && (b < FT(0)) != (mod < FT(0))) div -= FT(1);
     if (div == FT(0)) return FT(0) * (a / b);  // keeps the sign of zero
     FT fl = floor(div);

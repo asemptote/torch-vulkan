@@ -81,8 +81,8 @@ T apply(T a, T b)
 #ifdef IS_FLOAT
     case BINARY_MAXIMUM: return (isnan(a) || isnan(b)) ? T(a + b) : max(a, b);  // NaN propagates
     case BINARY_MINIMUM: return (isnan(a) || isnan(b)) ? T(a + b) : min(a, b);
-    case BINARY_DIV: return a / b;
-    case BINARY_DIV_TRUNC: return trunc(a / b);
+    case BINARY_DIV: return m_div(a, b);
+    case BINARY_DIV_TRUNC: return trunc(m_div(a, b));
     case BINARY_COPYSIGN: return m_signbit(b) ? -abs(a) : abs(a);
     case BINARY_HYPOT: {
         if (isinf(a) || isinf(b)) return T(1) / T(0);
@@ -116,18 +116,21 @@ T apply(T a, T b)
 #else
     case BINARY_MAXIMUM: return max(a, b);
     case BINARY_MINIMUM: return min(a, b);
+    // (x / -1 is -x, wrapping for the minimum, and x % -1 is 0: a division
+    // instruction may trap or saturate there)
     case BINARY_REMAINDER: {  // sign of the divisor
-        if (b == T(0)) return T(0);
+        if (b == T(0) || b == T(-1)) return T(0);
         T r = a % b;
         return (r != T(0) && ((r < T(0)) != (b < T(0)))) ? r + b : r;
     }
-    case BINARY_FMOD: return b == T(0) ? T(0) : a % b;  // sign of the dividend
+    case BINARY_FMOD: return (b == T(0) || b == T(-1)) ? T(0) : a % b;  // sign of the dividend
     case BINARY_FLOOR_DIVIDE: {
         if (b == T(0)) return T(0);
+        if (b == T(-1)) return T(0) - a;
         T q = a / b;
         return (a % b != T(0) && ((a < T(0)) != (b < T(0)))) ? q - T(1) : q;
     }
-    case BINARY_DIV_TRUNC: return b == T(0) ? T(0) : a / b;
+    case BINARY_DIV_TRUNC: return b == T(0) ? T(0) : (b == T(-1) ? T(0) - a : a / b);
     case BINARY_POW: return ipow(a, b);
     case BINARY_BITWISE_AND: return a & b;
     case BINARY_BITWISE_OR: return a | b;

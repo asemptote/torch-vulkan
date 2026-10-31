@@ -192,9 +192,11 @@ void lu_panel(uint t, uint z)
         // Pivot: the first row with the largest |a[i, j]|, i >= j (row j itself with UNIT).
         R best = UNIT != 0 && t == 0 ? mag1(a[j * ld + j]) : R(-1);
         int at = int(j);
+        // (Loads index rows min(i, n - 1), here and below: lavapipe performs a
+        // loop's first loads before testing its condition, for every lane.)
         for (uint i = j + t; UNIT == 0 && i < n; i += WG)
         {
-            R v = mag1(a[i * ld + j]);
+            R v = mag1(a[min(i, n - 1) * ld + j]);
             if (v > best || (isnan(v) && !isnan(best)))
             {
                 best = v;
@@ -227,8 +229,9 @@ void lu_panel(uint t, uint z)
         {
             for (uint c = t; c < p.cols; c += WG)
             {
-                T tmp = a[j * ld + c];
-                a[j * ld + c] = a[piv * ld + c];
+                uint cl = min(c, p.cols - 1);
+                T tmp = a[j * ld + cl];
+                a[j * ld + c] = a[piv * ld + cl];
                 a[piv * ld + c] = tmp;
             }
         }
@@ -241,13 +244,14 @@ void lu_panel(uint t, uint z)
         }
         T d = a[j * ld + j];
         for (uint i = j + 1 + t; i < n; i += WG)
-            a[i * ld + j] = dv(a[i * ld + j], d);
+            a[i * ld + j] = dv(a[min(i, n - 1) * ld + j], d);
         barrier();
         uint width = p.k + p.b - j - 1;
         uint height = n - j - 1;
+        uint w = max(width, 1u);  // (no division by zero where the loop does not run)
         for (uint e = t; e < width * height; e += WG)
         {
-            uint i = j + 1 + e / width, c = j + 1 + e % width;
+            uint i = min(j + 1 + e / w, n - 1), c = min(j + 1 + e % w, p.cols - 1);
             a[i * ld + c] = a[i * ld + c] - mul(a[i * ld + j], a[j * ld + c]);
         }
         barrier();
@@ -266,8 +270,9 @@ void laswp(uint t, uint z)
         {
             for (uint c = t; c < p.cols; c += WG)
             {
-                T tmp = a[i * ld + c];
-                a[i * ld + c] = a[r * ld + c];
+                uint cl = min(c, p.cols - 1);  // (see lu_panel)
+                T tmp = a[i * ld + cl];
+                a[i * ld + c] = a[r * ld + cl];
                 a[r * ld + c] = tmp;
             }
         }
