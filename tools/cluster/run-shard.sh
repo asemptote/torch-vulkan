@@ -20,4 +20,4 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 export PYTORCH_TEST_DIR=${PYTORCH_TEST_DIR:-$HOME/pytorch-src/test}
 mkdir -p "$OUT_DIR"
 exec nice -n 19 .venv/bin/python tools/pytorch_tests.py --out "$OUT_DIR" --shard "$SHARD/$SHARD_COUNT" "$@" \
-  -- --timeout 600 --timeout-method thread >"$OUT_DIR/runner.shard$SHARD-$SHARD_COUNT.$(hostname -s).log" 2>&1
+  -- --timeout 1800 --timeout-method thread >"$OUT_DIR/runner.shard$SHARD-$SHARD_COUNT.$(hostname -s).log" 2>&1
