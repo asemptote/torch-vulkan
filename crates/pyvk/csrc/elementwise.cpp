@@ -478,7 +478,9 @@ at::Tensor& addcmul_out(const at::Tensor& self, const at::Tensor& t1, const at::
   check_out_cast(at::promote_types(at::result_type(self, t1), at::result_type(t1, t2)), out);
   if (complex_ternary(self, t1, out) && is_vk(t2)) {
     at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), t1.sizes()), t2.sizes()));
-    out.copy_(at::add(self, at::mul(at::mul(t1, t2), value)));
+    // (operands in out's dtype first, then self + value * t1 * t2 left to right, as the CPU)
+    at::ScalarType ct = out.scalar_type();
+    out.copy_(at::add(self.to(ct), at::mul(at::mul(t1.to(ct), value), t2.to(ct))));
     return out;
   }
   if (value.isComplex() || !ternary_gpu(op::TERNARY_ADDCMUL, self, t1, &t2, std::nullopt, value, out)) {
@@ -491,7 +493,9 @@ at::Tensor& addcdiv_out(const at::Tensor& self, const at::Tensor& t1, const at::
                         at::Tensor& out) {
   if (complex_ternary(self, t1, out) && is_vk(t2)) {
     at::native::resize_output(out, at::infer_size(at::infer_size(self.sizes(), t1.sizes()), t2.sizes()));
-    out.copy_(at::add(self, at::mul(at::div(t1, t2), value)));
+    // (operands in out's dtype first, then self + value * t1 / t2 left to right, as the CPU)
+    at::ScalarType ct = out.scalar_type();
+    out.copy_(at::add(self.to(ct), at::div(at::mul(t1.to(ct), value), t2.to(ct))));
     return out;
   }
   if (value.isComplex() || !ternary_gpu(op::TERNARY_ADDCDIV, self, t1, &t2, std::nullopt, value, out)) {
