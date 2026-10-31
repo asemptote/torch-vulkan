@@ -122,7 +122,151 @@ def grid_sampler(input, grid, mode, k):
         raise RuntimeError("grid_sampler(): bicubic interpolation only supports 4D input")
 
 
+def _ints(v):
+    return [v] if isinstance(v, int) else list(v)
+
+
+def _pooling_output_shape(n, kernel, pad, stride, dilation, ceil_mode):
+    """The CPU's pooling_output_shape, with its checks."""
+    if stride == 0:
+        raise RuntimeError("stride should not be zero")
+    if pad < 0:
+        raise RuntimeError(f"pad must be non-negative, but got pad: {pad}")
+    if pad > ((kernel - 1) * dilation + 1) // 2:
+        raise RuntimeError(f"pad should be at most half of effective kernel size, but got pad={pad}, "
+                           f"kernel_size={kernel} and dilation={dilation}")
+    out = (n + 2 * pad - dilation * (kernel - 1) - 1 + (stride - 1 if ceil_mode else 0)) // stride + 1
+    if ceil_mode and (out - 1) * stride >= n + pad:
+        out -= 1
+    return out
+
+
+def _max_pool(k):
+    """The CPU's max_pool2d/3d_with_indices checks, with its messages."""
+    count = "two" if k == 2 else "three"
+
+    def check(x, kernel_size, stride=(), padding=0, dilation=1, ceil_mode=False, *rest, **kw):
+        ks, st, pd, dl = _ints(kernel_size), _ints(stride), _ints(padding), _ints(dilation)
+        if len(ks) not in (1, k):
+            raise RuntimeError(f"max_pool{k}d: kernel_size must either be a single int, or a tuple of {count} ints")
+        if len(st) not in (0, 1, k):
+            raise RuntimeError(f"max_pool{k}d: stride must either be omitted, a single int, or a tuple of {count} "
+                               "ints")
+        if len(pd) not in (1, k):
+            raise RuntimeError(f"max_pool{k}d: padding must either be a single int, or a tuple of {count} ints")
+        if len(dl) not in (1, k):
+            raise RuntimeError(f"max_pool{k}d: dilation must be either a single int, or a tuple of {count} ints")
+        ks, pd, dl = (ks * k)[:k], (pd * k)[:k], (dl * k)[:k]
+        st = (st * k)[:k] if st else ks
+        if k == 3 and x.dim() not in (4, 5):
+            raise RuntimeError("non-empty 4D or 5D (batch mode) tensor expected for input")
+        spatial = list(x.shape[-k:])
+        out = [_pooling_output_shape(spatial[d], ks[d], pd[d], st[d], dl[d], ceil_mode) for d in range(k)]
+        names = ["H", "W"] if k == 2 else ["T", "H", "W"]
+        if min(ks) <= 0:
+            raise RuntimeError("kernel size should be greater than zero, but got " +
+                               " ".join(f"k{n}: {v}" for n, v in zip(names, ks)))
+        if min(st) <= 0:
+            raise RuntimeError("stride should be greater than zero, but got " +
+                               " ".join(f"d{n}: {v}" for n, v in zip(names, st)))
+        if min(dl) <= 0:
+            raise RuntimeError("dilation should be greater than zero, but got " +
+                               " ".join(f"dilation{n}: {v}" for n, v in zip(names, dl)))
+        if k == 2:
+            n = x.dim()
+            ok = (n == 3 and min(x.shape) != 0) or (n == 4 and min(x.shape[1:]) != 0)
+            if not ok:
+                raise RuntimeError("Expected 3D or 4D (batch mode) tensor with optional 0 dim batch size for input, "
+                                   f"but got:{_sizes(x)}")
+        else:
+            fn = "max_pool3d_with_indices_out_cpu_template()"
+            for i in range(1 if x.dim() == 5 else 0, x.dim()):
+                if x.shape[i] <= 0:
+                    raise RuntimeError(f"{fn}: Expected input's non-batch dimensions to have positive length, but "
+                                       f"input has a shape of {_sizes(x)} and non-batch dimension {x.shape[i]} has "
+                                       "length zero!")
+        if min(out) < 1:
+            planes = x.shape[-k - 1]
+            raise RuntimeError(f"Given input size: ({'x'.join(map(str, (planes, *spatial)))}). Calculated output "
+                               f"size: ({'x'.join(map(str, (planes, *out)))}). Output size is too small")
+
+    return check
+
+
+def _adaptive_max_pool(k):
+    """The CPU's adaptive_max_pool2d/3d checks, with its messages."""
+    def check(x, output_size, *rest, **kw):
+        fn = f"adaptive_max_pool{k}d()"
+        if x.dim() not in (k + 1, k + 2):
+            raise RuntimeError(f"{fn}: Expected {k + 1}D or {k + 2}D tensor, but got: {_sizes(x)}")
+        for i in range(1, x.dim()):
+            if x.shape[i] <= 0:
+                raise RuntimeError(f"{fn}: Expected input to have non-zero size for non-batch dimensions, but input "
+                                   f"has sizes {_sizes(x)} with dimension {i} being empty")
+        if len(output_size) != k:
+            raise RuntimeError(f"{fn}: internal error: output_size.size() must be {k}")
+        shape = [*x.shape[:-k], *output_size]
+        for v in shape:
+            if v < 0:
+                raise RuntimeError(f"Trying to create tensor with negative dimension {v}: {shape}")
+    return check
+
+
+def _margin_input(x):
+    if not ((x.dim() == 2 and x.shape[1] != 0) or (x.dim() == 1 and x.shape[0] != 0) or x.dim() == 0):
+        raise RuntimeError(f"Expected non-empty vector or matrix with optional 0-dim batch size, but got: {_sizes(x)}")
+    return (1, 1 if x.dim() == 0 else x.shape[0]) if x.dim() <= 1 else tuple(x.shape)
+
+
+def _long_target(target):
+    if target.dtype != torch.int64:
+        raise RuntimeError(f"expected scalar type Long but found {_C10_NAMES.get(str(target.dtype)[6:])}")
+
+
+def _multi_margin_loss(x, target, p=1, margin=1, weight=None, *rest, **kw):
+    if p not in (1, 2):
+        raise RuntimeError("only p == 1 and p == 2 supported")
+    nframe, dim = _margin_input(x)
+    if target.dim() > 1 or target.numel() != nframe:
+        raise RuntimeError("multi_margin_loss: target tensor should be 1-D with size equal to the number of input "
+                           f"samples (batch size). Expected target size [{nframe}], but got {_sizes(target)}. Input "
+                           f"has shape {_sizes(x)}.")
+    if weight is not None and (weight.dim() > 1 or weight.numel() != dim):
+        raise RuntimeError(f"inconsistent weight size, expected {dim} but got {_sizes(weight)}")
+    _long_target(target)
+
+
+def _multilabel_margin_loss(x, target, *rest, **kw):
+    nframe, dim = _margin_input(x)
+    ok = (target.dim() <= 1 and target.numel() == dim) if x.dim() <= 1 else (
+        target.dim() == 2 and tuple(target.shape) == (nframe, dim))
+    if not ok:
+        raise RuntimeError(f"inconsistent target size: {_sizes(target)} for input of size: {_sizes(x)}")
+    _long_target(target)
+
+
+def _cross(a, b, dim, out):
+    if a.dim() != b.dim():
+        raise RuntimeError("linalg.cross: inputs must have the same number of dimensions.")
+    if not -max(a.dim(), 1) <= dim < max(a.dim(), 1):
+        raise IndexError(f"Dimension out of range (expected to be in range of [{-max(a.dim(), 1)}, "
+                         f"{max(a.dim(), 1) - 1}], but got {dim})")
+    if a.shape[dim] != 3 or b.shape[dim] != 3:
+        raise RuntimeError(f"linalg.cross: inputs dimension {dim} must have length 3. Got {a.shape[dim]} and "
+                           f"{b.shape[dim]}")
+    _no_overlap(out, a, b)
+
+
 CHECKS = {
+    # (self, kernel_size, stride, padding, dilation, ceil_mode)
+    "max_pool2d_with_indices": _max_pool(2),
+    "max_pool3d_with_indices": _max_pool(3),
+    # (self, output_size)
+    "adaptive_max_pool2d": _adaptive_max_pool(2),
+    "adaptive_max_pool3d": _adaptive_max_pool(3),
+    # (self, target, p, margin, weight, reduction) and (self, target, reduction)
+    "multi_margin_loss": _multi_margin_loss,
+    "multilabel_margin_loss_forward": _multilabel_margin_loss,
     # (input, grid, interpolation_mode, padding_mode, align_corners)
     "grid_sampler_2d": lambda x, grid, mode, *rest, **kw: grid_sampler(x, grid, mode, 2),
     # (self, kernel_size, dilation, padding, stride) and (self, output_size, kernel_size, ...)
@@ -135,7 +279,7 @@ CHECKS = {
     "nll_loss_backward": lambda grad, x, target, *rest, **kw: (
         ((grad, x, target.long(), *rest), kw) if target.dtype == torch.uint8 else None),
     # (self, other, dim, *, out)
-    "linalg_cross": lambda a, b, *rest, out=None, **kw: _no_overlap(out, a, b),
+    "linalg_cross": lambda a, b, dim=-1, *rest, out=None, **kw: _cross(a, b, dim, out),
     # (grad_output, self, negative_slope, self_is_result)
     "leaky_relu_backward": lambda grad, x, slope, is_result, *rest, **kw: _leaky_relu(slope, is_result),
     # (grad_output, alpha, scale, input_scale, is_result, self_or_result)

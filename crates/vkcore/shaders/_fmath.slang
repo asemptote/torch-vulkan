@@ -2,10 +2,10 @@
 // float for kernels with T_f32 (or FMATH_F32, e.g. complex64 kernels),
 // double for T_f64 (or FMATH_F64).
 //
-// float32 uses the GPU's GLSL.std.450 built-ins where they are accurate
-// enough, _math32.slang where there is no built-in, and short wrappers where
-// a built-in mishandles an edge case (tanh overflow, sinh/asinh cancellation,
-// pow/atan2 special values). float64 uses the software library in
+// float32 uses _math32.slang (Cephes' algorithms) rather than the GPU's
+// GLSL.std.450 transcendentals, whose accuracy varies by driver (lavapipe's
+// asin is off by 4e-4, its tanh near 0 by 6%); only sqrt, exp2, log2 and
+// special values come from built-ins. float64 uses the software library in
 // _math64*.slang, since SPIR-V has no 64-bit transcendentals. A float32
 // module never contains a double, so it runs on GPUs without float64.
 
@@ -31,60 +31,10 @@ float m_inf() { return f32_inf(); }
 float m_nan() { return f32_nan(); }
 bool m_signbit(float x) { return (bit_cast<uint>(x) >> 31) != 0; }
 
-// e^x by Cephes' expf (x = n ln 2 + r, |r| <= ln 2 / 2, a degree-5 polynomial):
-// about 1 ulp, where the built-in exp can be a few. The built-in beyond
-// |x| = 87.3 (overflow, subnormal results).
-float m_exp(float x)
-{
-    if (!(abs(x) < 87.3f)) return exp(x);
-    float n = floor(1.44269504088896f * x + 0.5f);
-    float r = (x - n * 0.693359375f) + n * 2.12194440e-4f;
-    float p = 1.9875691500e-4f;
-    p = p * r + 1.3981999507e-3f;
-    p = p * r + 8.3334519073e-3f;
-    p = p * r + 4.1665795894e-2f;
-    p = p * r + 1.6666665459e-1f;
-    p = p * r + 5.0000001201e-1f;
-    return ldexp(p * r * r + r + 1.0f, int(n));
-}
+float m_exp(float x) { return exp32(x); }
 float m_exp2(float x) { return exp2(x); }
 float m_expm1(float x) { return expm1_32(x); }
-// ln x by Cephes' logf (x = m 2^e with m in [sqrt(1/2), sqrt(2)), a degree-8
-// polynomial in m - 1): about 1 ulp, where the built-in log loses relative
-// accuracy near 1 (~1e-5). The built-in for zero, negatives, inf and NaN.
-float m_log(float x)
-{
-    if (!(x > 0.0f) || isinf(x)) return log(x);
-    float scale = 0.0f;
-    if (x < 1.17549435e-38f)  // subnormal: scale into the normal range
-    {
-        x *= 33554432.0f;  // 2^25
-        scale = -25.0f;
-    }
-    uint bits = bit_cast<uint>(x);
-    float e = float(int((bits >> 23) & 0xffu) - 126) + scale;
-    float m = bit_cast<float>((bits & 0x7fffffu) | 0x3f000000u);  // [0.5, 1)
-    if (m < 0.707106781186547524f)
-    {
-        m = m + m;
-        e = e - 1.0f;
-    }
-    float t = m - 1.0f;
-    float z = t * t;
-    float y = 7.0376836292e-2f;
-    y = y * t - 1.1514610310e-1f;
-    y = y * t + 1.1676998740e-1f;
-    y = y * t - 1.2420140846e-1f;
-    y = y * t + 1.4249322787e-1f;
-    y = y * t - 1.6668057665e-1f;
-    y = y * t + 2.0000714765e-1f;
-    y = y * t - 2.4999993993e-1f;
-    y = y * t + 3.3333331174e-1f;
-    y = y * z * t;
-    y += -2.12194440e-4f * e;
-    y += -0.5f * z;
-    return (t + y) + 0.693359375f * e;
-}
+float m_log(float x) { return log32(x); }
 float m_log2(float x) { return log2(x); }
 float m_log10(float x) { return m_log(x) * M_INV_LN10; }
 float m_log1p(float x) { return log1p32(x); }
@@ -131,7 +81,7 @@ float reduce_pio2_32(float x, out int n)
         return reduce_pio2_32_large(x, n);
     float k = round(x * 0.636619772367581f);
     n = int(k);
-    return ((x - k * 1.5707855225e+00f) - k * 1.0804273188e-05f) - k * 6.0770943833e-11f;
+    return ((x - k * 1.5703125f) - k * 4.837512969970703125e-4f) - k * 7.54978995489188216e-8f;  // (Cephes: k c1, k c2 exact)
 }
 float m_sin(float x)
 {
@@ -157,47 +107,72 @@ float m_tan(float x)
     float s = sin_poly32(r), c = cos_poly32(r);
     return (n & 1) == 0 ? s / c : -c / s;
 }
-float m_asin(float x) { return abs(x) <= 1.0f ? asin(x) : m_nan(); }  // (some built-ins clamp |x| > 1)
-// acos via asin, keeping relative accuracy near x = 1 (the built-in acos is
-// only accurate to ~1e-4 on some GPUs).
+float m_asin(float x) { return abs(x) <= 1.0f ? asin32(x) : m_nan(); }
+// acos via asin, keeping relative accuracy near x = 1 (as Cephes' acosf).
 float m_acos(float x)
 {
     if (!(abs(x) <= 1.0f)) return m_nan();
-    if (abs(x) < 0.5f) return 0.5f * M_PI - asin(x);
-    float r = 2.0f * asin(sqrt(0.5f * (1.0f - abs(x))));
-    return x > 0.0f ? r : M_PI - r;
+    if (abs(x) <= 0.5f) return (0.5f * M32_PI_HI - asin32(x)) + 0.5f * M32_PI_LO;
+    float r = 2.0f * asin32(sqrt(0.5f * (1.0f - abs(x))));
+    return x > 0.0f ? r : (M32_PI_HI - r) + M32_PI_LO;
 }
-float m_atan(float x) { return atan(x); }
+float m_atan(float x) { return atan32(x); }
 
+// Cephes' tanhf.
 float m_tanh(float x)
 {
-    if (abs(x) > 10.0f) return x > 0.0f ? 1.0f : -1.0f;  // e^2x overflows in the built-in
-    if (abs(x) < 0.5f)
+    float a = abs(x), r;
+    if (a > 44.0f) r = 1.0f;
+    else if (a >= 0.625f) r = 1.0f - 2.0f / (exp32(a + a) + 1.0f);
+    else
     {
-        float e = expm1_32(2.0f * x);
-        return e / (e + 2.0f);
+        float z = a * a;
+        r = ((((-5.70498872745e-3f * z + 2.06390887954e-2f) * z - 5.37397155531e-2f) * z + 1.33314422036e-1f) * z
+             - 3.33332819422e-1f) * z * a + a;
     }
-    return tanh(x);
+    return m_signbit(x) ? -r : r;
 }
 
-float m_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+float m_sigmoid(float x) { return 1.0f / (1.0f + exp32(-x)); }
 
+// Cephes' sinhf and coshf; e^|x| / 2 as (e^(|x|/2) / 2) e^(|x|/2) where e^|x| overflows.
 float m_sinh(float x)
 {
-    if (abs(x) < 1.0f)
+    float a = abs(x), r;
+    if (a > 88.0f)
     {
-        float e = expm1_32(x);
-        return 0.5f * (e + e / (e + 1.0f));
+        float h = exp32(0.5f * a);
+        r = (0.5f * h) * h;
     }
-    return sinh(x);
+    else if (a > 1.0f)
+    {
+        float e = exp32(a);
+        r = 0.5f * e - 0.5f / e;
+    }
+    else
+    {
+        float z = a * a;
+        r = ((2.03721912945e-4f * z + 8.33028376239e-3f) * z + 1.66667160211e-1f) * z * a + a;
+    }
+    return m_signbit(x) ? -r : r;
 }
 
-float m_cosh(float x) { return cosh(x); }
+float m_cosh(float x)
+{
+    float a = abs(x);
+    if (a > 88.0f)
+    {
+        float h = exp32(0.5f * a);
+        return (0.5f * h) * h;
+    }
+    float e = exp32(a);
+    return 0.5f * e + 0.5f / e;
+}
 
 float m_asinh(float x)
 {
     float a = abs(x), r;
-    if (a > 1e18f) r = log(a) + M_LN2;
+    if (a > 1e18f) r = log32(a) + M_LN2;
     else r = log1p32(a + a * a / (1.0f + sqrt(1.0f + a * a)));
     return m_signbit(x) ? -r : r;
 }
@@ -205,7 +180,7 @@ float m_asinh(float x)
 float m_acosh(float x)
 {
     if (x < 1.0f) return f32_nan();
-    if (x > 1e18f) return log(x) + M_LN2;
+    if (x > 1e18f) return log32(x) + M_LN2;
     float t = x - 1.0f;
     return log1p32(t + sqrt(2.0f * t + t * t));
 }
@@ -233,7 +208,8 @@ float m_atan2(float y, float x)
     if (y == 0.0f) return xneg ? sy * M_PI : y;  // atan2(+-0, -x) = +-pi, atan2(+-0, +x) = +-0
     if (x == 0.0f || isinf(y)) return sy * 0.5f * M_PI;
     if (isinf(x)) return xneg ? sy * M_PI : sy * 0.0f;
-    return atan2(y, x);
+    float a = atan32(abs(y) / abs(x));  // (as Cephes' atan2f)
+    return sy * (xneg ? (M32_PI_HI - a) + M32_PI_LO : a);
 }
 
 // x * 2^k exactly for 0 <= k <= 277 (k is split so each factor is a normal power of two).
@@ -401,7 +377,7 @@ FT m_pow(FT x, FT y)
         double tl = fma(y, l, -t);
         r = exp64(t) * (1.0l + tl);
 #else
-        r = pow(x, y);
+        r = pow32(x, y);
 #endif
     }
     return neg ? -r : r;

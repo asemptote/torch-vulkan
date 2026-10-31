@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M14 — complex completion**: device `"vk"` is a native PyTorch
+Status: **M15 — PyTorch's own tests**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -34,6 +34,45 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## PyTorch's own tests (M15)
+
+`tools/pytorch_tests.py` runs PyTorch's device-generic test files
+(`test_ops.py`, `test_torch.py`, `test_binary_ufuncs.py`,
+`test_unary_ufuncs.py`, `test_nn.py`, `test_linalg.py`, `test_reductions.py`,
+`test_indexing.py`, `test_tensor_creation_ops.py`, `test_shape_ops.py`,
+`test_type_promotion.py`, `test_sort_and_select.py`, `test_view_ops.py`) on
+`"vk"`, in shards, from a sparse checkout of PyTorch's `test/` at the
+installed torch's commit. Each test that fails on `"vk"` is run again on the
+CPU: failures shared with the CPU are not ours. Known, explained differences
+are listed in its `EXPECTED` table with the reason for each (sparse and
+quantized tensors are out of scope; some tests hard-code CUDA's or the CPU's
+behaviour). `tools/cluster/` runs the shards as a PBS job array on lavapipe
+(Mesa's CPU Vulkan driver), and optionally with GPU-assisted validation
+(bounds-checked buffer accesses).
+
+What the tests asked of `"vk"`, beyond correct values:
+
+- The CPU's argument checks and error messages, in C++ kernels and, for
+  composed kernels and PyTorch's decompositions, in `python/torch_vulkan/
+  _checks.py`; the dtypes the CPU accepts (`_dtypes.py`); out= semantics
+  (resizing and its warning, exact or castable dtypes, out= on another
+  device); memory-overlap errors; deterministic-algorithm alerts;
+  copy-on-write inputs left unmaterialized; output strides as PyTorch's
+  meta kernels predict them.
+- Results that do not depend on the driver. float32 math no longer uses the
+  GPU's transcendental built-ins, whose accuracy varies (lavapipe's asin is
+  off by 4e-4, its tanh near 0 by 6%): `_math32.slang` has Cephes'
+  algorithms for exp, log, asin, atan, tanh, sinh, cosh, and pow in
+  double-float arithmetic. Shaders are compiled with `-fp-mode precise`
+  (every float operation NoContraction), since Mesa reassociates
+  expressions otherwise (Cody-Waite's reduction, error-free sums). gemm
+  keeps fused multiply-adds.
+- No assumptions about how a workgroup executes: lavapipe runs one in
+  SIMD-width chunks, so a missing barrier (Jacobi eigh read entries other
+  threads had already rotated) gives wrong results there and right ones on a
+  GPU; and it performs loads on paths a lane does not take, so indices are
+  kept in range even where their value is unused.
 
 ## Complex completion and the remaining ops (M14)
 
@@ -652,5 +691,9 @@ no fallbacks in the OpInfo sweep).
 15. **M15 PyTorch's own tests**: run PyTorch's device-generic suites
     (`test_ops.py` and related, via `instantiate_device_type_tests`) on
     `"vk"`, checking tolerances, error messages, dtype rules and autograd
-    against PyTorch's expectations rather than ours.
+    against PyTorch's expectations rather than ours (see above). In
+    progress: the remaining failures, mostly numerics of composed ops and
+    tests of CUDA-specific behaviour.
+16. **M16 dedicated kernels**: native kernels for the hottest composed ops
+    (softmax, normalization, pooling, losses), chosen by profiling.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

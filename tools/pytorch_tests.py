@@ -219,6 +219,9 @@ EXPECTED = [
     (r"test_trivial_fancy_out_of_bounds_", r"",
      "out-of-range indices are flagged by the kernel and raised at the next synchronization, as CUDA's "
      "device asserts (CUDA skips this test)"),
+    (r"test_pow_cuda_complex_extremal_passing_", r"Scalars are not close",
+     "(-1 + inf i)^2: the CPU's complex pow gives inf + nan i from its special-value path; vk squares exactly "
+     "(-inf - inf i)"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

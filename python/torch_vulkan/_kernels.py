@@ -549,6 +549,35 @@ def _make_fractional_max(k):
     return forward, backward
 
 
+# ---------------------------------------------------------------- margin losses
+
+# PyTorch's decompositions, with the CPU's output shape without reduction:
+# 0-dim for an unbatched target (where they return [1]).
+
+def _multi_margin_loss(x, target, p=1, margin=1, weight=None, reduction=1):
+    r = decomposition_table[aten.multi_margin_loss.default](x, target, p, margin, weight, reduction)
+    return r.reshape(()) if target.dim() == 0 and reduction == 0 else r
+
+
+def _multilabel_margin_loss_forward(x, target, reduction):
+    r, is_target = decomposition_table[aten.multilabel_margin_loss_forward.default](x, target, reduction)
+    return (r.reshape(()) if target.dim() <= 1 and reduction == 0 else r), is_target
+
+
+# ---------------------------------------------------------------- ldexp
+
+def _ldexp(x, other):
+    # PyTorch's x * pow(2, other), with 2 in x's dtype (float32 for integers),
+    # but a half-precision power computed in float32: 2^20 overflows float16
+    # while 2^-10 * 2^20 does not.
+    two_dtype = x.dtype if x.is_floating_point() or x.is_complex() else torch.float32
+    power_dtype = torch.result_type(torch.empty((), dtype=two_dtype), other)
+    if power_dtype in (torch.float16, torch.bfloat16):
+        dtype = torch.result_type(x, torch.empty((), dtype=power_dtype))
+        return (x.float() * torch.pow(x.new_full((), 2.0, dtype=torch.float32), other)).to(dtype)
+    return x * torch.pow(x.new_full((), 2.0, dtype=two_dtype), other)
+
+
 # ---------------------------------------------------------------- rrelu
 
 def _rrelu_with_noise(x, noise, lower=1.0 / 8, upper=1.0 / 3, training=False, generator=None):
@@ -845,8 +874,9 @@ def _frexp_out(self, *, mantissa, exponent):
     m = ((bits & ~(mask << mbits)) | (bias << mbits)).view(x.dtype)
     nonfinite = ~torch.isfinite(x)
     special = (x == 0) | nonfinite
-    mantissa.resize_(x.shape)
-    exponent.resize_(x.shape)
+    from torch._prims_common.wrappers import _maybe_resize_out
+    _maybe_resize_out(mantissa, x.shape)  # (warns on resizing a non-empty out, as the CPU)
+    _maybe_resize_out(exponent, x.shape)
     mantissa.copy_(torch.where(special, x, m))
     exponent.copy_(torch.where(nonfinite, _frexp_nonfinite_exponent(), torch.where(special, 0, e)))
     return mantissa, exponent
@@ -1235,6 +1265,9 @@ def _kernels():
         "grid_sampler_2d_backward": _make_grid_sampler_backward("grid_sampler_2d_backward"),
         "grid_sampler_3d_backward": _make_grid_sampler_backward("grid_sampler_3d_backward"),
         "native_group_norm": _native_group_norm,
+        "ldexp.Tensor": _ldexp,
+        "multi_margin_loss": _multi_margin_loss,
+        "multilabel_margin_loss_forward": _multilabel_margin_loss_forward,
         "_cdist_forward": _cdist_forward,
         "_cdist_backward": _cdist_backward,
         "_pdist_forward": _pdist_forward,
@@ -1302,6 +1335,9 @@ def _make_out_kernel(functional, out_names, exact_dtype):
         results = functional(*args, **kwargs)
         results = results if isinstance(results, (tuple, list)) else (results,)
         for out, result in zip(outs, results):
+            if out.shape != result.shape and any(a is out for a in args):  # in place: no resizing
+                raise RuntimeError(f"output with shape {list(out.shape)} doesn't match the broadcast shape "
+                                   f"{list(result.shape)}")
             _maybe_resize_out(out, result.shape)
             _safe_copy_out(copy_from=result, copy_to=out, exact_dtype=exact_dtype)
         return outs[0] if len(outs) == 1 else tuple(outs)

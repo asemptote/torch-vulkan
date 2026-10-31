@@ -37,6 +37,14 @@ const SLANGC_FLAGS: &[&str] = &[
     "-denorm-mode-fp32", "preserve", "-denorm-mode-fp64", "preserve",
 ];
 
+/// Every kernel but these is compiled with `-fp-mode precise`, which marks
+/// each float operation NoContraction: drivers may then neither fuse nor
+/// reassociate them (Mesa's NIR otherwise rewrites e.g. Cody-Waite's
+/// (x - k c1) - k c2 into x - k (c1 + c2), and error-free transformations
+/// into nothing). Matrix products keep the default: their inner loops want
+/// fused multiply-adds, which only make them more accurate.
+const DEFAULT_FP_MODE: &[&str] = &["gemm"];
+
 fn slangc() -> PathBuf {
     if let Ok(p) = env::var("SLANGC") {
         return p.into();
@@ -172,8 +180,9 @@ fn main() {
             let spv = out.join(format!("{name}.spv"));
             writeln!(table, "    ({name:?}, include_bytes!({:?})),", spv.display().to_string()).unwrap();
 
+            let precise = !DEFAULT_FP_MODE.contains(&stem);
             let mut key = DefaultHasher::new();
-            (includes, &text, &defines).hash(&mut key);
+            (includes, &text, &defines, precise).hash(&mut key);
             let key = format!("{:016x}", key.finish());
             let stamp = out.join(format!("{name}.hash"));
             if spv.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str()) {
@@ -181,6 +190,9 @@ fn main() {
             }
             let mut cmd = Command::new(&compiler);
             cmd.arg(src).args(SLANGC_FLAGS).arg("-I").arg("shaders").arg("-I").arg(&out);
+            if precise {
+                cmd.args(["-fp-mode", "precise"]);
+            }
             for d in &defines {
                 cmd.arg(format!("-D{d}"));
             }

@@ -170,9 +170,6 @@ at::Tensor index_select(const at::Tensor& self, int64_t dim, const at::Tensor& i
 
 at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, bool sparse_grad,
                        at::Tensor& out) {
-  at::assert_no_internal_overlap(out);  // (as the CPU)
-  at::assert_no_overlap(out, self);
-  at::assert_no_overlap(out, index);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   // (the CPU's gather checks: structured out, index dtype, gather_shape_check)
   TORCH_CHECK(out.scalar_type() == self.scalar_type(), "Expected out tensor to have dtype ", self.dtype(),
@@ -189,6 +186,9 @@ at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& in
     }
   }
   at::native::resize_output(out, index.sizes());
+  at::assert_no_internal_overlap(out);  // (as the CPU: after resizing out)
+  at::assert_no_overlap(out, self);
+  at::assert_no_partial_overlap(out, index);
   if (!movable(self) || !is_vk(index) || !is_vk(out) || !index_dtype_ok(index) ||
       std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
     on_cpu("aten::gather", "out", self, dim, index, sparse_grad, out);
@@ -248,7 +248,6 @@ struct Advanced {
 };
 
 Advanced make_advanced(at::Tensor self, const c10::List<std::optional<at::Tensor>>& orig) {
-  TORCH_CHECK_INDEX(!orig.empty(), "at least one index must be provided");
   at::native::checkIndexTensorTypes(orig, /*allow_int=*/true);
   std::vector<at::Tensor> indices = at::native::expandTensors(self, orig, /*ensure_same_device=*/true);
   try {
@@ -328,6 +327,7 @@ bool indices_on_vk(const c10::List<std::optional<at::Tensor>>& indices) {
 }
 
 at::Tensor& index_out(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices, at::Tensor& out) {
+  TORCH_CHECK_INDEX(!indices.empty(), "at least one index must be provided");
   check_index_devices(self, indices);
   if (!movable(self) || !is_vk(out) || out.scalar_type() != self.scalar_type() || !indices_on_vk(indices)) {
     on_cpu("aten::index", "Tensor_out", self, indices, out);
@@ -776,6 +776,8 @@ at::Tensor bincount(const at::Tensor& self, const std::optional<at::Tensor>& wei
 at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& min, const at::Scalar& max,
                       at::Tensor& out) {
   TORCH_CHECK(bins > 0, "torch.histc(): bins must be > 0, but got ", bins);
+  TORCH_CHECK(self.dtype() == out.dtype(), "torch.histc: input tensor and hist tensor should have the same dtype, "
+              "but got input ", self.dtype(), " and hist ", out.dtype());  // (as the CPU)
   at::ScalarType t = self.scalar_type();
   if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(t) || accum_label(t) == nullptr) {
     on_cpu("aten::histc", "out", self, bins, min, max, out);
@@ -805,7 +807,7 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
   at::Tensor bucket = at::searchsorted(edges, x, false, /*right=*/true) - 1;
   bucket = at::where(at::eq(x, last), at::full_like(bucket, bins - 1), bucket);
   at::Tensor keep = at::logical_and(at::ge(x, first), at::le(x, last));
-  at::Tensor offsets = at::masked_select(bucket, keep);
+  at::Tensor offsets = at::masked_select(bucket, keep) * out.stride(0);  // (elements apart in out)
   at::Tensor dst_view = out.as_strided({offsets.numel()}, {0});
   accumulate(dst_view, offsets, at::ones({offsets.numel()}, out.options()), op::SEGREDUCE_SUM, true);
   return out;
@@ -1247,7 +1249,12 @@ at::Tensor& logspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
                            : at::isFloatingType(dtype)                         ? at::kFloat
                                                                                : iota_dtype(at::kDouble);
   at::Tensor exponents = at::empty({0}, out.options().dtype(compute));
-  linspace_out(start, end, steps, exponents);
+  if (at::isIntegralType(dtype, false)) {
+    // As the CPU: start and end truncated to integers, exponents between them in double.
+    linspace_out(start.toLong(), end.toLong(), steps, exponents);
+  } else {
+    linspace_out(start, end, steps, exponents);
+  }
   if (out.numel() != steps) {  // (as the CPU: an out= with steps elements keeps its shape)
     at::native::resize_output(out, {steps});
   }

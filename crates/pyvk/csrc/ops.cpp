@@ -425,6 +425,11 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   if (at::isComplexType(dtype)) {
     return complex_binary_gpu(op, *lhs, scalar ? nullptr : other, scalar, alpha, out, dtype);
   }
+  if (scalar && is_half(dtype)) {
+    // As the CPU: a Python number joins a half-precision op as that dtype
+    // (2.3 as 2.30078125), though the kernel computes in float32.
+    scalar = at::scalar_tensor(*scalar, at::TensorOptions().dtype(dtype)).item();
+  }
   dtype = widened(dtype);
   label = dtype_label(dtype);
   if (!kind_allows(op.kind, dtype) || label == nullptr) {
@@ -489,6 +494,28 @@ at::Tensor& binary_out(const at::Tensor& self, const at::Tensor& other, at::Tens
   return out;
 }
 
+// nextafter in half precision steps through that format's values, by their
+// bits (the kernel computes in float32, whose neighbour rounds back to x).
+at::Tensor& nextafter_out(const at::Tensor& self, const at::Tensor& other, at::Tensor& out) {
+  at::ScalarType t = at::result_type(self, other);
+  if (!(t == at::kHalf || t == at::kBFloat16) || !is_vk(self) || !is_vk(other) || !is_vk(out) ||
+      out.scalar_type() != t) {
+    return binary_out<16>(self, other, out);
+  }
+  auto shape = at::infer_size(self.sizes(), other.sizes());
+  at::Tensor x = self.to(t).expand(shape).contiguous(), y = other.to(t).expand(shape).contiguous();
+  at::Tensor xf = x.to(at::kFloat), yf = y.to(at::kFloat);
+  at::Tensor up = at::eq(at::gt(yf, xf), at::gt(xf, 0));  // away from zero
+  at::Tensor bits = x.view(at::kShort) + at::where(up, 1, -1).to(at::kShort);
+  at::Tensor tiny = at::where(at::lt(yf, 0), -32767, 1).to(at::kShort);  // +-smallest subnormal
+  bits = at::where(at::eq(xf, 0), tiny, bits);
+  bits = at::where(at::eq(xf, yf), y.view(at::kShort), bits);
+  bits = at::where(at::logical_or(at::isnan(xf), at::isnan(yf)), (xf + yf).to(t).view(at::kShort), bits);
+  at::native::resize_output(out, shape);
+  out.copy_(bits.view(t));
+  return out;
+}
+
 at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
   TORCH_CHECK(!self.is_complex() && !values.is_complex() && !out.is_complex(),
               "heaviside is not yet implemented for complex tensors.");
@@ -498,6 +525,8 @@ at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::
 }
 
 at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, at::Tensor& out) {
+  TORCH_CHECK(!(at::isIntegralType(self.scalar_type(), true) && exponent.isIntegral(true) && exponent.toLong() < 0),
+              "Integers to negative integer powers are not allowed.");  // (as the CPU)
   if (!binary_gpu(kBinary[kPow], self, nullptr, &exponent, 1, out)) {
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);
   }
@@ -639,7 +668,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
   m.impl("copysign.out", &binary_out<14>);
   m.impl("hypot.out", &binary_out<15>);
-  m.impl("nextafter.out", &binary_out<16>);
+  m.impl("nextafter.out", &nextafter_out);
   m.impl("logaddexp.out", &binary_out<17>);
   m.impl("logaddexp2.out", &binary_out<18>);
   m.impl("xlogy.OutTensor", &binary_out<19>);

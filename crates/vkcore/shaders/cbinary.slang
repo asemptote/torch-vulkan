@@ -40,7 +40,12 @@ void main(uint3 id: SV_DispatchThreadID)
         switch (OP)
         {
         case CBINARY_ADD: r = a + mult * b; break;
-        case CBINARY_SUB: r = a - mult * b; break;
+        case CBINARY_SUB:
+            // As the CPU (and NumPy's reference): a - (alpha + 0i) b as a complex
+            // product, so an infinite part of b makes the other part NaN
+            // (0 inf). beta() is 0 here, a zero the compiler cannot fold away.
+            r = B_SCALAR != 0 ? a - b : a - T(mult * b.x - S(beta()) * b.y, mult * b.y + S(beta()) * b.x);
+            break;
         case CBINARY_MUL: r = cmul(a, b); break;
         case CBINARY_POW: r = c_pow(a, b); break;
         default: r = cdiv(a, b); break;  // CBINARY_DIV

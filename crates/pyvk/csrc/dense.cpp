@@ -680,7 +680,9 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> det_out(const at::Tensor& a, a
     on_cpu("aten::_linalg_det", "result", a, result, lu, pivots);
     return {result, lu, pivots};
   }
-  Lu r = lu_factor(a);
+  // As PyTorch: a contiguous real A is factored as A^T (det(A^T) = det(A)),
+  // and the backward solves with the factors accordingly.
+  Lu r = lu_factor(a.is_contiguous() && !a.is_complex() ? a.mH() : a);
   auto bs = batch_shape(a);
   at::Tensor det = r.lu.diagonal(0, 1, 2).prod(1) * pivot_sign(r.piv, a.options());
   assign(result, det.view(bs));
@@ -696,7 +698,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> slogdet_out(const
     on_cpu("aten::_linalg_slogdet", "sign", a, sign, logabsdet, lu, pivots);
     return {sign, logabsdet, lu, pivots};
   }
-  Lu r = lu_factor(a);
+  Lu r = lu_factor(a.is_contiguous() && !a.is_complex() ? a.mH() : a);  // (as det_out)
   auto bs = batch_shape(a);
   at::Tensor diag = r.lu.diagonal(0, 1, 2);
   assign(logabsdet, diag.abs().log().sum(1).view(bs));

@@ -580,9 +580,19 @@ at::Tensor& pow_scalar_base_out(const at::Scalar& self, const at::Tensor& expone
   at::native::resize_output(out, exponent.sizes());
   bool ok = is_vk(exponent) && is_vk(out);
   if (ok) {
-    // (a complex base too: through the same kernel as a tensor base, so both agree)
-    at::Tensor base = at::full(exponent.sizes(), self, exponent.options().dtype(out.scalar_type()));
-    ok = binary_op_gpu(op::BINARY_POW, base, &exponent, nullptr, out);
+    // In the promoted dtype, then cast (as the CPU: 2 ** uint8(17) is 0 even
+    // into an int64 out). A complex base too: through the same kernel as a
+    // tensor base, so both agree.
+    at::ScalarType compute = at::result_type(exponent, self);
+    check_out_cast(compute, out);
+    at::Tensor base = at::full(exponent.sizes(), self, exponent.options().dtype(compute));
+    if (compute == out.scalar_type()) {
+      ok = binary_op_gpu(op::BINARY_POW, base, &exponent, nullptr, out);
+    } else {
+      at::Tensor result = at::empty(exponent.sizes(), base.options());
+      ok = binary_op_gpu(op::BINARY_POW, base, &exponent, nullptr, result);
+      if (ok) out.copy_(result);
+    }
   }
   if (!ok) {
     on_cpu("aten::pow", "Scalar_out", self, exponent, out);
@@ -597,6 +607,13 @@ at::Tensor& div_mode_out(const at::Tensor& self, const at::Tensor& other, std::o
     ok = binary_op_gpu(op::BINARY_DIV, self, &other, nullptr, out);
   } else if (*mode == "floor") {
     ok = binary_op_gpu(op::BINARY_FLOOR_DIVIDE, self, &other, nullptr, out);
+  } else if (is_half(at::result_type(self, other)) && is_vk(self) && is_vk(other) && is_vk(out)) {
+    // As the CPU: the quotient rounded to half precision, then truncated.
+    at::Tensor q = at::div(self, other);
+    check_out_cast(q.scalar_type(), out);
+    at::native::resize_output(out, q.sizes());
+    out.copy_(at::trunc(q));
+    ok = true;
   } else {
     ok = binary_op_gpu(op::BINARY_DIV_TRUNC, self, &other, nullptr, out);
   }
