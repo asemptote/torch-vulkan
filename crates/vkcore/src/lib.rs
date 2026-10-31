@@ -45,7 +45,8 @@ impl Runtime {
     }
 
     pub fn alloc(&self, bytes: u64) -> Result<Allocation> {
-        self.pool.lock().unwrap().alloc(bytes)
+        // (Lock order pool -> stream: the stream never takes the pool's lock.)
+        self.pool.lock().unwrap().alloc(bytes, &mut || self.synchronize())
     }
 
     /// Returns `a` to the pool. Queued GPU work may still use it: reuse is

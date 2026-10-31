@@ -23,7 +23,8 @@ const LARGE_GRANULE: u64 = 2 << 20;
 /// Unused bytes before and after each block's allocations. Drivers may load
 /// from addresses a lane computes but does not use (lavapipe runs a loop's
 /// loads one iteration past its end, e.g. `piv[-1]`); near the ends of a
-/// block those land outside the mapping, and the process crashes.
+/// block those land outside the mapping, and the process crashes. Blocks
+/// within 2 * GUARD of the device's per-buffer limit get what room is left.
 const GUARD: u64 = 1 << 20;
 
 fn round_up(v: u64, to: u64) -> u64 {
@@ -82,6 +83,7 @@ struct Block {
     host: *mut u8,
     address: vk::DeviceAddress,
     size: u64,
+    guard: u64,
     ranges: RangeAllocator,
 }
 
@@ -142,10 +144,13 @@ impl Pool {
         Self { ctx, blocks: Vec::new(), allocated: 0 }
     }
 
-    pub fn alloc(&mut self, size: u64) -> Result<Allocation> {
+    /// Sub-allocates `size` bytes, growing the pool if no cached block has
+    /// room. Releasing cached blocks first calls `wait_idle`, which must wait
+    /// for queued GPU work: a freed allocation may still be in use by it.
+    pub fn alloc(&mut self, size: u64, wait_idle: &mut dyn FnMut() -> Result<()>) -> Result<Allocation> {
         let size = round_up(size.max(1), ALIGNMENT);
         // One block is one buffer and one memory allocation: both limits apply.
-        let limit = self.ctx.caps.max_buffer_size.min(self.ctx.caps.max_allocation_size).saturating_sub(2 * GUARD);
+        let limit = self.ctx.caps.max_buffer_size.min(self.ctx.caps.max_allocation_size);
         if size > limit {
             return Err(format!("allocation of {size} bytes exceeds the device's limit of {limit} bytes per buffer").into());
         }
@@ -153,12 +158,23 @@ impl Pool {
             return Ok(a);
         }
         let block_size = round_up(size.max(BLOCK_SIZE), LARGE_GRANULE).min(limit);
-        let block = match self.create_block(block_size) {
+        // Cached empty blocks too small for this request go back to Vulkan
+        // first when together they would cover it: otherwise every size a
+        // sequence of growing requests passes through stays reserved (a
+        // blocked LU's trailing matrices held 3 GB of idle blocks).
+        let idle: u64 = self.blocks.iter().flatten().filter(|b| b.ranges.is_empty()).map(|b| b.size).sum();
+        if idle >= block_size {
+            wait_idle()?;
+            self.trim();
+        }
+        let guard = GUARD.min((limit - block_size) / 2 / ALIGNMENT * ALIGNMENT);
+        let block = match self.create_block(block_size, guard) {
             Ok(b) => b,
             Err(_) => {
                 // Out of memory: release cached empty blocks and retry once.
+                wait_idle()?;
                 self.trim();
-                self.create_block(block_size)?
+                self.create_block(block_size, guard)?
             }
         };
         match self.blocks.iter().position(Option::is_none) {
@@ -172,7 +188,7 @@ impl Pool {
         for (i, slot) in self.blocks.iter_mut().enumerate() {
             let Some(block) = slot else { continue };
             if let Some(offset) = block.ranges.alloc(size) {
-                let offset = GUARD + offset;  // (within the buffer)
+                let offset = block.guard + offset;  // (within the buffer)
                 self.allocated += size;
                 return Some(Allocation {
                     block: i as u32,
@@ -189,11 +205,12 @@ impl Pool {
 
     pub fn free(&mut self, a: Allocation) {
         let block = self.blocks[a.block as usize].as_mut().expect("allocation from a released block");
-        block.ranges.free(a.offset - GUARD, a.size);
+        block.ranges.free(a.offset - block.guard, a.size);
         self.allocated -= a.size;
     }
 
-    /// Returns cached blocks that hold no allocations to Vulkan.
+    /// Returns cached blocks that hold no allocations to Vulkan. Queued GPU
+    /// work must not use them (synchronize the stream first).
     pub fn trim(&mut self) {
         let empty: Vec<Block> =
             self.blocks.iter_mut().filter(|slot| slot.as_ref().is_some_and(|b| b.ranges.is_empty())).filter_map(Option::take).collect();
@@ -207,12 +224,12 @@ impl Pool {
         PoolStats { allocated: self.allocated, reserved: live.clone().map(|b| b.size).sum(), blocks: live.count() }
     }
 
-    fn create_block(&self, size: u64) -> Result<Block> {
+    fn create_block(&self, size: u64, guard: u64) -> Result<Block> {
         let d = &self.ctx.device;
         unsafe {
             let buffer = d.create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(size + 2 * GUARD)
+                    .size(size + 2 * guard)
                     .usage(
                         vk::BufferUsageFlags::STORAGE_BUFFER
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -246,7 +263,7 @@ impl Pool {
             d.bind_buffer_memory(buffer, memory, 0)?;
             let host = d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
             let address = d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
-            Ok(Block { buffer, memory, host, address, size, ranges: RangeAllocator::new(size) })
+            Ok(Block { buffer, memory, host, address, size, guard, ranges: RangeAllocator::new(size) })
         }
     }
 
