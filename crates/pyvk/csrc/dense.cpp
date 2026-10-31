@@ -827,7 +827,7 @@ at::Tensor& cholesky_inverse_out(const at::Tensor& a, bool upper, at::Tensor& ou
 }
 
 at::Tensor cholesky_inverse_vk(const at::Tensor& a, bool upper) {
-  at::Tensor out = at::empty({0}, a.options());
+  at::Tensor out = empty_column_major(a.sizes(), a.options());  // (as LAPACK's, on the CPU)
   return cholesky_inverse_out(a, upper, out);
 }
 
@@ -865,7 +865,7 @@ at::Tensor& householder_product_out(const at::Tensor& a, const at::Tensor& tau, 
 }
 
 at::Tensor householder_product_vk(const at::Tensor& a, const at::Tensor& tau) {
-  at::Tensor out = at::empty({0}, a.options());
+  at::Tensor out = empty_column_major(a.sizes(), a.options());  // (as LAPACK's, on the CPU)
   return householder_product_out(a, tau, out);
 }
 
@@ -903,7 +903,7 @@ at::Tensor& ormqr_out(const at::Tensor& a, const at::Tensor& tau, const at::Tens
 }
 
 at::Tensor ormqr_vk(const at::Tensor& a, const at::Tensor& tau, const at::Tensor& c, bool left, bool transpose) {
-  at::Tensor out = at::empty({0}, c.options());
+  at::Tensor out = empty_column_major(c.sizes(), c.options());  // (as LAPACK's, on the CPU)
   return ormqr_out(a, tau, c, left, transpose, out);
 }
 

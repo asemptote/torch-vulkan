@@ -822,7 +822,8 @@ at::Tensor nonzero_vk(const at::Tensor& self) {
 at::Tensor nonzero_static(const at::Tensor& self, int64_t size, int64_t fill_value) {
   TORCH_CHECK(size >= 0, "nonzero_static: 'size' must be an non-negative integer");
   at::Tensor all = nonzero_vk(self);
-  at::Tensor out = at::full({size, self.dim()}, fill_value, self.options().dtype(at::kLong));
+  // Column-major, as PyTorch's meta kernel says for devices other than the CPU.
+  at::Tensor out = at::full({self.dim(), size}, fill_value, self.options().dtype(at::kLong)).t();
   int64_t n = std::min(size, all.size(0));
   if (n > 0) {
     out.narrow(0, 0, n).copy_(all.narrow(0, 0, n));

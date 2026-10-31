@@ -151,7 +151,10 @@ std::tuple<at::Tensor&, at::Tensor&> log_sigmoid_forward_out(const at::Tensor& s
     on_cpu("aten::log_sigmoid_forward", "output", self, output, buffer);
     return {output, buffer};
   }
-  at::native::resize_output(buffer, {0});  // only the CPU kernel uses the buffer
+  // The CPU kernel's buffer, e^-|x| (shaped as PyTorch's meta kernel says; our
+  // backward, PyTorch's decomposition, does not read it).
+  at::native::resize_output(buffer, self.sizes());
+  buffer.copy_(at::exp(at::neg(at::abs(self))));
   return {output, buffer};
 }
 

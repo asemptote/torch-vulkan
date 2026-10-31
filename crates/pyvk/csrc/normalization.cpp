@@ -66,8 +66,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
                 "running_mean and running_var must be defined in evaluation mode");
     mean = running_mean->to(acc);
     invstd = at::rsqrt(running_var->to(acc) + eps);
-    save_mean = at::empty({0}, x.options().dtype(acc));
-    save_invstd = at::empty({0}, x.options().dtype(acc));
+    // (per channel, as PyTorch's meta kernel says for devices other than the CPU)
+    save_mean = mean;
+    save_invstd = invstd;
   }
   at::Tensor scale = invstd, shift = -mean * invstd;
   if (weight.has_value() && weight->defined()) {
