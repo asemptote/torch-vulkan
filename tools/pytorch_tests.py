@@ -197,7 +197,7 @@ FAILING = ("failed", "crashed", "xpassed", "validation")
 # pattern, reason); counted as "expected", not as failures. Every entry needs
 # a reason a reader can check.
 EXPECTED = [
-    (r"_sparse_|_to_sparse_|test_errors_sparse", r"",
+    (r"_sparse_|_to_sparse_|test_errors_sparse|test_crow_col_indices_", r"",
      "sparse layouts are out of scope for this backend (dense tensors only)"),
     (r"", r"Sparsevk' backend",
      "sparse layouts are out of scope for this backend (dense tensors only)"),
