@@ -204,11 +204,11 @@ at::Tensor& addr_out(const at::Tensor& self, const at::Tensor& vec1, const at::T
   bool logical = out.scalar_type() == at::kBool;
   TORCH_CHECK(logical || !beta.isBoolean(), "Boolean beta only supported for Boolean results.");
   TORCH_CHECK(logical || !alpha.isBoolean(), "Boolean alpha only supported for Boolean results.");
-  if (!logical) {
-    TORCH_CHECK(at::isFloatingType(out.scalar_type()) || at::isComplexType(out.scalar_type()) ||
-                    (!beta.isFloatingPoint() && !alpha.isFloatingPoint()),
-                "For integral input tensors, argument beta must not be a floating point number.");
-  }
+  bool integral = !logical && !at::isFloatingType(out.scalar_type()) && !at::isComplexType(out.scalar_type());
+  TORCH_CHECK(!integral || !beta.isFloatingPoint(),
+              "For integral input tensors, argument beta must not be a floating point number.");
+  TORCH_CHECK(!integral || !alpha.isFloatingPoint(),
+              "For integral input tensors, argument alpha must not be a floating point number.");
   at::Tensor outer = at::outer(vec1, vec2);
   std::vector<int64_t> shape = {vec1.size(0), vec2.size(0)};
   at::Tensor base = self.expand(shape);
@@ -269,6 +269,14 @@ at::Tensor addbmm(const at::Tensor& self, const at::Tensor& batch1, const at::Te
 }
 
 at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
+  // (the CPU's checks, in its order)
+  TORCH_CHECK(self.dim() == 1 && other.dim() == 1, "1D tensors expected, but got ", self.dim(), "D and ", other.dim(),
+              "D tensors");
+  TORCH_CHECK(self.scalar_type() == other.scalar_type(), "dot : expected both vectors to have same dtype, but found ",
+              self.scalar_type(), " and ", other.scalar_type());
+  TORCH_CHECK(self.numel() == other.numel(), "inconsistent tensor size, expected tensor [", self.numel(),
+              "] and src [", other.numel(), "] to have the same number of elements, but got ", self.numel(), " and ",
+              other.numel(), " elements respectively");
   reject_dtype("dot", self.scalar_type(), self.scalar_type() == at::kBool);
   TORCH_CHECK(self.dim() == 1 && other.dim() == 1, "1D tensors expected, but got ", self.dim(), "D and ", other.dim(),
               "D tensors");

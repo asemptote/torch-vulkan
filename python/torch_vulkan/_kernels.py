@@ -1043,6 +1043,10 @@ def _matrix_sqrth(a):
 
 
 def _linalg_polar(a):
+    if a.dim() < 2:
+        raise RuntimeError(f"linalg.polar: A must have at least 2 dimensions, but got a {a.dim()}-D tensor")
+    if a.shape[-2] < a.shape[-1]:
+        raise RuntimeError("linalg.polar: A must have at least as many rows as columns")
     # A = U H from A = W S V^H: U = W V^H, H = V S V^H.
     w, s, vh = torch.linalg.svd(a, full_matrices=False)
     u = w @ vh
@@ -1127,8 +1131,41 @@ def _kernels():
     }
 
 
+def _out_overload(op):
+    """The out= overload of functional OpOverload `op` (same inputs, keyword-only
+    outputs), or None."""
+    inputs = [a.name for a in op._schema.arguments]
+    packet = getattr(torch.ops.aten, op._schema.name.split("::", 1)[1])
+    for name in packet.overloads():
+        other = getattr(packet, name)
+        args = other._schema.arguments
+        outs = [a for a in args if a.kwarg_only and a.alias_info and a.alias_info.is_write]
+        if outs and [a.name for a in args if a not in outs] == inputs and len(outs) == len(op._schema.returns):
+            return other, [a.name for a in outs]
+    return None
+
+
+def _make_out_kernel(functional, out_names):
+    """An out= kernel from a functional one: its results resized into and
+    copied to the out= tensors (PyTorch's rules for both, as its own
+    decompositions use)."""
+    from torch._prims_common.wrappers import _maybe_resize_out, _safe_copy_out
+
+    def out_kernel(*args, **kwargs):
+        outs = [kwargs.pop(name) for name in out_names]
+        results = functional(*args, **kwargs)
+        results = results if isinstance(results, (tuple, list)) else (results,)
+        for out, result in zip(outs, results):
+            _maybe_resize_out(out, result.shape)
+            _safe_copy_out(copy_from=result, copy_to=out, exact_dtype=False)
+        return outs[0] if len(outs) == 1 else tuple(outs)
+
+    return out_kernel
+
+
 def register():
-    """Registers the kernels (functional overloads only); returns their names."""
+    """Registers the kernels (functional overloads, and their out= overloads
+    when nothing else implements those); returns their names."""
     global _lib
     if _lib is not None:
         return []
@@ -1139,7 +1176,15 @@ def register():
             continue  # a C++ or decomposed kernel exists
         base, _, overload = name.partition(".")
         op = getattr(getattr(torch.ops.aten, base), overload or "default")
-        fn = _checks.with_cpu_checks(op, _dtypes.with_cpu_dtypes(base, fn))
-        _lib.impl(name, _layout.with_layout(op, fn), "PrivateUse1")
+        checked = _checks.with_cpu_checks(op, _dtypes.with_cpu_dtypes(base, fn))
+        _lib.impl(name, _layout.with_layout(op, checked), "PrivateUse1")
         names.append("aten::" + name)
+        found = _out_overload(op) if not op._schema.is_mutable else None
+        if found is not None:
+            out_op, out_names = found
+            if not torch._C._dispatch_has_kernel_for_dispatch_key(out_op.name(), "PrivateUse1"):
+                out_fn = _checks.with_cpu_checks(out_op, _make_out_kernel(checked, out_names))
+                _lib.impl(out_op._schema.name.split("::", 1)[1] + "." + out_op._overloadname,
+                          _layout.with_layout(out_op, out_fn), "PrivateUse1")
+                names.append(out_op.name())
     return names

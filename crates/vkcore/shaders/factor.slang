@@ -10,7 +10,8 @@
 // OP (FACTOR_*):
 //   LU_PANEL    partial-pivoting LU of columns [k, k + b) over rows [k, rows),
 //               swapping whole rows; pivots (1-based, absolute) into piv,
-//               the first zero pivot into info (LAPACK's getrf2 semantics)
+//               the first zero pivot into info (LAPACK's getrf2 semantics);
+//               with UNIT, no pivoting (pivots j + 1, as CUDA's)
 //   LASWP       apply the first b row interchanges in piv to the rows x cols
 //               matrix (in order, or in reverse with UPPER)
 //   TRI_INV     inverse of the b x b triangular block at (k, k) (lower or
@@ -188,10 +189,10 @@ void lu_panel(uint t, uint z)
     uint n = p.rows, ld = p.ld;
     for (uint j = p.k; j < p.k + p.b; j++)
     {
-        // Pivot: the first row with the largest |a[i, j]|, i >= j.
-        R best = R(-1);
+        // Pivot: the first row with the largest |a[i, j]|, i >= j (row j itself with UNIT).
+        R best = UNIT != 0 && t == 0 ? mag1(a[j * ld + j]) : R(-1);
         int at = int(j);
-        for (uint i = j + t; i < n; i += WG)
+        for (uint i = j + t; UNIT == 0 && i < n; i += WG)
         {
             R v = mag1(a[i * ld + j]);
             if (v > best || (isnan(v) && !isnan(best)))

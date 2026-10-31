@@ -209,7 +209,8 @@ at::Tensor tri_solve(const at::Tensor& a3, const at::Tensor& b3, bool upper, boo
   }
   // X A = B  <=>  A^T X^T = B^T, with A^T triangular the other way.
   at::Tensor at3 = a3.transpose(1, 2).contiguous();
-  at::Tensor y = b3.transpose(1, 2).contiguous();
+  // (a copy: contiguous() would return B itself when its transpose is contiguous)
+  at::Tensor y = b3.transpose(1, 2).clone(at::MemoryFormat::Contiguous);
   triangular_solve_inplace(at3, y, !upper, unit);
   return y.transpose(1, 2);
 }
@@ -222,7 +223,7 @@ struct Lu {
   at::Tensor info;   // [B] int32
 };
 
-Lu lu_factor(const at::Tensor& a) {
+Lu lu_factor(const at::Tensor& a, bool pivot = true) {
   Lu r;
   r.lu = batched(a);
   int64_t B = r.lu.size(0), m = r.lu.size(1), n = r.lu.size(2), kmax = std::min(m, n);
@@ -239,7 +240,7 @@ Lu lu_factor(const at::Tensor& a) {
     int64_t b = std::min(kBlock, kmax - k);
     p.k = static_cast<uint32_t>(k);
     p.b = static_cast<uint32_t>(b);
-    factor(op::FACTOR_LU_PANEL, p, B, a.scalar_type());
+    factor(op::FACTOR_LU_PANEL, p, B, a.scalar_type(), false, /*no pivoting:*/ !pivot);
     if (k + b < n) {
       // U12 = L11^{-1} A12;  A22 -= L21 U12.
       at::Tensor inv = block_inverse(r.lu, k, b, /*upper=*/false, /*unit=*/true);
@@ -524,11 +525,11 @@ at::Tensor left_vectors(const at::Tensor& w, const at::Tensor& sigma, int64_t co
 std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> lu_factor_ex_out(const at::Tensor& a, bool pivot, bool check,
                                                                    at::Tensor& lu, at::Tensor& pivots,
                                                                    at::Tensor& info) {
-  if (!pivot || !gpu_matrices(a) || !is_vk(lu)) {
+  if (!gpu_matrices(a) || !is_vk(lu)) {
     on_cpu("aten::linalg_lu_factor_ex", "out", a, pivot, check, lu, pivots, info);
     return {lu, pivots, info};
   }
-  Lu r = lu_factor(a);
+  Lu r = lu_factor(a, pivot);
   auto bs = batch_shape(a);
   assign(lu, r.lu.view(a.sizes()));
   assign(pivots, r.piv.view(with_tail(bs, {r.piv.size(1)})));
@@ -585,15 +586,19 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> lu_unpack_out(const at::Tensor
 
 std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> linalg_lu_out(const at::Tensor& a, bool pivot, at::Tensor& P,
                                                                 at::Tensor& L, at::Tensor& U) {
-  if (!pivot || !gpu_matrices(a) || !is_vk(P)) {
+  if (!gpu_matrices(a) || !is_vk(P)) {
     on_cpu("aten::linalg_lu", "out", a, pivot, P, L, U);
     return {P, L, U};
   }
-  Lu r = lu_factor(a);
-  auto [p, l, u] = unpack_lu(r.lu, r.piv, true, true);
+  Lu r = lu_factor(a, pivot);
+  auto [p, l, u] = unpack_lu(r.lu, r.piv, true, pivot);
   auto bs = batch_shape(a);
   int64_t m = a.size(-2), n = a.size(-1), k = std::min(m, n);
-  assign(P, p.view(with_tail(bs, {m, m})));
+  if (pivot) {
+    assign(P, p.view(with_tail(bs, {m, m})));
+  } else {
+    at::native::resize_output(P, {0});  // (no permutation: an empty P, as PyTorch)
+  }
   assign(L, l.view(with_tail(bs, {m, k})));
   assign(U, u.view(with_tail(bs, {k, n})));
   return {P, L, U};
@@ -624,12 +629,13 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> solve_ex_out(
   bool vector = false;
   at::Tensor b3 = rhs_batched(aa, bb, vector);
   Lu r = lu_factor(aa);
-  int64_t B = b3.size(0);
-  at::Tensor lu3 = r.lu.size(0) == B ? r.lu : r.lu.expand({B, r.lu.size(1), r.lu.size(2)}).contiguous();
-  at::Tensor piv = r.piv.size(0) == B ? r.piv : r.piv.expand({B, r.piv.size(1)}).contiguous();
-  at::Tensor x = lu_solve(lu3, piv, b3, false);
+  int64_t B = b3.size(0), n = aa.size(-1);
   auto bs = at::infer_size(batch_shape(aa), vector ? std::vector<int64_t>(bb.sizes().begin(), bb.sizes().end() - 1)
                                                    : batch_shape(bb));
+  // A's factors broadcast over the batch dims of A and B (e.g. [3, 1] with [6]).
+  at::Tensor lu3 = r.lu.view(with_tail(batch_shape(aa), {n, n})).expand(with_tail(bs, {n, n})).reshape({B, n, n});
+  at::Tensor piv = r.piv.view(with_tail(batch_shape(aa), {n})).expand(with_tail(bs, {n})).reshape({B, n});
+  at::Tensor x = lu_solve(lu3.contiguous(), piv.contiguous(), b3, false);
   at::Tensor xr = vector ? x.view(with_tail(bs, {x.size(1)})) : x.view(with_tail(bs, {x.size(1), x.size(2)}));
   if (!left) xr = xr.transpose(-2, -1);
   assign(result, xr);
@@ -840,7 +846,8 @@ std::tuple<at::Tensor&, at::Tensor&> geqrf_out(const at::Tensor& a, at::Tensor& 
 }
 
 std::tuple<at::Tensor, at::Tensor> geqrf_vk(const at::Tensor& a) {
-  at::Tensor qr = at::empty({0}, a.options()), tau = at::empty({0}, a.options());
+  // Column-major reflectors, as LAPACK's geqrf returns them on the CPU.
+  at::Tensor qr = empty_column_major(a.sizes(), a.options()), tau = at::empty({0}, a.options());
   geqrf_out(a, qr, tau);
   return {qr, tau};
 }
@@ -864,6 +871,25 @@ at::Tensor householder_product_vk(const at::Tensor& a, const at::Tensor& tau) {
 
 at::Tensor& ormqr_out(const at::Tensor& a, const at::Tensor& tau, const at::Tensor& c, bool left, bool transpose,
                       at::Tensor& out) {
+  // (the CPU's checks)
+  TORCH_CHECK(a.dim() >= 2, "torch.ormqr: input must have at least 2 dimensions.");
+  TORCH_CHECK(c.dim() >= 2, "torch.ormqr: other must have at least 2 dimensions.");
+  int64_t side = left ? -2 : -1;
+  TORCH_CHECK(c.size(side) >= tau.size(-1), "torch.ormqr: other.shape[", side,
+              "] must be greater than or equal to tau.shape[-1]");
+  TORCH_CHECK(c.size(side) == a.size(-2), "torch.ormqr: other.shape[", side, "] must be equal to input.shape[-2]");
+  TORCH_CHECK(tau.size(-1) <= a.size(-1), "torch.ormqr: tau.shape[-1] must be less than or equal to input.shape[-1]");
+  TORCH_CHECK(a.dim() - tau.dim() == 1, "torch.ormqr: Expected tau to have one dimension less than input, but got "
+              "tau.ndim equal to ", tau.dim(), " and input.ndim is equal to ", a.dim());
+  TORCH_CHECK(a.dim() == c.dim(), "torch.ormqr: Expected other to have the same number of dimensions as input, but "
+              "got other.ndim equal to ", c.dim(), " and input.ndim is equal to ", a.dim());
+  if (a.dim() > 2) {
+    at::IntArrayRef batch = a.sizes().slice(0, a.dim() - 2);
+    TORCH_CHECK(tau.sizes().slice(0, tau.dim() - 1).equals(batch), "torch.ormqr: Expected batch dimensions of tau to "
+                "be equal to input.shape[:-2], but got ", tau.sizes().slice(0, tau.dim() - 1));
+    TORCH_CHECK(c.sizes().slice(0, c.dim() - 2).equals(batch), "torch.ormqr: Expected batch dimensions of other to "
+                "be equal to input.shape[:-2], but got ", c.sizes().slice(0, c.dim() - 2));
+  }
   if (!gpu_matrices(a) || !is_vk(tau) || !is_vk(c) || !is_vk(out) || c.scalar_type() != a.scalar_type()) {
     on_cpu("aten::ormqr", "out", a, tau, c, left, transpose, out);
     return out;
@@ -913,7 +939,8 @@ std::tuple<at::Tensor&, at::Tensor&> eigh_out(const at::Tensor& a, c10::string_v
   }
   // Symmetric (Hermitian) matrix from the chosen triangle and the real part
   // of the diagonal.
-  at::Tensor strict = uplo == "U" ? a.triu(1) : a.tril(-1);
+  bool upper = uplo == "U" || uplo == "u";  // (either case, as the CPU)
+  at::Tensor strict = upper ? a.triu(1) : a.tril(-1);
   at::Tensor diag = at::real(a.diagonal(0, -2, -1)).to(a.scalar_type());
   at::Tensor sym = strict + adj(strict) + at::diag_embed(diag);
   at::Tensor a3 = batched(sym);
@@ -1209,7 +1236,9 @@ at::Tensor& triangle_out(const at::Tensor& self, int64_t diagonal, at::Tensor& o
   p.batch = static_cast<uint32_t>(in3.size(0));
   p.rows = static_cast<uint32_t>(in3.size(1));
   p.cols = static_cast<uint32_t>(in3.size(2));
-  p.diag = static_cast<int32_t>(diagonal);
+  // (diagonals beyond the matrix act as the matrix edge: clamped to fit int32)
+  int64_t span = std::max<int64_t>(in3.size(1), in3.size(2)) + 1;
+  p.diag = static_cast<int32_t>(std::clamp<int64_t>(diagonal, -span, span));
   p.in_sb = static_cast<int32_t>(in3.stride(0));
   p.in_sr = static_cast<int32_t>(in3.stride(1));
   p.in_sc = static_cast<int32_t>(in3.stride(2));

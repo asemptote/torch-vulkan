@@ -206,6 +206,10 @@ EXPECTED = [
      "uint8 bilinear/bicubic upsampling works on vk as on the CPU (the test expects only the CPU to support it)"),
     (r"test_out_(cholesky_inverse|geqrf|ormqr)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
+    (r"", r"^KeyError: 'vk(\W|$)",
+     "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
+    (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
+     "int4 packed-weight matmuls: packed layouts specific to x86/ARM CPUs and CUDA (out of scope)"),
     (r"", r"InductorError: KeyError: 'vk'",
      "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
 ]

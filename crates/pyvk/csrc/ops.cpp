@@ -388,7 +388,15 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
     at::Tensor a = to_dtype(self, promoted), b = to_dtype(*other, promoted);
     at::Tensor a_big = at::ge(at::real(a), at::real(b));
     at::Tensor hi = at::where(a_big, a, b), lo = at::where(a_big, b, a);
-    out.copy_(at::add(at::log1p(at::exp(at::sub(lo, hi))), hi));
+    at::Tensor r = at::add(at::log1p(at::exp(at::sub(lo, hi))), hi);
+    // The CPU's special cases: NaNs spread; equal infinite real parts give min
+    // (-inf) or log(e^a + e^b) (+inf), where the formula above would give NaN.
+    at::Tensor lr = at::real(lo), hr = at::real(hi);
+    at::Tensor both_inf = at::logical_and(at::isinf(lr), at::eq(lr, hr));
+    r = at::where(at::logical_and(both_inf, at::lt(lr, 0)), lo, r);
+    r = at::where(at::logical_and(both_inf, at::gt(lr, 0)), at::log(at::add(at::exp(lo), at::exp(hi))), r);
+    at::Tensor nan = at::logical_or(at::isnan(a), at::isnan(b));
+    out.copy_(at::where(nan, at::full({}, c10::complex<double>(NAN, NAN), r.options()), r));
     return true;
   }
   at::ScalarType dtype = compute_dtype(op, promoted);

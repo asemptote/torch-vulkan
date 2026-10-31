@@ -114,6 +114,15 @@ struct Plan {
 // Plans reducing `self` over `dims` (none/empty = all dims). False if the
 // kernels cannot address it (more than 4 non-mergeable kept or reduced dims,
 // or offsets beyond 32 bits).
+// self in the reduction's dtype= (by _to_copy, not to: PyTorch's own kernels
+// convert as they reduce, and its tests check that no aten::to runs).
+at::Tensor as_dtype(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
+  if (!dtype.has_value() || !is_vk(self) || *dtype == self.scalar_type()) {
+    return self;
+  }
+  return at::_to_copy(self, self.options().dtype(*dtype));
+}
+
 bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keepdim, Plan& plan) {
   int64_t ndim = self.dim();
   std::vector<bool> reduced(ndim, !dims.has_value() || dims->empty());
@@ -334,7 +343,7 @@ at::Tensor complex_cumprod_last(at::Tensor x) {
 
 at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                     std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, false);
     store(out, r, r.sizes().vec());
@@ -351,7 +360,7 @@ at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool ke
 
 at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                      std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, true);
     store(out, r, r.sizes().vec());
@@ -370,7 +379,7 @@ at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool k
 
 at::Tensor& prod_out(const at::Tensor& self, int64_t dim, bool keepdim, std::optional<at::ScalarType> dtype,
                      at::Tensor& out) {
-  at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     int64_t d = at::maybe_wrap_dim(dim, std::max<int64_t>(input.dim(), 1));
     at::Tensor r = input.dim() == 0 ? input.clone() : complex_prod_last(input.movedim(d, -1).resolve_conj());
@@ -565,7 +574,7 @@ at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const st
 
 at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                             std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {  // the norm of |z|
     at::Tensor r = at::linalg_vector_norm(at::abs(input), ord, dim, keepdim);
     store(out, r, r.sizes().vec());
@@ -643,7 +652,7 @@ template <uint32_t Op>  // 0 sum, 1 prod
 at::Tensor& cumulative_out(const at::Tensor& self, int64_t dim, std::optional<at::ScalarType> dtype, at::Tensor& out) {
   const char* name = Op == 0 ? "aten::cumsum" : "aten::cumprod";
   reject_dtype(name + 6, out.scalar_type(), out.scalar_type() == at::kBool);
-  at::Tensor input = dtype.has_value() && is_vk(self) ? self.to(*dtype) : self;
+  at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out) && input.dim() > 0) {
     int64_t d = at::maybe_wrap_dim(dim, input.dim());
     at::Tensor r = Op == 0 ? at::view_as_complex(at::view_as_real(input.resolve_conj()).cumsum(d).contiguous())
