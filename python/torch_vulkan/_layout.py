@@ -75,6 +75,13 @@ def with_layout(op, kernel):
 
     @functools.wraps(kernel)
     def wrapped(*args, **kwargs):
+        # A kernel runs below the dispatcher: torch function modes active
+        # in the caller (e.g. torch._refs' TorchRefsMode) must not see the
+        # ops it is made of, as they would not see a C++ kernel's.
+        with torch._C.DisableTorchFunction():
+            return _laid_out(*args, **kwargs)
+
+    def _laid_out(*args, **kwargs):
         result = kernel(*args, **kwargs)
         if getattr(_local, "busy", False) or op._schema.is_mutable:
             return result  # (in-place and out= kernels write into given tensors)

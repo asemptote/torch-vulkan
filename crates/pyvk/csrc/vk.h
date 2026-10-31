@@ -203,8 +203,11 @@ inline void check_overlap(const at::Tensor& out, std::initializer_list<const at:
   }
 }
 
-inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like) {
-  check_overlap(out, {like});
+inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like,
+                                      bool check_aliasing = true) {
+  if (check_aliasing) {
+    check_overlap(out, {like});
+  }
   if (out.sizes() == shape) {
     return;
   }

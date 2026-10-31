@@ -202,6 +202,8 @@ EXPECTED = [
     (r"test_dtypes_nn_functional_max_pool1d_", r"",
      "integer max_pool1d: vk takes PyTorch's max_pool2d path (integers work, as in max_pool2d on the CPU); "
      "only the CPU's no-grad shortcut is float-only"),
+    (r"test_upsamplingBiMode2d_nonsupported_dtypes_.*_mode_(bilinear|bicubic)_uint8", r"RuntimeError not raised",
+     "uint8 bilinear/bicubic upsampling works on vk as on the CPU (the test expects only the CPU to support it)"),
     (r"test_out_(cholesky_inverse|geqrf|ormqr)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
     (r"", r"InductorError: KeyError: 'vk'",
@@ -225,8 +227,16 @@ def failing_on_cpu(tests, nodeids, out, stem, timeout):
     results_path = out / f"{stem}.cpu.jsonl"
     results_path.unlink(missing_ok=True)
     run_tests(tests, list(twins), env, results_path, out / f"{stem}.cpu.log", ["--timeout", "300"], timeout)
+    return cpu_failures(results_path, nodeids)
+
+
+def cpu_failures(results_path, nodeids):
+    """The vk test ids among `nodeids` whose CPU twins (in results_path) fail
+    or are expected to fail: PyTorch knows those tests fail on the CPU."""
+    twins = {cpu_twin(nodeid): nodeid for nodeid in nodeids}
     results, _ = read_results(results_path)
-    return {twins[cpu_id] for cpu_id, (outcome, _) in results.items() if outcome in FAILING and cpu_id in twins}
+    return {twins[cpu_id] for cpu_id, (outcome, _) in results.items()
+            if (outcome in FAILING or outcome == "xfailed") and cpu_id in twins}
 
 
 def describe(counts):
@@ -241,6 +251,8 @@ def summarize(out, stems):
         results, _ = read_results(out / f"{stem}.jsonl")
         both_file = out / f"{stem}.cpu-too.txt"
         both = set(both_file.read_text(encoding="utf-8").split()) if both_file.exists() else set()
+        if (out / f"{stem}.cpu.jsonl").exists():  # (recomputed: the rule may have changed since the run)
+            both = cpu_failures(out / f"{stem}.cpu.jsonl", list(results))
         counts = collections.Counter()
         vk_only = []
         expected = []

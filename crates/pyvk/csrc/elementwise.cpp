@@ -41,8 +41,8 @@ constexpr double kInf = std::numeric_limits<double>::infinity();
 // out = unary op `code` (shaders/unary.slang) of self, computed in out's
 // float dtype, with parameters alpha, beta, gamma.
 bool param_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out, double alpha, double beta,
-                     double gamma = 0.0) {
-  resize_elementwise_output(out, self.sizes(), &self);
+                     double gamma = 0.0, bool check_aliasing = true) {
+  resize_elementwise_output(out, self.sizes(), &self, check_aliasing);
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(self) || !is_vk(out) || !is_float(dtype) || at::isComplexType(self.scalar_type())) {
     return false;
@@ -115,7 +115,8 @@ at::Tensor& threshold_out(const at::Tensor& self, const at::Scalar& threshold, c
     out.copy_(at::where(at::gt(self, threshold), self, at::scalar_tensor(value, self.options())));
     return out;
   }
-  if (!param_unary_gpu(op::UNARY_THRESHOLD, self, out, threshold.toDouble(), value.toDouble())) {
+  // (in place on a tensor that overlaps itself is fine: threshold is idempotent, and the CPU allows it)
+  if (!param_unary_gpu(op::UNARY_THRESHOLD, self, out, threshold.toDouble(), value.toDouble(), 0.0, false)) {
     on_cpu("aten::threshold", "out", self, threshold, value, out);
   }
   return out;

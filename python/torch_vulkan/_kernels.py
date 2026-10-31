@@ -531,6 +531,11 @@ def _make_aa(kind):
                 for d in range(2)]
 
     def forward(x, output_size, align_corners, scales_h=None, scales_w=None):
+        if not x.is_floating_point():
+            # uint8 (the only integer dtype the CPU takes): in float32, then
+            # rounded to the nearest integer and clamped, as the CPU's kernel.
+            y = forward(x.float(), output_size, align_corners, scales_h, scales_w)
+            return y.round().clamp(0, 255).to(x.dtype)
         mats = matrices(x.shape, output_size, align_corners, scales_h, scales_w, x)
         return _apply_dims(x, mats).contiguous()
 
