@@ -1055,9 +1055,11 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
   int64_t dim_diff = a.dim() - b.dim();
   TORCH_CHECK(0 <= dim_diff && dim_diff <= 1, "torch.linalg.lstsq: input.dim() must be greater or equal to "
               "other.dim() and (input.dim() - other.dim()) <= 1");
-  TORCH_CHECK(a.size(-2) == (dim_diff ? b.size(-1) : b.size(-2)),
-              dim_diff ? "torch.linalg.lstsq: input.size(-2) should match other.size(-1)"
-                       : "torch.linalg.lstsq: input.size(-2) should match other.size(-2)");
+  // (PyTorch's linalg_solve_is_vector_rhs)
+  bool vector = b.dim() == 1 || (dim_diff == 1 && b.sizes() == a.sizes().slice(0, a.dim() - 1));
+  TORCH_CHECK(a.size(-2) == (vector ? b.size(-1) : b.size(-2)),
+              vector ? "torch.linalg.lstsq: input.size(-2) should match other.size(-1)"
+                     : "torch.linalg.lstsq: input.size(-2) should match other.size(-2)");
   if (!gpu_matrices(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || !is_vk(solution)) {
     on_cpu("aten::linalg_lstsq", "out", a, b, rcond, driver, solution, residuals, rank, singular_values);
     return {solution, residuals, rank, singular_values};
@@ -1066,7 +1068,6 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
   TORCH_CHECK(drv == "gels" || drv == "gelsy" || drv == "gelsd" || drv == "gelss",
               "torch.linalg.lstsq: parameter `driver` should be one of (gels, gelsy, gelsd, gelss)");
   int64_t m = a.size(-2), n = a.size(-1);
-  bool vector = b.dim() == a.dim() - 1;
   at::Tensor bm = vector ? b.unsqueeze(-1) : b;
   auto bs = at::infer_size(batch_shape(a), batch_shape(bm));
   at::Tensor ae = a.expand(with_tail(bs, {m, n}));

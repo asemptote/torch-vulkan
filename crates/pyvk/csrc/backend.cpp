@@ -11,6 +11,7 @@
 #include <ATen/native/TensorFactories.h>
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/is_set_to_native.h>
 #include <ATen/ops/set_native.h>
 #include <ATen/ops/unfold_native.h>
 #include <ATen/ops/view_as_complex_native.h>
@@ -655,6 +656,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Storage", vk::set_storage);
   m.impl("set_.source_Tensor", vk::set_tensor);
   m.impl("set_", vk::set_empty);
+  m.impl("is_set_to", at::native::is_set_to);
   m.impl("empty.memory_format", vk::empty_memory_format);
   m.impl("empty_strided", vk::empty_strided);
   m.impl("view", at::native::view);

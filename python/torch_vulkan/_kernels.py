@@ -470,8 +470,8 @@ def _cdist_backward(grad, x1, x2, p, dist):
         dd = torch.where(d == 0, torch.zeros_like(diff), diff / d)
     elif p == math.inf:
         dd = torch.sign(diff) * (diff.abs() == d).to(diff.dtype)
-    else:
-        dd = torch.where(d == 0, torch.zeros_like(diff),
+    else:  # (zero where the difference is: |0|^(p - 1) is inf for p < 1)
+        dd = torch.where((d == 0) | (diff == 0), torch.zeros_like(diff),
                          torch.sign(diff) * diff.abs().pow(p - 1) / d.pow(p - 1))
     return (grad.unsqueeze(-1) * dd).sum(-2)
 

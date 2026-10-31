@@ -70,7 +70,7 @@ bool special_gpu(uint32_t code, const at::Tensor& a, const at::Tensor* b, double
   }
   std::vector<int64_t> shape = b != nullptr ? at::infer_size(a.sizes(), b->sizes()) : a.sizes().vec();
   check_inplace_shape(out, shape, {&a, b});
-  at::native::resize_output(out, shape);
+  resize_elementwise_output(out, shape, &a, /*check_aliasing=*/false);  // (in a's memory format)
   at::ScalarType dtype = widened(out.scalar_type());
   if (!float_kernel(dtype)) {
     return false;

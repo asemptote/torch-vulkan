@@ -87,10 +87,12 @@ void main(uint3 id: SV_DispatchThreadID)
         uint4 x = philox(uint4(i, 0u, uint(p.offset), uint(p.offset >> 32)), key);
         if (OP == RNG_RANDOM)
         {
+            // As the CPU: 64 random bits from a range of 2^28 on (32 bits
+            // modulo a larger range skew it), range 0 being the full 2^64.
             uint64_t range = p.b_bits;
-            uint64_t bits = range != 0ull && range <= 0x100000000ull ? uint64_t(x.x) % range
-                                                                     : ((uint64_t(x.x) << 32) | uint64_t(x.y));
-            if (range > 0x100000000ull)
+            uint64_t bits = range != 0ull && range < 0x10000000ull ? uint64_t(x.x) % range
+                                                                    : ((uint64_t(x.x) << 32) | uint64_t(x.y));
+            if (range >= 0x10000000ull)
                 bits %= range;
             p.out[i] = T(int64_t(p.a_bits) + int64_t(bits));
             continue;

@@ -174,16 +174,36 @@ at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& in
   at::assert_no_overlap(out, self);
   at::assert_no_overlap(out, index);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+  // (the CPU's gather checks: structured out, index dtype, gather_shape_check)
+  TORCH_CHECK(out.scalar_type() == self.scalar_type(), "Expected out tensor to have dtype ", self.dtype(),
+              ", but got ", out.dtype(), " instead");
+  if (index.numel() > 0) {
+    TORCH_CHECK(index_dtype_ok(index), "gather(): Expected dtype int32/int64 for index");
+    int64_t dims = std::max<int64_t>(self.dim(), 1);
+    TORCH_CHECK(dims == std::max<int64_t>(index.dim(), 1),
+                "Index tensor must have the same number of dimensions as input tensor");
+    for (int64_t d = 0; d < dims; ++d) {
+      TORCH_CHECK(d == dim || size_at(index, d) <= size_at(self, d), "Size does not match at dimension ", d,
+                  " expected index ", index.sizes(), " to be no larger than self ", self.sizes(),
+                  " apart from dimension ", dim);
+    }
+  }
   at::native::resize_output(out, index.sizes());
-  if (!movable(self) || !is_vk(index) || !is_vk(out) || out.scalar_type() != self.scalar_type() ||
-      !index_dtype_ok(index) || std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
+  if (!movable(self) || !is_vk(index) || !is_vk(out) || !index_dtype_ok(index) ||
+      std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
     on_cpu("aten::gather", "out", self, dim, index, sparse_grad, out);
     return out;
   }
-  at::Tensor src_view = restride_without(self, index.sizes(), dim);
+  if (index.numel() == 0) {
+    return out;
+  }
+  // (0-dim tensors as 1-element vectors)
+  at::Tensor src = self.dim() == 0 ? self.view({1}) : self;
+  at::Tensor idx = index.dim() == 0 ? index.view({1}) : index;
+  at::Tensor src_view = restride_without(src, idx.sizes(), dim);
   at::Tensor offsets =
-      index_offsets(index.sizes(), {{index, size_at(self, dim), stride_at(self, dim)}}, self.options(), /*wrap=*/false);
-  gather(out, src_view, offsets);
+      index_offsets(idx.sizes(), {{idx, size_at(src, dim), stride_at(src, dim)}}, src.options(), /*wrap=*/false);
+  gather(index.dim() == 0 ? out.view({1}) : out, src_view, offsets);
   return out;
 }
 
@@ -288,6 +308,16 @@ Advanced make_advanced(at::Tensor self, const c10::List<std::optional<at::Tensor
   return info;
 }
 
+// (the CPU's check, for a CPU tensor indexed with "vk" indices)
+void check_index_devices(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices) {
+  for (const std::optional<at::Tensor>& t : indices) {
+    if (t.has_value() && t->defined()) {
+      TORCH_CHECK(t->device() == self.device() || t->is_cpu(), "indices should be either on ", at::kCPU,
+                  " or on the same device as the indexed tensor (", self.device(), ")");
+    }
+  }
+}
+
 bool indices_on_vk(const c10::List<std::optional<at::Tensor>>& indices) {
   for (const std::optional<at::Tensor>& t : indices) {
     if (t.has_value() && t->defined() && !is_vk(*t) && !(t->dim() == 0 && t->device().is_cpu())) {
@@ -298,6 +328,7 @@ bool indices_on_vk(const c10::List<std::optional<at::Tensor>>& indices) {
 }
 
 at::Tensor& index_out(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices, at::Tensor& out) {
+  check_index_devices(self, indices);
   if (!movable(self) || !is_vk(out) || out.scalar_type() != self.scalar_type() || !indices_on_vk(indices)) {
     on_cpu("aten::index", "Tensor_out", self, indices, out);
     return out;
@@ -319,6 +350,17 @@ void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, cons
 
 at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
                            const at::Tensor& values, bool accumulate, bool unsafe) {
+  check_index_devices(self, indices);
+  if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {  // (as the CPU)
+    TORCH_WARN("Use of index_put_ on expanded tensors is deprecated. Please clone() the tensor before performing "
+               "this operation. This also applies to advanced indexing e.g. tensor[indices] = tensor");
+  }
+  at::assert_no_overlap(self, values);
+  for (const std::optional<at::Tensor>& index : indices) {
+    if (index.has_value() && index->defined()) {
+      at::assert_no_overlap(self, *index);
+    }
+  }
   bool values_ok = is_vk(values) || (values.dim() == 0 && values.device().is_cpu());
   if (!movable(self) || !values_ok || !indices_on_vk(indices) ||
       (accumulate && !accum_supported(self.scalar_type(), true))) {
@@ -431,6 +473,11 @@ at::Tensor& index_copy_out(const at::Tensor& self, int64_t dim, const at::Tensor
 }
 
 at::Tensor& index_fill_scalar(at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Scalar& value) {
+  if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {  // (as the CPU)
+    TORCH_WARN("Use of index_fill_ on expanded tensors is deprecated. Please clone() the tensor before performing "
+               "this operation. This also applies to advanced indexing e.g. tensor[mask] = scalar");
+  }
+  at::assert_no_partial_overlap(self, index);
   TORCH_CHECK(!value.isComplex() || self.is_complex(),
               "index_fill_(): Converting complex Scalar to non-complex type is not supported");
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
@@ -459,6 +506,9 @@ at::Tensor& index_fill_tensor(at::Tensor& self, int64_t dim, const at::Tensor& i
 }
 
 at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& source, bool accumulate) {
+  if (!accumulate) {  // (as the CPU: repeated indices write in no defined order)
+    at::globalContext().alertNotDeterministic("put_");
+  }
   at::assert_no_internal_overlap(self);  // (as the CPU)
   at::assert_no_overlap(self, index);
   at::assert_no_overlap(self, source);
@@ -979,6 +1029,7 @@ at::Tensor flip(const at::Tensor& self, at::IntArrayRef dims) {
 }
 
 at::Tensor roll_vk(const at::Tensor& self, at::IntArrayRef shifts, at::IntArrayRef dims) {
+  TORCH_CHECK(!shifts.empty(), "`shifts` required");
   if (!movable(self)) {
     return on_cpu("aten::roll", "", self, shifts, dims)[0].toTensor();
   }
@@ -1122,8 +1173,13 @@ at::Tensor& arange_out(const at::Scalar& start, const at::Scalar& end, const at:
   TORCH_CHECK(size_d >= 0 && size_d <= static_cast<double>(std::numeric_limits<int64_t>::max()),
               "invalid size, possible overflow?");
   int64_t size = static_cast<int64_t>(size_d);
-  if (out.numel() != size) {
-    at::native::resize_output(out, {size});
+  if (out.numel() != size) {  // (the CPU's warning and resize)
+    if (out.numel() > 0) {
+      TORCH_WARN("The number of elements in the out tensor of shape ", out.sizes(), " is ", out.numel(),
+                 " which does not match the computed number of elements ", size, ". Note that this may occur as a "
+                 "result of rounding error. The out tensor will be resized to a tensor of shape (", size, ",).");
+    }
+    out.resize_({size});
   }
   at::ScalarType compute = iota_dtype(dtype);
   std::string kernel = std::string("iota_") + storage_label(compute);

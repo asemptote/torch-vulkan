@@ -27,6 +27,12 @@ const int RIGHT = 0;
 [vk::constant_id(1)]
 const int OUT32 = 0;
 
+#if defined(T_f32) || defined(T_f64)
+bool nan_(T x) { return isnan(x); }
+#else
+bool nan_(T x) { return false; }
+#endif
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -41,7 +47,10 @@ void main(uint3 id: SV_DispatchThreadID)
         {
             uint mid = (lo + hi) >> 1;
             T s = p.seq[base + mid];
-            bool go_right = RIGHT != 0 ? !(v < s) : !(s >= v);  // (as the CPU: NaNs sort last)
+            // As the CPU's !(s > v) and !(s >= v): NaNs sort last. (Tested
+            // explicitly: GPU compilers turn !(s > v) into s <= v.)
+            bool unordered = nan_(v) || nan_(s);
+            bool go_right = unordered || (RIGHT != 0 ? s <= v : s < v);
             if (go_right)
                 lo = mid + 1u;
             else

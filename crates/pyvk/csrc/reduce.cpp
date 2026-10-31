@@ -274,10 +274,14 @@ bool reducible(const at::Tensor& self, bool allow_bool = true) {
          (allow_bool || self.scalar_type() != at::kBool);
 }
 
-void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {
-  // (TensorIterator ops skip the common-device check; their out check says this)
-  TORCH_CHECK(out.device() == flat.device(), "Expected out tensor to have device ", flat.device(), ", but got ",
+// (TensorIterator ops skip the common-device check; their out check says this)
+void check_iterator_out_device(const at::Tensor& self, const at::Tensor& out) {
+  TORCH_CHECK(out.device() == self.device(), "Expected out tensor to have device ", self.device(), ", but got ",
               out.device(), " instead");
+}
+
+void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {
+  check_iterator_out_device(flat, out);
   if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
     check_out_cast(flat.scalar_type(), out);
   }
@@ -345,6 +349,7 @@ at::Tensor complex_cumprod_last(at::Tensor x) {
 
 at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                     std::optional<at::ScalarType> dtype, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, false);
@@ -362,6 +367,7 @@ at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool ke
 
 at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                      std::optional<at::ScalarType> dtype, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, true);
@@ -381,6 +387,7 @@ at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool k
 
 at::Tensor& prod_out(const at::Tensor& self, int64_t dim, bool keepdim, std::optional<at::ScalarType> dtype,
                      at::Tensor& out) {
+  check_iterator_out_device(self, out);
   at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {
     int64_t d = at::maybe_wrap_dim(dim, std::max<int64_t>(input.dim(), 1));
@@ -414,6 +421,7 @@ at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
 
 template <ROp Op>
 at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   TORCH_CHECK(out.scalar_type() == at::kBool || out.scalar_type() == at::kByte, Op == kAny ? "any" : "all",
               " only supports bool tensor for result, got: ", out.scalar_type());
   if (complex_vk(self) && is_vk(out)) {
@@ -436,11 +444,13 @@ at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim
 
 template <ROp Op>
 at::Tensor& any_all_out(const at::Tensor& self, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   return any_all_dims_out<Op>(self, std::nullopt, false, out);
 }
 
 template <ROp Op>
 at::Tensor& any_all_dim_out(const at::Tensor& self, int64_t dim, bool keepdim, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   int64_t dims[] = {dim};
   return any_all_dims_out<Op>(self, dims, keepdim, out);
 }
@@ -449,6 +459,7 @@ at::Tensor& any_all_dim_out(const at::Tensor& self, int64_t dim, bool keepdim, a
 
 template <ROp Op>
 at::Tensor& amax_amin_out(const at::Tensor& self, at::IntArrayRef dim, bool keepdim, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   TORCH_CHECK(self.scalar_type() == out.scalar_type(), "Expected the dtype for input and out to match, but got ",
               self.scalar_type(), " for input's dtype and ", out.scalar_type(), " for out's dtype.");
   Plan plan;
@@ -528,6 +539,7 @@ std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int
 
 template <uint32_t Op>
 at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim, bool keepdim, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   Plan plan;
   std::vector<int64_t> dims;
   if (dim.has_value()) {
@@ -549,6 +561,7 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
 template <bool Std>
 at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, const std::optional<at::Scalar>& correction,
                         bool keepdim, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   if (complex_vk(self) && is_vk(out)) {
     // var(z) = var(Re z) + var(Im z)
     at::Tensor real = at::view_as_real(self.resolve_conj());
@@ -586,6 +599,7 @@ at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const st
 
 at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                             std::optional<at::ScalarType> dtype, at::Tensor& out) {
+  check_iterator_out_device(self, out);
   at::Tensor input = as_dtype(self, dtype);
   if (complex_vk(input) && is_vk(out)) {  // the norm of |z|
     at::Tensor r = at::linalg_vector_norm(at::abs(input), ord, dim, keepdim);

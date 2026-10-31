@@ -386,6 +386,11 @@ at::Tensor where_self(const at::Tensor& cond, const at::Tensor& self, const at::
 }
 
 at::Tensor& masked_fill_scalar(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value) {
+  if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {  // (as the CPU)
+    TORCH_WARN("Use of masked_fill_ on expanded tensors is deprecated. Please clone() the tensor before performing "
+               "this operation. This also applies to advanced indexing e.g. tensor[mask] = scalar");
+  }
+  at::assert_no_partial_overlap(self, mask);
   if (at::isComplexType(self.scalar_type()) && is_vk(self) && is_vk(mask) && !self.is_conj() &&
       dtype_label(self.scalar_type()) != nullptr) {
     // Fill the real and imaginary parts.
