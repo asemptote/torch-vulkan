@@ -29,6 +29,10 @@ vector<S, 2> cdiv(vector<S, 2> a, vector<S, 2> b)
 S cabs(vector<S, 2> a)
 {
     S x = abs(a.x), y = abs(a.y);
+    if (isinf(x) || isinf(y))  // (C99's hypot: inf even with a NaN part)
+        return S(1) / S(0);
+    if (isnan(x) || isnan(y))  // (max below drops NaNs on GPUs)
+        return x + y;
     S m = max(x, y);
     if (m == S(0) || isinf(m))
         return m;
