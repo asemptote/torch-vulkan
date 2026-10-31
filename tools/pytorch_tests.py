@@ -253,8 +253,9 @@ EXPECTED = [
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
      "integer histc: vk follows the CPU, which has no integer kernel (the test expects CUDA's)"),
-    (r"test_out_warning_mode_", r"Unexpected success",
-     "vk's mode out= warns when it resizes a non-empty out= (PyTorch's composite kernel did not; the test expects that)"),
+    (r"test_out_warning_(mode|addbmm)_", r"Unexpected success",
+     "vk's mode and addbmm out= warn when they resize a non-empty out= (PyTorch's kernels do not; the test "
+     "expects that)"),
     (r"test_out_(cholesky_inverse|geqrf|ormqr|triangular_solve)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
     (r"", r"^KeyError: 'vk(\W|$)",

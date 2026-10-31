@@ -598,6 +598,11 @@ def _rrelu_with_noise(x, noise, lower=1.0 / 8, upper=1.0 / 3, training=False, ge
     return torch.where(negative, x * slopes, x)
 
 
+def _rrelu_with_noise_(x, noise, lower=1.0 / 8, upper=1.0 / 3, training=False, generator=None):
+    # (the same random numbers as the functional form, from the "vk" generator)
+    return x.copy_(_rrelu_with_noise(x, noise, lower, upper, training, generator))
+
+
 # ---------------------------------------------------------------- antialiased upsampling
 
 def _aa_filter(kind, x):
@@ -1287,6 +1292,8 @@ def _kernels():
         "fractional_max_pool3d": fmp3,
         "fractional_max_pool3d_backward": fmp3_b,
         "rrelu_with_noise": _rrelu_with_noise,
+        "rrelu_with_noise_": _rrelu_with_noise_,
+        "addbmm_": lambda x, b1, b2, beta=1, alpha=1: x.copy_(torch.addbmm(x, b1, b2, beta=beta, alpha=alpha)),
         "_upsample_bilinear2d_aa": aa_bilinear,
         "_upsample_bilinear2d_aa_backward": aa_bilinear_b,
         "_upsample_bicubic2d_aa": aa_bicubic,
