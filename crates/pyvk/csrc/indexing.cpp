@@ -715,15 +715,6 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
                       at::Tensor& out) {
   TORCH_CHECK(bins > 0, "torch.histc(): bins must be > 0, but got ", bins);
   at::ScalarType t = self.scalar_type();
-  if (at::isIntegralType(t, /*includeBool=*/false) && is_vk(self) && is_vk(out)) {
-    // Integers (as CUDA; the CPU has no integer histc): counted in floating point.
-    at::ScalarType wide = t == at::kLong ? at::kDouble : at::kFloat;
-    at::Tensor counts = at::empty({0}, self.options().dtype(wide));
-    histc_out(self.to(wide), bins, min, max, counts);
-    at::native::resize_output(out, {bins});
-    out.copy_(counts);
-    return out;
-  }
   if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(t) || accum_label(t) == nullptr) {
     on_cpu("aten::histc", "out", self, bins, min, max, out);
     return out;

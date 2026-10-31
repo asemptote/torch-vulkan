@@ -326,6 +326,11 @@ std::tuple<at::Tensor, at::Tensor> mode(const at::Tensor& self, int64_t dim, boo
 // (PyTorch's composite mode.values allows only CPU, CUDA and XPU)
 std::tuple<at::Tensor&, at::Tensor&> mode_out(const at::Tensor& self, int64_t dim, bool keepdim, at::Tensor& values,
                                               at::Tensor& indices) {
+  // (the CPU's messages)
+  TORCH_CHECK(self.device() == values.device(), "mode: expected device ", self.device(), " but got ", values.device(),
+              " for values output");
+  TORCH_CHECK(self.device() == indices.device(), "mode: expected device ", self.device(), " but got ",
+              indices.device(), " for indices output");
   auto [v, i] = at::mode(self, dim, keepdim);  // (our functional kernel, via the dispatcher)
   assign_out(values, v);
   assign_out(indices, i);

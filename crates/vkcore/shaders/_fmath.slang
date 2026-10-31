@@ -49,9 +49,44 @@ float m_exp(float x)
 }
 float m_exp2(float x) { return exp2(x); }
 float m_expm1(float x) { return expm1_32(x); }
-float m_log(float x) { return log(x); }
+// ln x by Cephes' logf (x = m 2^e with m in [sqrt(1/2), sqrt(2)), a degree-8
+// polynomial in m - 1): about 1 ulp, where the built-in log loses relative
+// accuracy near 1 (~1e-5). The built-in for zero, negatives, inf and NaN.
+float m_log(float x)
+{
+    if (!(x > 0.0f) || isinf(x)) return log(x);
+    float scale = 0.0f;
+    if (x < 1.17549435e-38f)  // subnormal: scale into the normal range
+    {
+        x *= 33554432.0f;  // 2^25
+        scale = -25.0f;
+    }
+    uint bits = bit_cast<uint>(x);
+    float e = float(int((bits >> 23) & 0xffu) - 126) + scale;
+    float m = bit_cast<float>((bits & 0x7fffffu) | 0x3f000000u);  // [0.5, 1)
+    if (m < 0.707106781186547524f)
+    {
+        m = m + m;
+        e = e - 1.0f;
+    }
+    float t = m - 1.0f;
+    float z = t * t;
+    float y = 7.0376836292e-2f;
+    y = y * t - 1.1514610310e-1f;
+    y = y * t + 1.1676998740e-1f;
+    y = y * t - 1.2420140846e-1f;
+    y = y * t + 1.4249322787e-1f;
+    y = y * t - 1.6668057665e-1f;
+    y = y * t + 2.0000714765e-1f;
+    y = y * t - 2.4999993993e-1f;
+    y = y * t + 3.3333331174e-1f;
+    y = y * z * t;
+    y += -2.12194440e-4f * e;
+    y += -0.5f * z;
+    return (t + y) + 0.693359375f * e;
+}
 float m_log2(float x) { return log2(x); }
-float m_log10(float x) { return log(x) * M_INV_LN10; }
+float m_log10(float x) { return m_log(x) * M_INV_LN10; }
 float m_log1p(float x) { return log1p32(x); }
 // sin, cos and tan by reduction to [-pi/4, pi/4] (r, quadrant n) and the
 // _math32 polynomials: the built-ins can be off by ~1e-5 for moderate
