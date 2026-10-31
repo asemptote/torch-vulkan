@@ -53,15 +53,18 @@ T combine(T a, T b)
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    // (Every index into order stays in range, also on paths a lane does not
+    // take: lavapipe's code performs those loads too.)
+    uint last = max(p.n, 1u) - 1u;
     for (uint s = id.x; s < p.n; s += p.stride)
     {
-        int64_t off = p.offs[p.order[s]];
-        if (s > 0u && p.offs[p.order[s - 1u]] == off)
+        int64_t off = p.offs[p.order[min(s, last)]];
+        if (s > 0u && p.offs[p.order[max(s, 1u) - 1u]] == off)
             continue;  // not the start of a run
         bool have = INCLUDE_SELF != 0;
         T acc = have ? p.dst[off] : T(0);
         uint count = have ? 1u : 0u;
-        for (uint j = s; j < p.n && p.offs[p.order[j]] == off; j++)
+        for (uint j = s; j < p.n && p.offs[p.order[min(j, last)]] == off; j++)
         {
             T v = p.vals[p.order[j]];
             acc = have ? combine(acc, v) : v;

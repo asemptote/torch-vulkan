@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/native/Resize.h>
 
 #include <algorithm>
@@ -183,6 +184,7 @@ inline at::Tensor laid_out_like(const at::Tensor& result, const at::Tensor& layo
 // of `like` (an input of the output's shape, if any), contiguous in that
 // order, so ops on transposed or channels-last inputs keep their layout.
 inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like) {
+  at::assert_no_internal_overlap(out);  // (as TensorIterator: an output written twice per element)
   if (out.sizes() == shape) {
     return;
   }

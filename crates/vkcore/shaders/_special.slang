@@ -407,9 +407,10 @@ FT erfcx_y100(FT y100)
     if (k < 0 || k >= 100)
         return LIT(1.0);
     FT t = 2 * y100 - FT(2 * k + 1);
+    k = clamp(k, 0, 99);  // (calc_erfcx evaluates both of its arms: keep the row in range)
     FT r = ERFCX_Y100[k][6];
-    for (int i = 5; i >= 0; i--)
-        r = ERFCX_Y100[k][i] + r * t;
+    for (int j = 0; j < 6; j++)
+        r = ERFCX_Y100[k][5 - j] + r * t;
     return r;
 }
 

@@ -291,6 +291,11 @@ at::Tensor isnan(const at::Tensor& self) {
 
 template <uint32_t Code>
 at::Tensor& predicate_out(const at::Tensor& self, at::Tensor& out) {
+  if (Code == op::COMPARE_ISPOSINF || Code == op::COMPARE_ISNEGINF) {
+    const char* name = Code == op::COMPARE_ISPOSINF ? "isposinf" : "isneginf";
+    TORCH_CHECK(!self.is_complex(), name, " does not support complex inputs.");
+    TORCH_CHECK(out.scalar_type() == at::kBool, name, " does not support non-boolean outputs.");
+  }
   if (!predicate_gpu(Code, self, out)) {
     const char* name = Code == op::COMPARE_ISPOSINF   ? "aten::isposinf"
                        : Code == op::COMPARE_ISNEGINF ? "aten::isneginf"

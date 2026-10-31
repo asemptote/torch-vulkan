@@ -63,7 +63,7 @@ void main(uint3 id: SV_DispatchThreadID)
             for (uint j = 0u; j < p.n; j++)
             {
                 T v = LOADX(base + j);
-                count = (j > 0u && v == LOADX(base + j - 1u)) ? count + 1u : 1u;
+                count = (j > 0u && v == LOADX(base + max(j, 1u) - 1u)) ? count + 1u : 1u;  // (index in range for j = 0)
                 if (count > best_count)
                 {
                     best_count = count;

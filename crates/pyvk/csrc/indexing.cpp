@@ -20,6 +20,7 @@
 #include "vk.h"
 
 #include <ATen/ExpandUtils.h>
+#include <ATen/WrapDimUtilsMulti.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/TypeProperties.h>
@@ -807,6 +808,7 @@ at::Tensor count_nonzero(const at::Tensor& self, at::IntArrayRef dims) {
 }
 
 at::Tensor& masked_select_out(const at::Tensor& self, const at::Tensor& mask, at::Tensor& out) {
+  TORCH_CHECK(mask.scalar_type() == at::kBool, "masked_select: expected BoolTensor for mask");
   bool ok = movable(self) && is_vk(mask) && is_vk(out) && out.scalar_type() == self.scalar_type() &&
             (mask.scalar_type() == at::kBool || mask.scalar_type() == at::kByte);
   if (!ok) {
@@ -918,6 +920,7 @@ at::Tensor flip(const at::Tensor& self, at::IntArrayRef dims) {
   if (!movable(self)) {
     return on_cpu("aten::flip", "", self, dims)[0].toTensor();
   }
+  at::dim_list_to_bitset(dims, self.dim());  // (rejects repeated and out-of-range dims)
   std::vector<int64_t> flipped;
   std::vector<at::Tensor> indices;
   for (int64_t d : dims) {
@@ -1173,6 +1176,8 @@ bool equal(const at::Tensor& self, const at::Tensor& other) {
 
 at::Tensor& isin_out(const at::Tensor& elements, const at::Tensor& test, bool assume_unique, bool invert,
                      at::Tensor& out) {
+  TORCH_CHECK(elements.device() == test.device(), "Expected all tensors to be on the same device, but found at "
+              "least two devices, ", elements.device(), " and ", test.device(), "!");
   // Broadcast comparison: fine for moderate sizes (a sort-based method comes with M10).
   bool small = elements.numel() * std::max<int64_t>(test.numel(), 1) <= (int64_t(1) << 24);
   if (!is_vk(elements) || !is_vk(test) || !is_vk(out) || !small || dtype_label(elements.scalar_type()) == nullptr ||

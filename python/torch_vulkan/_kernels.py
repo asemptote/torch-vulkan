@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch._decomp import decomposition_table
 
-from . import _decomp, _dtypes, _layout, _native
+from . import _checks, _decomp, _dtypes, _layout, _native
 
 aten = torch.ops.aten
 _lib = None
@@ -1112,6 +1112,7 @@ def register():
             continue  # a C++ or decomposed kernel exists
         base, _, overload = name.partition(".")
         op = getattr(getattr(torch.ops.aten, base), overload or "default")
-        _lib.impl(name, _layout.with_layout(op, _dtypes.with_cpu_dtypes(base, fn)), "PrivateUse1")
+        fn = _checks.with_cpu_checks(base, _dtypes.with_cpu_dtypes(base, fn))
+        _lib.impl(name, _layout.with_layout(op, fn), "PrivateUse1")
         names.append("aten::" + name)
     return names

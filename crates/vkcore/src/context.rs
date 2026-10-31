@@ -97,9 +97,11 @@ unsafe extern "system" fn on_validation_message(
         CStr::from_ptr((*data).p_message).to_string_lossy()
     };
     // The layer's notes on its own settings (which GPU-assisted checks it
-    // turned off for this device) are not issues.
+    // turned off for this device) are not issues, nor is the loader's note
+    // that it found the layer through a symlink.
     if message.contains("Information with the layer settings provided")
         || message.contains("validation is adjusting settings")
+        || message.contains("was found to differ from OS loaded path")
     {
         return vk::FALSE;
     }

@@ -82,7 +82,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         {
             if (c > 0)
             {
-                A carry = p.totals[row * p.nchunks + c - 1];
+                A carry = p.totals[row * p.nchunks + max(c, 1u) - 1];  // (in range also where not taken)
                 for (uint k = 0; k < ITEMS; k++)
                 {
                     uint i = first + k;

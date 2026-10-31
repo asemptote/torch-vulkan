@@ -216,8 +216,9 @@ def tabulate_erfcx(out):
         "    int k = int(y100);\n"
         "    if (k < 0 || k >= 100)\n        return LIT(1.0);\n"
         "    FT t = 2 * y100 - FT(2 * k + 1);\n"
+        "    k = clamp(k, 0, 99);  // (calc_erfcx evaluates both of its arms: keep the row in range)\n"
         "    FT r = ERFCX_Y100[k][6];\n"
-        "    for (int i = 5; i >= 0; i--)\n        r = ERFCX_Y100[k][i] + r * t;\n"
+        "    for (int j = 0; j < 6; j++)\n        r = ERFCX_Y100[k][5 - j] + r * t;\n"
         "    return r;\n}"
     )
     return out[:start] + new + out[end:]

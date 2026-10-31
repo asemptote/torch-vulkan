@@ -139,13 +139,15 @@ impl Pool {
 
     pub fn alloc(&mut self, size: u64) -> Result<Allocation> {
         let size = round_up(size.max(1), ALIGNMENT);
-        if size > self.ctx.caps.max_buffer_size {
-            return Err(format!("allocation of {size} bytes exceeds the device's max buffer size").into());
+        // One block is one buffer and one memory allocation: both limits apply.
+        let limit = self.ctx.caps.max_buffer_size.min(self.ctx.caps.max_allocation_size);
+        if size > limit {
+            return Err(format!("allocation of {size} bytes exceeds the device's limit of {limit} bytes per buffer").into());
         }
         if let Some(a) = self.alloc_from_existing(size) {
             return Ok(a);
         }
-        let block_size = round_up(size.max(BLOCK_SIZE), LARGE_GRANULE).min(self.ctx.caps.max_buffer_size);
+        let block_size = round_up(size.max(BLOCK_SIZE), LARGE_GRANULE).min(limit);
         let block = match self.create_block(block_size) {
             Ok(b) => b,
             Err(_) => {

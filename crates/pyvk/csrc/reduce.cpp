@@ -13,6 +13,7 @@
 #include "strided.h"
 
 #include <ATen/WrapDimUtils.h>
+#include <ATen/WrapDimUtilsMulti.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
@@ -117,10 +118,12 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
   int64_t ndim = self.dim();
   std::vector<bool> reduced(ndim, !dims.has_value() || dims->empty());
   if (dims.has_value()) {
-    for (int64_t d : *dims) {
-      int64_t w = at::maybe_wrap_dim(d, ndim);  // validates; a 0-dim tensor accepts dim 0 / -1
-      if (ndim > 0) {
-        reduced[w] = true;
+    // Validates (as the CPU: repeated dims and more than 64 dims are errors);
+    // a 0-dim tensor accepts dim 0 / -1.
+    auto bits = at::dim_list_to_bitset(*dims, ndim);
+    for (int64_t d = 0; d < ndim; ++d) {
+      if (bits[d]) {
+        reduced[d] = true;
       }
     }
   }
@@ -399,6 +402,8 @@ at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
 
 template <ROp Op>
 at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim, at::Tensor& out) {
+  TORCH_CHECK(out.scalar_type() == at::kBool || out.scalar_type() == at::kByte, Op == kAny ? "any" : "all",
+              " only supports bool tensor for result, got: ", out.scalar_type());
   if (complex_vk(self) && is_vk(out)) {
     return any_all_dims_out<Op>(at::ne(self, 0), dim, keepdim, out);
   }

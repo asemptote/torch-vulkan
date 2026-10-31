@@ -458,6 +458,13 @@ at::Tensor& binary_out(const at::Tensor& self, const at::Tensor& other, at::Tens
   return out;
 }
 
+at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
+  TORCH_CHECK(!self.is_complex() && !values.is_complex(), "heaviside is not yet implemented for complex tensors.");
+  TORCH_CHECK(self.scalar_type() == values.scalar_type(),
+              "heaviside is not yet implemented for tensors with different dtypes.");
+  return binary_out<21>(self, values, out);
+}
+
 at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, at::Tensor& out) {
   if (!binary_gpu(kBinary[kPow], self, nullptr, &exponent, 1, out)) {
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);
@@ -603,7 +610,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("logaddexp2.out", &binary_out<18>);
   m.impl("xlogy.OutTensor", &binary_out<19>);
   m.impl("special_xlog1py.out", &binary_out<20>);
-  m.impl("heaviside.out", &binary_out<21>);
+  m.impl("heaviside.out", &heaviside_out);
   m.impl("fmax.out", &binary_out<22>);
   m.impl("fmin.out", &binary_out<23>);
   m.impl("bitwise_left_shift.Tensor_out", &binary_out<24>);

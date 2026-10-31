@@ -34,7 +34,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     for (uint t = gid.x * 256 + tid.x; t < total; t += p.ngroups * 256)
     {
         uint i = t / p.ncols, c = t % p.ncols;
-        int r = int(p.idx[i]);
+        int r = int(p.idx[min(i, p.nrows - 1)]);  // (i < nrows; clamped for loads past the loop's end)
         if (MODE == ROWS_GATHER)
             p.out[int(i) * p.out_rs + int(c) * p.out_cs] = p.in[r * p.in_rs + int(c) * p.in_cs];
         else

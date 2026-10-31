@@ -781,15 +781,19 @@ void ldl_solve(uint t, uint z)
     T* b = p.aux + z * p.saux;
     int* piv = p.piv + z * p.spiv;
     uint n = p.rows, ld = p.ld, nr = p.cols;
+    // Indices stay in range on every path, also those a lane does not take
+    // (lavapipe's code performs loads there too: see eig.slang's qr): the
+    // pivot is decoded before the branch, and k / k + 1 / k - 1 are clamped.
     for (uint c = t; c < nr; c += WG)
     {
         // L D y = P b
         uint k = 0;
         while (k < n)
         {
-            if (piv[k] > 0)
+            int pk = piv[min(k, n - 1)];
+            uint kp = min(uint(abs(pk) - 1), n - 1);
+            if (pk > 0)
             {
-                uint kp = uint(piv[k] - 1);
                 if (kp != k)
                 {
                     T tmp = b[k * nr + c];
@@ -805,26 +809,26 @@ void ldl_solve(uint t, uint z)
             }
             else
             {
-                uint kp = uint(-piv[k] - 1);
-                if (kp != k + 1)
+                uint k1 = min(k + 1, n - 1);  // (k + 1 < n in a 2 x 2 block)
+                if (kp != k1)
                 {
-                    T tmp = b[(k + 1) * nr + c];
-                    b[(k + 1) * nr + c] = b[kp * nr + c];
+                    T tmp = b[k1 * nr + c];
+                    b[k1 * nr + c] = b[kp * nr + c];
                     b[kp * nr + c] = tmp;
                 }
-                T bk0 = b[k * nr + c], bk1 = b[(k + 1) * nr + c];
+                T bk0 = b[k * nr + c], bk1 = b[k1 * nr + c];
                 for (uint i = k + 2; i < n; i++)
                     b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k], bk0);
                 for (uint i = k + 2; i < n; i++)
-                    b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k + 1], bk1);
-                T akm1k = a[(k + 1) * ld + k];
+                    b[i * nr + c] = b[i * nr + c] - mul(a[i * ld + k1], bk1);
+                T akm1k = a[k1 * ld + k];
                 T akm1 = dv(a[k * ld + k], hc(akm1k));
-                T ak = dv(a[(k + 1) * ld + k + 1], akm1k);
+                T ak = dv(a[k1 * ld + k1], akm1k);
                 T denom = mul(akm1, ak) - ONE;
                 T bkm1 = dv(b[k * nr + c], hc(akm1k));
-                T bkk = dv(b[(k + 1) * nr + c], akm1k);
+                T bkk = dv(b[k1 * nr + c], akm1k);
                 b[k * nr + c] = dv(mul(ak, bkm1) - bkk, denom);
-                b[(k + 1) * nr + c] = dv(mul(akm1, bkk) - bkm1, denom);
+                b[k1 * nr + c] = dv(mul(akm1, bkk) - bkm1, denom);
                 k += 2;
             }
         }
@@ -832,14 +836,15 @@ void ldl_solve(uint t, uint z)
         int kb = int(n) - 1;
         while (kb >= 0)
         {
-            uint k2 = uint(kb);
-            if (piv[k2] > 0)
+            uint k2 = uint(max(kb, 0));
+            int pk = piv[k2];
+            uint kp = min(uint(abs(pk) - 1), n - 1);
+            if (pk > 0)
             {
                 T s = ZERO;
                 for (uint i = k2 + 1; i < n; i++)
                     s += mul(hc(a[i * ld + k2]), b[i * nr + c]);
                 b[k2 * nr + c] = b[k2 * nr + c] - s;
-                uint kp = uint(piv[k2] - 1);
                 if (kp != k2)
                 {
                     T tmp = b[k2 * nr + c];
@@ -850,15 +855,15 @@ void ldl_solve(uint t, uint z)
             }
             else
             {
+                uint km1 = max(k2, 1u) - 1;  // (k2 >= 1 in a 2 x 2 block)
                 T s = ZERO, s1 = ZERO;
                 for (uint i = k2 + 1; i < n; i++)
                 {
                     s += mul(hc(a[i * ld + k2]), b[i * nr + c]);
-                    s1 += mul(hc(a[i * ld + k2 - 1]), b[i * nr + c]);
+                    s1 += mul(hc(a[i * ld + km1]), b[i * nr + c]);
                 }
                 b[k2 * nr + c] = b[k2 * nr + c] - s;
-                b[(k2 - 1) * nr + c] = b[(k2 - 1) * nr + c] - s1;
-                uint kp = uint(-piv[k2] - 1);
+                b[km1 * nr + c] = b[km1 * nr + c] - s1;
                 if (kp != k2)
                 {
                     T tmp = b[k2 * nr + c];

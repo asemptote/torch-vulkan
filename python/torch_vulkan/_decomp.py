@@ -19,7 +19,7 @@ import torch
 from torch._decomp import decomposition_table
 from torch.utils._pytree import tree_map
 
-from . import _dtypes, _layout, _native
+from . import _checks, _dtypes, _layout, _native
 
 # Decompositions that are wrong or much slower than the CPU for eager use on
 # "vk" (filled in from the OpInfo sweep and tests).
@@ -159,7 +159,8 @@ def register():
     for op, decomp, name in candidates():
         overload = op._overloadname
         qualified = op._schema.name.split("::", 1)[1] + ("" if overload == "default" else "." + overload)
-        kernel = _dtypes.with_cpu_dtypes(op._schema.name.split("::", 1)[1], _make_kernel(op, decomp, name))
+        base = op._schema.name.split("::", 1)[1]
+        kernel = _checks.with_cpu_checks(base, _dtypes.with_cpu_dtypes(base, _make_kernel(op, decomp, name)))
         _lib.impl(qualified, _layout.with_layout(op, kernel), "PrivateUse1")
         names.append(name)
     return names
