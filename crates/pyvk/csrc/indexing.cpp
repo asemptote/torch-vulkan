@@ -831,13 +831,13 @@ static_assert(sizeof(NonzeroParams) == 72, "must match shaders/nonzero.slang");
 at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
   TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
               "devices, ", self.device(), " and ", out.device(), "!");
-  if (!is_vk(self) || !is_vk(out) || self.dim() > 8 || dtype_label(self.scalar_type()) == nullptr ||
-      out.scalar_type() != at::kLong) {
+  if (!is_vk(self) || !is_vk(out) || self.dim() > 8 || out.scalar_type() != at::kLong) {
     on_cpu("aten::nonzero", "out", self, out);
     return out;
   }
   int64_t ndim = self.dim();
-  at::Tensor mask = (self.scalar_type() == at::kBool ? self : at::ne(self, 0)).contiguous().reshape({-1});
+  // (a cast to bool is x != 0, for every dtype: uint8 masks too)
+  at::Tensor mask = self.to(at::kBool).contiguous().reshape({-1});
   int64_t count = 0;
   at::Tensor csum;
   if (mask.numel() > 0) {

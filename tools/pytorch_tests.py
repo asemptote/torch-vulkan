@@ -222,6 +222,22 @@ EXPECTED = [
     (r"test_pow_cuda_complex_extremal_passing_", r"Scalars are not close",
      "(-1 + inf i)^2: the CPU's complex pow gives inf + nan i from its special-value path; vk squares exactly "
      "(-inf - inf i)"),
+    (r"test_eig(vals)?_numpy_", r"Tensor-likes are not close",
+     "for batched inputs the test applies one batch's eigenvalue sort to another ([::-1] reverses the batch "
+     "axis), so it requires LAPACK's eigenvalue order; eigenvalues come in no particular order"),
+    (r"test_index_put_large_indices_|test_index_reduce_reduce_(mean|prod)_vk_(bfloat16|float16)", r"Tensor-likes are not close",
+     "vk accumulates 16-bit floats in float32 and rounds once; the CPU (the test's reference) rounds its running "
+     "sum or product to 16 bits at every step (for bfloat16 index_put_: error ~1 on vk, ~230 on the CPU)"),
+    (r"test_transformerencoderlayer_vk_", r"False is not true",
+     "TransformerEncoderLayer takes its fast path on PrivateUse1 devices too (torch.nn's _supported_device_type), "
+     "which gives NaN for fully masked rows; the test expects the fast path only on the CPU and CUDA"),
+    (r"test_TransformerEncoderLayer_empty_", r"NestedTensorvk",
+     "nested tensors are out of scope (as sparse ones)"),
+    (r"test_broadcast_fn_map2?_", r"map2?_ is only implemented on CPU tensors",
+     "Tensor.map_/map2_ are CPU-only Python callbacks; the test skips them only on CUDA"),
+    (r"test_grad_scaler_deprecated_warning_|test_grad_scaling_state_dict_", r"",
+     "the test assumes a device without torch.<device>.amp.GradScaler is the CPU (torch.cpu.amp, "
+     "torch.FloatTensor)"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

@@ -1169,6 +1169,8 @@ at::ScalarType complex_of(at::ScalarType t) {
   return t == at::kFloat || t == at::kComplexFloat ? at::kComplexFloat : at::kComplexDouble;
 }
 
+std::tuple<at::Tensor, at::Tensor> real_eig_pairs(const at::Tensor& w, const at::Tensor& v);
+
 // Eigenvalues [B, n] and (want_vectors) unit eigenvectors [B, n, n] of a's
 // matrices, complex: Hessenberg reduction, shifted QR to the complex Schur
 // form T = Z^H A Z, eigenvectors of T by back substitution, times Z. Each
@@ -1203,7 +1205,7 @@ std::tuple<at::Tensor, at::Tensor> general_eig(const at::Tensor& a, bool want_ve
   }
   at::Tensor values = h.diagonal(0, 1, 2).clone();
   if (!want_vectors) {
-    return {values, at::Tensor()};
+    return a.is_complex() ? std::make_tuple(values, at::Tensor()) : real_eig_pairs(values, at::Tensor());
   }
   if (B == 0 || n == 0) {
     return {values, z};
@@ -1219,7 +1221,31 @@ std::tuple<at::Tensor, at::Tensor> general_eig(const at::Tensor& a, bool want_ve
   v = v / norms.to(ct);
   at::Tensor big = at::gather(v, 1, abs2(v).argmax(1, true));  // [B, 1, n]
   at::Tensor phase = at::conj_physical(big) / at::abs(big).to(ct);
-  return {values, v * phase};
+  return a.is_complex() ? std::make_tuple(values, v * phase) : real_eig_pairs(values, v * phase);
+}
+
+// For a real matrix, eigenvalues as LAPACK's dgeev returns them: real ones
+// with zero imaginary parts and the others in exact conjugate pairs (each
+// with its conjugate eigenvector), where the complex Schur form leaves them
+// a rounding error apart (which reorders a sort by real part).
+std::tuple<at::Tensor, at::Tensor> real_eig_pairs(const at::Tensor& w, const at::Tensor& v) {
+  int64_t n = w.size(1);
+  if (n == 0) return {w, v};
+  // Each eigenvalue's partner: the one nearest its conjugate (itself if real).
+  at::Tensor d = at::abs(w.unsqueeze(2) - at::conj_physical(w).unsqueeze(1));  // [B, n, n]
+  at::Tensor partner = d.argmin(2);
+  at::Tensor self = at::arange(n, partner.options()).unsqueeze(0);
+  at::Tensor mutual = at::eq(at::gather(partner, 1, partner), self);
+  at::Tensor avg = (w + at::conj_physical(at::gather(w, 1, partner))) * 0.5;  // (exact conjugates of each other)
+  at::Tensor w2 = at::where(mutual, avg, w);
+  if (!v.defined()) return {w2, v};
+  at::Tensor is_real = at::logical_and(mutual, at::eq(partner, self)).unsqueeze(1);       // [B, 1, n]
+  at::Tensor lower = at::logical_and(at::logical_and(mutual, at::ne(partner, self)), at::lt(at::imag(w), 0))
+                         .unsqueeze(1);
+  at::Tensor vp = at::conj_physical(at::gather(v, 2, partner.unsqueeze(1).expand_as(v)));
+  at::Tensor v2 = at::where(lower, vp, v);
+  v2 = at::where(is_real, at::real(v2).to(v.scalar_type()), v2);
+  return {w2, v2};
 }
 
 bool eig_ok(const at::Tensor& a) {
