@@ -100,7 +100,8 @@ T apply(T x)
     case UNARY_LEAKY_RELU: return x > T(0) ? x : x * T(alpha());
     case UNARY_SOFTSHRINK: {
         T l = T(alpha());
-        return x > l ? x - l : (x < -l ? x + l : x * T(0));  // x * 0 keeps NaN and the sign of zero
+        // x * 0 keeps NaN and the sign of zero; the 0 is gamma() (unset, 0), as a literal 0 gets folded
+        return x > l ? x - l : (x < -l ? x + l : x * T(gamma()));
     }
     case UNARY_HARDSHRINK: return (x >= -T(alpha()) && x <= T(alpha())) ? T(0) : x;  // NaN stays
     case UNARY_THRESHOLD: return x <= T(alpha()) ? T(beta()) : x;  // NaN stays

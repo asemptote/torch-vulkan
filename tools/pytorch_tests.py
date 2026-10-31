@@ -258,6 +258,9 @@ EXPECTED = [
      "eigenvalues come in no particular order; the comparison expects LAPACK's"),
     (r"test_compare_cpu_nn_functional_alpha_dropout_vk", r"Tensor-likes are not close",
      "a training-mode sample: vk's random numbers are not the CPU's"),
+    (r"test_python_ref(_executor|_torch_fallback)?__refs_add(_executor_aten)?_vk_complex32", r"Reference result was farther",
+     "complex32 add runs on the CPU (vk has no complex32 arithmetic), whose a + (1 + 0i) b makes the other part NaN "
+     "beside an infinity; PyTorch's reference upcasts on vk and does not"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
