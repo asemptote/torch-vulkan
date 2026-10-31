@@ -249,6 +249,8 @@ EXPECTED = [
      "order reliably passes"),
     (r"test_tensor_storage_type_", r"None mismatch",
      "the test expects torch.<Type>Storage (the CPU's) for every device but CUDA"),
+    (r"test_compare_cpu_linalg_lu(_factor|_factor_ex)?_vk", r"Unexpected success",
+     "vk's LU agrees with the CPU's (same pivoting); the test expects other devices to differ, as CUDA's does"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
