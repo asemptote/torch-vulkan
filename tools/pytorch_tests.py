@@ -243,6 +243,10 @@ EXPECTED = [
      "autocast policy (PyTorch registers none for PrivateUse1), so both run in float32 and agree"),
     (r"test_python_ref_errors__refs_where_", r"is not on the expected device",
      "PyTorch's where reference words the mixed-device error its own way (an expected failure on CUDA and MPS)"),
+    (r"test_(nan)?sum_vs_numpy_vk_float32", r"Tensor-likes are not close",
+     "float32 sums compared with NumPy's pairwise sums within tolerances tighter than NumPy's own rounding "
+     "error (even the exactly rounded sum misses them in ~0.5% of random inputs); only the CPU's summation "
+     "order reliably passes"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

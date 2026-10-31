@@ -312,7 +312,16 @@ std::vector<int64_t> reduce_dims_of(const at::Tensor& self, at::OptionalIntArray
 at::Tensor complex_sum(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim, bool mean) {
   at::Tensor real = at::view_as_real(self.resolve_conj());
   std::vector<int64_t> dims = self.dim() == 0 ? std::vector<int64_t>{} : reduce_dims_of(self, dim);
-  at::Tensor r = dims.empty() ? real.clone() : (mean ? real.mean(dims, keepdim) : real.sum(dims, keepdim));
+  at::Tensor r = dims.empty() ? real.clone() : real.sum(dims, keepdim);
+  if (mean && !dims.empty()) {
+    // As the CPU: the sum times 1/n as a complex product, (re + i im)(1/n + 0i),
+    // so an infinite part makes the other part NaN (inf 0).
+    int64_t n = 1;
+    for (int64_t d : dims) n *= self.size(d);
+    double s = 1.0 / static_cast<double>(n);
+    at::Tensor re = r.select(-1, 0), im = r.select(-1, 1);
+    r = at::stack({re * s - im * 0, re * 0 + im * s}, -1);
+  }
   return at::view_as_complex(r.contiguous());
 }
 

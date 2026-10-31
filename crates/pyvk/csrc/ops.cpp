@@ -375,6 +375,17 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   }
   at::ScalarType promoted = scalar ? at::result_type(*lhs, *scalar) : at::result_type(*lhs, *other);
   check_out_cast(compute_dtype(op, promoted), out);
+  at::ScalarType result_dtype = compute_dtype(op, promoted);
+  if (out.scalar_type() != result_dtype && !(at::isComplexType(result_dtype) && at::isComplexType(out.scalar_type()))) {
+    // Computed in the promoted dtype, then cast to out= (as TensorIterator:
+    // uint8 5 - 8 is 253 and float16 33000 + 33000 inf, even into float64).
+    at::Tensor result = at::empty(out.sizes(), out.options().dtype(result_dtype));
+    if (!binary_gpu(op, self, other, other_scalar, alpha, result)) {
+      return false;
+    }
+    out.copy_(result);
+    return true;
+  }
   if (!at::isFloatingType(promoted) && !at::isComplexType(promoted) &&
       (op.code == op::BINARY_FMAX || op.code == op::BINARY_FMIN)) {
     // No NaNs to ignore: fmax and fmin are maximum and minimum.

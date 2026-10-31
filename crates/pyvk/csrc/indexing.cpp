@@ -86,9 +86,36 @@ void gather(const at::Tensor& out, const at::Tensor& src_view, const at::Tensor&
   launch_strided(kernel.c_str(), {op::MOVE_GATHER, 0}, out, &src_view, &offsets);
 }
 
-// dst_view[offsets] = values (broadcast to dst_view's shape).
+// Element offsets (from its storage offset) of every element of view `v`, int64, in v's shape.
+at::Tensor view_offsets(const at::Tensor& v) {
+  at::Tensor off = at::zeros({}, v.options().dtype(at::kLong));
+  for (int64_t d = 0; d < v.dim(); ++d) {
+    std::vector<int64_t> shape(v.dim(), 1);
+    shape[d] = v.size(d);
+    off = off + (at::arange(v.size(d), off.options()) * v.stride(d)).view(shape);
+  }
+  return off.expand(v.sizes());
+}
+
+// dst_view[offsets] = values (broadcast to dst_view's shape). In deterministic
+// mode, of several writes to one element the last (in index order) wins, as
+// on the CPU (index_put_, index_copy_ with repeated indices); otherwise
+// which one lands is unspecified.
 void scatter(const at::Tensor& dst_view, const at::Tensor& values, const at::Tensor& offsets) {
   std::string kernel = move_kernel(dst_view.itemsize());
+  if (at::globalContext().deterministicAlgorithms() && dst_view.numel() > 1) {
+    at::Tensor addr = (view_offsets(dst_view) + offsets.to(at::kLong).expand(dst_view.sizes())).reshape({-1});
+    at::Tensor v = values.expand(dst_view.sizes()).reshape({-1});
+    auto [sorted, perm] = at::sort(addr, /*stable=*/true, 0, false);
+    int64_t n = sorted.size(0);
+    at::Tensor last = at::cat({at::ne(sorted.narrow(0, 1, n - 1), sorted.narrow(0, 0, n - 1)),
+                               at::ones({1}, sorted.options().dtype(at::kBool))});
+    at::Tensor keep = at::masked_select(perm, last);
+    at::Tensor flat = dst_view.as_strided({keep.numel()}, {0}, dst_view.storage_offset());
+    at::Tensor kv = at::index_select(v, 0, keep), ka = at::index_select(addr, 0, keep);
+    launch_strided(kernel.c_str(), {op::MOVE_SCATTER, 0}, flat, &kv, &ka);
+    return;
+  }
   launch_strided(kernel.c_str(), {op::MOVE_SCATTER, 0}, dst_view, &values, &offsets);
 }
 
@@ -375,6 +402,19 @@ at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::T
     TORCH_CHECK(false, "shape mismatch: value tensor of shape ", values.sizes(),
                 " cannot be broadcast to indexing result of shape ", info.src.sizes());
   }
+  // (as the CPU, except where it takes masked_fill_: one bool mask, a 0-dim value)
+  int64_t defined = 0;
+  bool bool_mask = false;
+  for (const std::optional<at::Tensor>& index : indices) {
+    if (index.has_value() && index->defined()) {
+      ++defined;
+      bool_mask = index->scalar_type() == at::kBool;
+    }
+  }
+  bool masked_fill = !accumulate && values.dim() == 0 && defined == 1 && bool_mask;
+  TORCH_CHECK(masked_fill || values.scalar_type() == self.scalar_type(), "Index put requires the source and "
+              "destination dtypes match, got ", self.scalar_type(), " for the destination and ", values.scalar_type(),
+              " for the source.");
   if (info.src.numel() == 0) {
     return self;
   }
@@ -1191,6 +1231,30 @@ at::Tensor& arange_out(const at::Scalar& start, const at::Scalar& end, const at:
   return out;
 }
 
+// torch.range (deprecated; end inclusive), with the CPU's checks.
+at::Tensor& range_out(const at::Scalar& start, const at::Scalar& end, const at::Scalar& step, at::Tensor& out) {
+  at::ScalarType dtype = out.scalar_type();
+  if (!is_vk(out) || at::isComplexType(dtype) || dtype == at::kBool) {
+    on_cpu("aten::range", "out", start, end, step, out);
+    return out;
+  }
+  double xstart = start.toDouble(), xend = end.toDouble(), xstep = step.toDouble();
+  TORCH_CHECK(xstep > 0 || xstep < 0, "step must be nonzero");
+  TORCH_CHECK(std::isfinite(xstart) && std::isfinite(xend), "unsupported range: ", xstart, " -> ", xend);
+  TORCH_CHECK((xstep > 0 && xend >= xstart) || (xstep < 0 && xend <= xstart),
+              "upper bound and larger bound inconsistent with step sign");
+  int64_t size = static_cast<int64_t>((xend - xstart) / xstep + 1);
+  if (out.numel() != size) {
+    out.resize_({size});
+  }
+  at::ScalarType compute = iota_dtype(dtype);
+  std::string kernel = std::string("iota_") + storage_label(compute);
+  with_output(out, compute, [&](const at::Tensor& target) {
+    launch_strided(kernel.c_str(), {op::IOTA_ARANGE}, target, nullptr, nullptr, {start, step});
+  });
+  return out;
+}
+
 at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t steps, at::Tensor& out) {
   at::assert_no_internal_overlap(out);
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
@@ -1337,6 +1401,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("index_add.out", &index_add_out);
   m.impl("index_reduce.out", &index_reduce_out);
   m.impl("bincount", &vk::bincount);
+  m.impl("range.out", &range_out);
   m.impl("histc", &vk::histc);
   m.impl("histc.out", &histc_out);
   m.impl("nonzero", &vk::nonzero_vk);

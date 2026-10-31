@@ -96,6 +96,24 @@ A combine(A a, A b)
     return a + b;
 }
 
+// acc += v, for float sums with Kahan's compensation c: a thread's running
+// sum over thousands of elements otherwise loses ~n ulp (the CPU's and
+// NumPy's pairwise sums do not). Infinities skip the compensation (inf - inf).
+void accumulate(inout A acc, inout A c, A v)
+{
+#ifdef A_FLOAT
+    if (OP == OP_SUM || OP == OP_SUMABS || OP == OP_SUMSQ || OP == OP_SQDEV)
+    {
+        A y = v - c;
+        A t = acc + y;
+        c = isinf(t) || isnan(t) ? A(0) : (t - acc) - y;
+        acc = t;
+        return;
+    }
+#endif
+    acc = combine(acc, v);
+}
+
 // First-level transform of an input element.
 A load(T x, uint o)
 {
@@ -156,9 +174,9 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             uint c = t / p.n_out;
             int base = offset(o, p.ond, p.osz, p.ost);
             uint end = min((c + 1) * p.chunk, p.n_red);
-            A acc = identity();
+            A acc = identity(), comp = A(0);
             for (uint i = c * p.chunk; i < end; i++)
-                acc = combine(acc, load(p.in[base + offset(i, p.rnd, p.rsz, p.rst)], o));
+                accumulate(acc, comp, load(p.in[base + offset(i, p.rnd, p.rsz, p.rst)], o));
             p.out[o * p.nchunks + c] = p.nchunks == 1 ? finish(acc) : acc;
         }
         return;
@@ -169,9 +187,9 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         uint c = w % p.nchunks;
         int base = offset(o, p.ond, p.osz, p.ost);
         uint end = min((c + 1) * p.chunk, p.n_red);
-        A acc = identity();
+        A acc = identity(), comp = A(0);
         for (uint i = c * p.chunk + tid.x; i < end; i += WG)
-            acc = combine(acc, load(p.in[base + offset(i, p.rnd, p.rsz, p.rst)], o));
+            accumulate(acc, comp, load(p.in[base + offset(i, p.rnd, p.rsz, p.rst)], o));
         sdata[tid.x] = acc;
         GroupMemoryBarrierWithGroupSync();
         for (uint s = WG / 2; s > 0; s >>= 1)

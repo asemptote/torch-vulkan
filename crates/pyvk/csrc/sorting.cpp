@@ -440,6 +440,20 @@ static_assert(sizeof(SearchParams) == 48, "must match shaders/searchsorted.slang
 
 at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, bool out_int32, bool right,
                               const std::optional<at::Tensor>& sorter, at::Tensor& out) {
+  if (sorter.has_value() && sorter->defined()) {  // (the CPU's searchsorted_pre_check)
+    TORCH_CHECK(sorter->sizes() == sorted.sizes(), "torch.searchsorted(): boundary and sorter must have the same "
+                "size, but got boundary tensor ", sorted.sizes(), "and got sorter tensor ", sorter->sizes());
+    TORCH_CHECK(sorter->scalar_type() == at::kLong, "torch.searchsorted(): sorter must be a tensor of long dtype but "
+                "got dtype ", sorter->scalar_type());
+    if (sorter->numel() > 0) {
+      auto [lo, hi] = at::aminmax(*sorter);
+      TORCH_CHECK(lo.item<int64_t>() >= 0 && hi.item<int64_t>() < sorter->size(-1),
+                  "torch.searchsorted(): sorter index out of range");
+    }
+  }
+  TORCH_CHECK(out.scalar_type() == (out_int32 ? at::kInt : at::kLong), "torch.searchsorted(): output tensor's dtype "
+              "is wrong, it can only be Int(int32) or Long(int64) depending on whether out_int32 flag is True, but we "
+              "got output tensor's dtype ", out.scalar_type(), " and out_int32 flag is ", out_int32 ? "True" : "False");
   at::ScalarType dtype = at::result_type(sorted, self);
   const char* label = rowscan_label(dtype);
   bool ok = is_vk(sorted) && is_vk(self) && is_vk(out) && label != nullptr && dtype != at::kBool &&
@@ -447,6 +461,17 @@ at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, 
   if (!ok) {
     on_cpu("aten::searchsorted", "Tensor_out", sorted, self, out_int32, right, std::nullopt, sorter, out);
     return out;
+  }
+  // (the CPU's warnings, from searchsorted_maybe_trim_input_tensors)
+  if (!self.is_contiguous()) {
+    TORCH_WARN_ONCE("torch.searchsorted(): input value tensor is non-contiguous, this will lower the performance due "
+                    "to extra data copy when converting non-contiguous tensor to contiguous, please use contiguous "
+                    "input value tensor if possible. This message will only appear once per program.");
+  }
+  if (!sorted.is_contiguous()) {
+    TORCH_WARN_ONCE("torch.searchsorted(): boundary tensor is non-contiguous, this will lower the performance due "
+                    "to extra data copy when converting non-contiguous tensor to contiguous, please use contiguous "
+                    "boundary tensor if possible. This message will only appear once per program.");
   }
   at::native::resize_output(out, self.sizes());
   if (self.numel() == 0) {

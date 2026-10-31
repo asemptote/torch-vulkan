@@ -564,6 +564,15 @@ def _multilabel_margin_loss_forward(x, target, reduction):
     return (r.reshape(()) if target.dim() <= 1 and reduction == 0 else r), is_target
 
 
+# ---------------------------------------------------------------- bucketize
+
+def _bucketize_scalar(x, boundaries, out_int32=False, right=False):
+    # (the CPU's scalar_to_tensor: a 0-dim double or int64 on the boundaries' device)
+    dtype = torch.float64 if isinstance(x, float) else torch.complex128 if isinstance(x, complex) else torch.int64
+    return torch.bucketize(torch.tensor(x, dtype=dtype, device=boundaries.device), boundaries,
+                           out_int32=out_int32, right=right)
+
+
 # ---------------------------------------------------------------- ldexp
 
 def _ldexp(x, other):
@@ -1266,6 +1275,7 @@ def _kernels():
         "grid_sampler_3d_backward": _make_grid_sampler_backward("grid_sampler_3d_backward"),
         "native_group_norm": _native_group_norm,
         "ldexp.Tensor": _ldexp,
+        "bucketize.Scalar": _bucketize_scalar,
         "multi_margin_loss": _multi_margin_loss,
         "multilabel_margin_loss_forward": _multilabel_margin_loss_forward,
         "_cdist_forward": _cdist_forward,
