@@ -80,7 +80,8 @@ def _out_device_check(op):
         for name in outs:
             for t in _tensors(kwargs.get(name)):
                 if t.device.type != "vk":
-                    raise RuntimeError(f"Expected out tensor to have device vk:0, but got {t.device} instead")
+                    raise RuntimeError("Expected all tensors to be on the same device, but found at least two "
+                                       f"devices, vk:0 and {t.device}!")
 
     return check
 

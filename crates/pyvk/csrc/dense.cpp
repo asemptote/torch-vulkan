@@ -296,11 +296,18 @@ void check_errors(const at::Tensor& info, const char* api, bool is_matrix) {
   at::_linalg_check_errors(info, api, is_matrix);
 }
 
+// out = value. Linear algebra's out= tensors must have the result's dtype
+// exactly (PyTorch's structured kernels), unless `castable` (the few ops
+// whose CPU kernels accept a safe cast check that themselves).
 template <typename T>
-void assign(at::Tensor& out, const T& value) {
+void assign(at::Tensor& out, const T& value, bool castable = false) {
   check_out_device(value, out);
-  if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
+  if (castable) {
     check_out_cast(value.scalar_type(), out);
+  } else {
+    TORCH_CHECK(out.scalar_type() == value.scalar_type(), "Expected out tensor to have dtype ",
+                c10::scalarTypeToTypeMeta(value.scalar_type()).name(), ", but got ",
+                c10::scalarTypeToTypeMeta(out.scalar_type()).name(), " instead");
   }
   at::native::resize_output(out, value.sizes());
   out.copy_(value);
@@ -747,9 +754,26 @@ at::Tensor solve_triangular_vk(const at::Tensor& a, const at::Tensor& b, bool up
 }
 
 // Legacy torch.triangular_solve: (solution, copy of A).
+// The CPU's out= dtype checks of linalg ops: an exact dtype (structured
+// ops), or one the result can be cast to safely (with the op's words).
+void check_exact_out(const at::Tensor& like, at::ScalarType result, const at::Tensor& out) {
+  check_out_device(like, out);
+  TORCH_CHECK(out.scalar_type() == result, "Expected out tensor to have dtype ", c10::scalarTypeToTypeMeta(result).name(),
+              ", but got ", c10::scalarTypeToTypeMeta(out.scalar_type()).name(), " instead");
+}
+
+void check_castable_out(const at::Tensor& like, const char* fn, const char* what, at::ScalarType result,
+                        const at::Tensor& out) {
+  check_out_device(like, out);
+  TORCH_CHECK(at::canCast(result, out.scalar_type()), fn, ": Expected ", what, " to be safely castable from ", result,
+              " dtype, but got ", what, " with dtype ", out.scalar_type());
+}
+
 std::tuple<at::Tensor&, at::Tensor&> triangular_solve_legacy_out(const at::Tensor& b, const at::Tensor& a, bool upper,
                                                                   bool transpose, bool unit, at::Tensor& x,
                                                                   at::Tensor& m) {
+  check_exact_out(a, a.scalar_type(), x);
+  check_exact_out(a, a.scalar_type(), m);
   if (!gpu_matrices(a) || !is_vk(b)) {
     on_cpu("aten::triangular_solve", "X", b, a, upper, transpose, unit, x, m);
     return {x, m};
@@ -814,6 +838,7 @@ at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bo
 }
 
 at::Tensor& cholesky_inverse_out(const at::Tensor& a, bool upper, at::Tensor& out) {
+  check_castable_out(a, "cholesky_inverse", "result", a.scalar_type(), out);
   if (!gpu_matrices(a) || !is_vk(out)) {
     on_cpu("aten::cholesky_inverse", "out", a, upper, out);
     return out;
@@ -821,7 +846,7 @@ at::Tensor& cholesky_inverse_out(const at::Tensor& a, bool upper, at::Tensor& ou
   int64_t n = a.size(-1);
   at::Tensor eye = at::zeros(a.sizes(), a.options());
   eye.diagonal(0, -2, -1).fill_(1);
-  assign(out, cholesky_solve_helper(eye, a, upper).view(a.sizes()));
+  assign(out, cholesky_solve_helper(eye, a, upper).view(a.sizes()), /*castable=*/true);
   (void)n;
   return out;
 }
@@ -853,6 +878,14 @@ std::tuple<at::Tensor, at::Tensor> geqrf_vk(const at::Tensor& a) {
 }
 
 at::Tensor& householder_product_out(const at::Tensor& a, const at::Tensor& tau, at::Tensor& out) {
+  TORCH_CHECK(a.dim() >= 2, "torch.linalg.householder_product: input must have at least 2 dimensions.");
+  TORCH_CHECK(a.size(-2) >= a.size(-1),
+              "torch.linalg.householder_product: input.shape[-2] must be greater than or equal to input.shape[-1]");
+  TORCH_CHECK(a.size(-1) >= tau.size(-1),
+              "torch.linalg.householder_product: input.shape[-1] must be greater than or equal to tau.shape[-1]");
+  TORCH_CHECK(tau.scalar_type() == a.scalar_type(), "torch.linalg.householder_product: tau dtype ", tau.scalar_type(),
+              " does not match input dtype ", a.scalar_type());
+  check_castable_out(a, "torch.linalg.householder_product", "result", a.scalar_type(), out);
   if (!gpu_matrices(a) || !is_vk(tau) || !is_vk(out)) {
     on_cpu("aten::linalg_householder_product", "out", a, tau, out);
     return out;
@@ -860,7 +893,7 @@ at::Tensor& householder_product_out(const at::Tensor& a, const at::Tensor& tau, 
   at::Tensor a3 = batched(a);
   at::Tensor t = flat2(tau).contiguous();
   at::Tensor q = form_q(a3, t, a.size(-1));
-  assign(out, q.view(a.sizes()));
+  assign(out, q.view(a.sizes()), /*castable=*/true);
   return out;
 }
 
@@ -932,6 +965,10 @@ std::tuple<at::Tensor&, at::Tensor&> linalg_qr_out(const at::Tensor& a, c10::str
 
 std::tuple<at::Tensor&, at::Tensor&> eigh_out(const at::Tensor& a, c10::string_view uplo, bool compute_v,
                                               at::Tensor& values, at::Tensor& vectors) {
+  check_out_device(a, values);  // (all devices first, then dtypes, as the CPU)
+  if (compute_v) check_out_device(a, vectors);
+  check_exact_out(a, c10::toRealValueType(a.scalar_type()), values);
+  if (compute_v) check_exact_out(a, a.scalar_type(), vectors);
   if (!gpu_matrices(a) || !is_square(a) || !is_vk(values)) {
     on_cpu("aten::_linalg_eigh", "eigenvalues", a, uplo, compute_v, values, vectors);
     return {values, vectors};
@@ -1173,6 +1210,8 @@ bool eig_ok(const at::Tensor& a) {
 }
 
 std::tuple<at::Tensor&, at::Tensor&> eig_out(const at::Tensor& a, at::Tensor& values, at::Tensor& vectors) {
+  check_castable_out(a, "torch.linalg.eig", "eigenvalues", complex_of(a.scalar_type()), values);
+  check_castable_out(a, "torch.linalg.eig", "eigenvectors", complex_of(a.scalar_type()), vectors);
   if (!eig_ok(a) || !is_vk(values) || !is_vk(vectors)) {
     on_cpu("aten::linalg_eig", "out", a, values, vectors);
     return {values, vectors};
@@ -1180,8 +1219,8 @@ std::tuple<at::Tensor&, at::Tensor&> eig_out(const at::Tensor& a, at::Tensor& va
   auto [w, v] = general_eig(a, true);
   auto bs = batch_shape(a);
   int64_t n = a.size(-1);
-  assign(values, w.view(with_tail(bs, {n})));
-  assign(vectors, v.view(with_tail(bs, {n, n})));
+  assign(values, w.view(with_tail(bs, {n})), /*castable=*/true);
+  assign(vectors, v.view(with_tail(bs, {n, n})), /*castable=*/true);
   return {values, vectors};
 }
 
@@ -1195,12 +1234,13 @@ std::tuple<at::Tensor, at::Tensor> eig_vk(const at::Tensor& a) {
 }
 
 at::Tensor& eigvals_out(const at::Tensor& a, at::Tensor& out) {
+  check_castable_out(a, "torch.linalg.eigvals", "eigenvalues", complex_of(a.scalar_type()), out);
   if (!eig_ok(a) || !is_vk(out)) {
     on_cpu("aten::linalg_eigvals", "out", a, out);
     return out;
   }
   auto [w, v] = general_eig(a, false);
-  assign(out, w.view(with_tail(batch_shape(a), {a.size(-1)})));
+  assign(out, w.view(with_tail(batch_shape(a), {a.size(-1)})), /*castable=*/true);
   return out;
 }
 

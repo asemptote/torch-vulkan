@@ -254,7 +254,8 @@ inline void check_out_cast(at::ScalarType result, const at::Tensor& out) {
 // write it anywhere): PyTorch's own kernels check the device.
 inline void check_out_device(const at::Tensor& result, const at::Tensor& out) {
   TORCH_CHECK(result.device().type() != kDevice || out.device().type() == kDevice,
-              "Expected out tensor to have device ", result.device(), ", but got ", out.device(), " instead");
+              "Expected all tensors to be on the same device, but found at least two devices, ", result.device(),
+              " and ", out.device(), "!");
 }
 
 // Runs `body(target)` writing into `out` directly when its dtype is `dtype`,

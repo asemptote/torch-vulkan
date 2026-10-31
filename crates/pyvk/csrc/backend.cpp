@@ -548,8 +548,8 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
     const c10::IValue& v = stack[first + i];
     if (is_out(arguments[i]) && v.isTensor() && v.toTensor().defined()) {
       const at::Device device = v.toTensor().device();
-      TORCH_CHECK(device.type() == kDevice, "Expected out tensor to have device ", kDevice, ", but got ", device,
-                  " instead");
+      TORCH_CHECK(device.type() == kDevice, "Expected all tensors to be on the same device, but found at least two "
+                  "devices, ", kDevice, " and ", device, "!");
     }
   }
 }
