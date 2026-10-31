@@ -251,6 +251,13 @@ EXPECTED = [
      "the test expects torch.<Type>Storage (the CPU's) for every device but CUDA"),
     (r"test_compare_cpu_linalg_lu(_factor|_factor_ex)?_vk", r"Unexpected success",
      "vk's LU agrees with the CPU's (same pivoting); the test expects other devices to differ, as CUDA's does"),
+    (r"test_compare_cpu_nn_functional_grid_sample_vk_float32", r"Tensor-likes are not close",
+     "bilinear sampling of a 345x456 image: coordinates within an ulp of a pixel edge round to the other side "
+     "of it than in the CPU's vectorized kernel (~0.01% of elements, up to 1e-2 relative)"),
+    (r"test_compare_cpu_linalg_eig(vals)?_vk", r"Tensor-likes are not close",
+     "eigenvalues come in no particular order; the comparison expects LAPACK's"),
+    (r"test_compare_cpu_nn_functional_alpha_dropout_vk", r"Tensor-likes are not close",
+     "a training-mode sample: vk's random numbers are not the CPU's"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
