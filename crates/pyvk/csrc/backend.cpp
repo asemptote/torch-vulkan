@@ -496,8 +496,11 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
     return false;
   };
   auto is_out = [](const c10::Argument& a) { return a.kwarg_only() && a.alias_info() && a.alias_info()->isWrite(); };
-  // The indices of indexing ops (Tensor?[]) may be on the CPU.
-  auto indices = [](const c10::Argument& a) { return a.type()->str() == "Tensor?[]"; };
+  // The indices of indexing ops (Tensor?[]) may be on the CPU, and index_fill's index.
+  bool index_fill = schema.name().find("index_fill") != std::string::npos;
+  auto indices = [&](const c10::Argument& a) {
+    return a.type()->str() == "Tensor?[]" || (index_fill && a.name() == "index");
+  };
   auto cpu_tensor = [](const c10::IValue& v) {  // a CPU tensor that is not a scalar
     if (v.isTensor()) {
       const at::Tensor& t = v.toTensor();

@@ -204,7 +204,7 @@ EXPECTED = [
      "only the CPU's no-grad shortcut is float-only"),
     (r"test_upsamplingBiMode2d_nonsupported_dtypes_.*_mode_(bilinear|bicubic)_uint8", r"RuntimeError not raised",
      "uint8 bilinear/bicubic upsampling works on vk as on the CPU (the test expects only the CPU to support it)"),
-    (r"test_out_(cholesky_inverse|geqrf|ormqr)_", r"Unexpected success",
+    (r"test_out_(cholesky_inverse|geqrf|ormqr|triangular_solve)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
