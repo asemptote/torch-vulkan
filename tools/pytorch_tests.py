@@ -206,6 +206,8 @@ EXPECTED = [
      "only the CPU's no-grad shortcut is float-only"),
     (r"test_upsamplingBiMode2d_nonsupported_dtypes_.*_mode_(bilinear|bicubic)_uint8", r"RuntimeError not raised",
      "uint8 bilinear/bicubic upsampling works on vk as on the CPU (the test expects only the CPU to support it)"),
+    (r"test_fmod_remainder_by_zero_integral_", r"",
+     "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
      "integer histc: vk follows the CPU, which has no integer kernel (the test expects CUDA's)"),
     (r"test_out_warning_mode_", r"Unexpected success",

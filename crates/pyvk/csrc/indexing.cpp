@@ -1018,7 +1018,8 @@ at::Tensor& pad_out(const at::Tensor& self, at::IntArrayRef pad, bool reflect, c
     int64_t d = self.dim() - 1 - j;
     int64_t left = pad[2 * j], right = pad[2 * j + 1], n = self.size(d);
     if (reflect) {
-      TORCH_CHECK(left < n && right < n, name, ": padding size should be less than the corresponding input dimension");
+      TORCH_CHECK(left < n && right < n, "Argument #4: Padding size should be less than the corresponding input "
+                  "dimension, but got: padding (", left, ", ", right, ") at dimension ", d, " of input ", self.sizes());
     } else {
       TORCH_CHECK(n > 0, name, ": input dimension must be nonzero");
     }

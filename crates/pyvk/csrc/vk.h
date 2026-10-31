@@ -203,6 +203,17 @@ inline void check_overlap(const at::Tensor& out, std::initializer_list<const at:
   }
 }
 
+// An output that is also an input (in place) cannot grow to the broadcast
+// shape, as in PyTorch's TensorIterator.
+inline void check_inplace_shape(const at::Tensor& out, at::IntArrayRef shape,
+                                std::initializer_list<const at::Tensor*> inputs) {
+  if (out.sizes() == shape) return;
+  for (const at::Tensor* input : inputs) {
+    TORCH_CHECK(input == nullptr || !input->defined() || !out.is_same(*input), "output with shape ", out.sizes(),
+                " doesn't match the broadcast shape ", shape);
+  }
+}
+
 inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like,
                                       bool check_aliasing = true) {
   if (check_aliasing) {

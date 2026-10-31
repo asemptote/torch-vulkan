@@ -564,6 +564,10 @@ at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, con
   }
   double n = static_cast<double>(plan.n_red);
   double ddof = correction.has_value() ? correction->toDouble() : 1.0;
+  if (n - ddof <= 0) {  // (the CPU's warning)
+    TORCH_WARN(Std ? "std" : "var", "(): degrees of freedom is <= 0. Correction should be strictly less than the ",
+               "reduction factor (input numel divided by output numel).");
+  }
   at::Tensor mean = run_reduce(self, plan, kSum, kScale, 1.0 / n);
   double alpha = 1.0 / std::max(n - ddof, 0.0);  // inf -> nan/inf results, as on the CPU
   store(out, run_reduce(self, plan, kSqDev, Std ? kSqrtScale : kScale, alpha, &mean), plan.out_shape);

@@ -325,6 +325,7 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
         other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec();
     const at::Tensor* like = self.sizes() == at::IntArrayRef(shape) ? &self
                              : other != nullptr && other->sizes() == at::IntArrayRef(shape) ? other : nullptr;
+    check_inplace_shape(out, shape, {&self, other});
     resize_elementwise_output(out, shape, like);
   }
   const at::Tensor* lhs = &self;
