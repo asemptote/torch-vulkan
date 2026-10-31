@@ -270,7 +270,7 @@ void qr(uint t, uint zi)
             // bounds.)
             uint col = k == l ? uint(l) : uint(k - 1);
             T f = h[uint(k) * n + col] - (k == l ? mu : czero());
-            T g = h[uint(k + 1) * n + col];
+            T g = h[uint(min(k + 1, hi)) * n + col];  // (in range also for the load at k = hi)
             S c;
             T s;
             givens(f, g, c, s);
@@ -300,8 +300,9 @@ void vectors(uint t, uint zi)
     T* tm = p.a + zi * n * n;
     T* x = p.aux + zi * n * n;
     S smin = p.aux2[zi].x;
-    for (uint k = t; k < n; k += WG)
+    for (uint k0 = t; k0 < n; k0 += WG)
     {
+        uint k = min(k0, n - 1);  // (lanes past n still perform the first loads: see the note in qr)
         T lam = tm[k * n + k];
         for (uint j = k + 1; j < n; j++)
             x[j * n + k] = czero();
@@ -311,7 +312,7 @@ void vectors(uint t, uint zi)
             uint u = uint(max(j, 0));  // (j >= 0; see the note in qr)
             T s = czero();
             for (uint m = u + 1; m <= k; m++)
-                s += cmul(tm[u * n + m], x[m * n + k]);
+                s += cmul(tm[u * n + m], x[min(m, n - 1) * n + k]);
             T dd = tm[u * n + u] - lam;
             if (abs1(dd) < smin)
                 dd = T(smin, S(0));

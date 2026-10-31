@@ -20,6 +20,11 @@ pub const ALIGNMENT: u64 = 256;
 pub const BLOCK_SIZE: u64 = 64 << 20;
 /// Granularity for blocks made for requests larger than [`BLOCK_SIZE`].
 const LARGE_GRANULE: u64 = 2 << 20;
+/// Unused bytes before and after each block's allocations. Drivers may load
+/// from addresses a lane computes but does not use (lavapipe runs a loop's
+/// loads one iteration past its end, e.g. `piv[-1]`); near the ends of a
+/// block those land outside the mapping, and the process crashes.
+const GUARD: u64 = 1 << 20;
 
 fn round_up(v: u64, to: u64) -> u64 {
     v.div_ceil(to) * to
@@ -140,7 +145,7 @@ impl Pool {
     pub fn alloc(&mut self, size: u64) -> Result<Allocation> {
         let size = round_up(size.max(1), ALIGNMENT);
         // One block is one buffer and one memory allocation: both limits apply.
-        let limit = self.ctx.caps.max_buffer_size.min(self.ctx.caps.max_allocation_size);
+        let limit = self.ctx.caps.max_buffer_size.min(self.ctx.caps.max_allocation_size).saturating_sub(2 * GUARD);
         if size > limit {
             return Err(format!("allocation of {size} bytes exceeds the device's limit of {limit} bytes per buffer").into());
         }
@@ -167,6 +172,7 @@ impl Pool {
         for (i, slot) in self.blocks.iter_mut().enumerate() {
             let Some(block) = slot else { continue };
             if let Some(offset) = block.ranges.alloc(size) {
+                let offset = GUARD + offset;  // (within the buffer)
                 self.allocated += size;
                 return Some(Allocation {
                     block: i as u32,
@@ -183,7 +189,7 @@ impl Pool {
 
     pub fn free(&mut self, a: Allocation) {
         let block = self.blocks[a.block as usize].as_mut().expect("allocation from a released block");
-        block.ranges.free(a.offset, a.size);
+        block.ranges.free(a.offset - GUARD, a.size);
         self.allocated -= a.size;
     }
 
@@ -206,7 +212,7 @@ impl Pool {
         unsafe {
             let buffer = d.create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(size)
+                    .size(size + 2 * GUARD)
                     .usage(
                         vk::BufferUsageFlags::STORAGE_BUFFER
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS

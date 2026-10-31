@@ -65,7 +65,7 @@ impl Stream {
     }
 
     /// The command buffer being recorded, starting one if needed, with a
-    /// barrier against the previous command in the batch.
+    /// barrier against the previous command (in this batch or an earlier one).
     fn begin_command(&mut self) -> Result<vk::CommandBuffer> {
         let ctx = self.ctx.clone();
         let d = &ctx.device;
@@ -88,7 +88,11 @@ impl Stream {
                 cb
             },
         };
-        if self.commands > 0 {
+        // Also before a batch's first command: submission order alone orders
+        // nothing, and a barrier's first scope reaches back into earlier
+        // submissions on the queue. (Without it, lavapipe could start a batch's
+        // first dispatch while the previous batch's last one still ran.)
+        {
             let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)

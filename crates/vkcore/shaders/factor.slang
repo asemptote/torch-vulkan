@@ -264,8 +264,10 @@ void laswp(uint t, uint z)
     uint ld = p.ld;
     for (uint step = 0; step < p.b; step++)
     {
-        uint i = UPPER != 0 ? p.b - 1 - step : step;
-        uint r = uint(p.piv[z * p.spiv + i] - 1);
+        // (step clamped: lavapipe also performs the load for step = b, past the
+        // loop's end, and with UPPER that is piv[-1], before the allocation)
+        uint i = UPPER != 0 ? p.b - 1 - min(step, p.b - 1) : min(step, p.b - 1);
+        uint r = min(uint(p.piv[z * p.spiv + i] - 1), p.rows - 1);
         if (r != i)
         {
             for (uint c = t; c < p.cols; c += WG)
