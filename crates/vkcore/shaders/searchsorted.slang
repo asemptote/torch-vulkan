@@ -41,7 +41,7 @@ void main(uint3 id: SV_DispatchThreadID)
         {
             uint mid = (lo + hi) >> 1;
             T s = p.seq[base + mid];
-            bool go_right = RIGHT != 0 ? !(v < s) : (s < v);
+            bool go_right = RIGHT != 0 ? !(v < s) : !(s >= v);  // (as the CPU: NaNs sort last)
             if (go_right)
                 lo = mid + 1u;
             else

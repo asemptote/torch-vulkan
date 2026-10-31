@@ -49,7 +49,91 @@ def _no_overlap(out, *inputs):
                                "operation.")
 
 
+def _sizes(t):
+    return "[" + ", ".join(map(str, t.shape)) + "]"
+
+
+def _nll_loss(x, target, weight=None, *rest, **kw):
+    if not 1 <= x.dim() <= 2:
+        raise RuntimeError("input tensor should be 1D or 2D")
+    if target.dim() > 1:
+        raise RuntimeError("0D or 1D target tensor expected, multi-target not supported")
+    if x.dim() == 1 and target.dim() == 1 and target.shape[0] != 1:
+        raise ValueError(f"For 1D input, 1D target must have size 1, but got target size: {target.shape[0]}")
+    if not (x.dim() == 1 and target.dim() == 0) and x.shape[0] != target.shape[0]:
+        raise RuntimeError(f"size mismatch (got input: {_sizes(x)}, target: {_sizes(target)})")
+    n = x.shape[-1]
+    if weight is not None and (weight.dim() != 1 or weight.numel() != n):
+        raise RuntimeError(f"weight tensor should be defined either for all {n} classes or no classes but got "
+                           f"weight tensor of shape: {_sizes(weight)}")
+    if target.dtype == torch.uint8:  # (the CPU kernel also takes byte targets)
+        return (x, target.long(), weight, *rest), kw
+    return None
+
+
+def _nll_loss2d(x, target, weight=None, *rest, **kw):
+    if target.dim() != 3:
+        raise RuntimeError(f"only batches of spatial targets supported (3D tensors) but got targets of dimension: "
+                           f"{target.dim()}")
+    if x.dim() != 4:
+        raise RuntimeError(f"only batches of spatial inputs supported (4D tensors), but got input of dimension: "
+                           f"{x.dim()}")
+    if weight is not None and weight.numel() != x.shape[1]:
+        raise RuntimeError("weight tensor should be defined either for all or no classes")
+    if (x.shape[0], *x.shape[2:]) != tuple(target.shape):
+        raise RuntimeError(f"size mismatch (got input: {_sizes(x)} , target: {_sizes(target)}")
+    if target.dtype != torch.int64:
+        raise RuntimeError(f"expected scalar type Long but found {_C10_NAMES.get(str(target.dtype)[6:])}")
+    return None
+
+
+def _sliding_blocks(kernel_size, dilation, padding, stride):
+    """The CPU's im2col/col2im shape checks of the block parameters."""
+    (kh, kw), (dh, dw), (ph, pw), (sh, sw) = kernel_size, dilation, padding, stride
+    if kh <= 0 or kw <= 0:
+        raise RuntimeError(f"kernel size should be greater than zero, but got kernel_height: {kh} kernel_width: {kw}")
+    if dh <= 0 or dw <= 0:
+        raise RuntimeError(f"dilation should be greater than zero, but got dilation_height: {dh} dilation_width: {dw}")
+    if ph < 0 or pw < 0:
+        raise RuntimeError(f"padding should be non-negative, but got pad_height: {ph} pad_width: {pw}")
+    if sh <= 0 or sw <= 0:
+        raise RuntimeError(f"stride should be greater than zero, but got stride_height: {sh} stride_width: {sw}")
+    if kh * kw >= 2 ** 63:
+        raise RuntimeError(f"Given kernel_width = {kw} and kernel_height = {kh} the product of kernel_width and "
+                           "kernel_height overflowed.")
+
+
+def grid_sampler(input, grid, mode, k):
+    """The CPU's grid_sampler_{2,3}d checks, with its messages."""
+    if input.shape[0] != grid.shape[0]:
+        raise RuntimeError(f"grid_sampler(): expected grid and input to have same batch size, but got input with "
+                           f"sizes {list(input.shape)} and grid with sizes {list(grid.shape)}")
+    if grid.shape[-1] != input.dim() - 2:
+        raise RuntimeError(f"grid_sampler(): expected grid to have size {input.dim() - 2} in last dimension, but got "
+                           f"grid with sizes {list(grid.shape)}")
+    for d in range(2, input.dim()):
+        if input.shape[d] <= 0:
+            raise RuntimeError(f"grid_sampler(): expected input to have non-empty spatial dimensions, but input has "
+                               f"sizes {list(input.shape)} with dimension {d} being empty")
+    if input.dim() != k + 2 or grid.dim() != input.dim():
+        raise RuntimeError(f"grid_sampler(): expected {k + 2}D input and grid with same number of dimensions, but got "
+                           f"input with sizes {list(input.shape)} and grid with sizes {list(grid.shape)}")
+    if k == 3 and mode == 2:
+        raise RuntimeError("grid_sampler(): bicubic interpolation only supports 4D input")
+
+
 CHECKS = {
+    # (input, grid, interpolation_mode, padding_mode, align_corners)
+    "grid_sampler_2d": lambda x, grid, mode, *rest, **kw: grid_sampler(x, grid, mode, 2),
+    # (self, kernel_size, dilation, padding, stride) and (self, output_size, kernel_size, ...)
+    "im2col": lambda x, *blocks, **kw: _sliding_blocks(*blocks[:4]) if len(blocks) >= 4 else None,
+    "col2im": lambda x, output_size, *blocks, **kw: _sliding_blocks(*blocks[:4]) if len(blocks) >= 4 else None,
+    # (self, target, weight, reduction, ignore_index); these may return replacement (args, kwargs)
+    "nll_loss_forward": _nll_loss,
+    "nll_loss2d_forward": _nll_loss2d,
+    # (grad_output, self, target, ...)
+    "nll_loss_backward": lambda grad, x, target, *rest, **kw: (
+        ((grad, x, target.long(), *rest), kw) if target.dtype == torch.uint8 else None),
     # (self, other, dim, *, out)
     "linalg_cross": lambda a, b, *rest, out=None, **kw: _no_overlap(out, a, b),
     # (grad_output, self, negative_slope, self_is_result)
@@ -114,7 +198,9 @@ def with_cpu_checks(op, kernel):
     @functools.wraps(kernel)
     def checked(*args, **kwargs):
         for check in checks:
-            check(*args, **kwargs)
+            replaced = check(*args, **kwargs)
+            if replaced is not None:
+                args, kwargs = replaced
         try:
             return kernel(*args, **kwargs)
         except RuntimeError as e:

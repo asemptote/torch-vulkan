@@ -122,6 +122,61 @@ def _divisor(spatial, ks, st, pd, out, count_include_pad, divisor_override, devi
     return div
 
 
+def _int32(v):
+    if not -2 ** 31 <= v < 2 ** 31:
+        raise RuntimeError("value cannot be converted to type int without overflow")
+    return v
+
+
+def _pooling_output_shape(n, kernel, pad, stride, ceil_mode):
+    """The CPU's pooling_output_shape, with its checks."""
+    if stride == 0:
+        raise RuntimeError("stride should not be zero")
+    if pad < 0:
+        raise RuntimeError(f"pad must be non-negative, but got pad: {pad}")
+    if pad > kernel // 2:
+        raise RuntimeError(f"pad should be at most half of effective kernel size, but got pad={pad}, "
+                           f"kernel_size={kernel} and dilation=1")
+    return _pool_out_size(n, kernel, stride, pad, ceil_mode)
+
+
+def _check_avg_pool(x, kernel_size, stride, padding, ceil_mode, divisor_override, k):
+    """The CPU's avg_pool2d/avg_pool3d argument checks, with its messages."""
+    if k == 2:
+        counts = "either be a single int, or a tuple of two ints"
+        stride_counts = "either be omitted, a single int, or a tuple of two ints"
+    else:
+        counts = "be a single int, or a tuple of three ints"
+        stride_counts = "be omitted, a single int, or a tuple of three ints"
+    if len(kernel_size) not in (1, k):
+        raise RuntimeError(f"avg_pool{k}d: kernel_size must {counts}")
+    if len(stride) not in (0, 1, k):
+        raise RuntimeError(f"avg_pool{k}d: stride must {stride_counts}")
+    if len(padding) not in (1, k):
+        raise RuntimeError(f"avg_pool{k}d: padding must {counts}")
+    ks = [_int32(v) for v in (list(kernel_size) * k)[:k]]
+    st = [_int32(v) for v in (list(stride) * k)[:k]] if len(stride) else ks
+    pd = [_int32(v) for v in (list(padding) * k)[:k]]
+    if divisor_override is not None and divisor_override == 0:
+        raise RuntimeError("divisor must be not zero")
+    spatial = x.shape[-k:]
+    out = [_pooling_output_shape(spatial[d], ks[d], pd[d], st[d], ceil_mode) for d in range(k)]
+    names = ["T", "H", "W"][-k:]
+    if min(ks) <= 0:
+        raise RuntimeError("kernel size should be greater than zero, but got " +
+                           " ".join(f"k{n}: {v}" for n, v in zip(names, ks)))
+    if min(st) <= 0:
+        raise RuntimeError("stride should be greater than zero, but got " +
+                           " ".join(f"d{n}: {v}" for n, v in zip(names, st)))
+    planes = x.shape[-k - 1]
+    if k == 3 and any(n < kk for n, kk in zip(spatial, ks)):
+        raise RuntimeError(f"input image (T: {spatial[0]} H: {spatial[1]} W: {spatial[2]}) smaller than kernel size "
+                           f"(kT: {ks[0]} kH: {ks[1]} kW: {ks[2]})")
+    if min(out) < 1:
+        raise RuntimeError(f"Given input size: ({'x'.join(map(str, (planes, *spatial)))}). Calculated output size: "
+                           f"({'x'.join(map(str, (planes, *out)))}). Output size is too small")
+
+
 def _make_avg_pool(k):
     conv = [F.conv1d, F.conv2d, F.conv3d][k - 1]
 
@@ -131,6 +186,7 @@ def _make_avg_pool(k):
             return _on_cpu(f"avg_pool{k}d", x, kernel_size, stride, padding, ceil_mode, count_include_pad,
                            divisor_override)
         padding = [padding] if isinstance(padding, int) else padding
+        _check_avg_pool(x, kernel_size, stride, padding, ceil_mode, divisor_override, k)
         ks, st, pd, out, pad = _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k)
         batched = x.dim() == k + 2
         xb = x if batched else x.unsqueeze(0)
@@ -355,6 +411,7 @@ def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=Non
 
 
 def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
+    _checks.grid_sampler(input, grid, mode, 3)
     if mode not in (0, 1):  # bicubic
         return _on_cpu("grid_sampler_3d", input, grid, mode, padding_mode, align_corners)
     return _grid_sample(input, grid, mode, padding_mode, align_corners)
@@ -362,6 +419,11 @@ def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
 
 def _make_grid_sampler_backward(name):
     def backward(grad_output, input, grid, mode, padding_mode, align_corners, output_mask):
+        _checks.grid_sampler(input, grid, mode, 2 if "2d" in name else 3)
+        expected = [input.shape[0], input.shape[1], *grid.shape[1:-1]]
+        if list(grad_output.shape) != expected:
+            raise ValueError(f"{name}(): expected grad_output to have sizes {expected}, but got grad_output with "
+                             f"sizes {list(grad_output.shape)}")
         if mode not in (0, 1):  # bicubic
             return _on_cpu(name, grad_output, input, grid, mode, padding_mode, align_corners, output_mask)
         return _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output, output_mask)
@@ -385,7 +447,8 @@ def _cdist_forward(x1, x2, p, compute_mode=None):
         return torch.zeros((*x1.shape[:-1], x2.shape[-2]), device=x1.device, dtype=x1.dtype)
     diff = _pairwise_diff(x1, x2)
     if p == 0:
-        return (diff != 0).sum(-1).to(x1.dtype)
+        # (as the CPU's min(ceil(|d|), 1): a NaN difference, e.g. inf - inf, propagates)
+        return torch.where(diff.isnan(), diff, (diff != 0).to(diff.dtype)).sum(-1)
     if p == math.inf:
         return diff.abs().amax(-1)
     if p == 1:
@@ -411,6 +474,14 @@ def _cdist_backward(grad, x1, x2, p, dist):
         dd = torch.where(d == 0, torch.zeros_like(diff),
                          torch.sign(diff) * diff.abs().pow(p - 1) / d.pow(p - 1))
     return (grad.unsqueeze(-1) * dd).sum(-2)
+
+
+def _native_group_norm(x, weight, bias, n, c, hxw, group, eps):
+    # (PyTorch's composite kernel views the input, which fails for channels-last
+    # layouts; its reference reshapes)
+    out, mean, rstd = decomposition_table[aten.native_group_norm.default](x, weight, bias, n, c, hxw, group, eps)
+    channels_last = x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last) and not x.is_contiguous()
+    return out.contiguous(memory_format=torch.channels_last if channels_last else torch.contiguous_format), mean, rstd
 
 
 def _pdist_forward(x, p=2):
@@ -910,7 +981,21 @@ def _ctc_setup(log_probs, targets, input_lengths, target_lengths, blank):
     dev = lp.device
     il = torch.as_tensor(input_lengths, device="cpu").reshape(-1).tolist()
     tl = torch.as_tensor(target_lengths, device="cpu").reshape(-1).tolist()
+    # (the CPU's checks, with its messages)
+    torch._check(log_probs.numel() > 0, lambda: "log_probs tensor must not be empty")
+    torch._check(0 <= blank < C, lambda: "blank must be in label range")
+    torch._check(len(il) == N, lambda: "input_lengths must be of size batch_size")
+    torch._check(len(tl) == N, lambda: "target_lengths must be of size batch_size")
+    where = "(while checking arguments for ctc_loss_cpu)"
+    for n in tl:
+        torch._check(n >= 0, lambda: f"Expected target_lengths to have value at least 0, but got value {n} {where}")
     S = max(tl) if tl else 0
+    if targets.dim() != 1 and not unbatched:
+        torch._check(targets.shape[-1] >= S, lambda: f"Expected tensor to have size at least {S} at dimension 1, but "
+                     f"got size {targets.shape[-1]} for argument #2 'targets' {where}")
+    for n in il:
+        torch._check(n >= 0, lambda: f"Expected input_lengths to have value at least 0, but got value {n} {where}")
+        torch._check(n <= T, lambda: f"Expected input_lengths to have value at most {T}, but got value {n} {where}")
     if targets.dim() == 1 and not unbatched or (unbatched and targets.dim() == 1 and N > 1):
         starts = [0]
         for n in tl[:-1]:
@@ -979,8 +1064,7 @@ def _ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, zero_i
     m = torch.where(m == ninf, 0.0, m)
     nll = -(torch.log(torch.exp(a - m) + torch.exp(b - m)) + m)
     nll = torch.where(torch.tensor(il, device=lp.device) == 0, torch.where(ends == 0, 0.0, math.inf), nll)
-    if zero_infinity:
-        nll = torch.where(torch.isinf(nll), 0.0, nll)
+    # (zero_infinity zeroes infinite losses in ctc_loss and their gradients in the backward, not here)
     if unbatched:
         return nll.squeeze(0), log_alpha.squeeze(0)
     return nll, log_alpha
@@ -1150,6 +1234,7 @@ def _kernels():
         "grid_sampler_3d": _grid_sampler_forward,
         "grid_sampler_2d_backward": _make_grid_sampler_backward("grid_sampler_2d_backward"),
         "grid_sampler_3d_backward": _make_grid_sampler_backward("grid_sampler_3d_backward"),
+        "native_group_norm": _native_group_norm,
         "_cdist_forward": _cdist_forward,
         "_cdist_backward": _cdist_backward,
         "_pdist_forward": _pdist_forward,

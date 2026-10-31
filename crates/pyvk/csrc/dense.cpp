@@ -1046,11 +1046,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> svd_vk(const at::Tensor& a, bool 
 std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
     const at::Tensor& a, const at::Tensor& b, std::optional<double> rcond, std::optional<c10::string_view> driver,
     at::Tensor& solution, at::Tensor& residuals, at::Tensor& rank, at::Tensor& singular_values) {
+  TORCH_CHECK(a.dim() >= 2, "torch.linalg.lstsq: input must have at least 2 dimensions.");
+  TORCH_CHECK(b.dim() >= 1, "torch.linalg.lstsq: other must have at least 1 dimension.");
+  TORCH_CHECK(a.device() == b.device(), "torch.linalg.lstsq: Expected input and other to be on the same device, "
+              "but got input on ", a.device(), " and other on ", b.device());
+  TORCH_CHECK(a.scalar_type() == b.scalar_type(), "torch.linalg.lstsq: Expected input and other to have the same "
+              "dtype, but got input's dtype ", a.scalar_type(), " and other's dtype ", b.scalar_type());
+  int64_t dim_diff = a.dim() - b.dim();
+  TORCH_CHECK(0 <= dim_diff && dim_diff <= 1, "torch.linalg.lstsq: input.dim() must be greater or equal to "
+              "other.dim() and (input.dim() - other.dim()) <= 1");
+  TORCH_CHECK(a.size(-2) == (dim_diff ? b.size(-1) : b.size(-2)),
+              dim_diff ? "torch.linalg.lstsq: input.size(-2) should match other.size(-1)"
+                       : "torch.linalg.lstsq: input.size(-2) should match other.size(-2)");
   if (!gpu_matrices(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || !is_vk(solution)) {
     on_cpu("aten::linalg_lstsq", "out", a, b, rcond, driver, solution, residuals, rank, singular_values);
     return {solution, residuals, rank, singular_values};
   }
   std::string drv = driver.has_value() ? std::string(*driver) : "gelsy";
+  TORCH_CHECK(drv == "gels" || drv == "gelsy" || drv == "gelsd" || drv == "gelss",
+              "torch.linalg.lstsq: parameter `driver` should be one of (gels, gelsy, gelsd, gelss)");
   int64_t m = a.size(-2), n = a.size(-1);
   bool vector = b.dim() == a.dim() - 1;
   at::Tensor bm = vector ? b.unsqueeze(-1) : b;

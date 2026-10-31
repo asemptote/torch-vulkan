@@ -231,6 +231,11 @@ at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
   return out;
 }
 
+// (PyTorch's composite conj_physical_ calls the CPU/CUDA kernel stub directly)
+at::Tensor& conj_physical_inplace(at::Tensor& self) {
+  return at::isComplexType(self.scalar_type()) ? vk::conj_physical_out(static_cast<const at::Tensor&>(self), self) : self;
+}
+
 // ---------------------------------------------------------------- binary
 
 struct BinaryOp {
@@ -614,6 +619,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("relu", &relu);
   m.impl("relu_", &relu_);
   m.impl("conj_physical.out", &conj_physical_out);
+  m.impl("conj_physical_", &conj_physical_inplace);
 
   m.impl("add.out", &binary_alpha_out<0>);
   m.impl("sub.out", &binary_alpha_out<1>);

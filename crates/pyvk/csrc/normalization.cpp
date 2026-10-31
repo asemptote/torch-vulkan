@@ -40,6 +40,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
                                                                const std::optional<at::Tensor>& running_mean,
                                                                const std::optional<at::Tensor>& running_var,
                                                                bool training, double momentum, double eps) {
+  // (the CPU's mixed-type rule: parameters may differ from the input only as
+  // float parameters of a reduced-precision input)
+  at::ScalarType params = at::ScalarType::Undefined;
+  for (const auto* t : {&weight, &bias, &running_mean, &running_var}) {
+    if (t->has_value() && (*t)->defined()) {
+      if (params == at::ScalarType::Undefined) {
+        params = (*t)->scalar_type();
+      }
+      if (params != x.scalar_type()) {
+        TORCH_CHECK(at::isReducedFloatingType(x.scalar_type()), "mixed dtype (vk): all inputs must share same datatype.");
+        TORCH_CHECK((*t)->scalar_type() == at::kFloat, "mixed dtype (vk): expect parameter to have scalar type of Float");
+      }
+    }
+  }
   auto shape = channel_shape(x);
   // Statistics in float32 at least (as the CPU does for reduced precision).
   at::ScalarType acc = x.scalar_type() == at::kDouble ? at::kDouble : at::kFloat;

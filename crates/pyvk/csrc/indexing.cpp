@@ -228,6 +228,7 @@ struct Advanced {
 };
 
 Advanced make_advanced(at::Tensor self, const c10::List<std::optional<at::Tensor>>& orig) {
+  TORCH_CHECK_INDEX(!orig.empty(), "at least one index must be provided");
   at::native::checkIndexTensorTypes(orig, /*allow_int=*/true);
   std::vector<at::Tensor> indices = at::native::expandTensors(self, orig, /*ensure_same_device=*/true);
   try {
@@ -267,6 +268,10 @@ Advanced make_advanced(at::Tensor self, const c10::List<std::optional<at::Tensor
     shape.push_back(self.size(d));
     src_strides.push_back(self.stride(d));
   }
+  // (as the CPU: an indexed dim of size 0 has no valid index)
+  bool empty_dim = std::find(sizes.begin(), sizes.end(), 0) != sizes.end();
+  TORCH_CHECK_INDEX(!empty_dim || std::find(replacement.begin(), replacement.end(), 0) != replacement.end(),
+                    "index is out of bounds for dimension with size 0");
   Advanced info;
   info.src = self.as_strided(shape, src_strides, self.storage_offset());
   size_t k = 0;
@@ -321,6 +326,13 @@ at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::T
     return self;
   }
   Advanced info = make_advanced(self, indices);
+  if (!at::is_expandable_to(values.sizes(), info.src.sizes())) {
+    if (accumulate || at::globalContext().deterministicAlgorithms()) {
+      values.expand(info.src.sizes());  // (as other accelerators' sorting path: "... must match ...")
+    }
+    TORCH_CHECK(false, "shape mismatch: value tensor of shape ", values.sizes(),
+                " cannot be broadcast to indexing result of shape ", info.src.sizes());
+  }
   if (info.src.numel() == 0) {
     return self;
   }

@@ -67,8 +67,14 @@ class Recorder:
         self.write(start=nodeid)
 
     def pytest_runtest_teardown(self, item):
-        if VALIDATE:
+        # An out-of-range index is flagged by the kernel and raised at the next
+        # synchronization (as CUDA's device asserts): charge it to this test,
+        # not to whichever test synchronizes next.
+        try:
             _native.synchronize()
+        except IndexError as e:
+            self.write(nodeid=item.nodeid, outcome="failed", message=f"IndexError at teardown: {e}")
+        if VALIDATE:
             issues = _native.validation_issues()
             if issues != self.issues:
                 message = _native.last_validation_message().strip().splitlines()
@@ -208,6 +214,11 @@ EXPECTED = [
      "uint8 bilinear/bicubic upsampling works on vk as on the CPU (the test expects only the CPU to support it)"),
     (r"test_float_to_int_conversion_finite_", r"",
      "float -> integer conversion of out-of-range values (float max) is undefined: GPUs saturate, x86 (NumPy's reference) does not"),
+    (r"test_linalg_lstsq_input_checks_", r"`driver` other than `gels` is not supported on CUDA",
+     "the test expects CUDA's lstsq drivers on any non-CPU device; vk supports all of the CPU's"),
+    (r"test_trivial_fancy_out_of_bounds_", r"",
+     "out-of-range indices are flagged by the kernel and raised at the next synchronization, as CUDA's "
+     "device asserts (CUDA skips this test)"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",

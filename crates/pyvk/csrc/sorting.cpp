@@ -192,6 +192,28 @@ std::tuple<at::Tensor, at::Tensor> pick(const at::Tensor& self, int64_t dim, boo
   return {v, i};
 }
 
+// (the CPU's zero_numel_check_dims)
+void check_reduction_dim(const at::Tensor& self, int64_t dim, const char* fn) {
+  if (self.dim() == 0) {
+    TORCH_CHECK_INDEX(dim == 0 || dim == -1, fn, ": Expected reduction dim -1 or 0 for scalar but got ", dim);
+  } else {
+    TORCH_CHECK_INDEX(self.size(dim) != 0, fn, ": Expected reduction dim ", dim, " to have non-zero size.");
+  }
+}
+
+// (values, indices) of a reduction over `dim` of an empty tensor.
+std::tuple<at::Tensor, at::Tensor> empty_reduction(const at::Tensor& self, int64_t dim, bool keepdim) {
+  std::vector<int64_t> shape = self.sizes().vec();
+  if (self.dim() > 0) {
+    if (keepdim) {
+      shape[dim] = 1;
+    } else {
+      shape.erase(shape.begin() + dim);
+    }
+  }
+  return {at::empty(shape, self.options()), at::empty(shape, self.options().dtype(at::kLong))};
+}
+
 // Rows of self sorted ascending: (values, indices) as [rows, n].
 std::tuple<at::Tensor, at::Tensor> sorted_rows(const at::Tensor& self, int64_t dim) {
   at::Tensor x = as_rows(self, dim);
@@ -209,8 +231,15 @@ std::tuple<at::Tensor&, at::Tensor&> kthvalue_out(const at::Tensor& self, int64_
     return {values, indices};
   }
   dim = at::maybe_wrap_dim(dim, self.dim());
+  check_reduction_dim(self, dim, "kthvalue()");
   int64_t n = self.dim() == 0 ? 1 : self.size(dim);
   TORCH_CHECK(k >= 1 && k <= n, "kthvalue(): selected number k out of range for dimension ", dim);
+  if (self.numel() == 0) {
+    auto [v, i] = empty_reduction(self, dim, keepdim);
+    assign_out(values, v);
+    assign_out(indices, i);
+    return {values, indices};
+  }
   auto [sv, si] = sorted_rows(self, dim);
   at::Tensor pos = at::full({sv.size(0)}, k - 1, sv.options().dtype(at::kLong));
   auto [v, i] = pick(self, dim, keepdim, sv, si, pos);
@@ -236,7 +265,10 @@ at::Tensor median_positions(const at::Tensor& sorted_v, bool ignore_nan) {
 
 std::tuple<at::Tensor, at::Tensor> median_dim(const at::Tensor& self, int64_t dim, bool keepdim, bool ignore_nan) {
   dim = at::maybe_wrap_dim(dim, self.dim());
-  TORCH_CHECK(self.dim() == 0 || self.size(dim) > 0, "median() cannot compute median for a dimension of size 0");
+  check_reduction_dim(self, dim, ignore_nan ? "nanmedian()" : "median()");
+  if (self.numel() == 0) {
+    return empty_reduction(self, dim, keepdim);
+  }
   auto [sv, si] = sorted_rows(self, dim);
   return pick(self, dim, keepdim, sv, si, median_positions(sv, ignore_nan));
 }
@@ -331,6 +363,10 @@ std::tuple<at::Tensor&, at::Tensor&> mode_out(const at::Tensor& self, int64_t di
               " for values output");
   TORCH_CHECK(self.device() == indices.device(), "mode: expected device ", self.device(), " but got ",
               indices.device(), " for indices output");
+  TORCH_CHECK(self.scalar_type() == values.scalar_type(), "mode: expected scalar type '", self.scalar_type(),
+              "' but got '", values.scalar_type(), "' for values output");
+  TORCH_CHECK(indices.scalar_type() == at::kLong, "mode: expected scalar type '", at::kLong, "' but got '",
+              indices.scalar_type(), "' for indices output");
   auto [v, i] = at::mode(self, dim, keepdim);  // (our functional kernel, via the dispatcher)
   assign_out(values, v);
   assign_out(indices, i);

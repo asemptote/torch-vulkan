@@ -524,6 +524,10 @@ void eig_cols(uint t, uint pair, uint z)
             s = tt * c;
         }
     }
+    // Every thread has read A[p, p], A[q, q] and A[p, q] before any thread
+    // rotates them below (threads of a workgroup need not run in lockstep:
+    // lavapipe runs it in chunks of SIMD width).
+    barrier();
     if (t == 0)
     {
 #ifdef IS_COMPLEX

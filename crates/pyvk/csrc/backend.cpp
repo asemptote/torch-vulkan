@@ -450,6 +450,7 @@ at::Tensor copy_from_and_resize(const at::Tensor& self, const at::Tensor& dst) {
 }
 
 at::Scalar local_scalar_dense(const at::Tensor& self) {
+  TORCH_CHECK(self.numel() > 0, "_local_scalar_dense: Empty tensor not supported");
   synchronize();
   return host_view_const(self).item();
 }

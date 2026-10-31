@@ -275,7 +275,9 @@ bool reducible(const at::Tensor& self, bool allow_bool = true) {
 }
 
 void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {
-  check_out_device(flat, out);
+  // (TensorIterator ops skip the common-device check; their out check says this)
+  TORCH_CHECK(out.device() == flat.device(), "Expected out tensor to have device ", flat.device(), ", but got ",
+              out.device(), " instead");
   if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
     check_out_cast(flat.scalar_type(), out);
   }
