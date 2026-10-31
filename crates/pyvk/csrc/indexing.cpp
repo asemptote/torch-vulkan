@@ -408,15 +408,19 @@ at::Tensor& index_copy_out(const at::Tensor& self, int64_t dim, const at::Tensor
   if (source.numel() == 0) {
     return out;
   }
-  at::Tensor dst_view = restride_without(out, source.sizes(), dim);
+  // (a 0-dim source into a one-element slice of out, as the CPU allows)
+  at::Tensor src = source.dim() == 0 && out.dim() > 0 ? source.reshape(std::vector<int64_t>(out.dim(), 1)) : source;
+  at::Tensor dst_view = restride_without(out, src.sizes(), dim);
   at::Tensor offsets = index_offsets(
-      source.sizes(), {{index_along(index, dim, source.dim()), size_at(out, dim), stride_at(out, dim)}}, out.options(),
+      src.sizes(), {{index_along(index, dim, src.dim()), size_at(out, dim), stride_at(out, dim)}}, out.options(),
       /*wrap=*/false);
-  scatter(dst_view, source.to(out.scalar_type()), offsets);
+  scatter(dst_view, src.to(out.scalar_type()), offsets);
   return out;
 }
 
 at::Tensor& index_fill_scalar(at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Scalar& value) {
+  TORCH_CHECK(!value.isComplex() || self.is_complex(),
+              "index_fill_(): Converting complex Scalar to non-complex type is not supported");
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   if (!movable(self) || !is_vk(index) || index.scalar_type() != at::kLong || index.dim() > 1) {
     on_cpu("aten::index_fill_", "int_Scalar", self, dim, index, value);
@@ -685,8 +689,8 @@ at::Tensor& index_reduce_out(const at::Tensor& self, int64_t dim, const at::Tens
 
 at::Tensor bincount(const at::Tensor& self, const std::optional<at::Tensor>& weights, int64_t minlength) {
   TORCH_CHECK(minlength >= 0, "minlength should be >= 0");
-  TORCH_CHECK(self.dim() == 1 && !at::isFloatingType(self.scalar_type()) && self.scalar_type() != at::kBool,
-              "bincount only supports 1-d non-negative integral inputs.");
+  reject_dtype("bincount", self.scalar_type(), at::isFloatingType(self.scalar_type()) || self.scalar_type() == at::kBool);
+  TORCH_CHECK(self.dim() == 1, "bincount only supports 1-d non-negative integral inputs.");
   bool has_w = weights.has_value() && weights->defined();
   at::ScalarType dtype = !has_w ? at::kLong : at::isFloatingType(weights->scalar_type()) ? weights->scalar_type()
                                                                                          : at::kDouble;
@@ -711,6 +715,15 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
                       at::Tensor& out) {
   TORCH_CHECK(bins > 0, "torch.histc(): bins must be > 0, but got ", bins);
   at::ScalarType t = self.scalar_type();
+  if (at::isIntegralType(t, /*includeBool=*/false) && is_vk(self) && is_vk(out)) {
+    // Integers (as CUDA; the CPU has no integer histc): counted in floating point.
+    at::ScalarType wide = t == at::kLong ? at::kDouble : at::kFloat;
+    at::Tensor counts = at::empty({0}, self.options().dtype(wide));
+    histc_out(self.to(wide), bins, min, max, counts);
+    at::native::resize_output(out, {bins});
+    out.copy_(counts);
+    return out;
+  }
   if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(t) || accum_label(t) == nullptr) {
     on_cpu("aten::histc", "out", self, bins, min, max, out);
     return out;
@@ -761,6 +774,8 @@ struct NonzeroParams {
 static_assert(sizeof(NonzeroParams) == 72, "must match shaders/nonzero.slang");
 
 at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
+  TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", self.device(), " and ", out.device(), "!");
   if (!is_vk(self) || !is_vk(out) || self.dim() > 8 || dtype_label(self.scalar_type()) == nullptr ||
       out.scalar_type() != at::kLong) {
     on_cpu("aten::nonzero", "out", self, out);
@@ -940,7 +955,7 @@ at::Tensor flip(const at::Tensor& self, at::IntArrayRef dims) {
   if (!movable(self)) {
     return on_cpu("aten::flip", "", self, dims)[0].toTensor();
   }
-  at::dim_list_to_bitset(dims, self.dim());  // (rejects repeated and out-of-range dims)
+  at::dim_list_to_bitset(dims, std::max<int64_t>(self.dim(), 1));  // (rejects repeated and out-of-range dims)
   std::vector<int64_t> flipped;
   std::vector<at::Tensor> indices;
   for (int64_t d : dims) {
@@ -1088,9 +1103,14 @@ at::Tensor& arange_out(const at::Scalar& start, const at::Scalar& end, const at:
   // count in double (arange(3.1, dtype=int64) has 4 elements), while the
   // elements themselves are trunc(start) + i * trunc(step).
   bool integral_args = !start.isFloatingPoint() && !end.isFloatingPoint() && !step.isFloatingPoint();
-  double size_d = floating || !integral_args
-                      ? std::ceil((xend - xstart) / xstep)
-                      : std::ceil(static_cast<double>(end.toLong() - start.toLong()) / step.toLong());
+  double size_d;
+  if (floating || !integral_args) {
+    size_d = std::ceil((xend - xstart) / xstep);
+  } else {
+    // In int64, as the CPU: in double, (end - start) / step can round up past an integer.
+    int64_t a = start.toLong(), b = end.toLong(), d = step.toLong();
+    size_d = static_cast<double>((b - a + d - (d > 0 ? 1 : -1)) / d);
+  }
   TORCH_CHECK(size_d >= 0 && size_d <= static_cast<double>(std::numeric_limits<int64_t>::max()),
               "invalid size, possible overflow?");
   int64_t size = static_cast<int64_t>(size_d);
@@ -1164,13 +1184,16 @@ at::Tensor& logspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
                                                                                : iota_dtype(at::kDouble);
   at::Tensor exponents = at::empty({0}, out.options().dtype(compute));
   linspace_out(start, end, steps, exponents);
-  at::native::resize_output(out, {steps});
-  out.copy_(at::pow(base, exponents));
+  if (out.numel() != steps) {  // (as the CPU: an out= with steps elements keeps its shape)
+    at::native::resize_output(out, {steps});
+  }
+  out.copy_(at::pow(base, exponents).view(out.sizes()));
   return out;
 }
 
 at::Tensor& eye_m_out(int64_t n, int64_t m, at::Tensor& out) {
-  TORCH_CHECK(n >= 0 && m >= 0, "n and m must be non-negative");
+  TORCH_CHECK(n >= 0, "n must be greater or equal to 0, got ", n);
+  TORCH_CHECK(m >= 0, "m must be greater or equal to 0, got ", m);
   if (!movable(out)) {
     on_cpu("aten::eye", "m_out", n, m, out);
     return out;

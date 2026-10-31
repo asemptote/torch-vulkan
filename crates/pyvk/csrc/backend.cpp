@@ -7,6 +7,8 @@
 #include <ATen/EmptyTensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/CPUFallback.h>
+#include <ATen/native/ResizeCommon.h>
+#include <ATen/native/TensorFactories.h>
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/set_native.h>
@@ -241,17 +243,28 @@ struct VkHooks final : at::PrivateUse1HooksInterface {
 
 // ---------------------------------------------------------------- creation, views, resize
 
+// torch.use_deterministic_algorithms(True) (with fill_uninitialized_memory, the
+// default): new memory is filled with NaN or the largest integer, as the CPU.
+bool fill_uninitialized() {
+  return at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory();
+}
+
 at::Tensor empty_memory_format(at::IntArrayRef size, std::optional<at::ScalarType> dtype, std::optional<at::Layout>,
                                std::optional<at::Device>, std::optional<bool>,
                                std::optional<at::MemoryFormat> memory_format) {
-  return at::detail::empty_generic(size, allocator(), c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
-                                   c10::dtype_or_default(dtype), memory_format);
+  at::Tensor t = at::detail::empty_generic(size, allocator(), c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+                                           c10::dtype_or_default(dtype), memory_format);
+  if (fill_uninitialized()) at::native::fill_empty_deterministic_(t);
+  return t;
 }
 
 at::Tensor empty_strided(at::IntArrayRef size, at::IntArrayRef stride, std::optional<at::ScalarType> dtype,
                          std::optional<at::Layout>, std::optional<at::Device>, std::optional<bool>) {
-  return at::detail::empty_strided_generic(size, stride, allocator(), c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
-                                           c10::dtype_or_default(dtype));
+  at::Tensor t = at::detail::empty_strided_generic(size, stride, allocator(),
+                                                   c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+                                                   c10::dtype_or_default(dtype));
+  if (fill_uninitialized()) at::native::fill_empty_deterministic_(t);
+  return t;
 }
 
 // Grows (never shrinks) a storage, keeping its contents.
@@ -276,7 +289,9 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
   }
   size_t needed = (impl->storage_offset() + impl->numel()) * self.itemsize();
   if (impl->numel() > 0) {
+    int64_t old_nbytes = static_cast<int64_t>(self.storage().nbytes());
     resize_storage(self.storage(), needed);
+    if (fill_uninitialized()) at::native::fill_resize_deterministic_(self, old_nbytes);
   }
   return self;
 }

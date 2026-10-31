@@ -720,7 +720,8 @@ def _hash_tensor(self, dim=(), *, keepdim=False, mode=0):
     if self.dim() == 0:
         return bits.clone().view(torch.uint64)
     keep = [d for d in range(self.dim()) if d not in dims]
-    moved = bits.permute(keep + dims).reshape([self.shape[d] for d in keep] + [-1])
+    reduced = math.prod(self.shape[d] for d in dims)  # (not -1: ambiguous with 0 elements)
+    moved = bits.permute(keep + dims).reshape([self.shape[d] for d in keep] + [reduced])
     out = _xor_last(moved)
     if keepdim:
         for d in dims:
@@ -1054,6 +1055,62 @@ def _linalg_polar(a):
     return u, h
 
 
+# ---------------------------------------------------------------- fused RNN cells
+
+# PyTorch's LSTM/GRU cells call these on every device but the CPU (as on
+# CUDA): the gates' nonlinearities in one step, and their backward. The
+# workspace (saved for backward) holds the activated gates (LSTM: i, f, g, o)
+# or r, z, n, h and the hidden part of n's pre-activation (GRU).
+
+def _thnn_fused_lstm_cell(input_gates, hidden_gates, cx, input_bias=None, hidden_bias=None):
+    gates = input_gates + hidden_gates
+    if input_bias is not None:
+        gates = gates + input_bias + hidden_bias
+    i, f, g, o = gates.chunk(4, 1)
+    i, f, g, o = i.sigmoid(), f.sigmoid(), g.tanh(), o.sigmoid()
+    cy = f * cx + i * g
+    hy = o * cy.tanh()
+    return hy, cy, torch.cat([i, f, g, o], 1)
+
+
+def _thnn_fused_lstm_cell_backward_impl(grad_hy, grad_cy, cx, cy, workspace, has_bias):
+    i, f, g, o = workspace.chunk(4, 1)
+    tcy = cy.tanh()
+    gcy = grad_cy if grad_cy is not None else torch.zeros_like(cy)
+    go = torch.zeros_like(o)
+    if grad_hy is not None:
+        gcy = gcy + grad_hy * o * (1 - tcy * tcy)
+        go = grad_hy * tcy * o * (1 - o)
+    grad_gates = torch.cat([gcy * g * i * (1 - i), gcy * cx * f * (1 - f), gcy * i * (1 - g * g), go], 1)
+    grad_bias = grad_gates.sum(0) if has_bias else grad_gates.new_empty(0)
+    return grad_gates, gcy * f, grad_bias
+
+
+def _thnn_fused_gru_cell(input_gates, hidden_gates, hx, input_bias=None, hidden_bias=None):
+    if input_bias is not None:
+        input_gates = input_gates + input_bias
+        hidden_gates = hidden_gates + hidden_bias
+    ir, iz, in_ = input_gates.chunk(3, 1)
+    hr, hz, hn = hidden_gates.chunk(3, 1)
+    r = (ir + hr).sigmoid()
+    z = (iz + hz).sigmoid()
+    n = (in_ + r * hn).tanh()
+    hy = n + z * (hx - n)
+    return hy, torch.cat([r, z, n, hx, hn], 1)
+
+
+def _thnn_fused_gru_cell_backward(grad_hy, workspace, has_bias):
+    r, z, n, hx, hn = workspace.chunk(5, 1)
+    gn = grad_hy * (1 - z) * (1 - n * n)
+    gz = grad_hy * (hx - n) * z * (1 - z)
+    gr = gn * hn * r * (1 - r)
+    grad_input = torch.cat([gr, gz, gn], 1)
+    grad_hidden = torch.cat([gr, gz, gn * r], 1)
+    empty = grad_input.new_empty(0)
+    return (grad_input, grad_hidden, grad_hy * z, grad_input.sum(0) if has_bias else empty,
+            grad_hidden.sum(0) if has_bias else empty)
+
+
 # ---------------------------------------------------------------- registration
 
 def _kernels():
@@ -1127,6 +1184,10 @@ def _kernels():
         "_ctc_loss_backward.Tensor": _ctc_loss_backward_tensor,
         "linalg_matrix_sqrth": _matrix_sqrth,
         "linalg_polar": _linalg_polar,
+        "_thnn_fused_lstm_cell": _thnn_fused_lstm_cell,
+        "_thnn_fused_lstm_cell_backward_impl": _thnn_fused_lstm_cell_backward_impl,
+        "_thnn_fused_gru_cell": _thnn_fused_gru_cell,
+        "_thnn_fused_gru_cell_backward": _thnn_fused_gru_cell_backward,
         **upsample,
     }
 

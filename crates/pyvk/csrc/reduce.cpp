@@ -417,6 +417,12 @@ at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim
   if (complex_vk(self) && is_vk(out)) {
     return any_all_dims_out<Op>(at::ne(self, 0), dim, keepdim, out);
   }
+  if (dim.has_value() && dim->empty() && is_vk(out)) {  // dim=[]: no dims reduced, as the CPU
+    at::Tensor r = at::ne(self, 0);
+    at::native::resize_output(out, self.sizes());
+    out.copy_(r);
+    return out;
+  }
   Plan plan;
   if (!reducible(self) || !is_vk(out) || !plan_reduce(self, dim, keepdim, plan)) {
     on_cpu(Op == kAny ? "aten::any" : "aten::all", "dims_out", self, dim, keepdim, out);

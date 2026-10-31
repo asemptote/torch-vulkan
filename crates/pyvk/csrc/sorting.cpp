@@ -323,6 +323,15 @@ std::tuple<at::Tensor, at::Tensor> mode(const at::Tensor& self, int64_t dim, boo
   return {v, i};
 }
 
+// (PyTorch's composite mode.values allows only CPU, CUDA and XPU)
+std::tuple<at::Tensor&, at::Tensor&> mode_out(const at::Tensor& self, int64_t dim, bool keepdim, at::Tensor& values,
+                                              at::Tensor& indices) {
+  auto [v, i] = at::mode(self, dim, keepdim);  // (our functional kernel, via the dispatcher)
+  assign_out(values, v);
+  assign_out(indices, i);
+  return {values, indices};
+}
+
 // ---------------------------------------------------------------- cummax, cummin, logcumsumexp
 
 template <uint32_t Op>
@@ -598,6 +607,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("median", &median_all<false>);
   m.impl("nanmedian", &median_all<true>);
   m.impl("mode", &vk::mode);
+  m.impl("mode.values", &mode_out);
   m.impl("_cummax_helper", &cum_helper<op::ROWSCAN_CUMMAX>);
   m.impl("_cummin_helper", &cum_helper<op::ROWSCAN_CUMMIN>);
   m.impl("_logcumsumexp", &vk::logcumsumexp_vk);
