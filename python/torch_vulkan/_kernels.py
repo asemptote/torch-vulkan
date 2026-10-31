@@ -752,6 +752,12 @@ _FREXP_NONFINITE = None
 
 
 def _frexp_out(self, *, mantissa, exponent):
+    if not self.is_floating_point():
+        raise RuntimeError("torch.frexp() only supports floating-point dtypes")
+    if mantissa.dtype != self.dtype:
+        raise RuntimeError(f"torch.frexp() expects mantissa to have dtype {self.dtype} but got {mantissa.dtype}")
+    if exponent.dtype != torch.int32:
+        raise RuntimeError(f"torch.frexp() expects exponent to have int dtype but got {exponent.dtype}")
     x = self
     if x.dtype not in _FREXP:
         m, e = _frexp_out(x.float(), mantissa=torch.empty(0, device=x.device), exponent=exponent)

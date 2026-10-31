@@ -109,7 +109,16 @@ T apply(T x)
         if (isinf(x)) return x > T(0) ? T(beta()) : T(gamma());
         return x;
     }
-    case UNARY_CLAMP: return isnan(x) ? x : min(max(x, T(alpha())), T(beta()));  // NaN propagates
+    // NaN propagates; x itself where it equals a bound, so -0 stays -0, as the
+    // CPU's std::max/min. (Masks on the bits: selects of this shape, even on
+    // bit patterns, get compiled into min/max, which return the bound on ties.)
+    case UNARY_CLAMP: {
+        if (isnan(x)) return x;
+        T lo = T(alpha()), hi = T(beta());
+        UBITS below = UBITS(0) - UBITS(x < lo ? 1 : 0), above = UBITS(0) - UBITS(x > hi ? 1 : 0);
+        UBITS r = (bit_cast<UBITS>(lo) & below) | (bit_cast<UBITS>(x) & ~below);
+        return bit_cast<T>((bit_cast<UBITS>(hi) & above) | (r & ~above));
+    }
 #else
     case UNARY_CLAMP: return min(max(x, T(alpha_int())), T(beta_int()));
     case UNARY_BITWISE_NOT: return ~x;

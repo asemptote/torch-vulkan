@@ -5,9 +5,8 @@
 // Taylor/atanh series carried far enough that truncation error is far below
 // one ULP. Expect results within a few ULP of a correctly rounded libm.
 //
-// Limits: sin/cos/tan reduce arguments with a 3-part Cody-Waite pi/2, exact
-// for |x| up to ~1.6e6 (2^20 * pi/2); beyond that accuracy degrades
-// gradually (no Payne-Hanek reduction).
+// sin/cos/tan reduce arguments with a 3-part Cody-Waite pi/2 for |x| < 1e6
+// (exact up to ~1.6e6), and by Payne-Hanek beyond.
 //
 // Literals carry the `l` suffix: unsuffixed literals are float32 in Slang.
 
@@ -184,9 +183,84 @@ double cos_poly(double r)
     return 1.0l - z * p;
 }
 
+// 2/pi in 64-bit words, a zero word first (checked against pi computed
+// with Machin's formula).
+static const uint64_t TWO_OVER_PI_64[25] = {
+    0x0000000000000000ull, 0xa2f9836e4e441529ull, 0xfc2757d1f534ddc0ull, 0xdb6295993c439041ull,
+    0xfe5163abdebbc561ull, 0xb7246e3a424dd2e0ull, 0x06492eea09d1921cull, 0xfe1deb1cb129a73eull,
+    0xe88235f52ebb4484ull, 0xe99c7026b45f7e41ull, 0x3991d639835339f4ull, 0x9c845f8bbdf9283bull,
+    0x1ff897ffde05980full, 0xef2f118b5a0a6d1full, 0x6d367ecf27cb09b7ull, 0x4f463f669e5fea2dull,
+    0x7527bac7ebe5f17bull, 0x3d0739f78a5292eaull, 0x6bfb5fb11f8d5d08ull, 0x56033046fc7b6babull,
+    0xf0cfbc209af4361dull, 0xa9e391615ee61b08ull, 0x6599855f14a06840ull, 0x8dffd8804d732731ull,
+    0x06061556ca73a8c9ull};
+
+// The 128-bit product a b as (hi, lo).
+void mul64x64(uint64_t a, uint64_t b, out uint64_t hi, out uint64_t lo)
+{
+    uint64_t a0 = a & 0xffffffffull, a1 = a >> 32, b0 = b & 0xffffffffull, b1 = b >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0;
+    uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull);
+    lo = (mid << 32) | (p00 & 0xffffffffull);
+    hi = a1 * b1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+// 192 bits of the table from bit g (bit 0 = the first bit of word 0).
+uint64_t two_over_pi_bits(uint g, uint word)
+{
+    uint w = g / 64u + word, s = g % 64u;
+    return s == 0u ? TWO_OVER_PI_64[w] : (TWO_OVER_PI_64[w] << s) | (TWO_OVER_PI_64[w + 1] >> (64u - s));
+}
+
+// Payne-Hanek for finite |x| >= 2^19: with x = M 2^E (M the 53-bit
+// significand), x 2/pi mod 4 needs only the bits of 2/pi from 2^-(E-1) on;
+// M times 192 of them gives the quadrant and a 128-bit fraction, rounded to
+// the nearest quadrant and scaled by pi/2 in double-double.
+double reduce_pio2_large(double x, out int quadrant)
+{
+    uint64_t bits = bit_cast<uint64_t>(x);
+    int E = int((bits >> 52) & 0x7ffull) - 1075;
+    uint64_t M = (bits & 0xfffffffffffffull) | 0x10000000000000ull;
+    uint g = uint(E + 62);  // the bit 2^-(E-1) of 2/pi (E >= -33 here)
+    uint64_t h0, l0, h1, l1, h2, l2;
+    mul64x64(M, two_over_pi_bits(g, 0u), h0, l0);
+    mul64x64(M, two_over_pi_bits(g, 1u), h1, l1);
+    mul64x64(M, two_over_pi_bits(g, 2u), h2, l2);
+    // x 2/pi = (M V) 2^-190 mod 4: the words of M V from bit 64 and bit 128.
+    uint64_t w64 = l1 + h2;
+    uint64_t w128 = l0 + h1 + (w64 < l1 ? 1ull : 0ull);
+    int q = int(uint(w128 >> 62));
+    uint64_t fhi = (w128 << 2) | (w64 >> 62), flo = (w64 << 2) | (l2 >> 62);
+    double sign = 1.0l;
+    if ((fhi >> 63) != 0ull)  // fraction >= 1/2: the next quadrant, minus the complement
+    {
+        q += 1;
+        sign = -1.0l;
+        fhi = ~fhi;
+        flo = ~flo + 1ull;
+        if (flo == 0ull) fhi += 1ull;
+    }
+    // The fraction as a double-double h + l (units of 2^-64), times pi/2.
+    double dh = double(fhi);
+    int64_t rem = int64_t(fhi - uint64_t(dh));
+    double h = dh * 5.421010862427522e-20l;  // 2^-64
+    double l = (double(rem) + double(flo) * 5.421010862427522e-20l) * 5.421010862427522e-20l;
+    const double P1 = 1.5707963267948966l, P2 = 6.123233995736766e-17l;
+    double p = h * P1;
+    double r = p + (fma(h, P1, -p) + (h * P2 + l * P1));
+    if (x < 0.0l)
+    {
+        r = -r;
+        q = -q;
+    }
+    quadrant = q & 3;
+    return sign * r;
+}
+
 // x = k * pi/2 + r with |r| <= ~pi/4; returns r and the quadrant k mod 4.
 double reduce_pio2(double x, out int quadrant)
 {
+    if (!(abs(x) < 1.0e6l))
+        return reduce_pio2_large(x, quadrant);
     double k = round(x * TWO_OVER_PI);
     quadrant = int(int64_t(k) & 3);
     return ((x - k * PIO2_1) - k * PIO2_2) - k * PIO2_3;

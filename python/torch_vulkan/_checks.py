@@ -9,6 +9,7 @@ with the CPU's messages, per aten op (overload packet name).
 """
 
 import functools
+import re
 
 import torch
 
@@ -84,16 +85,41 @@ def _out_device_check(op):
     return check
 
 
+# c10's names for dtypes in error messages.
+_C10_NAMES = {"float32": "Float", "float64": "Double", "float16": "Half", "bfloat16": "BFloat16", "complex64":
+              "ComplexFloat", "complex128": "ComplexDouble", "int8": "Char", "int16": "Short", "int32": "Int",
+              "int64": "Long", "uint8": "Byte", "bool": "Bool"}
+_UNSAFE_CAST = re.compile(r"Attempting to cast from torch\.(\w+) to out tensor with dtype torch\.(\w+), but this "
+                          r"can't be cast because it is not safe")
+
+
+def _cast_error(error):
+    """PyTorch's decompositions word an unsafe out= cast differently from its
+    kernels: the kernels' wording ('result type Float can't be cast to the
+    desired output type Int'), or None."""
+    m = _UNSAFE_CAST.search(str(error))
+    if m is None:
+        return None
+    a, b = (_C10_NAMES.get(name, name) for name in m.groups())
+    return RuntimeError(f"result type {a} can't be cast to the desired output type {b}")
+
+
 def with_cpu_checks(op, kernel):
     """`kernel` for aten OpOverload `op`, first running the CPU's argument checks."""
     checks = [c for c in (_out_device_check(op), CHECKS.get(op._schema.name.split("::", 1)[1])) if c is not None]
-    if not checks:
+    if not checks and not op._schema.is_mutable:
         return kernel
 
     @functools.wraps(kernel)
     def checked(*args, **kwargs):
         for check in checks:
             check(*args, **kwargs)
-        return kernel(*args, **kwargs)
+        try:
+            return kernel(*args, **kwargs)
+        except RuntimeError as e:
+            translated = _cast_error(e)
+            if translated is None:
+                raise
+            raise translated from e
 
     return checked

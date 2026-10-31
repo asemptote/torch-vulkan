@@ -22,6 +22,11 @@
 #if defined(T_f32) || defined(T_f64)
 #define IS_FLOAT 1
 T scalar() { return T(alpha()); }
+#if defined(T_f32)
+typedef uint TBITS;
+#else
+typedef uint64_t TBITS;
+#endif
 #else
 T scalar() { return T(alpha_int()); }
 #endif
@@ -44,9 +49,21 @@ T apply(T a, T b, T c)
         if (HAS_LO != 0 && isnan(b)) return b;
         if (HAS_HI != 0 && isnan(c)) return c;
 #endif
-        T r = a;
-        if (HAS_LO != 0) r = max(r, b);
-        if (HAS_HI != 0) r = min(r, c);
+        T r = a;  // (comparisons, not max/min: x where it equals a bound, so -0 stays -0)
+#ifdef IS_FLOAT
+        // A select of a or a bound gets compiled into min/max (which return the
+        // bound on ties, +0 for -0): a's bits plus a zero the compiler cannot
+        // see (the scalar parameter, 0 for clamp) hide that it is a select of a.
+        TBITS zero = bit_cast<TBITS>(scalar());
+        TBITS below = TBITS(0) - TBITS(HAS_LO != 0 && a < b ? 1 : 0);
+        TBITS above = TBITS(0) - TBITS(HAS_HI != 0 && a > c ? 1 : 0);
+        TBITS bits = (bit_cast<TBITS>(b) & below) | ((bit_cast<TBITS>(a) + zero) & ~below);
+        bits = (bit_cast<TBITS>(c) & above) | (bits & ~above);
+        return bit_cast<T>(bits);
+#else
+        if (HAS_LO != 0 && r < b) r = b;
+        if (HAS_HI != 0 && r > c) r = c;
+#endif
         return r;
     }
     default: return a;

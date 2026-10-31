@@ -31,25 +31,76 @@ float m_inf() { return f32_inf(); }
 float m_nan() { return f32_nan(); }
 bool m_signbit(float x) { return (bit_cast<uint>(x) >> 31) != 0; }
 
-float m_exp(float x) { return exp(x); }
+// e^x by Cephes' expf (x = n ln 2 + r, |r| <= ln 2 / 2, a degree-5 polynomial):
+// about 1 ulp, where the built-in exp can be a few. The built-in beyond
+// |x| = 87.3 (overflow, subnormal results).
+float m_exp(float x)
+{
+    if (!(abs(x) < 87.3f)) return exp(x);
+    float n = floor(1.44269504088896f * x + 0.5f);
+    float r = (x - n * 0.693359375f) + n * 2.12194440e-4f;
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    return ldexp(p * r * r + r + 1.0f, int(n));
+}
 float m_exp2(float x) { return exp2(x); }
 float m_expm1(float x) { return expm1_32(x); }
 float m_log(float x) { return log(x); }
 float m_log2(float x) { return log2(x); }
 float m_log10(float x) { return log(x) * M_INV_LN10; }
 float m_log1p(float x) { return log1p32(x); }
-// sin, cos and tan by Cody-Waite reduction to [-pi/4, pi/4] (r, quadrant n)
-// and the _math32 polynomials: the built-ins can be off by ~1e-5 for
-// moderate arguments (sin, cos) or ~1e-4 (tan). The built-ins beyond |x| ~ 800.
+// sin, cos and tan by reduction to [-pi/4, pi/4] (r, quadrant n) and the
+// _math32 polynomials: the built-ins can be off by ~1e-5 for moderate
+// arguments (sin, cos) or ~1e-4 (tan), and are not reduced exactly for
+// large ones. Cody-Waite below |x| = 800, Payne-Hanek above.
+
+// (2/pi) / 4 in 32-bit words, a zero word first (checked against pi computed
+// with Machin's formula).
+static const uint TWO_OVER_PI_32[9] = {0x00000000u, 0x28be60dbu, 0x9391054au, 0x7f09d5f4u, 0x7d4d3770u, 0x36d8a566u,
+                                       0x4f10e410u, 0x7f9458eau, 0xf7aef158u};
+
+// Payne-Hanek for finite |x| >= 800, after N. Juffa: x times 96 bits of 2/pi
+// (chosen by x's exponent) in 2.62 fixed point, rounded to the nearest
+// quadrant.
+float reduce_pio2_32_large(float x, out int n)
+{
+    uint bits = bit_cast<uint>(abs(x));
+    uint e = ((bits >> 23) & 0xffu) - 126u;              // |x| = m 2^e, m in [0.5, 1)
+    uint ia = ((bits & 0x7fffffu) | 0x800000u) << 8;     // m 2^32
+    uint i = e >> 5, s = e & 31u;
+    uint w0 = TWO_OVER_PI_32[i], w1 = TWO_OVER_PI_32[i + 1], w2 = TWO_OVER_PI_32[i + 2], w3 = TWO_OVER_PI_32[i + 3];
+    uint hi = s == 0u ? w0 : (w0 << s) | (w1 >> (32u - s));
+    uint mid = s == 0u ? w1 : (w1 << s) | (w2 >> (32u - s));
+    uint lo = s == 0u ? w2 : (w2 << s) | (w3 >> (32u - s));
+    uint64_t p = uint64_t(ia) * uint64_t(lo);
+    p = uint64_t(ia) * uint64_t(mid) + (p >> 32);
+    p = (uint64_t(ia * hi) << 32) + p;
+    int q = int(uint(p >> 62));
+    p &= 0x3fffffffffffffffull;
+    if ((p & 0x2000000000000000ull) != 0ull)  // fraction >= 1/2: the next quadrant
+    {
+        p -= 0x4000000000000000ull;
+        q += 1;
+    }
+    float r = float(int64_t(p)) * 3.4061215800865545e-19f;  // pi/2 2^-62
+    n = x < 0.0f ? -q : q;
+    return x < 0.0f ? -r : r;
+}
 float reduce_pio2_32(float x, out int n)
 {
+    if (!(abs(x) < 800.0f))
+        return reduce_pio2_32_large(x, n);
     float k = round(x * 0.636619772367581f);
     n = int(k);
     return ((x - k * 1.5707855225e+00f) - k * 1.0804273188e-05f) - k * 6.0770943833e-11f;
 }
 float m_sin(float x)
 {
-    if (!(abs(x) < 800.0f)) return sin(x);
+    if (isnan(x) || isinf(x)) return m_nan();
     int n;
     float r = reduce_pio2_32(x, n);
     float v = (n & 1) == 0 ? sin_poly32(r) : cos_poly32(r);
@@ -57,7 +108,7 @@ float m_sin(float x)
 }
 float m_cos(float x)
 {
-    if (!(abs(x) < 800.0f)) return cos(x);
+    if (isnan(x) || isinf(x)) return m_nan();
     int n;
     float r = reduce_pio2_32(x, n);
     float v = (n & 1) == 0 ? cos_poly32(r) : sin_poly32(r);
@@ -65,17 +116,18 @@ float m_cos(float x)
 }
 float m_tan(float x)
 {
-    if (!(abs(x) < 800.0f)) return tan(x);
+    if (isnan(x) || isinf(x)) return m_nan();
     int n;
     float r = reduce_pio2_32(x, n);
     float s = sin_poly32(r), c = cos_poly32(r);
     return (n & 1) == 0 ? s / c : -c / s;
 }
-float m_asin(float x) { return asin(x); }
+float m_asin(float x) { return abs(x) <= 1.0f ? asin(x) : m_nan(); }  // (some built-ins clamp |x| > 1)
 // acos via asin, keeping relative accuracy near x = 1 (the built-in acos is
 // only accurate to ~1e-4 on some GPUs).
 float m_acos(float x)
 {
+    if (!(abs(x) <= 1.0f)) return m_nan();
     if (abs(x) < 0.5f) return 0.5f * M_PI - asin(x);
     float r = 2.0f * asin(sqrt(0.5f * (1.0f - abs(x))));
     return x > 0.0f ? r : M_PI - r;
