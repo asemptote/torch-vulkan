@@ -283,6 +283,9 @@ void resize_storage(const c10::Storage& storage, size_t nbytes) {
 
 const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::optional<at::MemoryFormat> memory_format) {
   auto* impl = self.unsafeGetTensorImpl();
+  if (self.sizes() == size && !memory_format.has_value()) {
+    return self;  // (as PyTorch: the same sizes keep their strides, e.g. a strided out=)
+  }
   impl->set_sizes_contiguous(size);
   if (memory_format.has_value() && *memory_format != at::MemoryFormat::Preserve) {
     impl->empty_tensor_restride(*memory_format);

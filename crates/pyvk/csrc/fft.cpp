@@ -333,6 +333,31 @@ at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
   return with_strides(result, exec_fft_strides(in_strides, result.sizes(), {dim.back()}));
 }
 
+// out= forms: the functional result in out (resized and cast as PyTorch's
+// out= rules; otherwise they would run on the CPU and differ slightly).
+at::Tensor& fft_out(const at::Tensor& result, at::Tensor& out) {
+  check_out_device(result, out);
+  check_out_cast(result.scalar_type(), out);
+  at::native::resize_output(out, result.sizes());
+  out.copy_(result);
+  return out;
+}
+
+at::Tensor& fft_c2c_out(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward,
+                        at::Tensor& out) {
+  return fft_out(fft_c2c(self, dim, normalization, forward), out);
+}
+
+at::Tensor& fft_r2c_out(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided,
+                        at::Tensor& out) {
+  return fft_out(fft_r2c(self, dim, normalization, onesided), out);
+}
+
+at::Tensor& fft_c2r_out(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size,
+                        at::Tensor& out) {
+  return fft_out(fft_c2r(self, dim, normalization, last_dim_size), out);
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -347,4 +372,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_fft_c2c", &vk::fft_c2c);
   m.impl("_fft_r2c", &vk::fft_r2c);
   m.impl("_fft_c2r", &vk::fft_c2r);
+  m.impl("_fft_c2c.out", &vk::fft_c2c_out);
+  m.impl("_fft_r2c.out", &vk::fft_r2c_out);
+  m.impl("_fft_c2r.out", &vk::fft_c2r_out);
 }
