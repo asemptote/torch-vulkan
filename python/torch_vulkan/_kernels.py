@@ -459,7 +459,16 @@ def _cdist_forward(x1, x2, p, compute_mode=None):
 
 
 def _cdist_backward(grad, x1, x2, p, dist):
-    """Gradient w.r.t. x1 of cdist(x1, x2)."""
+    """Gradient w.r.t. x1 of cdist(x1, x2), shaped as PyTorch's meta kernel:
+    x1 broadcast to both batch shapes, or x1's own shape when anything is empty."""
+    batch = list(torch.broadcast_shapes(x1.shape[:-2], x2.shape[:-2]))
+    if 0 in (x1.shape[-2], x2.shape[-2], x1.shape[-1], math.prod(batch)):
+        return torch.zeros_like(x1)
+    r = _cdist_backward_impl(grad, x1.expand(*batch, *x1.shape[-2:]), x2, p, dist)
+    return r.contiguous()
+
+
+def _cdist_backward_impl(grad, x1, x2, p, dist):
     if p == 0 or x1.shape[-1] == 0:
         return torch.zeros_like(x1)
     diff = _pairwise_diff(x1, x2)

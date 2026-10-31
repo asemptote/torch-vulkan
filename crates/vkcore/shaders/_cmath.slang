@@ -102,7 +102,13 @@ C c_tanh(C z)
 
 C c_tan(C z) { return c_neg_i_times(c_tanh(c_i_times(z))); }  // tan z = -i tanh(i z)
 
-C c_reciprocal(C z) { return cdiv(C(S(1), S(0)), z); }
+// 1 / z; of 0, NaN + NaN i, as the CPU's vectorized conj(z) / |z|^2 and NumPy
+// (where 1 / 0 as a division gives inf + NaN i).
+C c_reciprocal(C z)
+{
+    if (z.x == S(0) && z.y == S(0)) return C(S(0) / S(0), S(0) / S(0));
+    return cdiv(C(S(1), S(0)), z);
+}
 
 C c_log1p(C z)
 {
