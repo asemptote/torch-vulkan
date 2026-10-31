@@ -11,6 +11,7 @@
 #include <torch/library.h>
 
 #include <cstddef>
+#include <vector>
 
 namespace vk {
 namespace {
@@ -101,9 +102,58 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   return true;
 }
 
+// Index ranges [lo, lo + size) per dimension of view t within a row-major
+// parent whose strides are t's, or false if t is not such a view.
+bool parent_box(const at::Tensor& t, std::vector<int64_t>& lo) {
+  int64_t off = t.storage_offset();
+  lo.assign(t.dim(), 0);
+  for (int64_t d = 0; d < t.dim(); ++d) {
+    int64_t s = t.stride(d);
+    if (s <= 0 || (d > 0 && (t.stride(d - 1) % s != 0 || t.stride(d - 1) <= s))) {
+      return false;
+    }
+    lo[d] = off / s;
+    off %= s;
+    if (d > 0 && lo[d] + t.size(d) > t.stride(d - 1) / s) {
+      return false;
+    }
+  }
+  return off == 0;
+}
+
+// Whether views x and y certainly share no element: different storages,
+// disjoint byte ranges, or disjoint boxes in one row-major parent (e.g. a
+// blocked LU's L21 and A22).
+bool disjoint(const at::Tensor& x, const at::Tensor& y) {
+  if (x.numel() == 0 || y.numel() == 0 || !x.has_storage() || !y.has_storage() ||
+      !x.storage().is_alias_of(y.storage())) {
+    return true;
+  }
+  int64_t xs = max_offset(x), ys = max_offset(y);
+  if (xs < 0 || ys < 0) {
+    return false;
+  }
+  int64_t x0 = x.storage_offset() * x.element_size(), y0 = y.storage_offset() * y.element_size();
+  if (x0 + (xs + 1) * x.element_size() <= y0 || y0 + (ys + 1) * y.element_size() <= x0) {
+    return true;
+  }
+  std::vector<int64_t> xl, yl;
+  if (x.scalar_type() != y.scalar_type() || x.strides() != y.strides() || !parent_box(x, xl) || !parent_box(y, yl)) {
+    return false;
+  }
+  for (int64_t d = 0; d < x.dim(); ++d) {
+    if (xl[d] + x.size(d) <= yl[d] || yl[d] + y.size(d) <= xl[d]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Complex c = alpha a @ b (+ beta cin): four real GEMMs on the real and
-// imaginary parts (strided views, no copies), then complex element-wise ops
-// for alpha and beta.
+// imaginary parts (strided views, no copies). With real alpha and beta they
+// accumulate straight into c's parts (no temporaries: a blocked LU's
+// trailing updates are most of the matrix); otherwise, or when c overlaps
+// a or b, into new tensors combined with complex element-wise ops.
 bool complex_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
                   const at::Scalar& alpha, const at::Scalar& beta) {
   at::ScalarType t = c.scalar_type();
@@ -113,6 +163,24 @@ bool complex_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
   }
   at::Tensor ar = at::view_as_real(a.resolve_conj()), br = at::view_as_real(b.resolve_conj());
   at::Tensor a_re = ar.select(-1, 0), a_im = ar.select(-1, 1), b_re = br.select(-1, 0), b_im = br.select(-1, 1);
+  bool use_cin = cin != nullptr && !beta.equal(0);
+  if (!alpha.isComplex() && !beta.isComplex() && !c.is_conj() && disjoint(c, a) && disjoint(c, b)) {
+    at::Tensor cr = at::view_as_real(c);
+    at::Tensor c_re = cr.select(-1, 0), c_im = cr.select(-1, 1);
+    at::Tensor cinr = use_cin ? at::view_as_real(cin->resolve_conj()) : at::Tensor();
+    // (All four GEMMs must run once the first has written c.)
+    for (const at::Tensor* v : {&ar, &br, &cr, use_cin ? &cinr : &cr}) {
+      if (max_offset(*v) < 0 || max_offset(*v) >= (int64_t(1) << 31)) {
+        return false;
+      }
+    }
+    at::Tensor cin_re = use_cin ? cinr.select(-1, 0) : at::Tensor(), cin_im = use_cin ? cinr.select(-1, 1) : at::Tensor();
+    double al = alpha.toDouble(), be = use_cin ? beta.toDouble() : 0.0;
+    // (cin may be c itself: each part of cin is read by the first GEMM
+    // writing that part, element by element.)
+    return gemm(a_re, b_re, c_re, use_cin ? &cin_re : nullptr, al, be) && gemm(a_im, b_im, c_re, &c_re, -al, 1.0) &&
+           gemm(a_re, b_im, c_im, use_cin ? &cin_im : nullptr, al, be) && gemm(a_im, b_re, c_im, &c_im, al, 1.0);
+  }
   at::TensorOptions real = c.options().dtype(c10::toRealValueType(t));
   at::Tensor pr = at::empty(c.sizes(), real), pi = at::empty(c.sizes(), real);
   bool ok = gemm(a_re, b_re, pr, nullptr, 1.0, 0.0) && gemm(a_im, b_im, pr, &pr, -1.0, 1.0) &&
@@ -124,7 +192,7 @@ bool complex_gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
   if (!alpha.equal(1)) {
     result = result * alpha;
   }
-  if (cin != nullptr && !beta.equal(0)) {
+  if (use_cin) {
     result = result + *cin * beta;
   }
   c.copy_(result);
