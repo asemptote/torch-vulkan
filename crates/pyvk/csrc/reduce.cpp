@@ -205,7 +205,7 @@ at::Tensor run_reduce(const at::Tensor& self, const Plan& plan, ROp op, Final fi
     at::Tensor dst = at::empty({plan.n_out * nchunks}, self.options().dtype(acc));
     ReduceParams p{};
     p.in = gpu_address(in);
-    p.out = gpu_address(dst);
+    p.out = gpu_address_out(dst);
     p.mean = (mean != nullptr && level0) ? gpu_address(*mean) : 0;
     p.alpha = alpha;
     p.n_out = static_cast<uint32_t>(plan.n_out);
@@ -245,8 +245,8 @@ std::pair<at::Tensor, at::Tensor> run_argreduce(const at::Tensor& self, const Pl
     at::Tensor indices = at::empty({plan.n_out * nchunks}, self.options().dtype(at::kLong));
     ArgParams p{};
     p.in = gpu_address(in);
-    p.out = gpu_address(values);
-    p.out_idx = gpu_address(indices);
+    p.out = gpu_address_out(values);
+    p.out_idx = gpu_address_out(indices);
     p.in_idx = level0 ? 0 : gpu_address(in_idx);
     p.n_out = static_cast<uint32_t>(plan.n_out);
     p.n_red = static_cast<uint32_t>(n_red);
@@ -634,7 +634,7 @@ void run_scan(const at::Tensor& in, const Dims& rowdims, int64_t rows, int64_t n
   at::Tensor totals = at::empty({rows * nchunks}, out.options());
   ScanParams p{};
   p.in = gpu_address(in);
-  p.out = gpu_address(out);
+  p.out = gpu_address_out(out);
   p.totals = gpu_address(totals);
   p.ond = rowdims.n;
   p.dstride = static_cast<int32_t>(dstride);

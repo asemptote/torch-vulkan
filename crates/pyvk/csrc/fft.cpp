@@ -83,7 +83,7 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     at::Tensor out = at::empty_like(x);
     FftParams p{};
     p.in = gpu_address(x);
-    p.out = gpu_address(out);
+    p.out = gpu_address_out(out);
     p.table = gpu_address(table);
     p.n = static_cast<uint32_t>(n);
     p.batch = static_cast<uint32_t>(batch);
@@ -97,7 +97,7 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     at::Tensor& dst = buffers[which];
     FftParams p{};
     p.in = gpu_address(src);
-    p.out = gpu_address(dst);
+    p.out = gpu_address_out(dst);
     p.table = gpu_address(table);
     p.n = static_cast<uint32_t>(n);
     p.ns = static_cast<uint32_t>(ns);
@@ -239,7 +239,7 @@ at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
   if (batch > 0) {
     FftParams p{};
     p.in = gpu_address(rows);
-    p.out = gpu_address(full);
+    p.out = gpu_address_out(full);
     p.n = static_cast<uint32_t>(last_dim_size);
     p.m = static_cast<uint32_t>(m);
     p.batch = static_cast<uint32_t>(batch);

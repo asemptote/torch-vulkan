@@ -139,7 +139,7 @@ at::Tensor& fill_random(at::Tensor& self, uint32_t op, at::ScalarType compute, B
   auto [seed, offset] = generator(gen)->next_call();
   auto [a, b] = bits(compute);
   RngParams p{};
-  p.out = gpu_address(target);
+  p.out = gpu_address_out(target);
   p.seed = seed;
   p.offset = offset;
   p.a = a;

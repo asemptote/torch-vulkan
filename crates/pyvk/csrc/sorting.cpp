@@ -288,7 +288,7 @@ void rowscan(uint32_t op, const at::Tensor& x, const at::Tensor& out, const at::
              const at::Tensor* out_idx = nullptr) {
   RowScanParams p{};
   p.x = gpu_address(x);
-  p.out = gpu_address(out);
+  p.out = gpu_address_out(out);
   p.idx = idx ? gpu_address(*idx) : 0;
   p.out_idx = out_idx ? gpu_address(*out_idx) : 0;
   p.rows = static_cast<uint32_t>(x.size(0));
@@ -428,7 +428,7 @@ at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, 
   SearchParams p{};
   p.seq = gpu_address(seq);
   p.vals = gpu_address(vals);
-  p.out = gpu_address(result);
+  p.out = gpu_address_out(result);
   p.m = static_cast<uint32_t>(m);
   p.q = static_cast<uint32_t>(sorted.dim() == 1 ? self.numel() : q);
   p.seq_row = sorted.dim() == 1 ? 0 : static_cast<uint32_t>(m);

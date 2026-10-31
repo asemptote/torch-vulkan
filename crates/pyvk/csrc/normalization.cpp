@@ -67,7 +67,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
     mean = running_mean->to(acc);
     invstd = at::rsqrt(running_var->to(acc) + eps);
     // (per channel, as PyTorch's meta kernel says for devices other than the CPU)
-    save_mean = mean;
+    save_mean = mean.clone();  // (a copy: mean may be running_mean itself, and outputs must not alias inputs)
     save_invstd = invstd;
   }
   at::Tensor scale = invstd, shift = -mean * invstd;
@@ -169,6 +169,55 @@ int64_t fused_sdp_choice(const at::Tensor&, const at::Tensor&, const at::Tensor&
   return 0;  // sdp::SDPBackend::math
 }
 
+// out= forms: the functional kernels' results (via the dispatcher) in the
+// given tensors (they ran on the CPU, whose eval-mode statistics differ in shape).
+using BnOuts = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&>;
+
+BnOuts bn_assign(std::tuple<at::Tensor, at::Tensor, at::Tensor> r, at::Tensor& out, at::Tensor& save_mean,
+                 at::Tensor& save_invstd) {
+  at::Tensor* outs[] = {&out, &save_mean, &save_invstd};
+  const at::Tensor results[] = {std::get<0>(r), std::get<1>(r), std::get<2>(r)};
+  for (int i = 0; i < 3; ++i) {
+    check_out_device(results[i], *outs[i]);
+    check_out_cast(results[i].scalar_type(), *outs[i]);
+    at::native::resize_output(*outs[i], results[i].sizes());
+    outs[i]->copy_(results[i]);
+  }
+  return {out, save_mean, save_invstd};
+}
+
+BnOuts native_batch_norm_out(const at::Tensor& x, const std::optional<at::Tensor>& weight,
+                             const std::optional<at::Tensor>& bias, const std::optional<at::Tensor>& running_mean,
+                             const std::optional<at::Tensor>& running_var, bool training, double momentum, double eps,
+                             at::Tensor& out, at::Tensor& save_mean, at::Tensor& save_invstd) {
+  return bn_assign(at::native_batch_norm(x, weight, bias, running_mean, running_var, training, momentum, eps), out,
+                   save_mean, save_invstd);
+}
+
+BnOuts native_batch_norm_legit_out(const at::Tensor& x, const std::optional<at::Tensor>& weight,
+                                   const std::optional<at::Tensor>& bias, at::Tensor& running_mean,
+                                   at::Tensor& running_var, bool training, double momentum, double eps,
+                                   at::Tensor& out, at::Tensor& save_mean, at::Tensor& save_invstd) {
+  return bn_assign(at::_native_batch_norm_legit(x, weight, bias, running_mean, running_var, training, momentum, eps), out,
+                   save_mean, save_invstd);
+}
+
+BnOuts native_batch_norm_legit_no_stats_out(const at::Tensor& x, const std::optional<at::Tensor>& weight,
+                                            const std::optional<at::Tensor>& bias, bool training, double momentum,
+                                            double eps, at::Tensor& out, at::Tensor& save_mean,
+                                            at::Tensor& save_invstd) {
+  return bn_assign(at::_native_batch_norm_legit(x, weight, bias, training, momentum, eps), out, save_mean,
+                   save_invstd);
+}
+
+BnOuts native_batch_norm_legit_no_training_out(const at::Tensor& x, const std::optional<at::Tensor>& weight,
+                                               const std::optional<at::Tensor>& bias, const at::Tensor& running_mean,
+                                               const at::Tensor& running_var, double momentum, double eps,
+                                               at::Tensor& out0, at::Tensor& out1, at::Tensor& out2) {
+  return bn_assign(at::_native_batch_norm_legit_no_training(x, weight, bias, running_mean, running_var, momentum, eps),
+                   out0, out1, out2);
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -178,6 +227,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_native_batch_norm_legit", &native_batch_norm_legit);
   m.impl("_native_batch_norm_legit.no_stats", &native_batch_norm_legit_no_stats);
   m.impl("_native_batch_norm_legit_no_training", &native_batch_norm_legit_no_training);
+  m.impl("native_batch_norm.out", &native_batch_norm_out);
+  m.impl("_native_batch_norm_legit.out", &native_batch_norm_legit_out);
+  m.impl("_native_batch_norm_legit.no_stats_out", &native_batch_norm_legit_no_stats_out);
+  m.impl("_native_batch_norm_legit_no_training.out", &native_batch_norm_legit_no_training_out);
   m.impl("_batch_norm_with_update", &batch_norm_with_update);
   m.impl("_batch_norm_no_update", &batch_norm_no_update);
   m.impl("_scaled_dot_product_flash_attention_for_cpu", &sdpa_flash_for_cpu);

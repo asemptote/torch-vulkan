@@ -78,6 +78,9 @@ struct AllocCtx {
 // GPU address of the first element of `t` (0 for empty storage).
 uint64_t gpu_address(const at::TensorBase& t);
 uint64_t gpu_address(const at::TensorBase& t, const void* data);
+// The same for a tensor a kernel writes: materializes copy-on-write storage
+// first, so the write doesn't reach the tensors sharing it.
+uint64_t gpu_address_out(const at::TensorBase& t);
 
 c10::Allocator* allocator();
 

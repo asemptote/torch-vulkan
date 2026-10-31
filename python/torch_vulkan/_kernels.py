@@ -191,8 +191,8 @@ def _make_adaptive_avg(k):
 def _make_adaptive_max_backward(k):
     def backward(grad_output, x, indices):
         head = x.dim() - k
-        g = grad_output.reshape(*grad_output.shape[:head], -1)
-        i = indices.reshape(*indices.shape[:head], -1)
+        g = grad_output.reshape(*grad_output.shape[:head], math.prod(grad_output.shape[head:]))
+        i = indices.reshape(*indices.shape[:head], math.prod(indices.shape[head:]))
         gx = torch.zeros((*x.shape[:head], math.prod(x.shape[head:])), device=x.device, dtype=x.dtype)
         return gx.scatter_add(-1, i, g).reshape(x.shape)
 
@@ -202,8 +202,8 @@ def _make_adaptive_max_backward(k):
 def _make_max_pool_backward(k):
     def backward(grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices):
         head = x.dim() - k
-        g = grad_output.reshape(*grad_output.shape[:head], -1)
-        i = indices.reshape(*indices.shape[:head], -1)
+        g = grad_output.reshape(*grad_output.shape[:head], math.prod(grad_output.shape[head:]))
+        i = indices.reshape(*indices.shape[:head], math.prod(indices.shape[head:]))
         gx = torch.zeros((*x.shape[:head], math.prod(x.shape[head:])), device=x.device, dtype=x.dtype)
         return gx.scatter_add(-1, i, g).reshape(x.shape)
 
@@ -295,7 +295,7 @@ def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=Non
         cd, gd = _source_coord(grid[..., d], spatial[k - 1 - d], padding_mode, align_corners)
         coords.append(cd)
         dcoord.append(gd)
-    flat_in = input.reshape(n, c, -1)
+    flat_in = input.reshape(n, c, math.prod(spatial))
     strides = [math.prod(spatial[k - d:]) for d in range(k)]  # element stride of coordinate d's dim
     count = math.prod(out_spatial)
 
@@ -308,7 +308,7 @@ def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=Non
             valid = v if valid is None else valid & v
             term = idx[d].clamp(0, size - 1) * strides[d]
             flat = term if flat is None else flat + term
-        return flat.reshape(n, 1, -1), valid.reshape(n, -1)
+        return flat.reshape(n, 1, count), valid.reshape(n, count)
 
     if mode == 1:  # nearest (round half to even, as nearbyint)
         flat, valid = corner([torch.round(cd).long() for cd in coords])
@@ -316,7 +316,7 @@ def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=Non
         if grad_output is None:
             vals = torch.gather(flat_in, 2, index) * valid.unsqueeze(1).to(input.dtype)
             return vals.reshape(n, c, *out_spatial)
-        g = grad_output.reshape(n, c, -1) * valid.unsqueeze(1).to(input.dtype)
+        g = grad_output.reshape(n, c, count) * valid.unsqueeze(1).to(input.dtype)
         gi = torch.zeros_like(flat_in).scatter_add(2, index, g).reshape(input.shape)
         return (gi if mask[0] else None), (torch.zeros_like(grid) if mask[1] else None)
 
@@ -326,7 +326,7 @@ def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=Non
     out = None
     backward = grad_output is not None
     gi = torch.zeros_like(flat_in) if backward and mask[0] else None
-    g = grad_output.reshape(n, c, -1) if backward else None
+    g = grad_output.reshape(n, c, count) if backward else None
     gcoord = [torch.zeros(n, count, device=input.device, dtype=input.dtype) for _ in range(k)]
     for bits in range(1 << k):
         b = [(bits >> d) & 1 for d in range(k)]
@@ -470,8 +470,8 @@ def _make_fractional_max(k):
 
     def backward(grad_output, x, kernel_size, output_size, indices):
         head = x.dim() - k
-        g = grad_output.reshape(*grad_output.shape[:head], -1)
-        i = indices.reshape(*indices.shape[:head], -1)
+        g = grad_output.reshape(*grad_output.shape[:head], math.prod(grad_output.shape[head:]))
+        i = indices.reshape(*indices.shape[:head], math.prod(indices.shape[head:]))
         gx = torch.zeros((*x.shape[:head], math.prod(x.shape[head:])), device=x.device, dtype=x.dtype)
         return gx.scatter_add(-1, i, g).reshape(x.shape)
 

@@ -1271,7 +1271,7 @@ at::Tensor& triangle_out(const at::Tensor& self, int64_t diagonal, at::Tensor& o
   at::Tensor out3 = target.view({-1, out.size(-2), out.size(-1)});
   TriangleParams p{};
   p.in = gpu_address(in3);
-  p.out = gpu_address(out3);
+  p.out = gpu_address_out(out3);
   p.batch = static_cast<uint32_t>(in3.size(0));
   p.rows = static_cast<uint32_t>(in3.size(1));
   p.cols = static_cast<uint32_t>(in3.size(2));

@@ -75,7 +75,7 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   GemmParams p{};
   p.a = gpu_address(a);
   p.b = gpu_address(b);
-  p.c = gpu_address(c);
+  p.c = gpu_address_out(c);
   p.cin = use_cin ? gpu_address(*cin) : 0;
   p.alpha = alpha;
   p.beta = beta;

@@ -103,6 +103,10 @@ uint64_t gpu_address(const at::TensorBase& t) {
   return gpu_address(t, t.const_data_ptr());
 }
 
+uint64_t gpu_address_out(const at::TensorBase& t) {
+  return gpu_address(t, t.mutable_data_ptr());
+}
+
 const char* dtype_label(at::ScalarType t) {
   switch (t) {
     case at::kFloat: return "f32";

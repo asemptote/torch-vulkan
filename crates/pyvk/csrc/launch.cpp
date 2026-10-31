@@ -71,7 +71,7 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
   std::array<uint64_t, K> base{};
   std::array<int64_t, K> itemsize{};
   for (size_t k = 0; k < K; ++k) {
-    base[k] = ops[k] ? gpu_address(*ops[k]) : 0;
+    base[k] = !ops[k] ? 0 : k == 0 ? gpu_address_out(*ops[k]) : gpu_address(*ops[k]);
     itemsize[k] = ops[k] ? ops[k]->itemsize() : 0;
   }
   for_each_dispatch<K>(dims, D, [&](int64_t count, const std::array<int64_t, K>& offsets) {

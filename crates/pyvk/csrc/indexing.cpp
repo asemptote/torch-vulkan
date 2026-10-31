@@ -570,7 +570,7 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
   at::Tensor vals = values.to(dst_view.scalar_type()).expand(offsets.sizes()).contiguous();
   at::Tensor order = sort_rows(offs, false);
   SegReduceParams p{};
-  p.dst = gpu_address(dst_view);
+  p.dst = gpu_address_out(dst_view);
   p.offs = gpu_address(offs);
   p.vals = gpu_address(vals);
   p.order = gpu_address(order);
@@ -789,7 +789,7 @@ at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
   NonzeroParams p{};
   p.mask = gpu_address(mask);
   p.csum = gpu_address(csum);
-  p.out = gpu_address(target);
+  p.out = gpu_address_out(target);
   TORCH_CHECK(mask.numel() < (int64_t(1) << 32), "torch_vulkan: nonzero of more than 2^32 elements");
   p.n = static_cast<uint32_t>(mask.numel());
   p.ndim = static_cast<uint32_t>(ndim);
