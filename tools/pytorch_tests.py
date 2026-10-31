@@ -282,6 +282,8 @@ EXPECTED = [
      "and every op of the chunked path gives the CPU's result exactly"),
     (r"test_fake_crossref_backward_(no_)?amp_normal_number_mean_vk", r"Expected len\(flat_diff_results\) > 0",
      "the op's first samples have no input that requires grad; PyTorch skips the test on CUDA for the same error"),
+    (r"", r"exceeds the device's limit of \d+ bytes per buffer",
+     "a tensor larger than the driver's largest buffer (lavapipe: 2 GiB; a tensor is one buffer)"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
     (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
