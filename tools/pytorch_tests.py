@@ -276,6 +276,12 @@ EXPECTED = [
      "expects that)"),
     (r"test_out_(cholesky_inverse|geqrf|ormqr|triangular_solve)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
+    (r"test_linear_cross_entropy_loss_with_acc_dtype_bias_True_b?float16_", r"not less than or equal to",
+     "ULP trip-wires calibrated for one seed on the CPU, CUDA and MPS (the CPU misses them for most other seeds; "
+     "a device that is none of these gets CUDA's caps); vk's random weights differ from the CPU's at that seed, "
+     "and every op of the chunked path gives the CPU's result exactly"),
+    (r"test_fake_crossref_backward_(no_)?amp_normal_number_mean_vk", r"Expected len\(flat_diff_results\) > 0",
+     "the op's first samples have no input that requires grad; PyTorch skips the test on CUDA for the same error"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
     (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
