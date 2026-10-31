@@ -122,6 +122,7 @@ std::tuple<at::Tensor, at::Tensor> sort_along(const at::Tensor& self, int64_t di
 }
 
 void assign_out(at::Tensor& out, const at::Tensor& result) {
+  check_out_device(result, out);
   if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
     check_out_cast(result.scalar_type(), out);
   }
@@ -201,6 +202,8 @@ std::tuple<at::Tensor, at::Tensor> sorted_rows(const at::Tensor& self, int64_t d
 std::tuple<at::Tensor&, at::Tensor&> kthvalue_out(const at::Tensor& self, int64_t k, int64_t dim, bool keepdim,
                                                   at::Tensor& values, at::Tensor& indices) {
   reject_dtype("kthvalue", self.scalar_type(), self.scalar_type() == at::kBool);
+  at::assert_no_overlap(self, values);  // (as the CPU)
+  at::assert_no_overlap(self, indices);
   if (!sortable(self) || !is_vk(values) || !is_vk(indices)) {
     on_cpu("aten::kthvalue", "values", self, k, dim, keepdim, values, indices);
     return {values, indices};
@@ -528,6 +531,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_consecutive(const at::Tens
 
 std::tuple<at::Tensor&, at::Tensor&> aminmax_out(const at::Tensor& self, std::optional<int64_t> dim, bool keepdim,
                                                  at::Tensor& min, at::Tensor& max) {
+  for (const at::Tensor* out : {&min, &max}) {
+    TORCH_CHECK(out->scalar_type() == self.scalar_type(), "Expected out tensor to have dtype ", self.dtype(),
+                ", but got ", out->dtype(), " instead");
+  }
   if (dim.has_value()) {
     assign_out(min, at::amin(self, *dim, keepdim));
     assign_out(max, at::amax(self, *dim, keepdim));

@@ -140,6 +140,9 @@ at::Tensor linear_to_offsets(const at::Tensor& linear, const at::Tensor& t) {
 // ---------------------------------------------------------------- index_select, gather, take
 
 at::Tensor& index_select_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, at::Tensor& out) {
+  at::assert_no_internal_overlap(out);  // (as the CPU)
+  at::assert_no_overlap(out, self);
+  at::assert_no_overlap(out, index);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   TORCH_CHECK_INDEX(index.dim() <= 1, "index_select(): Index is supposed to be a vector");
   std::vector<int64_t> shape = self.sizes().vec();
@@ -167,6 +170,9 @@ at::Tensor index_select(const at::Tensor& self, int64_t dim, const at::Tensor& i
 
 at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, bool sparse_grad,
                        at::Tensor& out) {
+  at::assert_no_internal_overlap(out);  // (as the CPU)
+  at::assert_no_overlap(out, self);
+  at::assert_no_overlap(out, index);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
   at::native::resize_output(out, index.sizes());
   if (!movable(self) || !is_vk(index) || !is_vk(out) || out.scalar_type() != self.scalar_type() ||
@@ -187,6 +193,9 @@ at::Tensor checked_linear(const at::Tensor& index, int64_t numel) {
 }
 
 at::Tensor& take_out(const at::Tensor& self, const at::Tensor& index, at::Tensor& out) {
+  at::assert_no_internal_overlap(out);  // (as the CPU)
+  at::assert_no_overlap(out, self);
+  at::assert_no_overlap(out, index);
   at::native::resize_output(out, index.sizes());
   if (!movable(self) || !is_vk(index) || !is_vk(out) || out.scalar_type() != self.scalar_type() ||
       index.scalar_type() != at::kLong) {
@@ -434,6 +443,9 @@ at::Tensor& index_fill_tensor(at::Tensor& self, int64_t dim, const at::Tensor& i
 }
 
 at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& source, bool accumulate) {
+  at::assert_no_internal_overlap(self);  // (as the CPU)
+  at::assert_no_overlap(self, index);
+  at::assert_no_overlap(self, source);
   if (!movable(self) || !is_vk(index) || !is_vk(source) || index.scalar_type() != at::kLong ||
       (accumulate && !accum_supported(self.scalar_type(), true))) {
     on_cpu("aten::put_", "", self, index, source, accumulate);
@@ -808,6 +820,9 @@ at::Tensor count_nonzero(const at::Tensor& self, at::IntArrayRef dims) {
 }
 
 at::Tensor& masked_select_out(const at::Tensor& self, const at::Tensor& mask, at::Tensor& out) {
+  at::assert_no_internal_overlap(out);  // (as the CPU)
+  at::assert_no_overlap(out, self);
+  at::assert_no_overlap(out, mask);
   TORCH_CHECK(mask.scalar_type() == at::kBool, "masked_select: expected BoolTensor for mask");
   bool ok = movable(self) && is_vk(mask) && is_vk(out) && out.scalar_type() == self.scalar_type() &&
             (mask.scalar_type() == at::kBool || mask.scalar_type() == at::kByte);
@@ -826,6 +841,7 @@ at::Tensor masked_select(const at::Tensor& self, const at::Tensor& mask) {
 }
 
 at::Tensor& masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::Tensor& source) {
+  at::assert_no_internal_overlap(self);
   bool ok = movable(self) && is_vk(mask) && is_vk(source) && mask.scalar_type() == at::kBool &&
             source.scalar_type() == self.scalar_type();
   if (!ok) {
@@ -849,6 +865,10 @@ at::Tensor& masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::
 
 at::Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, at::Tensor& out) {
   std::vector<at::Tensor> all(tensors.begin(), tensors.end());
+  at::assert_no_internal_overlap(out);  // (as the CPU)
+  for (const at::Tensor& t : all) {
+    at::assert_no_overlap(out, t);
+  }
   if (!all.empty()) {
     // (a TypeError, as on the CPU)
     TORCH_CHECK_TYPE(at::canCast(at::native::result_type(all), out.scalar_type()),
@@ -977,6 +997,10 @@ at::Tensor& pad_out(const at::Tensor& self, at::IntArrayRef pad, bool reflect, c
   int64_t k = static_cast<int64_t>(pad.size()) / 2;
   TORCH_CHECK(self.dim() == k + 1 || self.dim() == k + 2, name, ": expected ", k + 1, "D or ", k + 2,
               "D input, got ", self.dim(), "D");
+  for (int64_t d = self.dim() == k + 2 ? 1 : 0; d < self.dim(); ++d) {  // (as the CPU: only a batch can be empty)
+    TORCH_CHECK(self.size(d) != 0, "Expected ", k + 1, "D or ", k + 2, "D (batch mode) tensor with possibly 0 batch "
+                "size and other non-zero dimensions for input, but got: ", self.sizes());
+  }
   std::vector<int64_t> shape = self.sizes().vec();
   std::vector<int64_t> dims;
   std::vector<at::Tensor> indices;
@@ -1082,6 +1106,7 @@ at::Tensor& arange_out(const at::Scalar& start, const at::Scalar& end, const at:
 }
 
 at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t steps, at::Tensor& out) {
+  at::assert_no_internal_overlap(out);
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(out) || at::isComplexType(dtype) || dtype == at::kBool) {
@@ -1127,6 +1152,7 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
 }
 
 at::Tensor& logspace_out(const at::Scalar& start, const at::Scalar& end, int64_t steps, double base, at::Tensor& out) {
+  at::assert_no_internal_overlap(out);
   at::ScalarType dtype = out.scalar_type();
   if (!is_vk(out) || at::isComplexType(dtype) || dtype == at::kBool) {
     on_cpu("aten::logspace", "out", start, end, steps, base, out);

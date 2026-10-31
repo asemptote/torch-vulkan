@@ -139,10 +139,25 @@ def run_tests(tests, ids, env, results_path, log, extra, timeout):
             listing.write_text("\n".join(remaining), encoding="utf-8")
             cmd = [sys.executable, "-c", RUNNER, str(results_path), f"@{listing}", "-q", "-p", "no:cacheprovider",
                    *extra]
+            start = fh.tell()
             try:
                 code = subprocess.call(cmd, cwd=tests, env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=timeout)
             except subprocess.TimeoutExpired:
                 code = "timeout"
+            if code == 4:
+                # pytest runs nothing if any id is not found (e.g. a CPU
+                # twin's, not collected for "vk"): record those, run the rest.
+                fh.flush()
+                with open(log, encoding="utf-8") as text:
+                    text.seek(start)
+                    missing = {line.split("::", 1)[1].strip() for line in text if line.startswith("ERROR: not found:")}
+                missing = {nodeid for nodeid in remaining if nodeid.split("::", 1)[1] in missing}
+                if missing:
+                    with open(results_path, "a", encoding="utf-8") as out:
+                        for nodeid in sorted(missing):
+                            out.write(json.dumps({"nodeid": nodeid, "outcome": "not found", "message": ""}) + "\n")
+                    remaining = [nodeid for nodeid in remaining if nodeid not in missing]
+                    continue
             results, started = read_results(results_path)
             if started is None:
                 break  # finished, or died between tests

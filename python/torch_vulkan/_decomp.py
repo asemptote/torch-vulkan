@@ -160,7 +160,7 @@ def register():
         overload = op._overloadname
         qualified = op._schema.name.split("::", 1)[1] + ("" if overload == "default" else "." + overload)
         base = op._schema.name.split("::", 1)[1]
-        kernel = _checks.with_cpu_checks(base, _dtypes.with_cpu_dtypes(base, _make_kernel(op, decomp, name)))
+        kernel = _checks.with_cpu_checks(op, _dtypes.with_cpu_dtypes(base, _make_kernel(op, decomp, name)))
         _lib.impl(qualified, _layout.with_layout(op, kernel), "PrivateUse1")
         names.append(name)
     return names

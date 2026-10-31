@@ -694,6 +694,20 @@ def _xor_last(x):
 def _hash_tensor(self, dim=(), *, keepdim=False, mode=0):
     if mode != 0:
         return _on_cpu("hash_tensor", self, dim, keepdim=keepdim, mode=mode)
+    # The CPU's checks of the reduced dims.
+    if self.dim() > 64:
+        raise RuntimeError("only tensors with up to 64 dims are supported")
+    n = max(self.dim(), 1)
+    for d in dim:
+        if not -n <= d < n:
+            raise IndexError(f"Dimension out of range (expected to be in range of [{-n}, {n - 1}], but got {d})")
+    wrapped = [d % n for d in dim]
+    for d in wrapped:
+        if wrapped.count(d) > 1:
+            raise RuntimeError(f"dim {d} appears multiple times in the list of dims")
+    for d in wrapped if dim else range(self.dim()):
+        if self.dim() > 0 and self.shape[d] == 0:
+            raise IndexError(f"hash_tensor: Expected reduction dim {d} to have non-zero size.")
     # Elements as 64-bit floats or integers, their bits XOR-reduced.
     wide = self.to(torch.float64) if self.is_floating_point() else self.to(torch.int64)
     bits = wide.view(torch.int64)
@@ -815,6 +829,8 @@ def _points(self):
 
 
 def _histogramdd_bin_edges(self, bins, *, range=None, weight=None, density=False):
+    if self.dim() > 0 and len(bins) != self.shape[-1]:
+        raise RuntimeError("histogramdd: The size of bins must be equal to the innermost dimension of the input.")
     pts = _points(self)
     return [torch.linspace(left, right, b + 1, dtype=self.dtype, device=self.device)
             for (left, right), b in zip(_outer_edges(pts, range), bins)]
@@ -1112,7 +1128,7 @@ def register():
             continue  # a C++ or decomposed kernel exists
         base, _, overload = name.partition(".")
         op = getattr(getattr(torch.ops.aten, base), overload or "default")
-        fn = _checks.with_cpu_checks(base, _dtypes.with_cpu_dtypes(base, fn))
+        fn = _checks.with_cpu_checks(op, _dtypes.with_cpu_dtypes(base, fn))
         _lib.impl(name, _layout.with_layout(op, fn), "PrivateUse1")
         names.append("aten::" + name)
     return names

@@ -10,6 +10,7 @@
 #include <ATen/native/CPUFallback.h>
 
 #include <array>
+#include <initializer_list>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -101,6 +102,13 @@ std::string move_kernel(int64_t itemsize);
 // Records that `op` ran on the CPU instead of the GPU (warns once per op).
 void record_fallback(const std::string& op);
 
+// Before running an op on the CPU for "vk" tensors, the device checks of
+// PyTorch's own kernels (the fallback would otherwise compute on the CPU
+// and succeed): out= tensors must be on "vk" when an input is, and "vk" and
+// CPU tensors do not mix (except 0-dim CPU tensors, i.e. scalars, and the
+// indices of indexing ops).
+void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stack& stack);
+
 // out (vk) = result computed on the CPU by `compute`, recorded as a fallback.
 template <typename F>
 void cpu_out(const char* op, const at::Tensor& out, F&& compute) {
@@ -183,8 +191,20 @@ inline at::Tensor laid_out_like(const at::Tensor& result, const at::Tensor& layo
 // output that must be resized (e.g. a fresh empty one) takes the dim order
 // of `like` (an input of the output's shape, if any), contiguous in that
 // order, so ops on transposed or channels-last inputs keep their layout.
+// The CPU's (TensorIterator's) aliasing checks for an op writing out from
+// inputs: no element of out written twice, no input partly overlapping it
+// (an input identical to out is fine).
+inline void check_overlap(const at::Tensor& out, std::initializer_list<const at::Tensor*> inputs = {}) {
+  at::assert_no_internal_overlap(out);
+  for (const at::Tensor* input : inputs) {
+    if (input != nullptr && input->defined()) {
+      at::assert_no_partial_overlap(out, *input);
+    }
+  }
+}
+
 inline void resize_elementwise_output(const at::Tensor& out, at::IntArrayRef shape, const at::Tensor* like) {
-  at::assert_no_internal_overlap(out);  // (as TensorIterator: an output written twice per element)
+  check_overlap(out, {like});
   if (out.sizes() == shape) {
     return;
   }
@@ -227,6 +247,13 @@ inline void check_out_cast(at::ScalarType result, const at::Tensor& out) {
               " can't be cast to the desired output type ", out.scalar_type());
 }
 
+// An out= tensor must be on "vk" when the result is (copy_ would quietly
+// write it anywhere): PyTorch's own kernels check the device.
+inline void check_out_device(const at::Tensor& result, const at::Tensor& out) {
+  TORCH_CHECK(result.device().type() != kDevice || out.device().type() == kDevice,
+              "Expected out tensor to have device ", result.device(), ", but got ", out.device(), " instead");
+}
+
 // Runs `body(target)` writing into `out` directly when its dtype is `dtype`,
 // otherwise into a temporary that is then cast into `out`.
 template <typename F>
@@ -252,6 +279,7 @@ torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... 
   record_fallback(*overload ? std::string(name) + "." + overload : std::string(name));
   torch::jit::Stack stack;
   (stack.emplace_back(args), ...);
+  check_out_devices(op.schema(), stack);
   at::native::cpu_fallback(op, &stack);
   return stack;
 }

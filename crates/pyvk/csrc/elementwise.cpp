@@ -54,6 +54,7 @@ bool param_unary_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& ou
 }
 
 at::Tensor& gelu_out(const at::Tensor& self, c10::string_view approximate, at::Tensor& out) {
+  TORCH_CHECK(approximate == "none" || approximate == "tanh", "approximate argument must be either none or tanh.");
   if (!param_unary_gpu(approximate == "tanh" ? op::UNARY_GELU_TANH : op::UNARY_GELU, self, out, 0, 0)) {
     on_cpu("aten::gelu", "out", self, approximate, out);
   }
@@ -504,6 +505,11 @@ at::Tensor& glu_out(const at::Tensor& self, int64_t dim, at::Tensor& out) {
 }
 
 at::Tensor& complex_out(const at::Tensor& real, const at::Tensor& imag, at::Tensor& out) {
+  // (the CPU's checks)
+  TORCH_CHECK(real.scalar_type() == imag.scalar_type(), "Expected object of scalar type ", real.scalar_type(),
+              " but got scalar type ", imag.scalar_type(), " for second argument");
+  TORCH_CHECK(out.scalar_type() == c10::toComplexType(real.scalar_type()), "Expected object of scalar type ",
+              c10::toComplexType(real.scalar_type()), " but got scalar type ", out.scalar_type(), " for argument 'out'");
   at::native::resize_output(out, at::infer_size(real.sizes(), imag.sizes()));
   if (!is_vk(out) || !is_vk(real) || !is_vk(imag) || dtype_label(out.scalar_type()) == nullptr) {
     on_cpu("aten::complex", "out", real, imag, out);
@@ -516,6 +522,8 @@ at::Tensor& complex_out(const at::Tensor& real, const at::Tensor& imag, at::Tens
 }
 
 at::Tensor& polar_out(const at::Tensor& abs, const at::Tensor& angle, at::Tensor& out) {
+  TORCH_CHECK(abs.scalar_type() == angle.scalar_type(), "Expected object of scalar type ", abs.scalar_type(),
+              " but got scalar type ", angle.scalar_type(), " for second argument");
   return complex_out(abs * at::cos(angle), abs * at::sin(angle), out);
 }
 
@@ -559,6 +567,7 @@ at::Tensor& sgn_out(const at::Tensor& self, at::Tensor& out) {
 }
 
 at::Tensor& pow_scalar_base_out(const at::Scalar& self, const at::Tensor& exponent, at::Tensor& out) {
+  check_overlap(out, {&exponent});
   at::native::resize_output(out, exponent.sizes());
   bool ok = is_vk(exponent) && is_vk(out) && !self.isComplex();
   if (ok) {

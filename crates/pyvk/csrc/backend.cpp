@@ -395,6 +395,7 @@ at::Tensor copy_from(const at::Tensor& self, const at::Tensor& dst, bool /*non_b
   if (self.numel() == 0 && dst.numel() == 0) {
     return dst;
   }
+  check_overlap(dst, {&self});  // (as the CPU's copy_)
   bool conj = self.is_conj() != dst.is_conj();
   bool neg = self.is_neg() != dst.is_neg();
   bool src_vk = self.device().type() == kDevice;
@@ -460,6 +461,7 @@ std::map<std::string, int64_t> g_fallbacks;
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   const auto& name = op.schema().operator_name();
   record_fallback(name.overload_name.empty() ? name.name : name.name + "." + name.overload_name);
+  check_out_devices(op.schema(), *stack);
   // A view op run on the CPU would return a copy, silently breaking aliasing
   // (e.g. `x.real += 1`); error out instead so a missing view kernel is caught.
   at::native::cpu_fallback(op, stack, /*error_on_views=*/true);
@@ -474,6 +476,61 @@ bool strict_mode() {
     return v != nullptr && *v != '\0' && std::string(v) != "0";
   }();
   return strict;
+}
+
+void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
+  const auto& arguments = schema.arguments();
+  if (stack.size() < arguments.size()) {
+    return;
+  }
+  size_t first = stack.size() - arguments.size();
+  auto on_vk = [](const c10::IValue& v) {
+    if (v.isTensor()) {
+      return v.toTensor().defined() && v.toTensor().device().type() == kDevice;
+    }
+    if (v.isTensorList()) {
+      for (const at::Tensor& t : v.toTensorList().vec()) {
+        if (t.defined() && t.device().type() == kDevice) return true;
+      }
+    }
+    return false;
+  };
+  auto is_out = [](const c10::Argument& a) { return a.kwarg_only() && a.alias_info() && a.alias_info()->isWrite(); };
+  // The indices of indexing ops (Tensor?[]) may be on the CPU.
+  auto indices = [](const c10::Argument& a) { return a.type()->str() == "Tensor?[]"; };
+  auto cpu_tensor = [](const c10::IValue& v) {  // a CPU tensor that is not a scalar
+    if (v.isTensor()) {
+      const at::Tensor& t = v.toTensor();
+      return t.defined() && t.device().is_cpu() && t.dim() > 0;
+    }
+    if (v.isTensorList()) {
+      for (const at::Tensor& t : v.toTensorList().vec()) {
+        if (t.defined() && t.device().is_cpu() && t.dim() > 0) return true;
+      }
+    }
+    return false;
+  };
+  bool vk_input = false, any_vk = false, any_cpu = false;
+  for (size_t i = 0; i < arguments.size(); ++i) {
+    const c10::IValue& v = stack[first + i];
+    vk_input = vk_input || (!is_out(arguments[i]) && on_vk(v));
+    any_vk = any_vk || on_vk(v);
+    any_cpu = any_cpu || (!indices(arguments[i]) && cpu_tensor(v));
+  }
+  bool copy = schema.name().find("copy") != std::string::npos;
+  TORCH_CHECK(!any_vk || !any_cpu || copy, "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", kDevice, " and cpu!");
+  if (!vk_input) {
+    return;
+  }
+  for (size_t i = 0; i < arguments.size(); ++i) {
+    const c10::IValue& v = stack[first + i];
+    if (is_out(arguments[i]) && v.isTensor() && v.toTensor().defined()) {
+      const at::Device device = v.toTensor().device();
+      TORCH_CHECK(device.type() == kDevice, "Expected out tensor to have device ", kDevice, ", but got ", device,
+                  " instead");
+    }
+  }
 }
 
 void record_fallback(const std::string& op) {

@@ -188,6 +188,12 @@ at::Tensor& unary_out(const at::Tensor& self, at::Tensor& out) {
   bool rounding = code == op::UNARY_FLOOR || code == op::UNARY_CEIL || code == op::UNARY_TRUNC ||
                   code == op::UNARY_ROUND;
   reject_dtype(kUnary[I].name + 6, self.scalar_type(), rounding && self.scalar_type() == at::kBool);
+  // These keep their input's dtype, and the CPU's kernels (TensorIterator's
+  // unary_op) want it in out= as well.
+  bool same_dtype = rounding || code == op::UNARY_NEG || code == op::UNARY_SIGN || code == op::UNARY_FRAC ||
+                    code == op::UNARY_BITWISE_NOT;
+  TORCH_CHECK(!same_dtype || out.scalar_type() == self.scalar_type(), "Found dtype ", out.scalar_type(),
+              " but expected ", self.scalar_type());
   check_out_cast(unary_result(kUnary[I].code, kUnary[I].kind, self), out);
   if (!unary_gpu(kUnary[I].code, kUnary[I].kind, self, out)) {
     on_cpu(kUnary[I].name, "out", self, out);
@@ -211,6 +217,8 @@ at::Tensor& relu_(at::Tensor& self) {
 }
 
 at::Tensor& conj_physical_out(const at::Tensor& self, at::Tensor& out) {
+  check_out_device(self, out);
+  check_out_cast(self.scalar_type(), out);
   resize_elementwise_output(out, self.sizes(), &self);
   const char* label = dtype_label(self.scalar_type());
   if (!at::isComplexType(self.scalar_type())) {
@@ -311,6 +319,7 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
   if (!is_vk(out)) {
     return false;
   }
+  check_overlap(out, {&self, other});
   {
     std::vector<int64_t> shape =
         other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec();
@@ -459,7 +468,8 @@ at::Tensor& binary_out(const at::Tensor& self, const at::Tensor& other, at::Tens
 }
 
 at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
-  TORCH_CHECK(!self.is_complex() && !values.is_complex(), "heaviside is not yet implemented for complex tensors.");
+  TORCH_CHECK(!self.is_complex() && !values.is_complex() && !out.is_complex(),
+              "heaviside is not yet implemented for complex tensors.");
   TORCH_CHECK(self.scalar_type() == values.scalar_type(),
               "heaviside is not yet implemented for tensors with different dtypes.");
   return binary_out<21>(self, values, out);
@@ -505,6 +515,7 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
   if (!is_vk(self) || !is_vk(out)) {
     return false;
   }
+  check_overlap(out, {&self, other});
   {
     std::vector<int64_t> shape =
         other != nullptr ? at::infer_size(self.sizes(), other->sizes()) : self.sizes().vec();

@@ -194,6 +194,46 @@ at::Tensor& baddbmm_out(const at::Tensor& self, const at::Tensor& batch1, const 
   return out;
 }
 
+// beta self + alpha outer(vec1, vec2), with the CPU kernel's checks (the
+// composite kernel "vk" would use otherwise has none).
+at::Tensor& addr_out(const at::Tensor& self, const at::Tensor& vec1, const at::Tensor& vec2, const at::Scalar& beta,
+                     const at::Scalar& alpha, at::Tensor& out) {
+  TORCH_CHECK(vec1.dim() == 1, "addr: Expected 1-D argument vec1, but got ", vec1.dim(), "-D");
+  TORCH_CHECK(vec2.dim() == 1, "addr: Expected 1-D argument vec2, but got ", vec2.dim(), "-D");
+  check_out_device(vec1, out);
+  bool logical = out.scalar_type() == at::kBool;
+  TORCH_CHECK(logical || !beta.isBoolean(), "Boolean beta only supported for Boolean results.");
+  TORCH_CHECK(logical || !alpha.isBoolean(), "Boolean alpha only supported for Boolean results.");
+  if (!logical) {
+    TORCH_CHECK(at::isFloatingType(out.scalar_type()) || at::isComplexType(out.scalar_type()) ||
+                    (!beta.isFloatingPoint() && !alpha.isFloatingPoint()),
+                "For integral input tensors, argument beta must not be a floating point number.");
+  }
+  at::Tensor outer = at::outer(vec1, vec2);
+  std::vector<int64_t> shape = {vec1.size(0), vec2.size(0)};
+  at::Tensor base = self.expand(shape);
+  at::Tensor r;
+  if (logical) {
+    at::Tensor kept = beta.toBool() ? base.to(at::kBool) : at::zeros(shape, out.options());
+    r = at::logical_or(kept, alpha.toBool() ? outer.to(at::kBool) : at::zeros(shape, out.options()));
+  } else {
+    r = alpha.equal(1) ? outer : outer * alpha;
+    if (!beta.equal(0)) {
+      r = at::add(r, base, beta);  // (beta = 0 ignores self, NaNs included, as the CPU)
+    }
+  }
+  check_out_cast(r.scalar_type(), out);
+  at::native::resize_output(out, shape);
+  out.copy_(r);
+  return out;
+}
+
+at::Tensor addr(const at::Tensor& self, const at::Tensor& vec1, const at::Tensor& vec2, const at::Scalar& beta,
+                const at::Scalar& alpha) {
+  at::Tensor out = at::empty({0}, vec1.options().dtype(at::promote_types(self.scalar_type(), at::result_type(vec1, vec2))));
+  return addr_out(self, vec1, vec2, beta, alpha, out);
+}
+
 at::Tensor& addmv_out(const at::Tensor& self, const at::Tensor& mat, const at::Tensor& vec, const at::Scalar& beta,
                       const at::Scalar& alpha, at::Tensor& out) {
   int64_t m = mat.size(0);
@@ -251,6 +291,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("addmm.out", &addmm_out);
   m.impl("baddbmm.out", &baddbmm_out);
   m.impl("addmv.out", &addmv_out);
+  m.impl("addr", &vk::addr);
+  m.impl("addr.out", &addr_out);
   m.impl("addbmm.out", &addbmm_out);
   m.impl("addbmm", &vk::addbmm);
   m.impl("dot", &dot);

@@ -12,6 +12,7 @@
 #include "opcodes.h"
 #include "vk.h"
 
+#include <ATen/native/DistributionTemplates.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
@@ -178,7 +179,16 @@ at::Tensor& uniform_(at::Tensor& self, double from, double to, std::optional<at:
     on_cpu("aten::uniform_", "", self, from, to, gen);
     return self;
   }
+  // (the CPU's checks: bounds of the dtype, and to - from representable)
+  double max = self.scalar_type() == at::kHalf       ? 65504.0
+               : self.scalar_type() == at::kBFloat16 ? 3.3895313892515355e38
+               : self.scalar_type() == at::kFloat    ? double(std::numeric_limits<float>::max())
+                                                     : std::numeric_limits<double>::max();
+  TORCH_CHECK(from >= -max && from <= max, "from is out of bounds for ", self.dtype());
+  TORCH_CHECK(to >= -max && to <= max, "to is out of bounds for ", self.dtype());
   TORCH_CHECK(from <= to, "uniform_ expects to return a [from, to) range, but found from=", from, " > to=", to);
+  TORCH_CHECK(to - from <= max, "uniform_ expects to-from <= std::numeric_limits<", toString(self.scalar_type()),
+              ">::max(), but found to=", to, " and from=", from, " which result in to-from to exceed the limit");
   return float_fill(self, op::RNG_UNIFORM, from, to, gen);
 }
 
@@ -278,9 +288,11 @@ at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> t
   int64_t hi = to.has_value() ? *to : random_max(self.scalar_type());
   if (to.has_value()) {
     TORCH_CHECK(from < hi, "random_ expects 'from' to be less than 'to', but got from=", from, " >= to=", hi);
+    at::native::templates::check_from_to_in_range(from, hi - 1, self.dtype());
     return random_range(self, from, static_cast<uint64_t>(hi) - static_cast<uint64_t>(from), gen);
   }
   TORCH_CHECK(from <= hi, "random_ expects 'from' casted to dtype to be less than or equal to 'to'");
+  at::native::templates::check_from_to_in_range(from, hi, self.dtype());
   // Inclusive of the maximum: [from, hi]; the full int64 range wraps to 0 (= 2^64).
   return random_range(self, from, static_cast<uint64_t>(hi) - static_cast<uint64_t>(from) + 1, gen);
 }
@@ -291,6 +303,7 @@ at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator>
     return self;
   }
   TORCH_CHECK(to > 0, "random_ expects 'from' to be less than 'to', but got from=0 >= to=", to);
+  at::native::templates::check_from_to_in_range(0, to - 1, self.dtype());
   return random_range(self, 0, static_cast<uint64_t>(to), gen);
 }
 
@@ -306,6 +319,7 @@ at::Tensor& random_full(at::Tensor& self, std::optional<at::Generator> gen) {
 
 // u < p in the float precision of `p`, cast into self.
 at::Tensor& bernoulli_tensor_(at::Tensor& self, const at::Tensor& p, std::optional<at::Generator> gen) {
+  at::assert_no_internal_overlap(self);  // (as the CPU)
   if (!random_ok(self) || !is_vk(p) || !at::isFloatingType(p.scalar_type())) {
     on_cpu("aten::bernoulli_", "Tensor", self, p, gen);
     return self;
@@ -318,6 +332,7 @@ at::Tensor& bernoulli_tensor_(at::Tensor& self, const at::Tensor& p, std::option
 }
 
 at::Tensor& bernoulli_float_(at::Tensor& self, double p, std::optional<at::Generator> gen) {
+  at::assert_no_internal_overlap(self);
   if (!random_ok(self)) {
     on_cpu("aten::bernoulli_", "float", self, p, gen);
     return self;
@@ -346,7 +361,13 @@ at::Tensor& bernoulli_out(const at::Tensor& self, std::optional<at::Generator> g
 
 // ---------------------------------------------------------------- normal with tensor parameters
 
+void check_std(const at::Tensor& std) {
+  TORCH_CHECK(!std.is_complex(), "normal expects standard deviation to be non-complex");
+  TORCH_CHECK(std.numel() == 0 || at::ge(std, 0).all().item<bool>(), "normal expects all elements of std >= 0.0");
+}
+
 at::Tensor normal_tt(const at::Tensor& mean, const at::Tensor& std, std::optional<at::Generator> gen) {
+  check_std(std);
   std::vector<int64_t> shape = at::infer_size(mean.sizes(), std.sizes());
   at::Tensor z = at::empty(shape, mean.options().dtype(at::result_type(mean, std)));
   normal_(z, 0, 1, gen);
@@ -361,6 +382,7 @@ at::Tensor normal_tf(const at::Tensor& mean, double std, std::optional<at::Gener
 }
 
 at::Tensor normal_ft(double mean, const at::Tensor& std, std::optional<at::Generator> gen) {
+  check_std(std);
   at::Tensor z = at::empty(std.sizes(), std.options());
   normal_(z, 0, 1, gen);
   return z * std + mean;
@@ -394,6 +416,8 @@ at::Tensor& multinomial_out(const at::Tensor& self, int64_t n, bool replacement,
   TORCH_CHECK(self.dim() == 1 || self.dim() == 2, "prob_dist must be 1 or 2 dim");
   TORCH_CHECK(at::isFloatingType(self.scalar_type()), "multinomial only supports floating-point dtypes for input");
   TORCH_CHECK(n > 0, "cannot sample n_sample <= 0 samples");
+  TORCH_CHECK(out.scalar_type() == at::kLong, "multinomial expects Long tensor out, got: ", out.scalar_type());
+  TORCH_CHECK(self.size(-1) <= (int64_t(1) << 24), "number of categories cannot exceed 2^24");
   int64_t ncat = self.size(-1);
   TORCH_CHECK(replacement || n <= ncat, "cannot sample n_sample > prob_dist.size(-1) samples without replacement");
   if (!is_vk(self) || !is_vk(out)) {
@@ -441,6 +465,16 @@ at::Tensor multinomial(const at::Tensor& self, int64_t n, bool replacement, std:
 // vanishingly rare and broken by position).
 at::Tensor& randperm_out(int64_t n, std::optional<at::Generator> gen, at::Tensor& out) {
   TORCH_CHECK(n >= 0, "n must be non-negative, got", n);
+  // (as the CPU: every value must be representable in out's dtype)
+  at::ScalarType t = out.scalar_type();
+  if (at::isIntegralType(t, /*includeBool=*/true)) {
+    int64_t top = t == at::kByte ? 255 : t == at::kChar ? 127 : t == at::kShort ? 32767 : t == at::kInt ? 2147483647
+                : t == at::kBool ? 1 : std::numeric_limits<int64_t>::max();
+    TORCH_CHECK(n <= 1 || n - 1 <= top, "n is too large for result tensor type: '", out.toString(), "'");
+  }
+  TORCH_CHECK(t != at::kHalf || n <= (int64_t(1) << 11) + 1, "n cannot be greater than 2049 for Half type.");
+  TORCH_CHECK(t != at::kFloat || n <= (int64_t(1) << 24) + 1, "n cannot be greater than 2^24+1 for Float type.");
+  TORCH_CHECK(t != at::kDouble || n <= (int64_t(1) << 53) + 1, "n cannot be greater than 2^53+1 for Double type.");
   if (!is_vk(out) || storage_label(out.scalar_type()) == nullptr || at::isComplexType(out.scalar_type())) {
     on_cpu("aten::randperm", "generator_out", n, gen, out);
     return out;

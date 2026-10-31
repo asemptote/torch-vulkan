@@ -266,6 +266,7 @@ bool reducible(const at::Tensor& self, bool allow_bool = true) {
 }
 
 void store(const at::Tensor& out, const at::Tensor& flat, const std::vector<int64_t>& shape) {
+  check_out_device(flat, out);
   if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
     check_out_cast(flat.scalar_type(), out);
   }
@@ -459,6 +460,9 @@ at::Tensor full_max_min(const at::Tensor& self) {
 template <ROp Op>
 at::Tensor& full_max_min_out(const at::Tensor& self, at::Tensor& out) {
   at::Tensor r = full_max_min<Op>(self);
+  check_out_device(r, out);
+  TORCH_CHECK(out.scalar_type() == r.scalar_type(), "Expected out tensor to have dtype ", r.scalar_type(), ", but got ",
+              out.scalar_type(), " instead");
   at::native::resize_output(out, {});
   out.copy_(r);
   return out;
@@ -471,6 +475,10 @@ bool arg_reducible(const at::Tensor& self) {
 template <uint32_t Op>  // 0 max, 1 min
 std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int64_t dim, bool keepdim,
                                                      at::Tensor& values, at::Tensor& indices) {
+  TORCH_CHECK(values.scalar_type() == self.scalar_type(), "Expected out tensor to have dtype ", self.scalar_type(),
+              ", but got ", values.scalar_type(), " instead");
+  TORCH_CHECK(indices.scalar_type() == at::kLong, "Expected out tensor to have dtype long int, but got ",
+              indices.scalar_type(), " instead");
   Plan plan;
   int64_t dims[] = {dim};
   if (self.dim() == 0 && is_vk(self) && is_vk(values) && is_vk(indices)) {

@@ -297,6 +297,7 @@ void check_errors(const at::Tensor& info, const char* api, bool is_matrix) {
 
 template <typename T>
 void assign(at::Tensor& out, const T& value) {
+  check_out_device(value, out);
   if (out.scalar_type() != at::kBool) {  // logical results (any, all, ...) accumulate in other dtypes
     check_out_cast(value.scalar_type(), out);
   }
@@ -1093,6 +1094,7 @@ at::ScalarType complex_of(at::ScalarType t) {
 // form T = Z^H A Z, eigenvectors of T by back substitution, times Z. Each
 // vector has unit norm and its largest component real, as LAPACK's geev.
 std::tuple<at::Tensor, at::Tensor> general_eig(const at::Tensor& a, bool want_vectors) {
+  TORCH_CHECK(at::isfinite(a).all().item<bool>(), "torch.linalg.eig: input tensor should not contain infs or NaNs.");
   at::ScalarType ct = complex_of(a.scalar_type());
   at::Tensor h = flat3(a).to(ct).clone(at::MemoryFormat::Contiguous);
   int64_t B = h.size(0), n = h.size(1);
