@@ -251,17 +251,21 @@ mod tests {
         assert_eq!(declared_capabilities(&module()), vec![1, 4464]);
     }
 
-    /// Element-wise kernels other than float64/complex128 ones must run on
-    /// GPUs without shaderFloat64.
+    /// Kernels without a float64/complex128 type must run on GPUs without
+    /// shaderFloat64 (scalar parameters travel as raw 64-bit slots).
     #[test]
-    fn elementwise_kernels_need_float64_only_for_double_types() {
-        let families = ["unary_", "binary_", "compare_", "move_", "where_", "ternary_", "cbinary_", "cunary_", "cabs_", "iota_"];
+    fn kernels_need_float64_only_for_double_types() {
+        let mut offenders = Vec::new();
         for (name, spirv) in SPIRV {
-            if !families.iter().any(|f| name.starts_with(f)) || name.ends_with("_f64") || name.ends_with("_c128") {
+            // (square_plus_third: a test kernel of float64 arithmetic)
+            if name.split('_').any(|part| part == "f64" || part == "c128") || *name == "square_plus_third" {
                 continue;
             }
             let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv)).unwrap();
-            assert!(!declared_capabilities(&words).contains(&CAP_FLOAT64), "{name} declares Float64");
+            if declared_capabilities(&words).contains(&CAP_FLOAT64) {
+                offenders.push(*name);
+            }
         }
+        assert!(offenders.is_empty(), "declare Float64: {offenders:?}");
     }
 }

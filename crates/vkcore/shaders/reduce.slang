@@ -28,7 +28,7 @@ struct Params
     A* mean;        // 16  per-output mean (OP_SQDEV)
     uint ond;       // 24  number of outer (kept) dims, <= 4, innermost first
     uint rnd;       // 28  number of reduced dims, <= 4, innermost first
-    double alpha;   // 32  scale for FINAL (1/N for mean, 1/(N-ddof) for var)
+    uint64_t alpha; // 32  scale for FINAL (1/N for mean, 1/(N-ddof) for var), a raw slot: see param
     uint n_out;     // 40
     uint n_red;     // 44  elements reduced per output
     uint chunk;     // 48  elements per workgroup chunk
@@ -42,6 +42,20 @@ struct Params
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
+
+// A raw 64-bit parameter slot as A (packed by the host per T: double bits for
+// float64, float bits in the low word for float32, an int64 otherwise), so
+// that only float64 kernels touch a double.
+A param(uint64_t bits)
+{
+#if defined(T_f64)
+    return bit_cast<double>(bits);
+#elif defined(T_f32)
+    return bit_cast<float>(uint(bits));
+#else
+    return A(int64_t(bits));
+#endif
+}
 
 [vk::constant_id(0)] const int OP = 0;
 [vk::constant_id(1)] const int LEVEL0 = 1;
@@ -154,8 +168,8 @@ int offset(uint index, uint nd, uint4 sz, int4 st)
 A finish(A r)
 {
 #ifdef A_FLOAT
-    if (FINAL == FINAL_SCALE) return r * A(p.alpha);
-    if (FINAL == FINAL_SQRT_SCALE) return sqrt(r * A(p.alpha));
+    if (FINAL == FINAL_SCALE) return r * A(param(p.alpha));
+    if (FINAL == FINAL_SQRT_SCALE) return sqrt(r * A(param(p.alpha)));
 #endif
     return r;
 }

@@ -37,7 +37,7 @@ enum Final : uint32_t { kNone = op::FINAL_NONE, kScale = op::FINAL_SCALE, kSqrtS
 struct ReduceParams {
   uint64_t in, out, mean;
   uint32_t ond, rnd;
-  double alpha;
+  uint64_t alpha;  // a pack_param slot
   uint32_t n_out, n_red, chunk, nchunks, ngroups, pad;
   uint32_t osz[4];
   int32_t ost[4];
@@ -207,7 +207,7 @@ at::Tensor run_reduce(const at::Tensor& self, const Plan& plan, ROp op, Final fi
     p.in = gpu_address(in);
     p.out = gpu_address_out(dst);
     p.mean = (mean != nullptr && level0) ? gpu_address(*mean) : 0;
-    p.alpha = alpha;
+    p.alpha = pack_param(alpha, in.scalar_type());
     p.n_out = static_cast<uint32_t>(plan.n_out);
     p.n_red = static_cast<uint32_t>(n_red);
     p.chunk = static_cast<uint32_t>(chunk);

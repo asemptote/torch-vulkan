@@ -24,8 +24,8 @@ struct Params
     T* b;            // 8
     T* c;            // 16
     T* cin;          // 24
-    double alpha;    // 32
-    double beta;     // 40
+    uint64_t alpha;  // 32  (raw slots: see param)
+    uint64_t beta;   // 40
     uint m;          // 48
     uint n;          // 52
     uint k;          // 56
@@ -37,6 +37,20 @@ struct Params
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
+
+// A raw 64-bit parameter slot as T (packed by the host per T, as in
+// _strided.slang: double bits for float64, float bits in the low word for
+// float32, an int64 otherwise), so that only float64 kernels touch a double.
+T param(uint64_t bits)
+{
+#if defined(T_f64)
+    return bit_cast<double>(bits);
+#elif defined(T_f32)
+    return bit_cast<float>(uint(bits));
+#else
+    return T(int64_t(bits));
+#endif
+}
 
 [vk::constant_id(0)] const int USE_CIN = 0;
 
@@ -93,7 +107,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    T alpha = T(p.alpha), beta = T(p.beta);
+    T alpha = param(p.alpha), beta = param(p.beta);
     for (uint i = 0; i < RM; i++)
     {
         uint gm = row0 + ty + 16 * i;

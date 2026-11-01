@@ -29,9 +29,8 @@ static_assert(sizeof(StridedLayout<3>) == 128 && offsetof(StridedLayout<3>, size
 static_assert(sizeof(StridedLayout<4>) == 128 && offsetof(StridedLayout<4>, size) == 64,
               "must match shaders/_strided4.slang");
 
-// A parameter slot for a kernel whose element type T is `t`: an int64 for
-// integer and bool kernels, double bits for float64/complex128, float bits
-// (in the low word) otherwise.
+}  // namespace
+
 uint64_t pack_param(const c10::Scalar& s, at::ScalarType t) {
   if (at::isIntegralType(t, /*includeBool=*/true)) {
     return static_cast<uint64_t>(s.toLong());
@@ -47,6 +46,8 @@ uint64_t pack_param(const c10::Scalar& s, at::ScalarType t) {
   std::memcpy(&bits, &v, sizeof(bits));
   return bits;
 }
+
+namespace {
 
 template <size_t K>
 void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::array<const at::Tensor*, K>& ops,

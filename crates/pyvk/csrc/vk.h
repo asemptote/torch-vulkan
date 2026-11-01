@@ -146,6 +146,12 @@ at::Generator new_generator();
 // ascending (descending: largest first), ties in original order. sorting.cpp.
 at::Tensor sort_rows(const at::Tensor& x, bool descending);
 
+// A parameter slot for a kernel whose element type T is `t`: an int64 for
+// integer and bool kernels, double bits for float64/complex128, float bits
+// (in the low word) otherwise, so that only float64 kernels need a double
+// (GPUs without shaderFloat64 run the rest). launch.cpp.
+uint64_t pack_param(const c10::Scalar& s, at::ScalarType t);
+
 // launch_strided with the parameter slots given as raw bits (e.g. a fill
 // value's bytes).
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,

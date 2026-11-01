@@ -18,7 +18,7 @@ namespace {
 
 struct GemmParams {
   uint64_t a, b, c, cin;
-  double alpha, beta;
+  uint64_t alpha, beta;  // pack_param slots
   uint32_t m, n, k, pad;
   int32_t a_sm, a_sk, a_sb;
   int32_t b_sk, b_sn, b_sb;
@@ -78,8 +78,8 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   p.b = gpu_address(b);
   p.c = gpu_address_out(c);
   p.cin = use_cin ? gpu_address(*cin) : 0;
-  p.alpha = alpha;
-  p.beta = beta;
+  p.alpha = pack_param(alpha, c.scalar_type());
+  p.beta = pack_param(beta, c.scalar_type());
   p.m = static_cast<uint32_t>(m);
   p.n = static_cast<uint32_t>(n);
   p.k = static_cast<uint32_t>(k);
