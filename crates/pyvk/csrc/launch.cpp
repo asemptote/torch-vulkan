@@ -86,6 +86,15 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
   });
 }
 
+struct Copy8Layout {
+  uint64_t out, a;
+  uint32_t n, ndim, stride, pad;
+  uint32_t size[8];
+  int32_t so[8], sa[8];
+};
+static_assert(sizeof(Copy8Layout) == 128 && offsetof(Copy8Layout, size) == 32 && offsetof(Copy8Layout, sa) == 96,
+              "must match shaders/copy8.slang");
+
 std::vector<uint64_t> pack_params(c10::ArrayRef<c10::Scalar> params, at::ScalarType t) {
   std::vector<uint64_t> bits;
   for (const c10::Scalar& s : params) {
@@ -99,6 +108,42 @@ std::vector<uint64_t> pack_params(c10::ArrayRef<c10::Scalar> params, at::ScalarT
 void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
                     const at::Tensor* b, c10::ArrayRef<c10::Scalar> params) {
   launch<3>(kernel, spec, {&out, a, b}, pack_params(params, (a ? *a : out).scalar_type()));
+}
+
+bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* size_label) {
+  StridedDims<2> dims = plan_operands<2>(dst, {&dst, &src});
+  if (dims.ndim() <= 4 || dims.ndim() > 8 || dst.numel() == 0) {
+    return false;
+  }
+  int64_t count = 1;
+  std::array<int64_t, 2> span{};
+  for (size_t d = 0; d < dims.ndim(); ++d) {
+    count *= dims.size[d];
+    for (size_t k = 0; k < 2; ++k) {
+      if (dims.stride[d][k] < 0) {
+        return false;
+      }
+      span[k] += (dims.size[d] - 1) * dims.stride[d][k];
+    }
+  }
+  if (count >= (int64_t(1) << 32) || span[0] >= (int64_t(1) << 31) || span[1] >= (int64_t(1) << 31)) {
+    return false;
+  }
+  Copy8Layout p{};
+  p.out = gpu_address_out(dst);
+  p.a = gpu_address(src);
+  p.n = static_cast<uint32_t>(count);
+  p.ndim = static_cast<uint32_t>(dims.ndim());
+  for (size_t d = 0; d < 8; ++d) {
+    bool used = d < dims.ndim();
+    p.size[d] = used ? static_cast<uint32_t>(dims.size[d]) : 1;
+    p.so[d] = used ? static_cast<int32_t>(dims.stride[d][0]) : 0;
+    p.sa[d] = used ? static_cast<int32_t>(dims.stride[d][1]) : 0;
+  }
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
+  dispatch(std::string("copy8_") + size_label, {}, p, groups);
+  return true;
 }
 
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,

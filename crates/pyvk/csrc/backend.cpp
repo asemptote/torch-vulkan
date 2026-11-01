@@ -360,7 +360,9 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
   if (src.scalar_type() == dst.scalar_type()) {
     std::string kernel = move_kernel(src.itemsize());
     if (!kernel.empty()) {
-      launch_strided(kernel.c_str(), {op::MOVE_COPY}, dst, &src, nullptr);
+      if (!copy_many_dims(dst, src, kernel.c_str() + kernel.find('_') + 1)) {
+        launch_strided(kernel.c_str(), {op::MOVE_COPY}, dst, &src, nullptr);
+      }
       return;
     }
   }

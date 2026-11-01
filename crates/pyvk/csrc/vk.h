@@ -152,6 +152,12 @@ at::Tensor sort_rows(const at::Tensor& x, bool descending);
 // (GPUs without shaderFloat64 run the rest). launch.cpp.
 uint64_t pack_param(const c10::Scalar& s, at::ScalarType t);
 
+// dst = src (same element size, src broadcast to dst's shape) in one
+// dispatch of shaders/copy8.slang when the copy needs 5 to 8 dims after
+// merging (the strided kernels take 4 and loop over the rest, one dispatch
+// each); false otherwise. size_label: b1, b2, b4, b8 or b16. launch.cpp.
+bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* size_label);
+
 // launch_strided with the parameter slots given as raw bits (e.g. a fill
 // value's bytes).
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
