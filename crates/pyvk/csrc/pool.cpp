@@ -1,6 +1,6 @@
-// Pooling kernels (shaders/pool.slang) as custom ops torch_vulkan::
-// max_pool_forward / max_pool_backward / avg_pool_forward / avg_pool_backward.
-// The aten kernels are
+// Pooling and resampling kernels (shaders/pool.slang, resample.slang) as
+// custom ops torch_vulkan::max_pool_forward / max_pool_backward /
+// avg_pool_forward / avg_pool_backward / upsample_linear. The aten kernels are
 // Python (torch_vulkan/_kernels.py): they run the CPU's argument checks,
 // compute the output size and lay the planes out, then call these.
 
@@ -146,6 +146,49 @@ at::Tensor avg_pool_backward(const at::Tensor& grad_output, at::IntArrayRef inpu
   return gin;
 }
 
+struct ResampleParams {
+  uint64_t in, out;
+  uint32_t total, ngroups, align, ndim;
+  uint32_t isz[4], osz[4];
+  uint64_t scale[3];
+  uint64_t pad[2];
+};
+static_assert(sizeof(ResampleParams) == 104 && offsetof(ResampleParams, scale) == 64,
+              "must match shaders/resample.slang");
+
+// x [planes, D, H, W] -> [planes, *output_size], linear interpolation per
+// dim with the given scales (computed by the caller in x's dtype, as the CPU
+// does); ndim: the real spatial dims (the last ndim of the three).
+at::Tensor upsample_linear(const at::Tensor& x, at::IntArrayRef output_size, bool align_corners,
+                           at::ArrayRef<double> scales, int64_t ndim) {
+  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble) &&
+                  output_size.size() == 3 && scales.size() == 3 && ndim >= 1 && ndim <= 3,
+              "upsample_linear: expected a float32/float64 [planes, D, H, W] tensor and 3 sizes and scales");
+  at::Tensor in = x.contiguous();
+  at::Tensor out = at::empty({x.size(0), output_size[0], output_size[1], output_size[2]}, x.options());
+  if (out.numel() == 0 || in.numel() == 0) {
+    return out;
+  }
+  int64_t total = out.numel();
+  TORCH_CHECK(total < (int64_t(1) << 32) && in.numel() < (int64_t(1) << 32),
+              "upsample_linear: more elements than 32-bit offsets address");
+  ResampleParams p{};
+  p.in = gpu_address(in);
+  p.out = gpu_address_out(out);
+  p.total = static_cast<uint32_t>(total);
+  int64_t groups = std::min<int64_t>((total + kGroup - 1) / kGroup, kMaxGroups);
+  p.ngroups = static_cast<uint32_t>(groups);
+  p.align = align_corners ? 1u : 0u;
+  p.ndim = static_cast<uint32_t>(ndim);
+  for (int d = 0; d < 3; ++d) {
+    p.isz[d] = static_cast<uint32_t>(in.size(1 + d));
+    p.osz[d] = static_cast<uint32_t>(output_size[d]);
+    p.scale[d] = pack_param(scales[d], x.scalar_type());
+  }
+  dispatch(std::string("resample_") + dtype_label(x.scalar_type()), {}, p, static_cast<uint32_t>(groups));
+  return out;
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -158,6 +201,7 @@ TORCH_LIBRARY(torch_vulkan, m) {
         "int divisor_override, bool count_include_pad, bool truncate) -> Tensor");
   m.def("avg_pool_backward(Tensor grad_output, int[] input_size, int[] kernel_size, int[] stride, int[] padding, "
         "int divisor_override, bool count_include_pad) -> Tensor");
+  m.def("upsample_linear(Tensor x, int[] output_size, bool align_corners, float[] scales, int ndim) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
@@ -165,4 +209,5 @@ TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
   m.impl("max_pool_backward", &vk::max_pool_backward);
   m.impl("avg_pool_forward", &vk::avg_pool_forward);
   m.impl("avg_pool_backward", &vk::avg_pool_backward);
+  m.impl("upsample_linear", &vk::upsample_linear);
 }

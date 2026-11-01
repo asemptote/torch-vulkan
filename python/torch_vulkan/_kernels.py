@@ -56,10 +56,77 @@ def _upsample_matrices(name, input_size, output_size, align_corners, scales, lik
             eye = torch.eye(n_in, device=like.device, dtype=like.dtype).view(1, n_in, n_in, 1)
             m = fn(eye, [n_out, 1], align_corners, scale, None)[0, :, :, 0].transpose(0, 1)
         else:  # linear1d, bilinear2d, trilinear3d: separable linear
-            fn = decomposition_table[aten.upsample_linear1d.default]
-            m = _interp_matrix(lambda x, o, ac, s: fn(x, [o], ac, s), n_in, n_out, like, align_corners, scale)
+            m = _linear_matrix(n_in, n_out, align_corners, scale, like)
         mats.append(m)
     return mats
+
+
+def _linear_scale(n_in, n_out, align_corners, scale, dtype):
+    """The CPU's area_pixel_compute_scale in opmath (float32 for float32 and
+    16-bit floats, float64 for float64), as a Python float."""
+    opmath = torch.float64 if dtype == torch.float64 else torch.float32
+    if align_corners:
+        if n_out <= 1:
+            return 0.0
+        return (torch.tensor(n_in - 1, dtype=opmath) / torch.tensor(n_out - 1, dtype=opmath)).item()
+    if scale is not None and scale > 0:
+        return torch.tensor(1.0 / scale, dtype=opmath).item()
+    return (torch.tensor(n_in, dtype=opmath) / torch.tensor(n_out, dtype=opmath)).item()
+
+
+def _linear_matrix(n_in, n_out, align_corners, scale, like):
+    """The out x in matrix of 1-D linear interpolation, built on the host with
+    the weights shaders/resample.slang uses (as the CPU), then moved to like's
+    device and dtype."""
+    opmath = torch.float64 if like.dtype == torch.float64 else torch.float32
+    sc = torch.tensor(_linear_scale(n_in, n_out, align_corners, scale, like.dtype), dtype=opmath)
+    o = torch.arange(n_out, dtype=opmath)
+    if align_corners:
+        src = sc * o if n_out > 1 else torch.zeros(n_out, dtype=opmath)
+    else:
+        src = (sc * (o + 0.5) - 0.5).clamp_min(0)
+    i0 = src.floor().clamp(max=n_in - 1).long()
+    i1 = i0 + (i0 < n_in - 1).long()
+    w1 = (src - i0).clamp(0, 1)
+    rows = torch.arange(n_out)
+    m = torch.zeros(n_out, n_in, dtype=opmath)
+    m.index_put_((rows, i0), 1 - w1, accumulate=True)
+    m.index_put_((rows, i1), w1, accumulate=True)
+    return m.to(device=like.device, dtype=like.dtype)
+
+
+def _make_upsample_linear(k):
+    """upsample_linear1d / bilinear2d / trilinear3d: one thread per output
+    (shaders/resample.slang). The op first runs on a meta tensor: PyTorch's
+    checks, with the CPU's messages, and the output size."""
+    op = [aten.upsample_linear1d, aten.upsample_bilinear2d, aten.upsample_trilinear3d][k - 1].default
+
+    def forward(x, output_size, align_corners, *scales):
+        # (the CPU's upsample checks, which the meta kernel lacks)
+        if len(output_size) != k:
+            raise RuntimeError(f"It is expected output_size equals to {k}, but got size {len(output_size)}")
+        if x.dim() != k + 2:
+            raise RuntimeError(f"It is expected input_size equals to {k + 2}, but got size {x.dim()}")
+        names = ["D", "H", "W"][3 - k:]
+        if min(x.shape[-k:]) <= 0 or min(output_size) <= 0:
+            def dims(v):
+                return ", ".join(f"{n}: {s}" for n, s in zip(names, v))
+            raise RuntimeError(f"Input and output sizes should be greater than 0, but got input ({dims(x.shape[-k:])}) "
+                               f"output ({dims(output_size)})")
+        if x.numel() == 0 and math.prod(x.shape[1:]) == 0:
+            raise RuntimeError(f"Non-empty {k + 2}D data tensor expected but got a tensor with sizes {list(x.shape)}")
+        out_shape = op(torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device="meta"), output_size,
+                       align_corners, *scales).shape
+        if not x.is_floating_point():
+            return _on_cpu(op._schema.name.split("::")[1], x, output_size, align_corners, *scales)
+        spatial, out = list(x.shape[-k:]), list(out_shape[-k:])
+        sc = [_linear_scale(spatial[d], out[d], align_corners, scales[d] if d < len(scales) else None, x.dtype)
+              for d in range(k)]
+        planes = x.reshape(math.prod(x.shape[:-k]), *_as_3d(spatial, 1)).to(_pool_dtype(x.dtype))
+        y = torch.ops.torch_vulkan.upsample_linear(planes, _as_3d(out, 1), align_corners, _as_3d(sc, 0.0), k)
+        return y.reshape(out_shape).to(x.dtype).contiguous(memory_format=_pool_memory_format(x, k))
+
+    return forward
 
 
 def _make_upsample_backward(name, has_align):
@@ -1280,6 +1347,9 @@ def _kernels():
         "_upsample_nearest_exact1d_backward": _make_upsample_backward("nearest_exact1d", False),
         "_upsample_nearest_exact2d_backward": _make_upsample_backward("nearest_exact2d", False),
         "_upsample_nearest_exact3d_backward": _make_upsample_backward("nearest_exact3d", False),
+        "upsample_linear1d": _make_upsample_linear(1),
+        "upsample_bilinear2d": _make_upsample_linear(2),
+        "upsample_trilinear3d": _make_upsample_linear(3),
         "upsample_linear1d_backward": _make_upsample_backward("linear1d", True),
         "upsample_bilinear2d_backward": _make_upsample_backward("bilinear2d", True),
         "upsample_trilinear3d_backward": _make_upsample_backward("trilinear3d", True),
