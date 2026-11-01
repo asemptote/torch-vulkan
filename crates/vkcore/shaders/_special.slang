@@ -276,7 +276,7 @@ FT calc_ndtri(FT y0) {
     return (x * s2pi);
   }
 
-  FT x = m_sqrt(FT(-LIT(2.0)) * m_log(y));
+  FT x = sqrt(FT(-LIT(2.0)) * m_log(y));
   const FT x0 = x - m_log(x) / x;
 
   const FT z = one / x;
@@ -506,7 +506,7 @@ static FT _igam_helper_fac(FT a, FT x) {
   }
 
   fac = a + lanczos_g - LIT(0.5);
-  res = m_sqrt(fac / EXP1) / lanczos_sum_expg_scaled(a);
+  res = sqrt(fac / EXP1) / lanczos_sum_expg_scaled(a);
 
   if ((a < 200) && (x < 200)) {
     res *= m_exp(a - x) * m_pow(x / fac, a);
@@ -824,15 +824,15 @@ static FT _igam_helper_asymptotic_series(FT a, FT x, bool igam) {
   }
 
   if (lambda > 1) {
-    eta = m_sqrt(-2 * (m_log1p(sigma) - sigma));
+    eta = sqrt(-2 * (m_log1p(sigma) - sigma));
   }
   else if (lambda < 1) {
-    eta = -m_sqrt(-2 * (m_log1p(sigma) - sigma));
+    eta = -sqrt(-2 * (m_log1p(sigma) - sigma));
   }
   else {
     eta = 0;
   }
-  res = LIT(0.5) * m_erfc(sgn * eta * m_sqrt(a / 2));
+  res = LIT(0.5) * m_erfc(sgn * eta * sqrt(a / 2));
 
   for (k = 0; k < 25; k++) {
     ck = d[k][0];
@@ -859,7 +859,7 @@ static FT _igam_helper_asymptotic_series(FT a, FT x, bool igam) {
     absoldterm = absterm;
     afac /= a;
   }
-  res += sgn * m_exp(-LIT(0.5) * a * eta * eta) * sum / m_sqrt(2 * K_PI * a);
+  res += sgn * m_exp(-LIT(0.5) * a * eta * eta) * sum / sqrt(2 * K_PI * a);
 
   return res;
 }
@@ -964,7 +964,7 @@ FT calc_igammac(FT a, FT x) {
   if ((a > SMALL) && (a < LARGE) && (absxma_a < SMALLRATIO)) {
      return _igam_helper_asymptotic_series(a, x, 0);
   }
-  else if ((a > LARGE) && (absxma_a < LARGERATIO / m_sqrt(a))) {
+  else if ((a > LARGE) && (absxma_a < LARGERATIO / sqrt(a))) {
      return _igam_helper_asymptotic_series(a, x, 0);
   }
 
@@ -1035,7 +1035,7 @@ FT calc_igamma(FT a, FT x) {
   if ((a > SMALL) && (a < LARGE) && (absxma_a < SMALLRATIO)) {
     return _igam_helper_asymptotic_series(a, x, 1);
   }
-  else if ((a > LARGE) && (absxma_a < LARGERATIO / m_sqrt(a))) {
+  else if ((a > LARGE) && (absxma_a < LARGERATIO / sqrt(a))) {
     return _igam_helper_asymptotic_series(a, x, 1);
   }
 
@@ -1137,7 +1137,7 @@ FT airy_ai_forward(FT x) {
     FT k;
 
     if (x < FT(-LIT(2.09))) {
-        FT z = FT(LIT(1.0)) / (FT(-LIT(2.0)) * x * m_sqrt(-x) / FT(LIT(3.0)));
+        FT z = FT(LIT(1.0)) / (FT(-LIT(2.0)) * x * sqrt(-x) / FT(LIT(3.0)));
 
         FT afn = LIT(0.0);
 
@@ -1163,15 +1163,15 @@ FT airy_ai_forward(FT x) {
             agd = agd * (z * z) + AGD[index];
         }
 
-        FT t = FT(-LIT(2.0)) * x * m_sqrt(-x) / FT(LIT(3.0)) + FT(LIT(0.25)) * K_PI;
+        FT t = FT(-LIT(2.0)) * x * sqrt(-x) / FT(LIT(3.0)) + FT(LIT(0.25)) * K_PI;
 
-        return FT(LIT(5.64189583547756286948e-01)) / m_sqrt(m_sqrt(-x)) * (m_sin(t) * (FT(LIT(1.0)) + z * z * afn / afd) - m_cos(t) * (z * agn / agd));
+        return FT(LIT(5.64189583547756286948e-01)) / sqrt(sqrt(-x)) * (m_sin(t) * (FT(LIT(1.0)) + z * z * afn / afd) - m_cos(t) * (z * agn / agd));
     }
 
     if (x >= FT(LIT(2.09))) {
         domain_flag = 5;
 
-        FT zeta = FT(LIT(2.0)) * x * m_sqrt(x) / FT(LIT(3.0));
+        FT zeta = FT(LIT(2.0)) * x * sqrt(x) / FT(LIT(3.0));
 
         FT an = LIT(0.0);
 
@@ -1185,7 +1185,7 @@ FT airy_ai_forward(FT x) {
             ad = ad * (FT(LIT(1.0)) / zeta) + AD[index];
         }
 
-        ai = FT(LIT(5.64189583547756286948e-01)) * (an / ad) / (FT(LIT(2.0)) * m_sqrt(m_sqrt(x)) * m_exp(zeta));
+        ai = FT(LIT(5.64189583547756286948e-01)) * (an / ad) / (FT(LIT(2.0)) * sqrt(sqrt(x)) * m_exp(zeta));
 
         if (x > FT(LIT(8.3203353))) {
             return ai;
@@ -1332,7 +1332,7 @@ FT bessel_j0_forward(FT x) {
         qq = qq * (FT(LIT(25.0)) / (x * x)) + QQ[index];
     }
 
-    return (pp / pq * m_cos(x - FT(LIT(0.785398163397448309615660845819875721))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(0.785398163397448309615660845819875721)))) * FT(LIT(0.797884560802865355879892119868763737)) / m_sqrt(x);
+    return (pp / pq * m_cos(x - FT(LIT(0.785398163397448309615660845819875721))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(0.785398163397448309615660845819875721)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 
 FT bessel_j1_forward_once(FT x) {
@@ -1439,7 +1439,7 @@ FT bessel_j1_forward_once(FT x) {
         qq = qq * (FT(LIT(5.0)) / x * (FT(LIT(5.0)) / x)) + QQ[index];
     }
 
-    return (pp / pq * m_cos(x - FT(LIT(2.356194490192344928846982537459627163))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / m_sqrt(x);
+    return (pp / pq * m_cos(x - FT(LIT(2.356194490192344928846982537459627163))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 FT bessel_j1_forward(FT x) {
     static const FT PP[] = {
@@ -1545,7 +1545,7 @@ FT bessel_j1_forward(FT x) {
         qq = qq * (FT(LIT(5.0)) / x * (FT(LIT(5.0)) / x)) + QQ[index];
     }
 
-    return (pp / pq * m_cos(x - FT(LIT(2.356194490192344928846982537459627163))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / m_sqrt(x);
+    return (pp / pq * m_cos(x - FT(LIT(2.356194490192344928846982537459627163))) - FT(LIT(5.0)) / x * (qp / qq) * m_sin(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 
 FT bessel_y0_forward(FT x) {
@@ -1659,7 +1659,7 @@ FT bessel_y0_forward(FT x) {
         qq = qq * (FT(LIT(25.0)) / (x * x)) + QQ[index];
     }
 
-    return (pp / pq * m_sin(x - FT(LIT(0.785398163397448309615660845819875721))) + FT(LIT(5.0)) / x * (qp / qq) * m_cos(x - FT(LIT(0.785398163397448309615660845819875721)))) * FT(LIT(0.797884560802865355879892119868763737)) / m_sqrt(x);
+    return (pp / pq * m_sin(x - FT(LIT(0.785398163397448309615660845819875721))) + FT(LIT(5.0)) / x * (qp / qq) * m_cos(x - FT(LIT(0.785398163397448309615660845819875721)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 
 FT bessel_y1_forward(FT x) {
@@ -1772,7 +1772,7 @@ FT bessel_y1_forward(FT x) {
         qq = qq * (FT(LIT(5.0)) / x * (FT(LIT(5.0)) / x)) + QQ[index];
     }
 
-    return (pp / pq * m_sin(x - FT(LIT(2.356194490192344928846982537459627163))) + FT(LIT(5.0)) / x * (qp / qq) * m_cos(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / m_sqrt(x);
+    return (pp / pq * m_sin(x - FT(LIT(2.356194490192344928846982537459627163))) + FT(LIT(5.0)) / x * (qp / qq) * m_cos(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 
 FT chebyshev_polynomial_t_forward(FT x, int64_t n) {
@@ -2168,7 +2168,7 @@ FT modified_bessel_i0_forward(FT x) {
         b = (FT(LIT(32.0)) / abs(x) - FT(LIT(2.0))) * q - p + B[index];
     }
 
-    return m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / m_sqrt(abs(x));
+    return m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / sqrt(abs(x));
 }
 
 FT modified_bessel_i1_forward(FT x) {
@@ -2260,10 +2260,10 @@ FT modified_bessel_i1_forward(FT x) {
     }
 
     if (x < FT(LIT(0.0))) {
-        return -(m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / m_sqrt(abs(x)));
+        return -(m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / sqrt(abs(x)));
     }
 
-    return m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / m_sqrt(abs(x));
+    return m_exp(abs(x)) * (FT(LIT(0.5)) * (b - p)) / sqrt(abs(x));
 }
 
 FT modified_bessel_k0_forward(FT x) {
@@ -2339,7 +2339,7 @@ FT modified_bessel_k0_forward(FT x) {
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
     }
 
-    return m_exp(-x) * (FT(LIT(0.5)) * (b - p)) / m_sqrt(x);
+    return m_exp(-x) * (FT(LIT(0.5)) * (b - p)) / sqrt(x);
 }
 
 FT modified_bessel_k1_forward(FT x) {
@@ -2416,7 +2416,7 @@ FT modified_bessel_k1_forward(FT x) {
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
     }
 
-    return m_exp(-x) * (FT(LIT(0.5)) * (b - p)) / m_sqrt(x);
+    return m_exp(-x) * (FT(LIT(0.5)) * (b - p)) / sqrt(x);
 }
 
 FT scaled_modified_bessel_k0_forward(FT x) {
@@ -2492,7 +2492,7 @@ FT scaled_modified_bessel_k0_forward(FT x) {
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
     }
 
-    return FT(LIT(0.5)) * (b - p) / m_sqrt(x);
+    return FT(LIT(0.5)) * (b - p) / sqrt(x);
 }
 
 FT scaled_modified_bessel_k1_forward(FT x) {
@@ -2569,7 +2569,7 @@ FT scaled_modified_bessel_k1_forward(FT x) {
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
     }
 
-    return (FT(LIT(0.5)) * (b - p) / m_sqrt(x));
+    return (FT(LIT(0.5)) * (b - p) / sqrt(x));
 }
 
 FT shifted_chebyshev_polynomial_t_forward(FT x, int64_t n) {

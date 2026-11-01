@@ -294,16 +294,6 @@ int m_ilogb(double x)
 }
 #endif
 
-// sqrt(x) correctly rounded: the built-in may be off by a few ulps (Vulkan
-// allows it; NVIDIA's float32 sqrt is), which ill-conditioned uses magnify
-// (airy_ai takes the sine of 2/3 |x|^1.5). One step with the exact residual.
-FT m_sqrt(FT x)
-{
-    FT s = sqrt(x);
-    if (!(s > FT(0)) || isinf(s)) return s;  // 0, -0, NaN, inf
-    return s + fma(-s, s, x) * (FT(0.5) / s);
-}
-
 // |a| with the sign bit of b, on the bits: negating a NaN need not set its
 // sign bit (NVIDIA's float64 negation and abs do not).
 FT m_copysign(FT a, FT b)

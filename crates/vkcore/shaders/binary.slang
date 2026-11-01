@@ -97,7 +97,7 @@ T apply(T a, T b)
         T m = max(abs(a), abs(b));
         if (m == T(0) || isnan(m)) return m;
         T u = m_div(a, m), v = m_div(b, m);  // (not /: see m_div, m near the largest float)
-        return m * m_sqrt(u * u + v * v);
+        return m * sqrt(u * u + v * v);
     }
     case BINARY_NEXTAFTER: return nextafter_(a, b);
     case BINARY_HEAVISIDE: return a == T(0) ? b : (a > T(0) ? T(1) : T(0));  // NaN gives 0, as the CPU
