@@ -11,6 +11,16 @@
 //                      with idx[p, o] = i, in output order (as the CPU's
 //                      scatter adds them): a gather over the outputs whose
 //                      windows can cover i, so no atomics and deterministic.
+//   POOL_AVG_FORWARD:  out[p, o] = the sum over o's window / its divisor, as
+//                      the CPU's avg_pool: the window runs from o * s - pad
+//                      to min(that + k, n + pad), the divisor is
+//                      divisor_override, else its size (count_include_pad),
+//                      else the size of its part inside the input; truncated
+//                      for integer inputs (computed in float64).
+//   POOL_AVG_BACKWARD: gin[p, i] = the sum of gout[p, o] / divisor(o) over the
+//                      outputs whose windows cover i, in output order.
+// Average pooling has no dilation; its settings take the dilation slots:
+// dl = (divisor_override or 0, count_include_pad, truncate).
 
 #include "opcodes.slang"
 
@@ -55,6 +65,24 @@ uint2 covering(uint i, uint n_out, uint k, uint s, int pad, uint d)
     return uint2(lo, max(lo, hi));
 }
 
+// One dim of an average-pooling window: (start, end) inside the input and
+// its full size (padding included).
+int3 avg_window(uint o, uint k, uint s, int pad, uint n)
+{
+    int start = int(o * s) - pad;
+    int end = min(start + int(k), int(n) + pad);
+    return int3(max(start, 0), min(end, int(n)), end - start);
+}
+
+T avg_divisor(int3 z, int3 y, int3 x)
+{
+    if (p.dl.x != 0)
+        return T(int(p.dl.x));  // (the override may be negative)
+    if (p.dl.y != 0)
+        return T(z.z * y.z * x.z);
+    return T((z.y - z.x) * (y.y - y.x) * (x.y - x.x));
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
@@ -63,7 +91,49 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     uint iv = p.isz.x * p.isz.y * p.isz.z;
     for (uint t = gid.x * 256 + tid.x; t < p.total; t += p.ngroups * 256)
     {
-        if (OP == POOL_MAX_FORWARD)
+        if (OP == POOL_AVG_FORWARD)
+        {
+            uint plane = t / ov, r = t - plane * ov;
+            uint ox = r % p.osz.z;
+            r /= p.osz.z;
+            uint oy = r % p.osz.y, oz = r / p.osz.y;
+            int3 wz = avg_window(oz, p.ks.x, p.st.x, p.pd.x, p.isz.x);
+            int3 wy = avg_window(oy, p.ks.y, p.st.y, p.pd.y, p.isz.y);
+            int3 wx = avg_window(ox, p.ks.z, p.st.z, p.pd.z, p.isz.z);
+            T sum = T(0);
+            for (int iz = wz.x; iz < wz.y; iz++)
+                for (int iy = wy.x; iy < wy.y; iy++)
+                    for (int ix = wx.x; ix < wx.y; ix++)
+                        sum += p.a[plane * iv + (uint(iz) * p.isz.y + uint(iy)) * p.isz.z + uint(ix)];
+            T q = sum / avg_divisor(wz, wy, wx);
+            p.out[t] = p.dl.z != 0 ? trunc(q) : q;
+        }
+        else if (OP == POOL_AVG_BACKWARD)
+        {
+            uint plane = t / iv, r = t - plane * iv;
+            uint ix = r % p.isz.z;
+            r /= p.isz.z;
+            uint iy = r % p.isz.y, iz = r / p.isz.y;
+            uint2 rz = covering(iz, p.osz.x, p.ks.x, p.st.x, p.pd.x, 1);
+            uint2 ry = covering(iy, p.osz.y, p.ks.y, p.st.y, p.pd.y, 1);
+            uint2 rx = covering(ix, p.osz.z, p.ks.z, p.st.z, p.pd.z, 1);
+            T sum = T(0);
+            for (uint oz = rz.x; oz < rz.y; oz++)
+            {
+                int3 wz = avg_window(oz, p.ks.x, p.st.x, p.pd.x, p.isz.x);
+                for (uint oy = ry.x; oy < ry.y; oy++)
+                {
+                    int3 wy = avg_window(oy, p.ks.y, p.st.y, p.pd.y, p.isz.y);
+                    for (uint ox = rx.x; ox < rx.y; ox++)
+                    {
+                        int3 wx = avg_window(ox, p.ks.z, p.st.z, p.pd.z, p.isz.z);
+                        sum += p.a[plane * ov + (oz * p.osz.y + oy) * p.osz.z + ox] / avg_divisor(wz, wy, wx);
+                    }
+                }
+            }
+            p.out[t] = sum;
+        }
+        else if (OP == POOL_MAX_FORWARD)
         {
             uint plane = t / ov, r = t - plane * ov;
             uint ox = r % p.osz.z;

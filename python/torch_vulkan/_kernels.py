@@ -85,16 +85,6 @@ def _pool_out_size(n, k, s, p, ceil_mode):
     return out
 
 
-def _window_counts(n, k, s, p, out, count_include_pad, device):
-    starts = torch.arange(out, dtype=torch.float64) * s - p
-    ends = torch.clamp(starts + k, max=n + p)
-    if count_include_pad:
-        counts = ends - starts
-    else:
-        counts = torch.clamp(ends, max=n) - torch.clamp(starts, min=0)
-    return counts.to(device)
-
-
 def _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k):
     ks = list(kernel_size) * (k // len(kernel_size)) if len(kernel_size) < k else list(kernel_size)
     st = list(stride) if stride else ks
@@ -107,19 +97,6 @@ def _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k):
     for d in reversed(range(k)):
         pad += [pd[d], max(0, (out[d] - 1) * st[d] + ks[d] - spatial[d] - pd[d])]
     return ks, st, pd, out, pad
-
-
-def _divisor(spatial, ks, st, pd, out, count_include_pad, divisor_override, device, dtype):
-    if divisor_override:
-        return torch.tensor(float(divisor_override), device=device, dtype=dtype)
-    div = None
-    for d in range(len(ks)):
-        c = _window_counts(spatial[d], ks[d], st[d], pd[d], out[d], count_include_pad, device).to(dtype)
-        shape = [1] * len(ks)
-        shape[d] = out[d]
-        c = c.view(shape)
-        div = c if div is None else div * c
-    return div
 
 
 def _int32(v):
@@ -178,46 +155,28 @@ def _check_avg_pool(x, kernel_size, stride, padding, ceil_mode, divisor_override
 
 
 def _make_avg_pool(k):
-    conv = [F.conv1d, F.conv2d, F.conv3d][k - 1]
-
+    """avg_poolNd and its backward: one thread per output / per input element
+    (shaders/pool.slang), with the CPU's divisors and integer truncation."""
     def forward(x, kernel_size, stride=(), padding=0, ceil_mode=False, count_include_pad=True,
                 divisor_override=None):
-        if x.dtype not in (torch.float32, torch.float64, torch.int32, torch.int64):
-            return _on_cpu(f"avg_pool{k}d", x, kernel_size, stride, padding, ceil_mode, count_include_pad,
-                           divisor_override)
         padding = [padding] if isinstance(padding, int) else padding
         _check_avg_pool(x, kernel_size, stride, padding, ceil_mode, divisor_override, k)
-        ks, st, pd, out, pad = _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k)
-        batched = x.dim() == k + 2
-        xb = x if batched else x.unsqueeze(0)
-        c = xb.shape[1]
-        xp = F.pad(xb, pad)
-        w = torch.ones((c, 1, *ks), device=x.device, dtype=x.dtype)
-        sums = conv(xp, w, None, st, 0, 1, c)
-        if x.is_floating_point():
-            y = sums / _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, x.dtype)
-        else:  # integer division truncates, as on the CPU
-            d = _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, torch.float32)
-            y = torch.div(sums, d.round().to(x.dtype), rounding_mode="trunc")
-        return y if batched else y.squeeze(0)
+        ks, st, pd, out, _ = _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k)
+        head = list(x.shape[:-k])
+        planes = x.reshape(math.prod(head), *_as_3d(list(x.shape[-k:]), 1)).to(_pool_dtype(x.dtype))
+        y = torch.ops.torch_vulkan.avg_pool_forward(
+            planes, _as_3d(out, 1), _as_3d(ks, 1), _as_3d(st, 1), _as_3d(pd, 0), divisor_override or 0,
+            count_include_pad, not x.is_floating_point())
+        return y.reshape(*head, *out).to(x.dtype).contiguous(memory_format=_pool_memory_format(x, k))
 
     def backward(grad_output, x, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override):
-        ks, st, pd, out, pad = _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k)
-        batched = x.dim() == k + 2
-        xb = x if batched else x.unsqueeze(0)
-        gb = grad_output if batched else grad_output.unsqueeze(0)
-        c = xb.shape[1]
-        g = gb / _divisor(x.shape[-k:], ks, st, pd, out, count_include_pad, divisor_override, x.device, x.dtype)
-        xp = F.pad(xb, pad)
-        w = torch.ones((c, 1, *ks), device=x.device, dtype=x.dtype)
-        gxp = aten.convolution_backward(g, xp, w, None, st, [0] * k, [1] * k, False, [0] * k, c,
-                                        [True, False, False])[0]
-        # Drop the padding again.
-        index = [slice(None), slice(None)]
-        for d in range(k):
-            index.append(slice(pd[d], pd[d] + x.shape[-k + d]))
-        gx = gxp[tuple(index)].contiguous()
-        return gx if batched else gx.squeeze(0)
+        ks, st, pd, out, _ = _avg_pool_setup(x, kernel_size, stride, padding, ceil_mode, k)
+        planes = math.prod(x.shape[:-k])
+        g = grad_output.reshape(planes, *_as_3d(list(grad_output.shape[-k:]), 1)).to(_pool_dtype(grad_output.dtype))
+        gx = torch.ops.torch_vulkan.avg_pool_backward(
+            g, _as_3d(list(x.shape[-k:]), 1), _as_3d(ks, 1), _as_3d(st, 1), _as_3d(pd, 0), divisor_override or 0,
+            count_include_pad)
+        return gx.reshape(x.shape).to(grad_output.dtype).contiguous(memory_format=_pool_memory_format(x, k))
 
     return forward, backward
 

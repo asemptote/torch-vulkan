@@ -1,5 +1,6 @@
-// Max pooling kernels (shaders/pool.slang) as custom ops
-// torch_vulkan::max_pool_forward / max_pool_backward. The aten kernels are
+// Pooling kernels (shaders/pool.slang) as custom ops torch_vulkan::
+// max_pool_forward / max_pool_backward / avg_pool_forward / avg_pool_backward.
+// The aten kernels are
 // Python (torch_vulkan/_kernels.py): they run the CPU's argument checks,
 // compute the output size and lay the planes out, then call these.
 
@@ -94,6 +95,57 @@ at::Tensor max_pool_backward(const at::Tensor& grad_output, const at::Tensor& in
   return gin;
 }
 
+// Average pooling: dilation slots carry (divisor_override, count_include_pad, truncate).
+void set_avg(PoolParams& p, int64_t divisor_override, bool count_include_pad, bool truncate) {
+  p.dl[0] = static_cast<uint32_t>(divisor_override);
+  p.dl[1] = count_include_pad ? 1u : 0u;
+  p.dl[2] = truncate ? 1u : 0u;
+}
+
+// x [planes, D, H, W] -> [planes, *output_size]; truncate: integer inputs
+// (passed as float64), whose CPU kernel divides with truncation.
+at::Tensor avg_pool_forward(const at::Tensor& x, at::IntArrayRef output_size, at::IntArrayRef kernel_size,
+                            at::IntArrayRef stride, at::IntArrayRef padding, int64_t divisor_override,
+                            bool count_include_pad, bool truncate) {
+  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble),
+              "avg_pool_forward: expected a float32/float64 [planes, D, H, W] tensor");
+  at::Tensor in = x.contiguous();
+  at::Tensor out = at::empty({x.size(0), output_size[0], output_size[1], output_size[2]}, x.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  PoolParams p{};
+  p.a = gpu_address(in);
+  p.out = gpu_address_out(out);
+  int64_t ones[] = {1, 1, 1};
+  set_window(p, in.sizes().slice(1), output_size, kernel_size, stride, padding, ones);
+  set_avg(p, divisor_override, count_include_pad, truncate);
+  launch(op::POOL_AVG_FORWARD, x.scalar_type(), p, out.numel());
+  return out;
+}
+
+// grad_output [planes, *output] -> grad_input [planes, *input_size].
+at::Tensor avg_pool_backward(const at::Tensor& grad_output, at::IntArrayRef input_size, at::IntArrayRef kernel_size,
+                             at::IntArrayRef stride, at::IntArrayRef padding, int64_t divisor_override,
+                             bool count_include_pad) {
+  TORCH_CHECK(grad_output.dim() == 4 &&
+                  (grad_output.scalar_type() == at::kFloat || grad_output.scalar_type() == at::kDouble),
+              "avg_pool_backward: expected a float32/float64 [planes, D, H, W] grad_output");
+  at::Tensor g = grad_output.contiguous();
+  at::Tensor gin = at::empty({g.size(0), input_size[0], input_size[1], input_size[2]}, g.options());
+  if (gin.numel() == 0) {
+    return gin;
+  }
+  PoolParams p{};
+  p.a = gpu_address(g);
+  p.out = gpu_address_out(gin);
+  int64_t ones[] = {1, 1, 1};
+  set_window(p, input_size, g.sizes().slice(1), kernel_size, stride, padding, ones);
+  set_avg(p, divisor_override, count_include_pad, false);
+  launch(op::POOL_AVG_BACKWARD, g.scalar_type(), p, gin.numel());
+  return gin;
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -102,9 +154,15 @@ TORCH_LIBRARY(torch_vulkan, m) {
         "int[] dilation) -> (Tensor, Tensor)");
   m.def("max_pool_backward(Tensor grad_output, Tensor indices, int[] input_size, int[] kernel_size, int[] stride, "
         "int[] padding, int[] dilation) -> Tensor");
+  m.def("avg_pool_forward(Tensor x, int[] output_size, int[] kernel_size, int[] stride, int[] padding, "
+        "int divisor_override, bool count_include_pad, bool truncate) -> Tensor");
+  m.def("avg_pool_backward(Tensor grad_output, int[] input_size, int[] kernel_size, int[] stride, int[] padding, "
+        "int divisor_override, bool count_include_pad) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
   m.impl("max_pool_forward", &vk::max_pool_forward);
   m.impl("max_pool_backward", &vk::max_pool_backward);
+  m.impl("avg_pool_forward", &vk::avg_pool_forward);
+  m.impl("avg_pool_backward", &vk::avg_pool_backward);
 }
