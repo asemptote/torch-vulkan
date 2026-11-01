@@ -52,6 +52,12 @@ def _device_of(args, kwargs):
 
 
 _HALF = (torch.float16, torch.bfloat16)
+# Ops left to the CPU even with 16-bit floats (as backend.cpp's half_on_cpu):
+# linear algebra and FFTs (no 16-bit CPU kernels), nan_to_num (dtype-extreme
+# defaults), softshrink/hardshrink (threshold rounded to the dtype).
+_HALF_ON_CPU = ("linalg_", "_linalg_", "cholesky", "lu", "_lu", "triangular_solve", "svd", "_svd", "geqrf", "ormqr",
+                "orgqr", "qr", "householder", "eig", "_eig", "lstsq", "ldl", "inverse", "det", "logdet", "slogdet",
+                "matrix_exp", "_fft", "fft_", "stft", "istft", "nan_to_num", "softshrink", "hardshrink")
 
 
 def _is_vk(x):
@@ -69,6 +75,8 @@ def _half_via_float(op, args, kwargs):
     floating = {x.dtype for x in tree_flatten((args, kwargs))[0]
                 if _is_vk(x) and (x.is_floating_point() or x.is_complex())}
     if len(floating) != 1 or next(iter(floating)) not in _HALF:
+        return NotImplemented
+    if op._schema.name.split("::", 1)[1].startswith(_HALF_ON_CPU):
         return NotImplemented
     if any(r.alias_info is not None and not r.alias_info.is_write for r in op._schema.returns):
         return NotImplemented

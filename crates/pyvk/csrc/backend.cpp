@@ -599,6 +599,26 @@ at::Tensor widen_half_arg(const at::Tensor& t) {
   return is_half_vk(t) ? at::_to_copy(t, t.options().dtype(at::kFloat)) : t;
 }
 
+// Ops left to the CPU even with 16-bit floats (keep in step with _decomp.py's
+// _HALF_ON_CPU): linear algebra and FFTs, which the CPU has no 16-bit
+// kernels for (widening would make them work where PyTorch says they do
+// not); nan_to_num, whose default replacements are the dtype's extremes;
+// softshrink/hardshrink, whose threshold the CPU rounds to the dtype.
+bool half_on_cpu(const std::string& name) {
+  static const char* prefixes[] = {"linalg_", "_linalg_", "cholesky", "lu", "_lu", "triangular_solve", "svd", "_svd",
+                                   "geqrf", "ormqr", "orgqr", "qr", "householder", "eig", "_eig", "lstsq", "ldl",
+                                   "inverse", "det", "logdet", "slogdet", "matrix_exp", "_fft", "fft_", "stft",
+                                   "istft", "nan_to_num", "softshrink", "hardshrink"};
+  std::string base = name.rfind("aten::", 0) == 0 ? name.substr(6) : name;
+  for (const char* p : prefixes) {
+    if (base.rfind(p, 0) == 0) {
+      // ("lu" and "eig" prefixes, not substrings: relu, gelu, glu stay)
+      return true;
+    }
+  }
+  return false;
+}
+
 at::Tensor meta_like(const at::Tensor& t) {
   return t.defined() && is_vk(t) ? at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta)) : t;
 }
@@ -613,6 +633,9 @@ at::Tensor meta_like(const at::Tensor& t) {
 // lists, or the meta call failing (the CPU then decides).
 bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   const auto& schema = op.schema();
+  if (half_on_cpu(schema.name())) {
+    return false;
+  }
   for (const auto& r : schema.returns()) {
     if (r.alias_info() != nullptr && !r.alias_info()->isWrite()) {
       return false;
