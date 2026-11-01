@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M15 — PyTorch's own tests**: device `"vk"` is a native PyTorch
+Status: **M15 done, M16 (dedicated kernels) next**: device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -73,6 +73,29 @@ What the tests asked of `"vk"`, beyond correct values:
   threads had already rotated) gives wrong results there and right ones on a
   GPU; and it performs loads on paths a lane does not take, so indices are
   kept in range even where their value is unused.
+- Correct results on NVIDIA's driver, which the full runs now also use (an
+  H100 job beside the lavapipe shards). It computes SPIR-V's signed
+  remainder as an unsigned one when an operand is negative (integer
+  remainder, fmod and floor division use a - (a / b) b instead); turns
+  compare-and-select into min/max, which drops NaN (hardtanh tests NaN
+  first); divides float32 as a * (1 / b), and 1 / b is a subnormal it flushes
+  for |b| > 2^126 (m_div quarters both first); and drops a NaN's sign and
+  payload when widening float32 to float64 or negating float64 (casts widen
+  NaN bits as x86 does; copysign works on the bits). Half-precision
+  reductions run on the GPU in float32: on a discrete GPU the CPU fallback
+  copies the whole tensor each time.
+- Memory a long run can live with. The pool returns cached blocks to the
+  driver before growing when they would cover the new one (a blocked LU's
+  shrinking trailing matrices otherwise stay reserved at every size), and
+  complex matrix products accumulate into the output's real and imaginary
+  parts instead of temporaries.
+
+Every failure left in these files, on lavapipe and on the H100, also fails
+on the CPU or has an `EXPECTED` entry giving the reason: out-of-scope layouts
+(sparse, quantized, int4), CUDA-specific expectations, tolerances tuned to
+one seed or device, random numbers that are not the CPU's, ill-conditioned
+float32 comparisons, float32 subnormals on devices that flush them (the H100
+cannot keep them in shaders), and tensors of 2^31 or more elements.
 
 ## Complex completion and the remaining ops (M14)
 
@@ -725,12 +748,12 @@ no fallbacks in the OpInfo sweep).
     the sweep still sends to the CPU (see `tools/opinfo_coverage.json`),
     accuracy-faithful complex edge cases (infinities, branch cuts at signed
     zeros), a faster eig (multishift QR, aggressive deflation).
-15. **M15 PyTorch's own tests**: run PyTorch's device-generic suites
-    (`test_ops.py` and related, via `instantiate_device_type_tests`) on
-    `"vk"`, checking tolerances, error messages, dtype rules and autograd
-    against PyTorch's expectations rather than ours (see above). In
-    progress: the remaining failures, mostly numerics of composed ops and
-    tests of CUDA-specific behaviour.
+15. ~~**M15 PyTorch's own tests**~~: done (see above). Not yet: tensors of
+    2^31 or more elements (32-bit element offsets; lavapipe's buffers stop at
+    2 GiB), float32 subnormals on devices that flush them, speed on lavapipe
+    (a 1000x1000 SVD takes 99 s; test_pca_lowrank needs the 60-minute
+    per-test timeout), and long float64 kernels on Windows GPUs (the float64
+    zeta test outlasts the Intel UHD 620's watchdog and loses the device).
 16. **M16 dedicated kernels**: native kernels for the hottest composed ops
     (softmax, normalization, pooling, losses), chosen by profiling.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
