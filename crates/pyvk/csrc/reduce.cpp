@@ -268,6 +268,17 @@ std::pair<at::Tensor, at::Tensor> run_argreduce(const at::Tensor& self, const Pl
   }
 }
 
+// float16 / bfloat16 inputs reduce as float32 (the kernels have no 16-bit
+// types; the CPU accumulates them in float too), widened on the GPU: on a
+// discrete GPU the CPU fallback copies the whole tensor each time.
+at::Tensor widen_half(const at::Tensor& t) {
+  at::ScalarType st = t.scalar_type();
+  if (!is_vk(t) || (st != at::kHalf && st != at::kBFloat16) || storage_label(st) == nullptr) {
+    return t;
+  }
+  return at::_to_copy(t, t.options().dtype(at::kFloat));
+}
+
 bool reducible(const at::Tensor& self, bool allow_bool = true) {
   const char* label = dtype_label(self.scalar_type());
   return is_vk(self) && label != nullptr && !at::isComplexType(self.scalar_type()) &&
@@ -359,7 +370,7 @@ at::Tensor complex_cumprod_last(at::Tensor x) {
 at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                     std::optional<at::ScalarType> dtype, at::Tensor& out) {
   check_iterator_out_device(self, out);
-  at::Tensor input = as_dtype(self, dtype);
+  at::Tensor input = widen_half(as_dtype(self, dtype));
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, false);
     store(out, r, r.sizes().vec());
@@ -377,7 +388,7 @@ at::Tensor& sum_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool ke
 at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                      std::optional<at::ScalarType> dtype, at::Tensor& out) {
   check_iterator_out_device(self, out);
-  at::Tensor input = as_dtype(self, dtype);
+  at::Tensor input = widen_half(as_dtype(self, dtype));
   if (complex_vk(input) && is_vk(out)) {
     at::Tensor r = complex_sum(input, dim, keepdim, true);
     store(out, r, r.sizes().vec());
@@ -397,7 +408,7 @@ at::Tensor& mean_out(const at::Tensor& self, at::OptionalIntArrayRef dim, bool k
 at::Tensor& prod_out(const at::Tensor& self, int64_t dim, bool keepdim, std::optional<at::ScalarType> dtype,
                      at::Tensor& out) {
   check_iterator_out_device(self, out);
-  at::Tensor input = as_dtype(self, dtype);
+  at::Tensor input = widen_half(as_dtype(self, dtype));
   if (complex_vk(input) && is_vk(out)) {
     int64_t d = at::maybe_wrap_dim(dim, std::max<int64_t>(input.dim(), 1));
     at::Tensor r = input.dim() == 0 ? input.clone() : complex_prod_last(input.movedim(d, -1).resolve_conj());
@@ -471,27 +482,29 @@ at::Tensor& amax_amin_out(const at::Tensor& self, at::IntArrayRef dim, bool keep
   check_iterator_out_device(self, out);
   TORCH_CHECK(self.scalar_type() == out.scalar_type(), "Expected the dtype for input and out to match, but got ",
               self.scalar_type(), " for input's dtype and ", out.scalar_type(), " for out's dtype.");
+  at::Tensor src = widen_half(self);
   Plan plan;
-  if (!reducible(self) || !is_vk(out) || !plan_reduce(self, dim, keepdim, plan)) {
+  if (!reducible(src) || !is_vk(out) || !plan_reduce(src, dim, keepdim, plan)) {
     on_cpu(Op == kMax ? "aten::amax" : "aten::amin", "out", self, dim, keepdim, out);
     return out;
   }
   TORCH_CHECK(plan.n_red > 0 || self.numel() > 0 || plan.n_out == 0,
               Op == kMax ? "amax" : "amin", "(): Expected reduction dim to have non-zero size.");
-  store(out, run_reduce(self, plan, Op, kNone, 0.0), plan.out_shape);
+  store(out, run_reduce(src, plan, Op, kNone, 0.0), plan.out_shape);
   return out;
 }
 
 template <ROp Op>
 at::Tensor full_max_min(const at::Tensor& self) {
+  at::Tensor src = widen_half(self);
   Plan plan;
-  if (!reducible(self) || !plan_reduce(self, std::nullopt, false, plan)) {
+  if (!reducible(src) || !plan_reduce(src, std::nullopt, false, plan)) {
     return on_cpu(Op == kMax ? "aten::max" : "aten::min", "", self)[0].toTensor();
   }
   TORCH_CHECK(self.numel() > 0, Op == kMax ? "max" : "min",
               "(): Expected reduction dim to be specified for input.numel() == 0. Specify the reduction dim with the "
               "'dim' argument.");
-  return run_reduce(self, plan, Op, kNone, 0.0).view(at::IntArrayRef{}).to(self.scalar_type());
+  return run_reduce(src, plan, Op, kNone, 0.0).view(at::IntArrayRef{}).to(self.scalar_type());
 }
 
 template <ROp Op>
@@ -534,13 +547,14 @@ std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int
     values.copy_(wide);
     return {values, indices};
   }
-  if (!arg_reducible(self) || !is_vk(values) || !is_vk(indices) || self.dim() == 0 ||
-      !plan_reduce(self, dims, keepdim, plan)) {
+  at::Tensor src = widen_half(self);
+  if (!arg_reducible(src) || !is_vk(values) || !is_vk(indices) || self.dim() == 0 ||
+      !plan_reduce(src, dims, keepdim, plan)) {
     on_cpu(Op == 0 ? "aten::max" : "aten::min", Op == 0 ? "dim_max" : "dim_min", self, dim, keepdim, values, indices);
     return {values, indices};
   }
   TORCH_CHECK(plan.n_red > 0, Op == 0 ? "max" : "min", "(): Expected reduction dim ", dim, " to have non-zero size.");
-  auto [v, i] = run_argreduce(self, plan, Op);
+  auto [v, i] = run_argreduce(src, plan, Op);
   store(values, v, plan.out_shape);
   store(indices, i, plan.out_shape);
   return {values, indices};
@@ -554,14 +568,15 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
   if (dim.has_value()) {
     dims.push_back(*dim);
   }
-  bool ok = arg_reducible(self) && is_vk(out) &&
-            plan_reduce(self, dim.has_value() ? at::OptionalIntArrayRef(dims) : std::nullopt, keepdim, plan);
+  at::Tensor src = widen_half(self);
+  bool ok = arg_reducible(src) && is_vk(out) &&
+            plan_reduce(src, dim.has_value() ? at::OptionalIntArrayRef(dims) : std::nullopt, keepdim, plan);
   if (!ok || (!dim.has_value() && keepdim)) {
     on_cpu(Op == 0 ? "aten::argmax" : "aten::argmin", "out", self, dim, keepdim, out);
     return out;
   }
   TORCH_CHECK(plan.n_red > 0, Op == 0 ? "argmax" : "argmin", "(): Expected reduction dim to have non-zero size.");
-  store(out, run_argreduce(self, plan, Op).second, plan.out_shape);
+  store(out, run_argreduce(src, plan, Op).second, plan.out_shape);
   return out;
 }
 
@@ -580,9 +595,10 @@ at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, con
     store(out, r, r.sizes().vec());
     return out;
   }
+  at::Tensor src = widen_half(self);
   Plan plan;
-  if (!reducible(self) || !at::isFloatingType(self.scalar_type()) || !is_vk(out) ||
-      !plan_reduce(self, dim, keepdim, plan)) {
+  if (!reducible(src) || !at::isFloatingType(src.scalar_type()) || !is_vk(out) ||
+      !plan_reduce(src, dim, keepdim, plan)) {
     on_cpu(Std ? "aten::std" : "aten::var", "correction_out", self, dim, correction, keepdim, out);
     return out;
   }
@@ -592,9 +608,9 @@ at::Tensor& var_std_out(const at::Tensor& self, at::OptionalIntArrayRef dim, con
     TORCH_WARN(Std ? "std" : "var", "(): degrees of freedom is <= 0. Correction should be strictly less than the ",
                "reduction factor (input numel divided by output numel).");
   }
-  at::Tensor mean = run_reduce(self, plan, kSum, kScale, 1.0 / n);
+  at::Tensor mean = run_reduce(src, plan, kSum, kScale, 1.0 / n);
   double alpha = 1.0 / std::max(n - ddof, 0.0);  // inf -> nan/inf results, as on the CPU
-  store(out, run_reduce(self, plan, kSqDev, Std ? kSqrtScale : kScale, alpha, &mean), plan.out_shape);
+  store(out, run_reduce(src, plan, kSqDev, Std ? kSqrtScale : kScale, alpha, &mean), plan.out_shape);
   return out;
 }
 
