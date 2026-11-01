@@ -255,13 +255,68 @@ def _make_adaptive_max_backward(k):
     return backward
 
 
+def _per_dim(v, k):
+    """A pooling setting as k values (an int or a 1-element list repeats)."""
+    v = [v] if isinstance(v, int) else list(v)
+    return v * k if len(v) == 1 else v
+
+
+def _pool_window(kernel_size, stride, padding, dilation, k):
+    ks = _per_dim(kernel_size, k)
+    return ks, (_per_dim(stride, k) if len(stride) else ks), _per_dim(padding, k), _per_dim(dilation, k)
+
+
+def _as_3d(v, fill):
+    """k spatial values as the kernels' 3 (D, H, W), leading dims `fill`."""
+    return [fill] * (3 - len(v)) + list(v)
+
+
+def _pool_dtype(t):
+    """The dtype shaders/pool.slang computes `t` in: 16-bit floats in float32,
+    integers in float64 (exact to 2^53)."""
+    if t in (torch.float32, torch.float64):
+        return t
+    return torch.float32 if t in (torch.float16, torch.bfloat16) else torch.float64
+
+
+def _pool_memory_format(x, k):
+    """Channels-last results for a channels-last input, as the CPU kernels."""
+    if x.dim() == k + 2 and not x.is_contiguous():
+        fmt = torch.channels_last if k == 2 else torch.channels_last_3d
+        if x.is_contiguous(memory_format=fmt):
+            return fmt
+    return torch.contiguous_format
+
+
+def _make_max_pool(k):
+    """max_poolNd_with_indices: one thread per output (shaders/pool.slang)."""
+    def forward(x, kernel_size, stride=(), padding=0, dilation=1, ceil_mode=False):
+        ks, st, pd, dl = _pool_window(kernel_size, stride, padding, dilation, k)
+        spatial = list(x.shape[-k:])
+        out = [_checks._pooling_output_shape(spatial[d], ks[d], pd[d], st[d], dl[d], ceil_mode) for d in range(k)]
+        head = list(x.shape[:-k])
+        planes = x.reshape(math.prod(head), *_as_3d(spatial, 1)).to(_pool_dtype(x.dtype))
+        values, indices = torch.ops.torch_vulkan.max_pool_forward(
+            planes, _as_3d(out, 1), _as_3d(ks, 1), _as_3d(st, 1), _as_3d(pd, 0), _as_3d(dl, 1))
+        fmt = _pool_memory_format(x, k)
+        values = values.reshape(*head, *out).to(x.dtype).contiguous(memory_format=fmt)
+        return values, indices.reshape(*head, *out).contiguous(memory_format=fmt)
+
+    return forward
+
+
 def _make_max_pool_backward(k):
+    """max_poolNd_with_indices_backward: a gather per input element over the
+    outputs whose windows cover it (shaders/pool.slang), in output order."""
     def backward(grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices):
-        head = x.dim() - k
-        g = grad_output.reshape(*grad_output.shape[:head], math.prod(grad_output.shape[head:]))
-        i = indices.reshape(*indices.shape[:head], math.prod(indices.shape[head:]))
-        gx = torch.zeros((*x.shape[:head], math.prod(x.shape[head:])), device=x.device, dtype=x.dtype)
-        return gx.scatter_add(-1, i, g).reshape(x.shape)
+        ks, st, pd, dl = _pool_window(kernel_size, stride, padding, dilation, k)
+        planes = math.prod(x.shape[:-k])
+        out = list(grad_output.shape[-k:])
+        g = grad_output.reshape(planes, *_as_3d(out, 1)).to(_pool_dtype(grad_output.dtype))
+        i = indices.reshape(planes, *_as_3d(out, 1))
+        gx = torch.ops.torch_vulkan.max_pool_backward(
+            g, i, _as_3d(list(x.shape[-k:]), 1), _as_3d(ks, 1), _as_3d(st, 1), _as_3d(pd, 0), _as_3d(dl, 1))
+        return gx.reshape(x.shape).to(grad_output.dtype).contiguous(memory_format=_pool_memory_format(x, k))
 
     return backward
 
@@ -1281,6 +1336,9 @@ def _kernels():
         "_adaptive_avg_pool3d_backward": ad3_b,
         "adaptive_max_pool2d_backward": _make_adaptive_max_backward(2),
         "adaptive_max_pool3d_backward": _make_adaptive_max_backward(3),
+        "max_pool2d_with_indices": _make_max_pool(2),
+        "max_pool3d_with_indices": _make_max_pool(3),
+        "max_pool2d_with_indices_backward": _make_max_pool_backward(2),
         "max_pool3d_with_indices_backward": _make_max_pool_backward(3),
         "adaptive_max_pool2d": _make_adaptive_max(2),
         "adaptive_max_pool3d": _make_adaptive_max(3),

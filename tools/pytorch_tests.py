@@ -269,6 +269,9 @@ EXPECTED = [
      "an expected failure on every device (complex32 multiplication); vk's passes"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
+    (r"test_dtypes_nn_functional_max_pool1d_vk", r"worked in forward but are not listed",
+     "max_pool1d off the CPU goes through max_pool2d_with_indices, whose CPU kernel (which vk follows) takes "
+     "integers; the OpInfo lists CUDA's floating dtypes"),
     (r"test_histc_min_max_corner_cases_device_vk_(u?int)", r"",
      "integer histc: vk follows the CPU, which has no integer kernel (the test expects CUDA's)"),
     (r"test_out_warning_(mode|addbmm)_", r"Unexpected success",
