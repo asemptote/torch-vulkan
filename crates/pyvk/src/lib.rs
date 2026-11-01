@@ -102,6 +102,12 @@ fn device_name() -> PyResult<String> {
     Ok(py_runtime()?.ctx.device_name.clone())
 }
 
+/// Kernels dispatched so far (for profiling: launches per op).
+#[pyfunction]
+fn dispatch_count() -> PyResult<u64> {
+    Ok(py_runtime()?.stream.lock().unwrap().dispatches)
+}
+
 /// Names of all compiled kernels.
 #[pyfunction]
 fn kernels() -> Vec<&'static str> {
@@ -169,6 +175,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     unsafe { vkt_register_backend() };
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
+    m.add_function(wrap_pyfunction!(dispatch_count, m)?)?;
     m.add_function(wrap_pyfunction!(record_fallback, m)?)?;
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(manual_seed, m)?)?;

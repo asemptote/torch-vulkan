@@ -31,6 +31,8 @@ pub struct Stream {
     in_flight: VecDeque<(u64, vk::CommandBuffer)>,
     spare: Vec<vk::CommandBuffer>,
     pub max_batch: u32,
+    /// Kernels dispatched since the stream was created.
+    pub dispatches: u64,
 }
 
 // The stream owns its queue: only one stream is created per Context.
@@ -60,6 +62,7 @@ impl Stream {
                 in_flight: VecDeque::new(),
                 spare: Vec::new(),
                 max_batch: DEFAULT_MAX_BATCH,
+                dispatches: 0,
             })
         }
     }
@@ -116,6 +119,7 @@ impl Stream {
     /// [`PUSH_CONSTANT_BYTES`] bytes) as its push constants.
     pub fn dispatch(&mut self, kernel: &Kernel, push: &[u8], groups: [u32; 3]) -> Result<()> {
         assert!(push.len() <= PUSH_CONSTANT_BYTES as usize, "push constants too large for {}", kernel.name);
+        self.dispatches += 1;
         // Always set the whole range the layout declares, so no byte a kernel
         // might read is left undefined.
         let mut padded = [0u8; PUSH_CONSTANT_BYTES as usize];

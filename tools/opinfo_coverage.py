@@ -39,6 +39,8 @@ DTYPES = {
     "int64": torch.int64,
     "bool": torch.bool,
     "complex64": torch.complex64,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
 }
 
 
@@ -56,6 +58,9 @@ SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
 # General eigendecompositions: eigenvalues in no particular order, vectors up
 # to a phase; compared as sorted eigenvalues and by A V = V diag(w).
 EIG = ("linalg.eig", "linalg.eigvals")
+# Batch norm in evaluation mode: the CPU returns empty save_mean/save_invstd,
+# other devices per-channel ones (PyTorch's meta kernel): the output only.
+FIRST_OUTPUT_ONLY = ("native_batch_norm", "_native_batch_norm_legit")
 
 
 def op_name(info):
@@ -163,8 +168,10 @@ def compare(expected, actual):
         if isinstance(e, torch.Tensor):
             if not isinstance(a, torch.Tensor):
                 return f"expected tensor, got {type(a).__name__}"
+            # (16-bit floats: a few of their ulps, as results are rounded once from float32)
+            tol = max(1e-4, 4 * torch.finfo(e.dtype).eps) if e.dtype in (torch.float16, torch.bfloat16) else 1e-4
             try:
-                torch.testing.assert_close(a, e, equal_nan=True, check_device=False, atol=1e-4, rtol=1e-4)
+                torch.testing.assert_close(a, e, equal_nan=True, check_device=False, atol=tol, rtol=tol)
             except AssertionError as err:
                 return str(err).splitlines()[0][:200]
         elif e != a and not (isinstance(e, float) and e != e and a != a):
@@ -202,6 +209,8 @@ def check_op(info, dtypes, nsamples):
                 problem = compare_tied(name, sample, expected, actual)
             elif name in EIG:
                 problem = compare_eig(sample, expected, actual)
+            elif name in FIRST_OUTPUT_ONLY and isinstance(expected, tuple):
+                problem = compare(expected[0], actual[0])
             elif name in SIGN_AMBIGUOUS:
                 problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:
