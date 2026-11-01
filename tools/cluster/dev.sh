@@ -13,7 +13,9 @@
 #
 # run, rss, pt and py use lavapipe on DEV_HOST; with DRIVER=nvidia they run
 # on the NVIDIA driver instead, as a PBS job on a GPU node (DEV_GPU_QSUB),
-# submitted through DEV_HEAD and waited for, with its output printed.
+# submitted through DEV_HEAD and waited for, with its output printed; with
+# DRIVER=nvidia-host, on DEV_HOST's own NVIDIA GPU (ws3: a Tesla M4, 4 GB),
+# directly: no queue, for quick checks of the NVIDIA driver.
 #
 # ID is a pytest node id (test_linalg.py::TestLinalgPRIVATEUSE1::test_foo_vk);
 # run and pt pass the runner's / pytest's remaining options through.
@@ -36,8 +38,8 @@ remote() { ssh -o ServerAliveInterval=30 $SSH_OPTS "$HOST" "$@"; }
 
 case "$DRIVER" in
   lavapipe) ICD=lvp ;;  # Mesa's file name for lavapipe
-  nvidia) ICD=nvidia ;;
-  *) echo "unknown DRIVER $DRIVER (lavapipe or nvidia)" >&2; exit 2 ;;
+  nvidia | nvidia-host) ICD=nvidia ;;
+  *) echo "unknown DRIVER $DRIVER (lavapipe, nvidia or nvidia-host)" >&2; exit 2 ;;
 esac
 
 # Environment for running in the dev copy (a shell prefix).

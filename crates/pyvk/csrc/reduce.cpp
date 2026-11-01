@@ -625,7 +625,7 @@ at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const st
 at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                             std::optional<at::ScalarType> dtype, at::Tensor& out) {
   check_iterator_out_device(self, out);
-  at::Tensor input = as_dtype(self, dtype);
+  at::Tensor input = widen_half(as_dtype(self, dtype));  // (|x|^p in float32: it overflows 16 bits)
   if (complex_vk(input) && is_vk(out)) {  // the norm of |z|
     at::Tensor r = at::linalg_vector_norm(at::abs(input), ord, dim, keepdim);
     store(out, r, r.sizes().vec());

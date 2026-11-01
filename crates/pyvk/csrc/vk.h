@@ -295,16 +295,20 @@ inline bool is_vk(const at::Tensor& t) {
   return t.device().type() == kDevice;
 }
 
-// Runs aten op `name.overload` on the CPU with these arguments (vk tensors
-// are copied over and mutated/out arguments copied back). Returns the stack.
+// Runs `op` on `stack` where "vk" has no kernel for it: float16/bfloat16 vk
+// tensors in float32 on the GPU when that applies (half_via_float in
+// backend.cpp), otherwise on the CPU (vk tensors copied over, mutated/out
+// arguments copied back), recorded as a fallback.
+void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views);
+
+// Runs aten op `name.overload` without a Vulkan kernel (see run_fallback) with
+// these arguments. Returns the stack.
 template <typename... Args>
 torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... args) {
   auto op = c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
-  record_fallback(*overload ? std::string(name) + "." + overload : std::string(name));
   torch::jit::Stack stack;
   (stack.emplace_back(args), ...);
-  check_out_devices(op.schema(), stack);
-  at::native::cpu_fallback(op, &stack);
+  run_fallback(op, &stack, /*error_on_views=*/false);
   return stack;
 }
 

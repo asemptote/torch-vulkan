@@ -510,12 +510,9 @@ std::mutex g_fallback_mutex;
 std::map<std::string, int64_t> g_fallbacks;
 
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
-  const auto& name = op.schema().operator_name();
-  record_fallback(name.overload_name.empty() ? name.name : name.name + "." + name.overload_name);
-  check_out_devices(op.schema(), *stack);
   // A view op run on the CPU would return a copy, silently breaking aliasing
   // (e.g. `x.real += 1`); error out instead so a missing view kernel is caught.
-  at::native::cpu_fallback(op, stack, /*error_on_views=*/true);
+  run_fallback(op, stack, /*error_on_views=*/true);
 }
 
 }  // namespace
@@ -585,6 +582,171 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
                   "devices, ", kDevice, " and ", device, "!");
     }
   }
+}
+
+// ---------------------------------------------------------------- 16-bit floats through float32
+
+namespace {
+
+bool is_half_vk(const at::Tensor& t) {
+  return t.defined() && is_vk(t) && (t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16) &&
+         storage_label(t.scalar_type()) != nullptr;
+}
+
+at::Tensor widen_half_arg(const at::Tensor& t) {
+  return is_half_vk(t) ? at::_to_copy(t, t.options().dtype(at::kFloat)) : t;
+}
+
+at::Tensor meta_like(const at::Tensor& t) {
+  return t.defined() && is_vk(t) ? at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta)) : t;
+}
+
+// Runs `op` with its float16/bfloat16 "vk" tensors widened to float32, on the
+// GPU, instead of on the CPU: results are rounded once from float32, as CUDA
+// computes most 16-bit ops. The op first runs on meta tensors of the original
+// dtypes, which applies PyTorch's dtype checks and gives the result dtypes.
+// False (stack untouched) where this does not apply: no 16-bit vk tensor,
+// floating vk tensors of more than one dtype (mixed-dtype errors, which not
+// every meta kernel raises, e.g. mm's, stay the CPU's), views, mutated tensor
+// lists, or the meta call failing (the CPU then decides).
+bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  for (const auto& r : schema.returns()) {
+    if (r.alias_info() != nullptr && !r.alias_info()->isWrite()) {
+      return false;
+    }
+  }
+  size_t n = schema.arguments().size();
+  size_t base = stack->size() - n;
+  bool any = false;
+  std::optional<at::ScalarType> floating;  // the one floating dtype of the vk tensors
+  bool mixed = false;
+  auto note = [&](const at::Tensor& t) {
+    if (t.defined() && is_vk(t) && (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
+      mixed = mixed || (floating.has_value() && *floating != t.scalar_type());
+      floating = t.scalar_type();
+    }
+  };
+  for (size_t i = 0; i < n; ++i) {
+    const c10::IValue& v = (*stack)[base + i];
+    const auto* ai = schema.arguments()[i].alias_info();
+    bool write = ai != nullptr && ai->isWrite();
+    if (v.isTensor()) {
+      any = any || is_half_vk(v.toTensor());
+      note(v.toTensor());
+    } else if (v.isTensorList()) {
+      for (const at::Tensor& t : v.toTensorList()) {
+        note(t);
+        if (is_half_vk(t)) {
+          if (write) {
+            return false;
+          }
+          any = true;
+        }
+      }
+    } else if (v.isList()) {
+      for (const c10::IValue& e : v.toListRef()) {
+        if (e.isTensor() && is_half_vk(e.toTensor())) {
+          return false;  // (lists of optional tensors: left to the CPU)
+        }
+      }
+    }
+  }
+  if (!any || mixed) {
+    return false;
+  }
+  torch::jit::Stack meta(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
+  for (c10::IValue& v : meta) {
+    if (v.isTensor()) {
+      v = meta_like(v.toTensor());
+    } else if (v.isTensorList()) {
+      c10::List<at::Tensor> l;
+      for (const at::Tensor& t : v.toTensorList()) {
+        l.push_back(meta_like(t));
+      }
+      v = l;
+    }
+  }
+  try {
+    op.callBoxed(&meta);
+  } catch (const std::exception&) {
+    return false;
+  }
+  std::vector<std::pair<at::Tensor, at::Tensor>> written;  // (original, widened)
+  torch::jit::Stack saved(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
+  for (size_t i = 0; i < n; ++i) {
+    c10::IValue& v = (*stack)[base + i];
+    const auto* ai = schema.arguments()[i].alias_info();
+    if (v.isTensor() && is_half_vk(v.toTensor())) {
+      at::Tensor orig = v.toTensor();
+      at::Tensor w = widen_half_arg(orig);
+      if (ai != nullptr && ai->isWrite()) {
+        written.emplace_back(orig, w);
+      }
+      v = w;
+    } else if (v.isTensorList()) {
+      c10::List<at::Tensor> l;
+      for (const at::Tensor& t : v.toTensorList()) {
+        l.push_back(widen_half_arg(t));
+      }
+      v = l;
+    }
+  }
+  try {
+    op.callBoxed(stack);
+  } catch (const std::exception&) {
+    // (e.g. a dtype= argument the widened tensors contradict: the CPU decides;
+    // the original tensors are only written after success)
+    stack->resize(base);
+    stack->insert(stack->end(), saved.begin(), saved.end());
+    return false;
+  }
+  for (auto& [orig, w] : written) {
+    if (!orig.sizes().equals(w.sizes())) {
+      orig.resize_(w.sizes());  // (an out= the op resized; it warned on the widened copy)
+    }
+    orig.copy_(w);
+  }
+  size_t nr = schema.returns().size();
+  for (size_t j = 0; j < nr; ++j) {
+    c10::IValue& r = (*stack)[stack->size() - nr + j];
+    const c10::IValue& m = meta[meta.size() - nr + j];
+    if (r.isTensor()) {
+      at::Tensor t = r.toTensor();
+      for (auto& [orig, w] : written) {
+        if (t.is_same(w)) {
+          t = orig;
+        }
+      }
+      if (t.defined() && m.isTensor() && t.scalar_type() != m.toTensor().scalar_type()) {
+        t = t.to(m.toTensor().scalar_type());
+      }
+      r = t;
+    } else if (r.isTensorList() && m.isTensorList()) {
+      c10::List<at::Tensor> l;
+      auto ml = m.toTensorList();
+      auto rl = r.toTensorList();
+      for (size_t k = 0; k < rl.size(); ++k) {
+        at::Tensor t = rl.get(k);
+        at::ScalarType want = k < ml.size() ? ml.get(k).scalar_type() : t.scalar_type();
+        l.push_back(t.defined() && t.scalar_type() != want ? t.to(want) : t);
+      }
+      r = l;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
+  if (half_via_float(op, stack)) {
+    return;
+  }
+  const auto& name = op.schema().operator_name();
+  record_fallback(name.overload_name.empty() ? name.name : name.name + "." + name.overload_name);
+  check_out_devices(op.schema(), *stack);
+  at::native::cpu_fallback(op, stack, error_on_views);
 }
 
 void record_fallback(const std::string& op) {

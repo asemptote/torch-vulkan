@@ -17,7 +17,7 @@ import threading
 
 import torch
 from torch._decomp import decomposition_table
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_map
 
 from . import _checks, _dtypes, _layout, _native
 
@@ -51,7 +51,67 @@ def _device_of(args, kwargs):
     return torch.device("vk")
 
 
+_HALF = (torch.float16, torch.bfloat16)
+
+
+def _is_vk(x):
+    return isinstance(x, torch.Tensor) and x.device.type == "vk"
+
+
+def _half_via_float(op, args, kwargs):
+    """The op with its float16/bfloat16 "vk" tensors widened to float32, on the
+    GPU, results rounded once (as CUDA computes most 16-bit ops); NotImplemented
+    where that does not apply. As backend.cpp's half_via_float: the floating
+    vk tensors must all be of one 16-bit dtype (mixed-dtype errors stay the
+    CPU's), no view results, and the op must run on meta tensors of the
+    original dtypes, which applies PyTorch's checks and gives the result
+    dtypes."""
+    floating = {x.dtype for x in tree_flatten((args, kwargs))[0]
+                if _is_vk(x) and (x.is_floating_point() or x.is_complex())}
+    if len(floating) != 1 or next(iter(floating)) not in _HALF:
+        return NotImplemented
+    if any(r.alias_info is not None and not r.alias_info.is_write for r in op._schema.returns):
+        return NotImplemented
+
+    def to_meta(x):
+        return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device="meta") if _is_vk(x) else x
+
+    try:
+        meta = op(*tree_map(to_meta, args), **tree_map(to_meta, kwargs))
+    except Exception:  # noqa: BLE001 (the CPU decides)
+        return NotImplemented
+
+    def widen(x):
+        return x.to(torch.float32) if _is_vk(x) and x.dtype in _HALF else x
+
+    wide_args, wide_kwargs = tree_map(widen, args), tree_map(widen, kwargs)
+    try:
+        result = op(*wide_args, **wide_kwargs)
+    except Exception:  # noqa: BLE001 (e.g. a dtype= the widened tensors contradict: the CPU decides)
+        return NotImplemented
+    written = [a.name for a in op._schema.arguments if a.alias_info and a.alias_info.is_write]
+    if written:
+        for name in written:
+            target, source = kwargs[name], wide_kwargs[name]
+            if target is not source:
+                if target.shape != source.shape:
+                    target.resize_(source.shape)
+                target.copy_(source)
+        outs = tuple(kwargs[name] for name in written)
+        return outs[0] if len(outs) == 1 else outs
+    flat_r, spec = tree_flatten(result)
+    flat_m, _ = tree_flatten(meta)
+    if len(flat_r) != len(flat_m):
+        return result
+    cast = [r.to(m.dtype) if isinstance(r, torch.Tensor) and isinstance(m, torch.Tensor) and r.dtype != m.dtype else r
+            for r, m in zip(flat_r, flat_m)]
+    return spec.unflatten(cast)
+
+
 def _cpu_fallback(op, name, args, kwargs):
+    result = _half_via_float(op, args, kwargs)
+    if result is not NotImplemented:
+        return result
     if not _native.record_fallback(name):
         raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
     device = _device_of(args, kwargs)
