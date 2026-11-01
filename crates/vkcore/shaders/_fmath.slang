@@ -294,6 +294,24 @@ int m_ilogb(double x)
 }
 #endif
 
+// sqrt(x) correctly rounded: the built-in may be off by a few ulps (Vulkan
+// allows it; NVIDIA's float32 sqrt is), which ill-conditioned uses magnify
+// (airy_ai takes the sine of 2/3 |x|^1.5). One step with the exact residual.
+FT m_sqrt(FT x)
+{
+    FT s = sqrt(x);
+    if (!(s > FT(0)) || isinf(s)) return s;  // 0, -0, NaN, inf
+    return s + fma(-s, s, x) * (FT(0.5) / s);
+}
+
+// |a| with the sign bit of b, on the bits: negating a NaN need not set its
+// sign bit (NVIDIA's float64 negation and abs do not).
+FT m_copysign(FT a, FT b)
+{
+    UBITS mask = ~(~UBITS(0) >> 1);
+    return bit_cast<FT>((bit_cast<UBITS>(a) & ~mask) | (bit_cast<UBITS>(b) & mask));
+}
+
 // log(1 + e^x) without overflow.
 FT m_softplus(FT x)
 {
@@ -318,9 +336,16 @@ FT m_fmod(FT a, FT b)
 
 // a / b correctly rounded: Vulkan allows OpFDiv 2.5 ulp, so 6 / 3 can be
 // 1.9999999 (and trunc it 1). One correction with the exact remainder (an
-// FMA) fixes the last bit.
+// FMA) fixes the last bit. For |b| > 2^126 both are quartered (exactly)
+// first: GPUs may divide as a * (1 / b) (NVIDIA does in float32), and 1 / b
+// is then subnormal, which devices without subnormals flush to 0.
 FT m_div(FT a, FT b)
 {
+    if (abs(b) > LIT(8.5070591730234616e37))
+    {
+        a *= FT(0.25);
+        b *= FT(0.25);
+    }
     FT q = a / b;
     if (isnan(q) || isinf(q) || q == FT(0) || isinf(b)) return q;
     return q + fma(-q, b, a) / b;
@@ -385,7 +410,10 @@ FT m_pow(FT x, FT y)
         double l = log64(x);
         double t = y * l;
         double tl = fma(y, l, -t);
-        r = exp64(t) * (1.0l + tl);
+        // (the correction only where exp(t) is finite and nonzero: for a huge
+        // t, its rounding error tl is huge too, and 1 + tl can be negative)
+        r = exp64(t);
+        if (r != 0.0l && !isinf(r)) r *= 1.0l + tl;
 #else
         r = pow32(x, y);
 #endif

@@ -69,10 +69,10 @@ CALLS = {
     "std::exp": "m_exp", "std::log": "m_log", "std::log1p": "m_log1p", "std::expm1": "m_expm1",
     "std::sin": "m_sin", "std::cos": "m_cos", "std::tan": "m_tan", "std::sinh": "m_sinh", "std::cosh": "m_cosh",
     "std::pow": "m_pow", "::pow": "m_pow", "std::lgamma": "m_lgamma", "std::erfc": "m_erfc", "std::erf": "m_erf",
-    "std::exp2": "m_exp2", "std::sqrt": "sqrt", "std::abs": "abs", "std::fabs": "abs", "::fabs": "abs",
+    "std::exp2": "m_exp2", "std::sqrt": "m_sqrt", "std::abs": "abs", "std::fabs": "abs", "::fabs": "abs",
     "std::floor": "floor", "std::isnan": "isnan", "std::isinf": "isinf", "std::copysign": "m_copysign",
     "sinf": "m_sin", "sin": "m_sin", "exp": "m_exp", "log": "m_log", "cos": "m_cos", "std::trunc": "trunc", "std::round": "round", "std::ceil": "ceil",
-    "at::_isnan": "isnan", "std::acos": "m_acos", "::sqrt": "sqrt", "::log": "m_log", "::exp": "m_exp",
+    "at::_isnan": "isnan", "std::acos": "m_acos", "::sqrt": "m_sqrt", "::log": "m_log", "::exp": "m_exp",
 }
 
 
@@ -158,8 +158,6 @@ static const FT M_TINY = 1.1754943508222875e-38f;
 
 static const FT K_PI = LIT(3.14159265358979323846);
 static const FT K_SQRT1_2 = LIT(0.70710678118654752440);
-
-FT m_copysign(FT a, FT b) {{ return m_signbit(b) ? -abs(a) : abs(a); }}
 
 // Polynomial c[0] x^len + ... + c[len] (Cephes polevl).
 FT polevl<let N : int>(FT x, FT c[N], int len)

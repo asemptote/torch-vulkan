@@ -52,6 +52,14 @@ T ipow(T base, T e)
     return r;
 }
 
+// Truncated remainder (the sign of a), b != 0. Not `%`: NVIDIA's driver
+// (H100, 2026) computes SPIR-V OpSRem as an unsigned remainder when an
+// operand is negative (-33 % 4 gave 3); its OpSDiv is right.
+T irem(T a, T b)
+{
+    return a - (a / b) * b;
+}
+
 T igcd(T a, T b)
 {
     a = abs(a);
@@ -83,13 +91,13 @@ T apply(T a, T b)
     case BINARY_MINIMUM: return (isnan(a) || isnan(b)) ? T(a + b) : min(a, b);
     case BINARY_DIV: return m_div(a, b);
     case BINARY_DIV_TRUNC: return trunc(m_div(a, b));
-    case BINARY_COPYSIGN: return m_signbit(b) ? -abs(a) : abs(a);
+    case BINARY_COPYSIGN: return m_copysign(a, b);
     case BINARY_HYPOT: {
         if (isinf(a) || isinf(b)) return T(1) / T(0);
         T m = max(abs(a), abs(b));
         if (m == T(0) || isnan(m)) return m;
-        T u = a / m, v = b / m;
-        return m * sqrt(u * u + v * v);
+        T u = m_div(a, m), v = m_div(b, m);  // (not /: see m_div, m near the largest float)
+        return m * m_sqrt(u * u + v * v);
     }
     case BINARY_NEXTAFTER: return nextafter_(a, b);
     case BINARY_HEAVISIDE: return a == T(0) ? b : (a > T(0) ? T(1) : T(0));  // NaN gives 0, as the CPU
@@ -120,15 +128,15 @@ T apply(T a, T b)
     // instruction may trap or saturate there)
     case BINARY_REMAINDER: {  // sign of the divisor
         if (b == T(0) || b == T(-1)) return T(0);
-        T r = a % b;
+        T r = irem(a, b);
         return (r != T(0) && ((r < T(0)) != (b < T(0)))) ? r + b : r;
     }
-    case BINARY_FMOD: return (b == T(0) || b == T(-1)) ? T(0) : a % b;  // sign of the dividend
+    case BINARY_FMOD: return (b == T(0) || b == T(-1)) ? T(0) : irem(a, b);  // sign of the dividend
     case BINARY_FLOOR_DIVIDE: {
         if (b == T(0)) return T(0);
         if (b == T(-1)) return T(0) - a;
         T q = a / b;
-        return (a % b != T(0) && ((a < T(0)) != (b < T(0)))) ? q - T(1) : q;
+        return (a - q * b != T(0) && ((a < T(0)) != (b < T(0)))) ? q - T(1) : q;
     }
     case BINARY_DIV_TRUNC: return b == T(0) ? T(0) : (b == T(-1) ? T(0) - a : a / b);
     case BINARY_POW: return ipow(a, b);

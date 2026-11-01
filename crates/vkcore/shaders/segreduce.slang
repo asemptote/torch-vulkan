@@ -78,7 +78,7 @@ void main(uint3 id: SV_DispatchThreadID)
 #else
             T c = T(count);
             T q = acc / c;
-            acc = (acc % c != T(0) && acc < T(0)) ? q - T(1) : q;
+            acc = (acc - q * c != T(0) && acc < T(0)) ? q - T(1) : q;  // (not %: see binary.slang's irem)
 #endif
         }
         p.dst[off] = acc;

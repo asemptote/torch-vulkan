@@ -47,6 +47,18 @@ DST store(DV x) { return x; }
 #define DST_PART double
 #endif
 
+#if (defined(DST_f64) || defined(DST_c128)) && (defined(SRC_f32) || defined(SRC_bf16) || defined(SRC_f16) || defined(SRC_c64))
+// float to double keeping a NaN's sign and payload (shifted up, quiet bit
+// set), as x86 does: NVIDIA's conversion returns a canonical NaN.
+double widen(float x)
+{
+    if (!isnan(x)) return double(x);
+    uint u = bit_cast<uint>(x);
+    return bit_cast<double>((uint64_t(u >> 31) << 63) | 0x7FF8000000000000ull | (uint64_t(u & 0x7fffffu) << 29));
+}
+#define TO_WIDE(v) widen(float(v))
+#endif
+
 DV convert(SV x)
 {
 #if defined(SRC_b8)
@@ -65,11 +77,23 @@ DV convert(SV x)
 #else
     return DV(int64_t(x));
 #endif
+#elif defined(DST_PART) && defined(TO_WIDE)
+#ifdef SRC_COMPLEX
+    return DV(TO_WIDE(x.x), TO_WIDE(x.y));
+#else
+    return DV(TO_WIDE(x), DST_PART(0));
+#endif
 #elif defined(DST_PART)
 #ifdef SRC_COMPLEX
     return DV(DST_PART(x.x), DST_PART(x.y));
 #else
     return DV(DST_PART(x), DST_PART(0));
+#endif
+#elif defined(TO_WIDE)
+#ifdef SRC_COMPLEX
+    return DV(TO_WIDE(x.x));
+#else
+    return DV(TO_WIDE(x));
 #endif
 #else
 #ifdef SRC_COMPLEX

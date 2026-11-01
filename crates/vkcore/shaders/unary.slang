@@ -94,7 +94,10 @@ T apply(T x)
         if (T(gamma()) != T(0)) z = z < T(alpha()) ? T(alpha()) : (z > T(1) - T(alpha()) ? T(1) - T(alpha()) : z);  // NaN stays
         return m_log(z / (T(1) - z));
     }
-    case UNARY_HARDTANH: return x < T(alpha()) ? T(alpha()) : (x > T(beta()) ? T(beta()) : x);  // NaN stays
+    case UNARY_HARDTANH:
+        // (NaN tested first: NVIDIA's compiler turns these selects into
+        // min/max, which return the bound for NaN)
+        return isnan(x) ? x : (x < T(alpha()) ? T(alpha()) : (x > T(beta()) ? T(beta()) : x));
     case UNARY_HARDSWISH: return isnan(x) ? x : x * min(max(x + T(3), T(0)), T(6)) / T(6);
     case UNARY_HARDSIGMOID: return isnan(x) ? x : min(max(x + T(3), T(0)), T(6)) / T(6);
     case UNARY_LEAKY_RELU: return x > T(0) ? x : x * T(alpha());
