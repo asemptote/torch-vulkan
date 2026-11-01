@@ -282,8 +282,16 @@ EXPECTED = [
      "and every op of the chunked path gives the CPU's result exactly"),
     (r"test_fake_crossref_backward_(no_)?amp_normal_number_mean_vk", r"Expected len\(flat_diff_results\) > 0",
      "the op's first samples have no input that requires grad; PyTorch skips the test on CUDA for the same error"),
-    (r"", r"exceeds the device's limit of \d+ bytes per buffer",
-     "a tensor larger than the driver's largest buffer (lavapipe: 2 GiB; a tensor is one buffer)"),
+    (r"", r"exceeds the device's limit of \d+ bytes per buffer|element offsets beyond 2\^31",
+     "a tensor of 2^31 or more elements: kernels address elements with 32-bit offsets, and lavapipe's "
+     "largest buffer is 2 GiB (a tensor is one buffer)"),
+    (r"test_complex_div_underflow_overflow_vk_complex64", r"Tensor-likes are not close",
+     "the GPU flushes float32 subnormals (the H100 cannot keep them in shaders: shaderDenormPreserveFloat32 "
+     "is false), and the test divides by numbers near 1e-38"),
+    (r"test_compare_cpu_special_airy_ai_vk_float32", r"Tensor-likes are not close",
+     "ill-conditioned in float32: at x = -13437.7, Ai(x) is a sine of t ~ 1e6, whose ulp (0.06) decides the "
+     "result; the CPU's float32 value is itself 8% off the float64 one. vk matches it where the driver's float32 "
+     "division rounds as the CPU's (lavapipe), not on NVIDIA or Intel"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
     (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
