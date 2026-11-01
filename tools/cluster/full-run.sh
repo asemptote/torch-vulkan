@@ -18,6 +18,6 @@ qsub -J 0-47 -o "$RUNS/pbs-logs" \
   -v "FIRST_SHARD=0,SHARD_COUNT=48,OUT_DIR=$RUNS/$NAME,TEST_FILES=$FILES" tools/cluster/pbs-lavapipe.sh
 if [ "${2:-}" = "--gpu" ]; then
   mkdir -p "$RUNS/$NAME-h100"
-  qsub -q h100 -l select=1:ncpus=16:ngpus=1:mem=64gb -o "$RUNS/pbs-logs" \
+  qsub -q h100 -l select=1:ncpus=16:ngpus=1:mem=32gb -o "$RUNS/pbs-logs" \
     -v "FIRST_SHARD=0,SHARDS_PER_JOB=16,SHARD_COUNT=16,OUT_DIR=$RUNS/$NAME-h100,TEST_FILES=$FILES" tools/cluster/pbs-gpu.sh
 fi
