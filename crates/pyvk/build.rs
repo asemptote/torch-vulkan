@@ -92,6 +92,7 @@ fn main() {
             "csrc/dense.cpp",
             "csrc/special.cpp",
             "csrc/pool.cpp",
+            "csrc/softmax.cpp",
         ])
         // Every object file registers aten kernels from static initializers
         // and nothing references them by symbol, so link the archive whole.
