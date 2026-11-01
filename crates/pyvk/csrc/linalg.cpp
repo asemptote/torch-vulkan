@@ -287,7 +287,9 @@ at::Tensor& addr_out(const at::Tensor& self, const at::Tensor& vec1, const at::T
   } else {
     r = alpha.equal(1) ? outer : outer * alpha;
     if (!beta.equal(0)) {
-      r = at::add(r, base, beta);  // (beta = 0 ignores self, NaNs included, as the CPU)
+      // (beta = 0 ignores self, NaNs included, as the CPU; a complex beta
+      // multiplies first: add's alpha is real on "vk")
+      r = beta.isComplex() ? at::add(r, base * beta) : at::add(r, base, beta);
     }
   }
   check_out_cast(r.scalar_type(), out);
