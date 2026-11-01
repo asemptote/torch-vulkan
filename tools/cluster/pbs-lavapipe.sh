@@ -8,7 +8,11 @@
 #PBS -l select=1:ncpus=1:mem=6gb
 #PBS -l walltime=12:00:00
 #PBS -j oe
-SHARD=$((FIRST_SHARD + PBS_ARRAY_INDEX))
 export LP_NUM_THREADS=1  # one core per job
+# With RUN_DIR (queue-run.sh): a worker claiming shards from the run's queue.
+if [ -n "${RUN_DIR:-}" ]; then
+  exec "${TORCH_VULKAN:-$HOME/torch-vulkan}/tools/cluster/worker.sh" lavapipe "$RUN_DIR"
+fi
+SHARD=$((FIRST_SHARD + PBS_ARRAY_INDEX))
 exec "${TORCH_VULKAN:-$HOME/torch-vulkan}/tools/cluster/run-shard.sh" "$SHARD" "$SHARD_COUNT" lavapipe "$OUT_DIR" \
   $TEST_FILES

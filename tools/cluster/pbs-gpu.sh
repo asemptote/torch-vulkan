@@ -7,6 +7,14 @@
 #PBS -l walltime=12:00:00
 #PBS -j oe
 nvidia-smi -L
+# With RUN_DIR (queue-run.sh): WORKERS workers claiming shards from the run's queue.
+if [ -n "${RUN_DIR:-}" ]; then
+  for i in $(seq 1 "${WORKERS:-16}"); do
+    "${TORCH_VULKAN:-$HOME/torch-vulkan}/tools/cluster/worker.sh" nvidia "$RUN_DIR" &
+  done
+  wait
+  exit 0
+fi
 for i in $(seq 0 $((SHARDS_PER_JOB - 1))); do
   "${TORCH_VULKAN:-$HOME/torch-vulkan}/tools/cluster/run-shard.sh" $((FIRST_SHARD + i)) "$SHARD_COUNT" nvidia \
     "$OUT_DIR" $TEST_FILES &

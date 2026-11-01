@@ -71,6 +71,25 @@ shards in `OUT_DIR`, and writes `<run>.failures.txt` (vk-only failures) and
 the reason). Concatenating the `failures.txt` files gives the input for an
 `--ids` re-run.
 
+## Queued runs: the cluster plus workstation backfill
+
+`queue-run.sh start NAME` (from the local repo root) spreads a full run over
+every machine that can take part. Each driver family gets a queue of small
+shards on the shared file system: `$RUNS/NAME` for lavapipe and
+`$RUNS/NAME-nvidia`.
+
+- Cluster workers take shards from the start of each queue: the PBS lavapipe
+  array, plus an H100 job and an L40S job (separate queues).
+- Workstation workers (`pool.sh`) take shards from the end: ws0's and ws3's
+  cores on lavapipe, ws3's Tesla M4 on the NVIDIA run, and ws2's free
+  cores. Each one stops when its machine gets busy.
+
+The two sides meet in the middle, so whatever starts soonest does the most,
+and a busy cluster queue no longer holds the run up. Every worker claims a
+shard by renaming its file into `claimed/` (`worker.sh`).
+`queue-run.sh status NAME` shows the progress per machine. Results merge as
+for fixed shards.
+
 ## The dev copy
 
 `dev.sh` keeps a second checkout (`DEV_DIR`, with its own venv and Cargo
