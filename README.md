@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M15 done, M16 (dedicated kernels) next**: device `"vk"` is a native PyTorch
+Status: **M16 done** (the roadmap's last milestone): device `"vk"` is a native PyTorch
 backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -22,8 +22,11 @@ nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
 (solve, inv, det, slogdet, LU, Cholesky, QR, eigh, SVD, least squares,
 matrix_exp, triangular solves, general eig, LDL, real and complex, any size
 and batch, no LAPACK) and the special functions (Bessel, incomplete gamma,
-zeta/polygamma, erfcx, orthogonal polynomials) run on the GPU; every other
-op runs on the CPU through PyTorch's boxed fallback. Tested on an Intel UHD 620 with the validation layer clean.
+zeta/polygamma, erfcx, orthogonal polynomials) run on the GPU, float16 and
+bfloat16 included (computed in float32, rounded once); every other op runs on
+the CPU through PyTorch's boxed fallback. In the OpInfo sweep
+(`tools/opinfo_coverage.py`) every op runs fully on the GPU and matches the
+CPU. Tested on an Intel UHD 620 with the validation layer clean.
 
 ```python
 import torch, torch_vulkan
@@ -34,6 +37,37 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## Dedicated kernels (M16)
+
+Ops that ran as chains of generic kernels (PyTorch's decompositions), chosen
+by profiling (`benchmarks/composed.py`, which counts each op's launches and
+CPU fallbacks) and by the slowest tests of the full runs on lavapipe:
+
+- softmax / log_softmax and layer norm, forward and backward: one workgroup
+  per row (`softmax.slang`, `layernorm.slang`);
+- batch norm and group norm, forward and backward: per-channel (or per-group)
+  moments and gradient sums, then one element-wise pass (`normgrad.slang`);
+- max / average pooling, linear upsampling (a gather per dim for the
+  backward) and grid sampling, forward and backward (`pool.slang`,
+  `resample.slang`, `gridsample.slang`);
+- nll_loss (so cross_entropy) forward and backward (`loss.slang`);
+- embedding's backward and grid sampling's grad_input as rows summed by key:
+  one sort of the keys, then whole rows folded in index order, as the CPU's
+  loops (`segreduce.slang`'s row mode);
+- the activations' backward (gelu, silu, mish, hardswish, hardsigmoid,
+  log_sigmoid, sigmoid, tanh) as one binary kernel each;
+- reductions and arg-reductions of a few elements per output: one thread per
+  output instead of a workgroup;
+- the one-sided Jacobi SVD: column-major storage, and no rotations for
+  column pairs already orthogonal to the sweep's tolerance or for columns
+  negligible beside |A| (as LAPACK's gesvj), so rank-deficient matrices
+  converge in a third of the sweeps.
+
+Not done: rms_norm stays composed (its fused op `_fused_rms_norm` has no CPU
+backward kernel, and PyTorch only takes that path on CUDA-like devices);
+softplus, elu and the smooth-L1/Huber losses' backward still take a few
+generic kernels; convolution and attention are matrix products already.
 
 ## PyTorch's own tests (M15)
 
@@ -704,12 +738,12 @@ evidence as its reason, rather than a workaround.
    (per-allocation dependency tracking) and a separate transfer queue.
 2. ~~**M2 Python prototype**~~: done; superseded by M3.
 3. ~~**M3 native backend**~~: done (see above). Not yet: bool binary ops
-   (`&`, `*` on masks), multiple devices, pinned memory, a GPU random-number
-   generator (random fills run on the CPU).
-4. ~~**M4 reductions, scans, float64 math**~~: done (see above). Not yet:
-   `logcumsumexp`, `cummax`, `median`/`sort`-based ops, `masked_select`,
-   float64 `pow`/`atan2`, the arg-reduction thread-per-output mode, and
-   Payne-Hanek reduction for huge sin/cos arguments.
+   (`&`, `*` on masks), multiple devices, pinned memory. (A GPU random-number
+   generator came with M11.)
+4. ~~**M4 reductions, scans, float64 math**~~: done (see above); the ops
+   it left (`logcumsumexp`, `cummax`, `median`, `masked_select`, float64
+   `pow`/`atan2`, the arg-reduction thread-per-output mode) came later. Not
+   yet: Payne-Hanek reduction for huge sin/cos arguments.
 5. ~~**M5 matrix products**~~: done (see above). Not yet: a faster
    subgroup/cooperative-matrix kernel, integer and half-precision GEMM,
    convolutions.
@@ -720,9 +754,10 @@ evidence as its reason, rather than a workaround.
 7. ~~**M7 dense linear algebra**~~: done (see above). Not yet: blocked QR
    (compact-WY updates), batched GPU paths, look-ahead, eigh/SVD on the GPU.
 8. ~~**M8 element-wise completeness**~~ and infrastructure cleanup: done (see
-   above). Not yet: arithmetic on int8/uint8/int16/float16/bfloat16 (they
-   only move and cast so far), complex transcendentals (M14), `polygamma`,
-   Bessel and other `torch.special` functions.
+   above). Since: float16/bfloat16 arithmetic (in float32, M16), complex
+   transcendentals (M14), `polygamma`, Bessel and the other `torch.special`
+   functions. Not yet: 8/16-bit integer arithmetic in its own width (it
+   computes in int32).
 
 Goal for M9-M14: every dense aten op runs on Vulkan (`TORCH_VK_STRICT=1` with
 no fallbacks in the OpInfo sweep).
@@ -739,8 +774,8 @@ no fallbacks in the OpInfo sweep).
     `random_` on complex dtypes (rand/randn on complex do run on the GPU).
 12. ~~**M12 neural-network ops**~~: done (see above). Not yet: CTC loss,
     `segment_reduce`, bicubic `grid_sample` backward, integer convolution and
-    pooling on the GPU, native (non-composed) kernels for the hottest
-    composed ops (softmax, layer norm, pooling).
+    pooling on the GPU. (Native kernels for the hottest composed ops came
+    with M16.)
 13. ~~**M13 linear algebra on the GPU**~~: done (see above). Not yet:
     general (nonsymmetric) `eig`/`eigvals`, `ldl_factor`/`ldl_solve`
     (Bunch-Kaufman pivoting), complex matrices (M14).
@@ -750,10 +785,10 @@ no fallbacks in the OpInfo sweep).
     zeros), a faster eig (multishift QR, aggressive deflation).
 15. ~~**M15 PyTorch's own tests**~~: done (see above). Not yet: tensors of
     2^31 or more elements (32-bit element offsets; lavapipe's buffers stop at
-    2 GiB), float32 subnormals on devices that flush them, speed on lavapipe
-    (a 1000x1000 SVD takes 99 s; test_pca_lowrank needs the 60-minute
-    per-test timeout), and long float64 kernels on Windows GPUs (the float64
-    zeta test outlasts the Intel UHD 620's watchdog and loses the device).
-16. **M16 dedicated kernels**: native kernels for the hottest composed ops
-    (softmax, normalization, pooling, losses), chosen by profiling.
+    2 GiB), float32 subnormals on devices that flush them, and long float64
+    kernels on Windows GPUs (the float64 zeta test outlasts the Intel UHD
+    620's watchdog and loses the device). (lavapipe's slowest tests, the
+    SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
+16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm,
+    softplus/elu/smooth-L1 backward as single kernels.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
