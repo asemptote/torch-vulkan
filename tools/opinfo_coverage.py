@@ -51,7 +51,10 @@ SKIP_ENTIRELY = ("sparse.", "to_sparse", "tensor_split")
 # Ops returning (values, indices) where PyTorch leaves the index among equal
 # values unspecified (the CPU uses unstable partial sorts): the values must
 # match, and the indices must point at them.
-TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk")
+TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk", "sort")
+# Ops returning only indices of a (possibly tied) ordering: compared by the
+# values they select.
+TIED_ORDER = ("argsort",)
 # Ops whose vector outputs are unique only up to sign (eigenvectors,
 # singular vectors): compared by absolute value.
 SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
@@ -179,6 +182,42 @@ def compare(expected, actual):
     return None
 
 
+def max_error(x, ref):
+    """Largest |x - ref| over float leaves (NaN where ref is not NaN: inf)."""
+    worst = 0.0
+    for a, r in zip(tree_flatten(x)[0], tree_flatten(ref)[0]):
+        if not isinstance(a, torch.Tensor) or not (a.is_floating_point() or a.is_complex()):
+            if isinstance(a, torch.Tensor) and not torch.equal(a.cpu(), r.cpu()):
+                return float("inf")
+            continue
+        wide = torch.complex128 if a.is_complex() else torch.float64
+        a, r = a.cpu().to(wide), r.cpu().to(wide)
+        if a.shape != r.shape:
+            return float("inf")
+        both_nan = a.isnan() & r.isnan()
+        same_inf = (a == r) & a.isinf()
+        d = (a - r).abs().where(~(both_nan | same_inf), torch.zeros((), dtype=torch.float64))
+        d = d.where(~d.isnan(), torch.full((), float("inf"), dtype=torch.float64))
+        if d.numel():
+            worst = max(worst, d.max().item())
+    return worst
+
+
+def as_accurate_as_cpu(op, sample, dtype, expected, actual):
+    """For 16-bit dtypes: True if the vk result is no further from the op
+    computed in float64 (on the CPU) than the CPU's own 16-bit result. The
+    CPU often rounds to 16 bits at every step where vk computes in float32 and
+    rounds once, so the two differ by more than a few ulps without vk being
+    less accurate."""
+    def up(x):
+        return x.to(torch.float64) if isinstance(x, torch.Tensor) and x.dtype == dtype else x
+    try:
+        precise = op(*tree_map(up, (sample.input, *sample.args)), **tree_map(up, sample.kwargs))
+    except Exception:
+        return False
+    return max_error(actual, precise) <= max_error(expected, precise)
+
+
 def check_op(info, dtypes, nsamples):
     """Result dict for one OpInfo, or None if it has no usable samples."""
     status, detail, fallbacks = "gpu", "", set()
@@ -207,6 +246,10 @@ def check_op(info, dtypes, nsamples):
             name = op_name(info)
             if name in TIED_INDICES and isinstance(expected, tuple):
                 problem = compare_tied(name, sample, expected, actual)
+            elif name in TIED_ORDER and isinstance(expected, torch.Tensor) and sample.input.dim() > 0:
+                dim = sample.args[0] if sample.args else sample.kwargs.get("dim", -1)
+                x = sample.input
+                problem = compare(torch.gather(x, dim, expected), torch.gather(x, dim, actual.cpu()))
             elif name in EIG:
                 problem = compare_eig(sample, expected, actual)
             elif name in FIRST_OUTPUT_ONLY and isinstance(expected, tuple):
@@ -215,6 +258,8 @@ def check_op(info, dtypes, nsamples):
                 problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:
                 problem = compare(expected, actual)
+            if problem and dtype in (torch.float16, torch.bfloat16) and not problem.startswith("The values for attr")                     and as_accurate_as_cpu(info.op, sample, dtype, expected, actual):
+                problem = None  # (differs from the CPU, but no less accurate)
             if problem:
                 return {"status": "mismatch", "detail": f"{dtype}: {problem}", "fallbacks": sorted(fallbacks)}
     if tried == 0:
