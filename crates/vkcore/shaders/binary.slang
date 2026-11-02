@@ -100,6 +100,40 @@ T apply(T a, T b)
         return m * sqrt(u * u + v * v);
     }
     case BINARY_NEXTAFTER: return nextafter_(a, b);
+    // Activation backward, a = grad_output: the CPU kernels' formulas.
+    case BINARY_GELU_BACKWARD: {
+        T cdf = T(0.5) * (T(1) + m_erf(b * LIT(0.7071067811865476)));
+        T pdf = LIT(0.3989422804014327) * m_exp(b * b * T(-0.5));
+        return a * (cdf + b * pdf);
+    }
+    case BINARY_GELU_TANH_BACKWARD: {
+        T x_sq = b * b, x_cube = x_sq * b;
+        T inner = LIT(0.7978845608028654) * (b + LIT(0.044715) * x_cube);
+        T t = m_tanh(inner);
+        T left = T(0.5) * b, right = T(1) + t;
+        T left_derivative = T(0.5) * right;
+        T inner_derivative = LIT(0.7978845608028654) * (T(1) + T(3) * LIT(0.044715) * x_sq);
+        T right_derivative = left * (T(1) - t * t) * inner_derivative;
+        return a * (left_derivative + right_derivative);
+    }
+    case BINARY_SILU_BACKWARD: {
+        T s = T(1) / (T(1) + m_exp(-b));
+        return a * s * (T(1) + b * (T(1) - s));
+    }
+    case BINARY_SIGMOID_BACKWARD: return a * (T(1) - b) * b;
+    case BINARY_TANH_BACKWARD: return a * (T(1) - b * b);
+    case BINARY_MISH_BACKWARD: {
+        T s = T(1) / (T(1) + m_exp(-b));
+        T ts = m_tanh(m_log1p(m_exp(b)));
+        return a * (ts + b * s * (T(1) - ts * ts));
+    }
+    case BINARY_HARDSWISH_BACKWARD: return b <= T(-3) ? T(0) : (b < T(3) ? a * (b / T(3) + T(0.5)) : a);  // (open interval, as the CPU)
+    case BINARY_HARDSIGMOID_BACKWARD: return (b > T(-3) && b < T(3)) ? a * (T(1) / T(6)) : T(0);
+    case BINARY_LOG_SIGMOID_BACKWARD: {
+        bool neg = b < T(0);
+        T z = m_exp(-abs(b));
+        return a * ((neg ? T(1) : T(0)) - (neg ? T(1) : T(-1)) * (z / (T(1) + z)));
+    }
     case BINARY_HEAVISIDE: return a == T(0) ? b : (a > T(0) ? T(1) : T(0));  // NaN gives 0, as the CPU
     case BINARY_FMAX: return isnan(a) ? b : (isnan(b) ? a : max(a, b));
     case BINARY_FMIN: return isnan(a) ? b : (isnan(b) ? a : min(a, b));

@@ -535,6 +535,96 @@ at::Tensor& nextafter_out(const at::Tensor& self, const at::Tensor& other, at::T
   return out;
 }
 
+// ---------------------------------------------------------------- activation backward
+// One binary kernel of (grad_output, input) (of the output for sigmoid and
+// tanh), where PyTorch's decompositions took 3 to 19 kernels. Floating
+// dtypes (16-bit ones in float32); complex sigmoid/tanh as the CPU's
+// conjugated formulas; anything else on the CPU.
+
+bool act_gpu(uint32_t code, const at::Tensor& grad, const at::Tensor& x, at::Tensor& out) {
+  return is_vk(grad) && is_vk(x) && is_vk(out) && at::isFloatingType(at::result_type(grad, x)) &&
+         binary_op_gpu(code, grad, &x, nullptr, out);
+}
+
+at::Tensor act_result(const at::Tensor& grad, const at::Tensor& x) {
+  return at::empty({0}, grad.options().dtype(at::result_type(grad, x)));
+}
+
+at::Tensor& gelu_backward_out(const at::Tensor& grad, const at::Tensor& self, c10::string_view approximate,
+                              at::Tensor& grad_input) {
+  TORCH_CHECK(approximate == "none" || approximate == "tanh", "approximate argument must be either none or tanh.");
+  uint32_t code = approximate == "tanh" ? op::BINARY_GELU_TANH_BACKWARD : op::BINARY_GELU_BACKWARD;
+  if (!act_gpu(code, grad, self, grad_input)) {
+    on_cpu("aten::gelu_backward", "grad_input", grad, self, approximate, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor gelu_backward(const at::Tensor& grad, const at::Tensor& self, c10::string_view approximate) {
+  at::Tensor out = act_result(grad, self);
+  return gelu_backward_out(grad, self, approximate, out);
+}
+
+#define VK_ACT_BACKWARD(fn, code, name, overload)                                      \
+  at::Tensor& fn##_out(const at::Tensor& grad, const at::Tensor& x, at::Tensor& out) { \
+    if (!act_gpu(code, grad, x, out)) {                                                \
+      on_cpu(name, overload, grad, x, out);                                            \
+    }                                                                                  \
+    return out;                                                                        \
+  }                                                                                    \
+  at::Tensor fn(const at::Tensor& grad, const at::Tensor& x) {                         \
+    at::Tensor out = act_result(grad, x);                                              \
+    return fn##_out(grad, x, out);                                                     \
+  }
+VK_ACT_BACKWARD(silu_backward, op::BINARY_SILU_BACKWARD, "aten::silu_backward", "grad_input")
+VK_ACT_BACKWARD(hardswish_backward, op::BINARY_HARDSWISH_BACKWARD, "aten::hardswish_backward", "out")
+VK_ACT_BACKWARD(hardsigmoid_backward, op::BINARY_HARDSIGMOID_BACKWARD, "aten::hardsigmoid_backward", "grad_input")
+#undef VK_ACT_BACKWARD
+
+at::Tensor mish_backward(const at::Tensor& grad, const at::Tensor& self) {
+  at::Tensor out = act_result(grad, self);
+  if (!act_gpu(op::BINARY_MISH_BACKWARD, grad, self, out)) {
+    return on_cpu("aten::mish_backward", "", grad, self)[0].toTensor();
+  }
+  return out;
+}
+
+// sigmoid / tanh backward, from the output y.
+template <bool Tanh>
+at::Tensor& sig_tanh_backward_out(const at::Tensor& grad, const at::Tensor& y, at::Tensor& out) {
+  const char* name = Tanh ? "aten::tanh_backward" : "aten::sigmoid_backward";
+  if (is_vk(grad) && is_vk(y) && is_vk(out) && at::isComplexType(at::result_type(grad, y))) {
+    // (as the CPU: grad * conj(1 - y^2), grad * conj((1 - y) y))
+    at::Tensor d = Tanh ? at::rsub(y * y, 1) : at::rsub(y, 1) * y;
+    at::native::resize_output(out, at::infer_size(grad.sizes(), y.sizes()));
+    out.copy_(grad * d.conj());
+    return out;
+  }
+  if (!act_gpu(Tanh ? op::BINARY_TANH_BACKWARD : op::BINARY_SIGMOID_BACKWARD, grad, y, out)) {
+    on_cpu(name, "grad_input", grad, y, out);
+  }
+  return out;
+}
+
+template <bool Tanh>
+at::Tensor sig_tanh_backward(const at::Tensor& grad, const at::Tensor& y) {
+  at::Tensor out = act_result(grad, y);
+  return sig_tanh_backward_out<Tanh>(grad, y, out);
+}
+
+at::Tensor& log_sigmoid_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& buffer,
+                                     at::Tensor& grad_input) {
+  if (!act_gpu(op::BINARY_LOG_SIGMOID_BACKWARD, grad, self, grad_input)) {
+    on_cpu("aten::log_sigmoid_backward", "grad_input", grad, self, buffer, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor log_sigmoid_backward(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& buffer) {
+  at::Tensor out = act_result(grad, self);
+  return log_sigmoid_backward_out(grad, self, buffer, out);
+}
+
 at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
   TORCH_CHECK(!self.is_complex() && !values.is_complex() && !out.is_complex(),
               "heaviside is not yet implemented for complex tensors.");
@@ -688,6 +778,21 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("copysign.out", &binary_out<14>);
   m.impl("hypot.out", &binary_out<15>);
   m.impl("nextafter.out", &nextafter_out);
+  m.impl("gelu_backward", &vk::gelu_backward);
+  m.impl("gelu_backward.grad_input", &gelu_backward_out);
+  m.impl("silu_backward", &vk::silu_backward);
+  m.impl("silu_backward.grad_input", &silu_backward_out);
+  m.impl("hardswish_backward", &vk::hardswish_backward);
+  m.impl("hardswish_backward.out", &hardswish_backward_out);
+  m.impl("hardsigmoid_backward", &vk::hardsigmoid_backward);
+  m.impl("hardsigmoid_backward.grad_input", &hardsigmoid_backward_out);
+  m.impl("mish_backward", &vk::mish_backward);
+  m.impl("sigmoid_backward", &sig_tanh_backward<false>);
+  m.impl("sigmoid_backward.grad_input", &sig_tanh_backward_out<false>);
+  m.impl("tanh_backward", &sig_tanh_backward<true>);
+  m.impl("tanh_backward.grad_input", &sig_tanh_backward_out<true>);
+  m.impl("log_sigmoid_backward", &vk::log_sigmoid_backward);
+  m.impl("log_sigmoid_backward.grad_input", &log_sigmoid_backward_out);
   m.impl("logaddexp.out", &binary_out<17>);
   m.impl("logaddexp2.out", &binary_out<18>);
   m.impl("xlogy.OutTensor", &binary_out<19>);
