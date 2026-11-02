@@ -280,3 +280,7 @@ SOFTMAX LOG_BACKWARD 3
 # shaders/layernorm.slang
 LAYERNORM FORWARD 0
 LAYERNORM BACKWARD 1
+
+# shaders/gridsample.slang
+GRID FORWARD 0
+GRID BACKWARD 1

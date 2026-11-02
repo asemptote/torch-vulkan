@@ -382,120 +382,18 @@ def _make_adaptive_max(k):
 
 # ---------------------------------------------------------------- grid sampling
 
-def _unnormalize(coord, size, align_corners):
-    if align_corners:
-        return (coord + 1) / 2 * (size - 1), (size - 1) / 2
-    return ((coord + 1) * size - 1) / 2, size / 2
-
-
-def _reflect(coord, twice_low, twice_high):
-    """PyTorch's reflect_coordinates and its derivative."""
-    if twice_low == twice_high:
-        return torch.zeros_like(coord), torch.zeros_like(coord)
-    low, span = twice_low / 2, (twice_high - twice_low) / 2
-    sign = torch.where(coord < low, -1.0, 1.0).to(coord.dtype)
-    c = (coord - low).abs()
-    extra = torch.fmod(c, span)
-    flips = torch.floor(c / span)
-    even = torch.remainder(flips, 2) == 0
-    out = torch.where(even, extra + low, span - extra + low)
-    return out, torch.where(even, sign, -sign)
-
-
-def _source_coord(coord, size, padding_mode, align_corners):
-    """Grid coordinate -> input coordinate, and d(input coord)/d(grid coord)."""
-    c, mult = _unnormalize(coord, size, align_corners)
-    grad = torch.full_like(c, mult)
-    if padding_mode == 2:  # reflection
-        if align_corners:
-            c, g = _reflect(c, 0, 2 * (size - 1))
-        else:
-            c, g = _reflect(c, -1, 2 * size - 1)
-        grad = grad * g
-    if padding_mode in (1, 2):  # border (and reflection): clip into [0, size - 1]
-        inside = (c > 0) & (c < size - 1)
-        grad = grad * inside.to(c.dtype)
-        c = c.clamp(0, size - 1)
-    return c, grad
-
-
-def _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output=None, mask=(True, True)):
-    """Forward (grad_output None) or backward of grid_sampler_{2,3}d for
-    bilinear (mode 0) and nearest (mode 1) interpolation."""
-    k = grid.shape[-1]
-    n, c = input.shape[:2]
-    spatial = input.shape[2:]  # (D,) H, W
-    out_spatial = grid.shape[1:-1]
-    # grid[..., 0] indexes W (the last dim), grid[..., 1] H, grid[..., 2] D.
-    coords, dcoord = [], []
-    for d in range(k):
-        cd, gd = _source_coord(grid[..., d], spatial[k - 1 - d], padding_mode, align_corners)
-        coords.append(cd)
-        dcoord.append(gd)
-    flat_in = input.reshape(n, c, math.prod(spatial))
-    strides = [math.prod(spatial[k - d:]) for d in range(k)]  # element stride of coordinate d's dim
-    count = math.prod(out_spatial)
-
-    def corner(idx):
-        """(flat index [n, 1, P], in-bounds mask [n, P]) for integer coords idx."""
-        valid, flat = None, None
-        for d in range(k):
-            size = spatial[k - 1 - d]
-            v = (idx[d] >= 0) & (idx[d] < size)
-            valid = v if valid is None else valid & v
-            term = idx[d].clamp(0, size - 1) * strides[d]
-            flat = term if flat is None else flat + term
-        return flat.reshape(n, 1, count), valid.reshape(n, count)
-
-    if mode == 1:  # nearest (round half to even, as nearbyint)
-        flat, valid = corner([torch.round(cd).long() for cd in coords])
-        index = flat.expand(n, c, count)
-        if grad_output is None:
-            vals = torch.gather(flat_in, 2, index) * valid.unsqueeze(1).to(input.dtype)
-            return vals.reshape(n, c, *out_spatial)
-        g = grad_output.reshape(n, c, count) * valid.unsqueeze(1).to(input.dtype)
-        gi = torch.zeros_like(flat_in).scatter_add(2, index, g).reshape(input.shape)
-        return (gi if mask[0] else None), (torch.zeros_like(grid) if mask[1] else None)
-
-    lo = [torch.floor(cd) for cd in coords]
-    frac = [(cd - l).reshape(n, count) for cd, l in zip(coords, lo)]
-    lo = [l.long() for l in lo]
-    out = None
-    backward = grad_output is not None
-    gi = torch.zeros_like(flat_in) if backward and mask[0] else None
-    g = grad_output.reshape(n, c, count) if backward else None
-    gcoord = [torch.zeros(n, count, device=input.device, dtype=input.dtype) for _ in range(k)]
-    for bits in range(1 << k):
-        b = [(bits >> d) & 1 for d in range(k)]
-        flat, valid = corner([lo[d] + b[d] for d in range(k)])
-        w_parts = [frac[d] if b[d] else 1 - frac[d] for d in range(k)]
-        validf = valid.to(input.dtype)
-        weight = math.prod(w_parts) * validf
-        index = flat.expand(n, c, count)
-        if not backward:
-            term = torch.gather(flat_in, 2, index) * weight.unsqueeze(1)
-            out = term if out is None else out + term
-            continue
-        if gi is not None:
-            gi = gi.scatter_add(2, index, g * weight.unsqueeze(1))
-        if mask[1]:
-            dot = (torch.gather(flat_in, 2, index) * g).sum(1) * validf  # [n, count]
-            for d in range(k):
-                others = math.prod(w_parts[e] for e in range(k) if e != d) if k > 1 else 1.0
-                gcoord[d] = gcoord[d] + dot * others * (1.0 if b[d] else -1.0)
-    if not backward:
-        return out.reshape(n, c, *out_spatial)
-    gg = None
-    if mask[1]:
-        gg = torch.stack([gcoord[d].reshape(n, *out_spatial) * dcoord[d] for d in range(k)], -1)
-    return (gi.reshape(input.shape) if gi is not None else None), gg
+def _grid_dtype(t):
+    """The dtype shaders/gridsample.slang computes `t` in (16-bit floats in float32)."""
+    return torch.float64 if t == torch.float64 else torch.float32
 
 
 def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
     _checks.grid_sampler(input, grid, mode, 3)
     if mode not in (0, 1):  # bicubic
         return _on_cpu("grid_sampler_3d", input, grid, mode, padding_mode, align_corners)
-    return _grid_sample(input, grid, mode, padding_mode, align_corners)
+    dt = _grid_dtype(input.dtype)
+    out = torch.ops.torch_vulkan.grid_sampler(input.to(dt), grid.to(dt), mode, padding_mode, align_corners)
+    return out.to(input.dtype)
 
 
 def _make_grid_sampler_backward(name):
@@ -507,7 +405,21 @@ def _make_grid_sampler_backward(name):
                              f"sizes {list(grad_output.shape)}")
         if mode not in (0, 1):  # bicubic
             return _on_cpu(name, grad_output, input, grid, mode, padding_mode, align_corners, output_mask)
-        return _grid_sample(input, grid, mode, padding_mode, align_corners, grad_output, output_mask)
+        # (shaders/gridsample.slang: grad_grid, and each output point's corners
+        # with their weights, which one scatter-add turns into grad_input)
+        dt = _grid_dtype(input.dtype)
+        gg, idx, wgt = torch.ops.torch_vulkan.grid_sampler_backward(
+            grad_output.to(dt), input.to(dt), grid.to(dt), mode, padding_mode, align_corners, output_mask[1])
+        gi = None
+        if output_mask[0]:
+            n, c = input.shape[:2]
+            points, corners = idx.shape[1], idx.shape[2]
+            g = grad_output.to(dt).reshape(n, c, points, 1) * wgt.reshape(n, 1, points, corners)
+            g = torch.where((idx >= 0).reshape(n, 1, points * corners), g.reshape(n, c, points * corners), 0.0)
+            index = idx.clamp(min=0).reshape(n, 1, points * corners).expand(n, c, points * corners)
+            flat = torch.zeros(n, c, math.prod(input.shape[2:]), device=input.device, dtype=dt)
+            gi = flat.scatter_add(2, index, g).reshape(input.shape).to(input.dtype)
+        return gi, (gg.to(grid.dtype) if output_mask[1] else None)
 
     return backward
 

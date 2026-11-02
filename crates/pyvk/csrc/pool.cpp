@@ -1,6 +1,7 @@
-// Pooling and resampling kernels (shaders/pool.slang, resample.slang) as
-// custom ops torch_vulkan::max_pool_forward / max_pool_backward /
-// avg_pool_forward / avg_pool_backward / upsample_linear. The aten kernels are
+// Pooling, resampling and grid-sampling kernels (shaders/pool.slang,
+// resample.slang, gridsample.slang) as custom ops torch_vulkan::
+// max_pool_forward / max_pool_backward / avg_pool_forward / avg_pool_backward
+// / upsample_linear / grid_sampler / grid_sampler_backward. The aten kernels are
 // Python (torch_vulkan/_kernels.py): they run the CPU's argument checks,
 // compute the output size and lay the planes out, then call these.
 
@@ -189,6 +190,88 @@ at::Tensor upsample_linear(const at::Tensor& x, at::IntArrayRef output_size, boo
   return out;
 }
 
+struct GridParams {
+  uint64_t input, grid, out, gout, ggrid, idx, wgt;
+  uint32_t n, c, p, k, padding, align, ngroups, want_grid, pad[2];
+  uint32_t isz[4];
+};
+static_assert(sizeof(GridParams) == 112 && offsetof(GridParams, isz) == 96, "must match shaders/gridsample.slang");
+
+// input [N, C, *S] and grid [N, *P, k] (k = 2 or 3) of one float dtype:
+// the parameters common to both directions; P the output points per batch.
+GridParams grid_params(const at::Tensor& input, const at::Tensor& grid, int64_t padding, bool align) {
+  int64_t k = grid.size(-1);
+  TORCH_CHECK((k == 2 || k == 3) && input.dim() == k + 2 && grid.dim() == k + 2 &&
+                  (input.scalar_type() == at::kFloat || input.scalar_type() == at::kDouble) &&
+                  grid.scalar_type() == input.scalar_type(),
+              "grid_sampler: expected float32/float64 [N, C, *S] input and [N, *P, k] grid of its dtype");
+  GridParams p{};
+  p.n = static_cast<uint32_t>(input.size(0));
+  p.c = static_cast<uint32_t>(input.size(1));
+  p.p = static_cast<uint32_t>(grid.numel() / std::max<int64_t>(grid.size(0) * k, 1));
+  p.k = static_cast<uint32_t>(k);
+  p.padding = static_cast<uint32_t>(padding);
+  p.align = align ? 1u : 0u;
+  for (int64_t d = 0; d < 3; ++d) {  // (by grid coordinate: W, H, D)
+    p.isz[d] = d < k ? static_cast<uint32_t>(input.size(input.dim() - 1 - d)) : 1u;
+  }
+  TORCH_CHECK(input.numel() < (int64_t(1) << 31) && grid.numel() < (int64_t(1) << 31) &&
+                  int64_t(p.c) * p.n * p.p < (int64_t(1) << 31),
+              "grid_sampler: more elements than 32-bit offsets address");
+  return p;
+}
+
+void launch_grid(uint32_t op, int64_t mode, GridParams& p, at::ScalarType t) {
+  int64_t threads = int64_t(p.n) * p.p;
+  int64_t groups = std::min<int64_t>((threads + 63) / 64, kMaxGroups);
+  p.ngroups = static_cast<uint32_t>(std::max<int64_t>(groups, 1));
+  dispatch(std::string("gridsample_") + dtype_label(t), {op, static_cast<uint32_t>(mode)}, p, p.ngroups);
+}
+
+// [N, C, *P]: bilinear (mode 0) or nearest (1) samples of input at grid.
+at::Tensor grid_sampler(const at::Tensor& input, const at::Tensor& grid, int64_t mode, int64_t padding,
+                        bool align_corners) {
+  at::Tensor in = input.contiguous(), g = grid.contiguous();
+  GridParams p = grid_params(in, g, padding, align_corners);
+  std::vector<int64_t> shape = {in.size(0), in.size(1)};
+  shape.insert(shape.end(), g.sizes().begin() + 1, g.sizes().end() - 1);
+  at::Tensor out = at::empty(shape, in.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  p.input = gpu_address(in);
+  p.grid = gpu_address(g);
+  p.out = gpu_address_out(out);
+  launch_grid(op::GRID_FORWARD, mode, p, in.scalar_type());
+  return out;
+}
+
+// (grad_grid [N, *P, k] (empty unless want_grid), corner offsets [N, P, 2^k]
+// (-1: outside the input), corner weights [N, P, 2^k]).
+std::tuple<at::Tensor, at::Tensor, at::Tensor> grid_sampler_backward(const at::Tensor& grad_output,
+                                                                     const at::Tensor& input, const at::Tensor& grid,
+                                                                     int64_t mode, int64_t padding,
+                                                                     bool align_corners, bool want_grid) {
+  at::Tensor in = input.contiguous(), g = grid.contiguous(), go = grad_output.contiguous();
+  GridParams p = grid_params(in, g, padding, align_corners);
+  int64_t corners = int64_t(1) << p.k;
+  at::Tensor ggrid = want_grid ? at::empty(g.sizes(), g.options()) : at::empty({0}, g.options());
+  at::Tensor idx = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options().dtype(at::kLong));
+  at::Tensor wgt = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options());
+  if (idx.numel() == 0) {
+    return {ggrid.zero_(), idx, wgt};
+  }
+  p.input = gpu_address(in);
+  p.grid = gpu_address(g);
+  p.gout = gpu_address(go);
+  p.ggrid = want_grid ? gpu_address_out(ggrid) : 0;
+  p.idx = gpu_address_out(idx);
+  p.wgt = gpu_address_out(wgt);
+  p.want_grid = want_grid ? 1u : 0u;
+  launch_grid(op::GRID_BACKWARD, mode, p, in.scalar_type());
+  return {ggrid, idx, wgt};
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -202,6 +285,9 @@ TORCH_LIBRARY(torch_vulkan, m) {
   m.def("avg_pool_backward(Tensor grad_output, int[] input_size, int[] kernel_size, int[] stride, int[] padding, "
         "int divisor_override, bool count_include_pad) -> Tensor");
   m.def("upsample_linear(Tensor x, int[] output_size, bool align_corners, float[] scales, int ndim) -> Tensor");
+  m.def("grid_sampler(Tensor input, Tensor grid, int mode, int padding, bool align_corners) -> Tensor");
+  m.def("grid_sampler_backward(Tensor grad_output, Tensor input, Tensor grid, int mode, int padding, "
+        "bool align_corners, bool want_grid) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
@@ -210,4 +296,6 @@ TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
   m.impl("avg_pool_forward", &vk::avg_pool_forward);
   m.impl("avg_pool_backward", &vk::avg_pool_backward);
   m.impl("upsample_linear", &vk::upsample_linear);
+  m.impl("grid_sampler", &vk::grid_sampler);
+  m.impl("grid_sampler_backward", &vk::grid_sampler_backward);
 }
