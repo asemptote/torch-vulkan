@@ -24,7 +24,8 @@
 //   LARFT       the b x b upper-triangular T of the panel's block reflector
 //               H = I - V T V^H (forward, columnwise) into aux2
 //   SVD_ROUND   one-sided Jacobi: for column pair `pairs[gid.x]` of the
-//               rows x cols matrix W and the cols x cols matrix V (at aux),
+//               rows x cols matrix W and the cols x cols matrix V (at aux), both
+//               column-major (column j at j * ld, V's at j * cols),
 //               rotate the two columns to make them orthogonal; the
 //               pair's |w_p^H w_q| / (|w_p| |w_q|) into aux2
 //   EIG_COLS    Jacobi eigenvalues, first half of a round: the rotation
@@ -100,6 +101,8 @@ struct Params
     uint saux2;  // ... of aux2
     uint npairs;
     uint spiv;   // elements between pivot vectors
+    float tol;   // SVD_ROUND: columns this close to orthogonal are not rotated,
+    float small; // nor columns of at most this squared norm (negligible beside |A|)
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
@@ -465,19 +468,21 @@ void svd_round(uint t, uint pair, uint z)
     }
     R alpha = R(0), beta = R(0);
     T gamma = ZERO;
+    // (column-major: column j's entry i at j * ld + i, and V's at j * n + i)
     for (uint i = t; i < m; i += WG)
     {
-        T x = w[i * ld + col_p], y = w[i * ld + col_q];
+        T x = w[col_p * ld + i], y = w[col_q * ld + i];
         alpha += norm2(x);
         beta += norm2(y);
         gamma += mul(cj(x), y);
     }
     reduce_sum3(t, alpha, beta, gamma);
     R g = mag(gamma);
-    R off = (alpha > R(0) && beta > R(0)) ? g / sqrt(alpha * beta) : R(0);
+    bool negligible = alpha <= R(p.small) || beta <= R(p.small);
+    R off = (alpha > R(0) && beta > R(0) && !negligible) ? g / sqrt(alpha * beta) : R(0);
     if (t == 0)
         p.aux2[z * p.saux2 + pair] = fromr(off);
-    if (g == R(0))
+    if (g == R(0) || off <= R(p.tol))  // (as LAPACK's gesvj)
         return;
 #ifdef IS_COMPLEX
     // Column q times conj(phase of gamma): then w_p^H w_q' = |gamma|.
@@ -492,15 +497,15 @@ void svd_round(uint t, uint pair, uint z)
     R c = R(1) / sqrt(R(1) + tt * tt), s = c * tt;
     for (uint i = t; i < m; i += WG)
     {
-        T x = w[i * ld + col_p], y = mul(ph, w[i * ld + col_q]);
-        w[i * ld + col_p] = c * x - s * y;
-        w[i * ld + col_q] = s * x + c * y;
+        T x = w[col_p * ld + i], y = mul(ph, w[col_q * ld + i]);
+        w[col_p * ld + i] = c * x - s * y;
+        w[col_q * ld + i] = s * x + c * y;
     }
     for (uint i = t; i < n; i += WG)
     {
-        T x = v[i * n + col_p], y = mul(ph, v[i * n + col_q]);
-        v[i * n + col_p] = c * x - s * y;
-        v[i * n + col_q] = s * x + c * y;
+        T x = v[col_p * n + i], y = mul(ph, v[col_q * n + i]);
+        v[col_p * n + i] = c * x - s * y;
+        v[col_q * n + i] = s * x + c * y;
     }
 }
 

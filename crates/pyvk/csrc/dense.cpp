@@ -40,8 +40,9 @@ constexpr int64_t kMaxBatch = 65535;  // workgroups per dispatch dimension
 struct FactorParams {
   uint64_t a, piv, aux, aux2, info, pairs;
   uint32_t rows, cols, ld, k, b, sa, saux, saux2, npairs, spiv;
+  float tol, small;  // (SVD_ROUND)
 };
-static_assert(sizeof(FactorParams) == 88, "must match shaders/factor.slang");
+static_assert(sizeof(FactorParams) == 96, "must match shaders/factor.slang");
 
 struct TriangleParams {
   uint64_t in, out;
@@ -425,7 +426,7 @@ at::Tensor jacobi_pairs(int64_t count, const at::TensorOptions& opts, int64_t& r
 }
 
 double epsilon(at::ScalarType t) {
-  return t == at::kDouble ? std::numeric_limits<double>::epsilon() : std::numeric_limits<float>::epsilon();
+  return t == at::kDouble || t == at::kComplexDouble ? std::numeric_limits<double>::epsilon() : std::numeric_limits<float>::epsilon();
 }
 
 // Symmetric (Hermitian) eigendecomposition of a3 [B, n, n] (overwritten):
@@ -473,21 +474,38 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
 
 // One-sided Jacobi SVD of a3 [B, m, n], m >= n (overwritten):
 // (singular values descending [B, n], W = U S unnormalized [B, m, n], V [B, n, n]).
-std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(const at::Tensor& a3) {
-  int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2);
-  at::Tensor v = at::zeros({B, n, n}, a3.options());
-  v.diagonal(0, 1, 2).fill_(1);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(const at::Tensor& a3_in) {
+  int64_t B = a3_in.size(0), m = a3_in.size(1), n = a3_in.size(2);
+  // W and V column-major: the rotations stream through each column's entries
+  // instead of striding by a row (a cache miss per element on a CPU driver,
+  // uncoalesced on a GPU). Rows of wc / vc are columns of W / V.
+  at::Tensor wc = a3_in.transpose(1, 2).contiguous();  // [B, n, m]
+  at::Tensor vc = at::zeros({B, n, n}, a3_in.options());
+  vc.diagonal(0, 1, 2).fill_(1);
+  at::Tensor a3 = wc.transpose(1, 2), v = vc.transpose(1, 2);  // [B, m, n], [B, n, n] views
   if (n > 1 && B > 0 && m > 0) {
     int64_t rounds = 0, per_round = 0;
     at::Tensor pairs = jacobi_pairs(n, a3.options(), rounds, per_round);
     at::Tensor off = at::empty({B, per_round}, a3.options());  // real parts used
-    FactorParams p = params_for(a3);
-    p.aux = gpu_address(v);
+    FactorParams p{};
+    p.a = gpu_address(wc);
+    p.rows = static_cast<uint32_t>(m);
+    p.cols = static_cast<uint32_t>(n);
+    p.ld = static_cast<uint32_t>(m);  // (column stride: SVD_ROUND reads column j at j * ld)
+    p.sa = static_cast<uint32_t>(n * m);
+    p.aux = gpu_address(vc);
     p.saux = static_cast<uint32_t>(n * n);
     p.aux2 = gpu_address(off);
     p.saux2 = static_cast<uint32_t>(per_round);
     p.npairs = static_cast<uint32_t>(per_round);
     double tol = epsilon(a3.scalar_type()) * std::sqrt(static_cast<double>(m));
+    p.tol = static_cast<float>(tol);
+    // A column of norm under eps |A|_F (|A|_F is unchanged by the rotations)
+    // is negligible: rotating it only orthogonalizes rounding noise, which
+    // takes many sweeps for a rank-deficient A. (The batch's smallest |A|_F.)
+    double frob2 = abs2(a3).sum({1, 2}).amin().item<double>();
+    double eps = epsilon(a3.scalar_type());
+    p.small = static_cast<float>(std::min(eps * eps * frob2, 1e38));
     for (int sweep = 0; sweep < 40; ++sweep) {
       at::Tensor worst = at::zeros({}, a3.options().dtype(c10::toRealValueType(a3.scalar_type())));
       for (int64_t r = 0; r < rounds; ++r) {
