@@ -192,6 +192,56 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
 
 }  // namespace
 
+std::pair<at::Tensor, at::Tensor> slice_moments(const at::Tensor& x3);
+at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Tensor& c);
+
+namespace {
+
+// Group norm forward: each (n, group)'s mean and variance (slice_moments),
+// then y = x a + c per (n, c) with a = rstd w[c] and c = b[c] - mean a, as the
+// CPU's kernel. Inputs the CPU would refuse go to it, for its messages.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm(const at::Tensor& input,
+                                                                 const std::optional<at::Tensor>& weight,
+                                                                 const std::optional<at::Tensor>& bias, int64_t N,
+                                                                 int64_t C, int64_t HxW, int64_t group, double eps) {
+  at::ScalarType t = compute_type(input);
+  bool reduced = at::isReducedFloatingType(input.scalar_type());
+  auto param_ok = [&](const std::optional<at::Tensor>& p) {
+    return !defined(p) || (is_vk(*p) && p->dim() == 1 && p->numel() == C &&
+                           (p->scalar_type() == input.scalar_type() || (reduced && p->scalar_type() == at::kFloat)));
+  };
+  bool kernel = t != at::ScalarType::Undefined && is_vk(input) && group > 0 && N > 0 && C > 0 && HxW > 0 &&
+                C % group == 0 && input.numel() == N * C * HxW && input.numel() < (int64_t(1) << 31) &&
+                param_ok(weight) && param_ok(bias);
+  if (!kernel) {
+    auto s = on_cpu("aten::native_group_norm", "", input, weight, bias, N, C, HxW, group, eps);
+    return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};
+  }
+  bool mixed = (defined(weight) && weight->scalar_type() != input.scalar_type()) ||
+               (defined(bias) && bias->scalar_type() != input.scalar_type());
+  int64_t cpg = C / group;
+  at::Tensor x = input.to(t).contiguous();
+  auto [mean, var] = slice_moments(x.view({1, N * group, cpg * HxW}));
+  at::Tensor rstd = at::sqrt(var + eps).reciprocal();  // (1 / sqrt, as the CPU)
+  at::Tensor r3 = rstd.view({N, group, 1}), m3 = mean.view({N, group, 1});
+  at::Tensor a = defined(weight) ? r3 * weight->to(t).view({1, group, cpg}) : r3.expand({N, group, cpg});
+  at::Tensor shift = -m3 * a;
+  if (defined(bias)) {
+    shift = shift + bias->to(t).view({1, group, cpg});
+  }
+  at::Tensor y = slice_affine(x.view({1, N * C, HxW}), a.reshape({N * C}), shift.reshape({N * C}))
+                     .view(input.sizes())
+                     .to(input.scalar_type());
+  at::MemoryFormat fmt = input.suggest_memory_format();
+  if (fmt != at::MemoryFormat::Contiguous) {
+    y = y.contiguous(fmt);
+  }
+  at::ScalarType stat = mixed ? at::kFloat : input.scalar_type();
+  return {y, mean.view({N, group}).to(stat), rstd.view({N, group}).to(stat)};
+}
+
+}  // namespace
+
 std::pair<at::Tensor, at::Tensor> slice_moments(const at::Tensor& x3) {
   int64_t K = x3.size(0), O = x3.size(1), L = x3.size(2);
   at::Tensor mean = at::empty({O}, x3.options()), var = at::empty({O}, x3.options());
@@ -233,4 +283,5 @@ at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Ten
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("native_batch_norm_backward", &vk::native_batch_norm_backward);
   m.impl("native_group_norm_backward", &vk::native_group_norm_backward);
+  m.impl("native_group_norm", &vk::native_group_norm);
 }
