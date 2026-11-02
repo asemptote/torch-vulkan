@@ -72,8 +72,13 @@ DV convert(SV x)
 #endif
 #elif defined(DST_u8) || defined(DST_i8) || defined(DST_i16)
     // Through int64, so out-of-range values wrap as on the CPU (e.g. -3.0 -> 253).
+    // (half through int32, which holds its whole range: Intel's UHD 620
+    // driver saturated half -> int64 -> 8 bits at 127, e.g. 178.6 -> 127 as
+    // uint8, also through float; lavapipe and NVIDIA wrap as the CPU)
 #ifdef SRC_COMPLEX
     return DV(int64_t(x.x));
+#elif defined(SRC_f16)
+    return DV(int(x));
 #else
     return DV(int64_t(x));
 #endif
