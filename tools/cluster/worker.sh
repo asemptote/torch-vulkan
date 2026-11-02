@@ -23,7 +23,9 @@
 # so it does not flap between paused and running). A worker that loses its slot mid-shard stops the shard's processes
 # (SIGSTOP; they keep their memory) and continues them when the slot frees;
 # after GIVE_BACK seconds stopped (1200) it kills the shard and returns it to
-# the queue for another machine.
+# the queue for another machine. So a backfill worker stays (idle) until no
+# shard is queued or claimed, as a claimed shard may still come back; the
+# cluster's workers leave once the queue is empty.
 set -u
 DRIVER=$1
 RUN=$2
@@ -50,6 +52,9 @@ fits() {
 }
 
 queue_empty() { [ -z "$(ls "$RUN/queue" 2>/dev/null)" ]; }
+# True when this worker should leave: the queue is empty and, for a backfill
+# worker, no other worker holds a shard (which could be given back).
+finished() { queue_empty && { [ "${BACKFILL:-0}" != 1 ] || [ -z "$(ls "$RUN/claimed" 2>/dev/null)" ]; }; }
 
 # Runs shard $1 (shard-NNNN) in the foreground.
 run_shard() {
@@ -62,7 +67,7 @@ run_shard() {
 
 while :; do
   if [ "${BACKFILL:-0}" = 1 ] && ! fits 0; then
-    queue_empty && break
+    finished && break
     sleep 60
     continue
   fi
@@ -71,7 +76,11 @@ while :; do
   else
     next=$(ls "$RUN/queue" 2>/dev/null | sort | head -n 1)
   fi
-  [ -z "$next" ] && break
+  if [ -z "$next" ]; then
+    finished && break
+    sleep 60
+    continue
+  fi
   claimed="$RUN/claimed/$next.$ME"
   mv "$RUN/queue/$next" "$claimed" 2>/dev/null || continue
   if [ "${BACKFILL:-0}" != 1 ]; then

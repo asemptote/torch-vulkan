@@ -85,7 +85,9 @@ shards on the shared file system: `$RUNS/NAME` for lavapipe and
   the cores other processes use (a per-machine `top` monitor) plus k fit in
   the machine (resuming a paused shard needs one core more). As other users' load rises, the highest ranks pause
   their shards and come back in order as it falls; a shard paused for 20
-  minutes goes back to the queue. ws3's Tesla M4 can join the NVIDIA run
+  minutes goes back to the queue, so backfill workers stay (idle) until no
+  shard is queued or claimed. (A shard left in `claimed/` by a worker that
+  died keeps them waiting: move it back to `queue/`.) ws3's Tesla M4 can join the NVIDIA run
   (`WS3_GPU_WORKERS`), but its 4 GB is too small for some tests, so by
   default it is left for quick checks (`dev.sh` with `DRIVER=nvidia-host`).
 
