@@ -629,7 +629,8 @@ at::Tensor meta_like(const at::Tensor& t) {
 // dtypes, which applies PyTorch's dtype checks and gives the result dtypes.
 // False (stack untouched) where this does not apply: no 16-bit vk tensor,
 // floating vk tensors of more than one dtype (mixed-dtype errors, which not
-// every meta kernel raises, e.g. mm's, stay the CPU's), views, mutated tensor
+// every meta kernel raises, e.g. mm's, stay the CPU's; 0-dim ones do not
+// count, as type promotion lets the other operand's dtype win), views, mutated tensor
 // lists, or the meta call failing (the CPU then decides).
 bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   const auto& schema = op.schema();
@@ -647,7 +648,8 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   std::optional<at::ScalarType> floating;  // the one floating dtype of the vk tensors
   bool mixed = false;
   auto note = [&](const at::Tensor& t) {
-    if (t.defined() && is_vk(t) && (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
+    if (t.defined() && is_vk(t) && t.dim() > 0 &&
+        (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
       mixed = mixed || (floating.has_value() && *floating != t.scalar_type());
       floating = t.scalar_type();
     }

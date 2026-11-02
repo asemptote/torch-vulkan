@@ -73,6 +73,30 @@ void launch(uint32_t op, LayerNormParams& p, at::ScalarType t, bool has_w, bool 
            static_cast<uint32_t>(groups));
 }
 
+// 16-bit inputs: computed in float32 and rounded once. Parameters may be of
+// the input's dtype or float32 (the CPU's mixed rule); the saved statistics
+// are in the input's dtype, or float32 with float32 parameters, as on the CPU.
+bool half_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
+  if (!is_vk(x) || !at::isReducedFloatingType(x.scalar_type())) {
+    return false;
+  }
+  for (const at::Tensor* p : {&w, &b}) {
+    if (p->defined() && (!is_vk(*p) || (p->scalar_type() != x.scalar_type() && p->scalar_type() != at::kFloat))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+at::ScalarType stat_type(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
+  bool mixed = (w.defined() && w.scalar_type() != x.scalar_type()) || (b.defined() && b.scalar_type() != x.scalar_type());
+  return mixed ? at::kFloat : x.scalar_type();
+}
+
+at::Tensor widened(const at::Tensor& t) {
+  return t.defined() ? t.to(at::kFloat) : t;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tensor& input,
                                                                  at::IntArrayRef normalized_shape,
                                                                  const std::optional<at::Tensor>& weight_opt,
@@ -83,6 +107,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tenso
   int64_t k = static_cast<int64_t>(normalized_shape.size());
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;
+  if (half_ok(input, weight, bias) && m > 0 && n > 0) {
+    auto [out, mean, rstd] = vk::native_layer_norm(widened(input), normalized_shape, widened(weight), widened(bias), eps);
+    at::ScalarType st = stat_type(input, weight, bias);
+    return {out.to(input.scalar_type()), mean.to(st), rstd.to(st)};
+  }
   if (!kernel_ok(input, weight, bias) || m == 0 || n == 0) {
     auto s = on_cpu("aten::native_layer_norm", "", input, normalized_shape, weight_opt, bias_opt, eps);
     return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};
@@ -115,6 +144,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm_backward(
   int64_t k = static_cast<int64_t>(normalized_shape.size());
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;
+  if (half_ok(input, weight, bias) && m > 0 && n > 0 && is_vk(grad_out) && is_vk(mean) && is_vk(rstd) &&
+      grad_out.scalar_type() == input.scalar_type() && grad_out.sizes().equals(input.sizes())) {
+    auto [gx, gw, gb] = vk::native_layer_norm_backward(widened(grad_out), widened(input), normalized_shape, widened(mean),
+                                                   widened(rstd), widened(weight), widened(bias), mask);
+    return {gx.defined() ? gx.to(input.scalar_type()) : gx, gw.defined() ? gw.to(weight.scalar_type()) : gw,
+            gb.defined() ? gb.to(bias.scalar_type()) : gb};
+  }
   if (!kernel_ok(input, weight, bias) || m == 0 || n == 0 || !is_vk(grad_out) ||
       grad_out.scalar_type() != input.scalar_type() || mean.scalar_type() != input.scalar_type() ||
       rstd.scalar_type() != input.scalar_type() || !grad_out.sizes().equals(input.sizes())) {

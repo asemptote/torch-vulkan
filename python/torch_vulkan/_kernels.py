@@ -676,13 +676,16 @@ def _embedding_bag(weight, indices, offsets, scale_grad_by_freq=False, mode=0, s
         else torch.zeros(nb, dtype=torch.long, device=device)
     rows = weight.index_select(0, indices) if n else weight.new_zeros((0, dim))
     if mode in (0, 1):
-        scale = validf if per_sample_weights is None else validf * per_sample_weights
-        out = torch.zeros((nb, dim), device=device, dtype=dtype).index_add(0, offset2bag, rows * scale.unsqueeze(1))
+        # (16-bit weights: products and sums in float32, rounded once, as the CPU)
+        acc = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        scale = validf.to(acc) if per_sample_weights is None else validf.to(acc) * per_sample_weights.to(acc)
+        out = torch.zeros((nb, dim), device=device, dtype=acc).index_add(0, offset2bag, rows.to(acc) * scale.unsqueeze(1))
         if mode == 1:
-            out = out / bag_size.clamp(min=1).unsqueeze(1).to(dtype)
+            out = out / bag_size.clamp(min=1).unsqueeze(1).to(acc)
             max_indices = bag_size.clone()
         else:
             max_indices = torch.zeros(nb, dtype=torch.long, device=device)
+        out = out.to(dtype)
         # The auxiliary outputs as PyTorch predicts them for a non-CPU device
         # (as CUDA's): bag_size has one entry per offset, max_indices is
         # empty except in max mode.

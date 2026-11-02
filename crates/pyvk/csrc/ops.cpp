@@ -522,13 +522,16 @@ at::Tensor& nextafter_out(const at::Tensor& self, const at::Tensor& other, at::T
   at::Tensor x = self.to(t).expand(shape).contiguous(), y = other.to(t).expand(shape).contiguous();
   at::Tensor xf = x.to(at::kFloat), yf = y.to(at::kFloat);
   at::Tensor up = at::eq(at::gt(yf, xf), at::gt(xf, 0));  // away from zero
-  at::Tensor bits = x.view(at::kShort) + at::where(up, 1, -1).to(at::kShort);
-  at::Tensor tiny = at::where(at::lt(yf, 0), -32767, 1).to(at::kShort);  // +-smallest subnormal
+  // (the bits as int32: vk has no int16 arithmetic; the int16 bits are
+  // sign-magnitude-like, so +1 steps away from zero for either sign)
+  auto bits_of = [&](const at::Tensor& v) { return v.view(at::kShort).to(at::kInt); };
+  at::Tensor bits = bits_of(x) + at::where(up, 1, -1).to(at::kInt);
+  at::Tensor tiny = at::where(at::lt(yf, 0), -32767, 1).to(at::kInt);  // +-smallest subnormal
   bits = at::where(at::eq(xf, 0), tiny, bits);
-  bits = at::where(at::eq(xf, yf), y.view(at::kShort), bits);
-  bits = at::where(at::logical_or(at::isnan(xf), at::isnan(yf)), (xf + yf).to(t).view(at::kShort), bits);
+  bits = at::where(at::eq(xf, yf), bits_of(y), bits);
+  bits = at::where(at::logical_or(at::isnan(xf), at::isnan(yf)), bits_of((xf + yf).to(t)), bits);
   at::native::resize_output(out, shape);
-  out.copy_(bits.view(t));
+  out.copy_(bits.to(at::kShort).view(t));
   return out;
 }
 

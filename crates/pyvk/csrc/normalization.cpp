@@ -174,8 +174,11 @@ std::tuple<at::Tensor, at::Tensor> sdpa_flash_for_cpu(const at::Tensor& q, const
                                                       double dropout_p, bool is_causal,
                                                       const std::optional<at::Tensor>& attn_mask,
                                                       std::optional<double> scale) {
+  // (in float32 for 16-bit inputs, as the CPU kernel accumulates)
+  at::ScalarType acc = q.scalar_type() == at::kDouble ? at::kDouble : at::kFloat;
+  at::Tensor qa = q.to(acc), ka = k.to(acc), va = v.to(acc);
   double s = scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(q.size(-1)));
-  at::Tensor scores = at::matmul(q, k.transpose(-2, -1)) * s;
+  at::Tensor scores = at::matmul(qa, ka.transpose(-2, -1)) * s;
   if (is_causal) {
     int64_t L = q.size(-2), S = k.size(-2);
     at::Tensor keep = at::ones({L, S}, q.options().dtype(at::kBool)).tril();
@@ -184,7 +187,7 @@ std::tuple<at::Tensor, at::Tensor> sdpa_flash_for_cpu(const at::Tensor& q, const
   if (attn_mask.has_value() && attn_mask->defined()) {
     scores = attn_mask->scalar_type() == at::kBool
                  ? scores.masked_fill(at::logical_not(*attn_mask), -std::numeric_limits<double>::infinity())
-                 : scores + *attn_mask;
+                 : scores + attn_mask->to(acc);
   }
   at::Tensor lse = at::logsumexp(scores, -1);
   at::Tensor attn = at::exp(scores - lse.unsqueeze(-1));
@@ -192,7 +195,7 @@ std::tuple<at::Tensor, at::Tensor> sdpa_flash_for_cpu(const at::Tensor& q, const
     attn = at::dropout(attn, dropout_p, true);
   }
   // The CPU kernel returns logsumexp as [B, H, L] in float32 for float inputs.
-  return {at::matmul(attn, v), lse.to(q.scalar_type() == at::kDouble ? at::kDouble : at::kFloat)};
+  return {at::matmul(attn, va).to(q.scalar_type()), lse};
 }
 
 // Which fused attention kernel to use: always the math path on "vk".

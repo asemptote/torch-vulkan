@@ -715,6 +715,15 @@ at::Tensor& cumulative_out(const at::Tensor& self, int64_t dim, std::optional<at
     out.copy_(r);
     return out;
   }
+  if (at::isReducedFloatingType(input.scalar_type()) && is_vk(input) && is_vk(out) &&
+      out.scalar_type() == input.scalar_type()) {
+    // (16-bit floats: accumulated in float32, each result rounded once, as the CPU)
+    at::Tensor wide = input.to(at::kFloat);
+    at::Tensor r = Op == 0 ? at::cumsum(wide, dim) : at::cumprod(wide, dim);
+    at::native::resize_output(out, input.sizes());
+    out.copy_(r);
+    return out;
+  }
   if (input.dim() == 0 && is_vk(input) && is_vk(out)) {
     at::maybe_wrap_dim(dim, 1);
     at::native::resize_output(out, {});

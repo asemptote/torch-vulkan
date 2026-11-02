@@ -377,6 +377,13 @@ std::tuple<at::Tensor&, at::Tensor&> mode_out(const at::Tensor& self, int64_t di
 
 template <uint32_t Op>
 void cum_helper(const at::Tensor& self, at::Tensor& values, at::Tensor& indices, int64_t dim) {
+  if (is_vk(self) && at::isReducedFloatingType(self.scalar_type()) && is_vk(values) && is_vk(indices)) {
+    // (16-bit floats: scanned as float32; the values selected are exact)
+    at::Tensor v = at::empty(values.sizes(), values.options().dtype(at::kFloat));
+    cum_helper<Op>(self.to(at::kFloat), v, indices, dim);
+    values.copy_(v);
+    return;
+  }
   if (!is_vk(self) || rowscan_label(self.scalar_type()) == nullptr || !is_vk(values) || !is_vk(indices)) {
     on_cpu(Op == op::ROWSCAN_CUMMAX ? "aten::_cummax_helper" : "aten::_cummin_helper", "", self, values, indices,
            dim);
@@ -395,6 +402,9 @@ void cum_helper(const at::Tensor& self, at::Tensor& values, at::Tensor& indices,
 
 at::Tensor logcumsumexp_vk(const at::Tensor& self, int64_t dim) {
   at::ScalarType t = self.scalar_type();
+  if (is_vk(self) && at::isReducedFloatingType(t)) {
+    return logcumsumexp_vk(self.to(at::kFloat), dim).to(t);  // (in float32, rounded once)
+  }
   if (is_vk(self) && at::isComplexType(t) && dtype_label(t) != nullptr && self.dim() == 0) {
     at::maybe_wrap_dim(dim, 1);
     return self.clone();  // of one element: the element

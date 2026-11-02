@@ -94,7 +94,32 @@ at::Tensor& leaky_relu_out(const at::Tensor& self, const at::Scalar& slope, at::
   return out;
 }
 
+// A 16-bit vk self and out of its dtype: f on a float32 copy, rounded once
+// into out. False otherwise.
+template <typename F>
+bool half_unary(const at::Tensor& self, at::Tensor& out, F f) {
+  if (!is_vk(self) || !is_vk(out) || !at::isReducedFloatingType(self.scalar_type()) ||
+      out.scalar_type() != self.scalar_type()) {
+    return false;
+  }
+  at::Tensor r = f(self.to(at::kFloat));
+  resize_elementwise_output(out, self.sizes(), &self);
+  out.copy_(r);
+  return true;
+}
+
+// v rounded to the 16-bit dtype t (the CPU compares 16-bit values with
+// shrink thresholds of their own dtype).
+double round_to(double v, at::ScalarType t) {
+  return t == at::kHalf ? static_cast<double>(static_cast<float>(c10::Half(static_cast<float>(v))))
+                        : static_cast<double>(static_cast<float>(c10::BFloat16(static_cast<float>(v))));
+}
+
 at::Tensor& softshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::Tensor& out) {
+  double l = lambd.toDouble();
+  if (half_unary(self, out, [&](const at::Tensor& x) { return at::softshrink(x, round_to(l, self.scalar_type())); })) {
+    return out;
+  }
   if (!param_unary_gpu(op::UNARY_SOFTSHRINK, self, out, lambd.toDouble(), 0)) {
     on_cpu("aten::softshrink", "out", self, lambd, out);
   }
@@ -102,6 +127,10 @@ at::Tensor& softshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::
 }
 
 at::Tensor& hardshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::Tensor& out) {
+  double l = lambd.toDouble();
+  if (half_unary(self, out, [&](const at::Tensor& x) { return at::hardshrink(x, round_to(l, self.scalar_type())); })) {
+    return out;
+  }
   if (!param_unary_gpu(op::UNARY_HARDSHRINK, self, out, lambd.toDouble(), 0)) {
     on_cpu("aten::hardshrink", "out", self, lambd, out);
   }
@@ -136,6 +165,15 @@ at::Tensor& nan_to_num_out(const at::Tensor& self, std::optional<double> nan, st
     resize_elementwise_output(out, self.sizes(), &self);
     out.copy_(self);  // integers and bools have nothing to replace
     return out;
+  }
+  if (at::isReducedFloatingType(self.scalar_type())) {
+    // (the default replacements are the 16-bit dtype's extremes, not float32's)
+    double top = self.scalar_type() == at::kHalf ? 65504.0 : static_cast<double>(std::numeric_limits<c10::BFloat16>::max());
+    if (half_unary(self, out, [&](const at::Tensor& x) {
+          return at::nan_to_num(x, nan.value_or(0.0), posinf.value_or(top), neginf.value_or(-top));
+        })) {
+      return out;
+    }
   }
   bool f32 = out.scalar_type() == at::kFloat;
   double big = f32 ? std::numeric_limits<float>::max() : std::numeric_limits<double>::max();
@@ -524,7 +562,9 @@ at::Tensor& complex_out(const at::Tensor& real, const at::Tensor& imag, at::Tens
   TORCH_CHECK(out.scalar_type() == c10::toComplexType(real.scalar_type()), "Expected object of scalar type ",
               c10::toComplexType(real.scalar_type()), " but got scalar type ", out.scalar_type(), " for argument 'out'");
   at::native::resize_output(out, at::infer_size(real.sizes(), imag.sizes()));
-  if (!is_vk(out) || !is_vk(real) || !is_vk(imag) || dtype_label(out.scalar_type()) == nullptr) {
+  // (complex32: written through its float16 parts)
+  if (!is_vk(out) || !is_vk(real) || !is_vk(imag) ||
+      (dtype_label(out.scalar_type()) == nullptr && out.scalar_type() != at::kComplexHalf)) {
     on_cpu("aten::complex", "out", real, imag, out);
     return out;
   }
@@ -537,6 +577,11 @@ at::Tensor& complex_out(const at::Tensor& real, const at::Tensor& imag, at::Tens
 at::Tensor& polar_out(const at::Tensor& abs, const at::Tensor& angle, at::Tensor& out) {
   TORCH_CHECK(abs.scalar_type() == angle.scalar_type(), "Expected object of scalar type ", abs.scalar_type(),
               " but got scalar type ", angle.scalar_type(), " for second argument");
+  if (at::isReducedFloatingType(abs.scalar_type()) && is_vk(abs) && is_vk(angle)) {
+    // (float16 parts computed in float32 and rounded once, as on the CPU)
+    at::Tensor a = abs.to(at::kFloat), t = angle.to(at::kFloat);
+    return complex_out((a * at::cos(t)).to(abs.scalar_type()), (a * at::sin(t)).to(abs.scalar_type()), out);
+  }
   return complex_out(abs * at::cos(angle), abs * at::sin(angle), out);
 }
 

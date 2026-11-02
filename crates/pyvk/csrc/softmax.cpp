@@ -88,6 +88,13 @@ at::Tensor softmax_backward(const at::Tensor& grad_output, const at::Tensor& out
   // (PyTorch's checks: same sizes, the dim)
   (Log ? at::_log_softmax_backward_data : at::_softmax_backward_data)(meta_of(grad_output), meta_of(output), dim,
                                                                        input_dtype);
+  at::ScalarType h = grad_output.scalar_type();
+  if (at::isReducedFloatingType(h) && output.scalar_type() == h && input_dtype == h && is_vk(grad_output) &&
+      is_vk(output)) {
+    // (16-bit floats: in float32, rounded once)
+    at::Tensor out_f = output.to(at::kFloat);
+    return run(Log ? op::SOFTMAX_LOG_BACKWARD : op::SOFTMAX_BACKWARD, grad_output.to(at::kFloat), &out_f, dim).to(h);
+  }
   if (!kernel_dtype(grad_output) || output.scalar_type() != grad_output.scalar_type() ||
       grad_output.scalar_type() != input_dtype || !is_vk(output)) {
     return on_cpu(Log ? "aten::_log_softmax_backward_data" : "aten::_softmax_backward_data", "", grad_output,
