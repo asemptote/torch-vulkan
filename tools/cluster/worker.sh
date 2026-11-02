@@ -14,13 +14,13 @@
 # (the workstations, one per core, ranked by RANK = 0, 1, ...) take them from
 # its end, so the two sides meet in the middle, and give way to the
 # machine's other users: worker k runs only while
-#   others + k + 1 <= cores
+#   others + k <= cores
 # where others is the cores the machine's other processes use (pool.sh's CPU
 # monitor writes it to /tmp/tv-others.USER; without a fresh one, the load
 # average minus our own running test processes), so
 # the highest ranks step aside first as other users' load rises and come back
-# in order as it falls (resuming needs one spare core more, so they do not
-# flap). A worker that loses its slot mid-shard stops the shard's processes
+# in order as it falls (resuming a paused shard needs one spare core more,
+# so it does not flap between paused and running). A worker that loses its slot mid-shard stops the shard's processes
 # (SIGSTOP; they keep their memory) and continues them when the slot frees;
 # after GIVE_BACK seconds stopped (1200) it kills the shard and returns it to
 # the queue for another machine.
@@ -36,7 +36,7 @@ GIVE_BACK=${GIVE_BACK:-1200}
 mkdir -p "$RUN/claimed" "$RUN/done"
 
 # Exit status 0 if this worker's rank fits beside the other users' load; $1
-# extra spare cores required (1 to resume, 0 to keep running).
+# extra spare cores required (1 to resume a paused shard, 0 otherwise).
 fits() {
   local others ours monitor="/tmp/tv-others.$(id -un)"
   if [ -f "$monitor" ] && [ $(($(date +%s) - $(stat -c %Y "$monitor"))) -lt 120 ]; then
@@ -46,7 +46,7 @@ fits() {
     ours=$(ps -u "$(id -un)" -o stat=,args= | grep -E '\.jsonl @' | grep -vc '^T')
     others=$(awk -v o="$ours" '{ x = $1 - o; print (x > 0 ? x : 0) }' /proc/loadavg)
   fi
-  awk -v x="$others" -v r="$RANK" -v c="$(nproc)" -v h="$1" 'BEGIN { exit !(x + r + 1 + h <= c) }'
+  awk -v x="$others" -v r="$RANK" -v c="$(nproc)" -v h="$1" 'BEGIN { exit !(x + r + h <= c) }'
 }
 
 queue_empty() { [ -z "$(ls "$RUN/queue" 2>/dev/null)" ]; }
@@ -61,7 +61,7 @@ run_shard() {
 }
 
 while :; do
-  if [ "${BACKFILL:-0}" = 1 ] && ! fits 1; then
+  if [ "${BACKFILL:-0}" = 1 ] && ! fits 0; then
     queue_empty && break
     sleep 60
     continue
