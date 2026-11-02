@@ -625,6 +625,138 @@ at::Tensor log_sigmoid_backward(const at::Tensor& grad, const at::Tensor& self, 
   return log_sigmoid_backward_out(grad, self, buffer, out);
 }
 
+// Activation backward ops with scalar parameters: binary op `code` of
+// (grad_output, x) with params alpha, beta, gamma in the compute dtype.
+bool act_param_gpu(uint32_t code, const at::Tensor& grad, const at::Tensor& x, at::Tensor& out,
+                   std::vector<at::Scalar> params) {
+  if (!is_vk(grad) || !is_vk(x) || !is_vk(out)) {
+    return false;
+  }
+  at::ScalarType dtype = at::result_type(grad, x);
+  at::ScalarType wide = widened(dtype);
+  const char* label = dtype_label(wide);
+  if (!at::isFloatingType(dtype) || label == nullptr || out.scalar_type() != dtype) {
+    return false;
+  }
+  std::vector<int64_t> shape = at::infer_size(grad.sizes(), x.sizes());
+  const at::Tensor* like = grad.sizes() == at::IntArrayRef(shape) ? &grad : x.sizes() == at::IntArrayRef(shape) ? &x : nullptr;
+  check_overlap(out, {&grad, &x});
+  check_inplace_shape(out, shape, {&grad, &x});
+  resize_elementwise_output(out, shape, like);
+  at::Tensor a = to_dtype(grad, wide), b = to_dtype(x, wide);
+  std::string kernel = std::string("binary_") + label;
+  with_output(out, wide, [&](const at::Tensor& target) { launch_strided(kernel.c_str(), {code, 0}, target, &a, &b, params); });
+  return true;
+}
+
+// a * b rounded in the CPU's opmath type for dtype (float32 for float32 and
+// 16-bit floats), as its kernels form elu's coefficients.
+double opmath_product(double a, double b, at::ScalarType dtype) {
+  return dtype == at::kDouble ? a * b : static_cast<double>(static_cast<float>(a) * static_cast<float>(b));
+}
+
+at::Tensor& softplus_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& beta,
+                                  const at::Scalar& threshold, at::Tensor& grad_input) {
+  if (!act_param_gpu(op::BINARY_SOFTPLUS_BACKWARD, grad, self, grad_input, {beta, threshold})) {
+    on_cpu("aten::softplus_backward", "grad_input", grad, self, beta, threshold, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor softplus_backward(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& beta,
+                             const at::Scalar& threshold) {
+  at::Tensor out = act_result(grad, self);
+  return softplus_backward_out(grad, self, beta, threshold, out);
+}
+
+at::Tensor& elu_backward_out(const at::Tensor& grad, const at::Scalar& alpha, const at::Scalar& scale,
+                             const at::Scalar& input_scale, bool is_result, const at::Tensor& self_or_result,
+                             at::Tensor& grad_input) {
+  // (the CPU's check)
+  TORCH_CHECK(!is_result || alpha.to<double>() >= 0.0, "In-place elu backward calculation is triggered with a negative "
+              "slope which is not supported. This is caused by calling in-place forward function with a negative slope, "
+              "please call out-of-place version instead.");
+  at::ScalarType t = at::result_type(grad, self_or_result);
+  double negcoef = opmath_product(alpha.to<double>(), scale.to<double>(), t);
+  if (!act_param_gpu(is_result ? op::BINARY_ELU_BACKWARD_RESULT : op::BINARY_ELU_BACKWARD, grad, self_or_result,
+                     grad_input, {negcoef, scale, input_scale})) {
+    on_cpu("aten::elu_backward", "grad_input", grad, alpha, scale, input_scale, is_result, self_or_result, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor elu_backward(const at::Tensor& grad, const at::Scalar& alpha, const at::Scalar& scale,
+                        const at::Scalar& input_scale, bool is_result, const at::Tensor& self_or_result) {
+  at::Tensor out = act_result(grad, self_or_result);
+  return elu_backward_out(grad, alpha, scale, input_scale, is_result, self_or_result, out);
+}
+
+at::Tensor& hardtanh_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& min_val,
+                                  const at::Scalar& max_val, at::Tensor& grad_input) {
+  if (!act_param_gpu(op::BINARY_HARDTANH_BACKWARD, grad, self, grad_input, {min_val, max_val})) {
+    on_cpu("aten::hardtanh_backward", "grad_input", grad, self, min_val, max_val, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor hardtanh_backward(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& min_val,
+                             const at::Scalar& max_val) {
+  at::Tensor out = act_result(grad, self);
+  return hardtanh_backward_out(grad, self, min_val, max_val, out);
+}
+
+at::Tensor& leaky_relu_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& negative_slope,
+                                    bool self_is_result, at::Tensor& grad_input) {
+  // (the CPU's check)
+  TORCH_CHECK(!self_is_result || negative_slope.to<double>() >= 0.0, "In-place leakyReLu backward calculation is "
+              "triggered with a negative slope which is not supported. This is caused by calling in-place forward "
+              "function with a negative slope, please call out-of-place version instead. File an issue at "
+              "https://github.com/pytorch/pytorch if you do require supporting in-place leakRelu backward calculation "
+              "with negative slope");
+  if (!act_param_gpu(op::BINARY_LEAKY_RELU_BACKWARD, grad, self, grad_input, {negative_slope})) {
+    on_cpu("aten::leaky_relu_backward", "grad_input", grad, self, negative_slope, self_is_result, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor leaky_relu_backward(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& negative_slope,
+                               bool self_is_result) {
+  at::Tensor out = act_result(grad, self);
+  return leaky_relu_backward_out(grad, self, negative_slope, self_is_result, out);
+}
+
+at::Tensor& logit_backward_out(const at::Tensor& grad, const at::Tensor& self, std::optional<double> eps,
+                               at::Tensor& grad_input) {
+  double lo = eps.value_or(-1.0), hi = 1.0 - lo;
+  if (eps.has_value()) {
+    // (the CPU forms lo = eps and hi = 1 - lo in the dtype: in float16,
+    // 1 - 1e-6 is 1)
+    at::ScalarType t = at::result_type(grad, self);
+    if (t == at::kHalf) {
+      c10::Half l(static_cast<float>(*eps));
+      lo = static_cast<float>(l);
+      hi = static_cast<float>(c10::Half(1.0f - static_cast<float>(l)));
+    } else if (t == at::kBFloat16) {
+      c10::BFloat16 l(static_cast<float>(*eps));
+      lo = static_cast<float>(l);
+      hi = static_cast<float>(c10::BFloat16(1.0f - static_cast<float>(l)));
+    } else if (t == at::kFloat) {
+      float l = static_cast<float>(*eps);
+      lo = l;
+      hi = 1.0f - l;
+    }
+  }
+  if (!act_param_gpu(op::BINARY_LOGIT_BACKWARD, grad, self, grad_input, {lo, hi})) {
+    on_cpu("aten::logit_backward", "grad_input", grad, self, eps, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor logit_backward(const at::Tensor& grad, const at::Tensor& self, std::optional<double> eps) {
+  at::Tensor out = act_result(grad, self);
+  return logit_backward_out(grad, self, eps, out);
+}
+
 at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
   TORCH_CHECK(!self.is_complex() && !values.is_complex() && !out.is_complex(),
               "heaviside is not yet implemented for complex tensors.");
@@ -793,6 +925,16 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("tanh_backward.grad_input", &sig_tanh_backward_out<true>);
   m.impl("log_sigmoid_backward", &vk::log_sigmoid_backward);
   m.impl("log_sigmoid_backward.grad_input", &log_sigmoid_backward_out);
+  m.impl("softplus_backward", &vk::softplus_backward);
+  m.impl("softplus_backward.grad_input", &softplus_backward_out);
+  m.impl("elu_backward", &vk::elu_backward);
+  m.impl("elu_backward.grad_input", &elu_backward_out);
+  m.impl("hardtanh_backward", &vk::hardtanh_backward);
+  m.impl("hardtanh_backward.grad_input", &hardtanh_backward_out);
+  m.impl("leaky_relu_backward", &vk::leaky_relu_backward);
+  m.impl("leaky_relu_backward.grad_input", &leaky_relu_backward_out);
+  m.impl("logit_backward", &vk::logit_backward);
+  m.impl("logit_backward.grad_input", &logit_backward_out);
   m.impl("logaddexp.out", &binary_out<17>);
   m.impl("logaddexp2.out", &binary_out<18>);
   m.impl("xlogy.OutTensor", &binary_out<19>);

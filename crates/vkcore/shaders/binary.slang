@@ -129,6 +129,22 @@ T apply(T a, T b)
     }
     case BINARY_HARDSWISH_BACKWARD: return b <= T(-3) ? T(0) : (b < T(3) ? a * (b / T(3) + T(0.5)) : a);  // (open interval, as the CPU)
     case BINARY_HARDSIGMOID_BACKWARD: return (b > T(-3) && b < T(3)) ? a * (T(1) / T(6)) : T(0);
+    // (alpha, beta, gamma: the op's scalars, in T)
+    case BINARY_SOFTPLUS_BACKWARD: {  // beta, threshold
+        T z = m_exp(b * T(alpha()));
+        return (b * T(alpha())) > T(beta()) ? a : a * z / (z + T(1));
+    }
+    case BINARY_ELU_BACKWARD:  // negcoef = alpha scale, poscoef = scale, negiptcoef = input_scale
+        return b <= T(0) ? a * T(gamma()) * T(alpha()) * m_exp(b * T(gamma())) : a * T(beta());
+    case BINARY_ELU_BACKWARD_RESULT:  // (b: the output)
+        return b <= T(0) ? a * T(gamma()) * (b + T(alpha())) : a * T(beta());
+    case BINARY_HARDTANH_BACKWARD: return (b <= T(alpha()) || b >= T(beta())) ? T(0) : a;
+    case BINARY_LEAKY_RELU_BACKWARD: return b > T(0) ? a : a * T(alpha());
+    case BINARY_LOGIT_BACKWARD: {  // alpha: eps (< 0: none), beta: 1 - eps
+        if (T(alpha()) < T(0))
+            return (b < T(0) || b > T(1)) ? m_nan() : ((b == T(0) || b == T(1)) ? a * m_inf() : a / (b * (T(1) - b)));
+        return (b < T(alpha()) || b > T(beta())) ? T(0) : a / (b * (T(1) - b));
+    }
     case BINARY_LOG_SIGMOID_BACKWARD: {
         bool neg = b < T(0);
         T z = m_exp(-abs(b));
