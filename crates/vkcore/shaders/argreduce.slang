@@ -32,6 +32,9 @@ struct Params
 
 [vk::constant_id(0)] const int OP = ARGREDUCE_MAX;
 [vk::constant_id(1)] const int LEVEL0 = 1;
+// One thread per (output, chunk) instead of a workgroup: for many outputs of
+// a few elements each (a workgroup would leave most of its lanes idle).
+[vk::constant_id(2)] const int PER_THREAD = 0;
 
 static const uint WG = 256;
 groupshared T svalue[WG];
@@ -74,6 +77,32 @@ int offset(uint index, uint nd, uint4 sz, int4 st)
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
     uint work = p.n_out * p.nchunks;
+    if (PER_THREAD != 0)
+    {
+        for (uint w = gid.x * WG + tid.x; w < work; w += p.ngroups * WG)
+        {
+            uint o = w / p.nchunks;
+            uint c = w % p.nchunks;
+            int base = offset(o, p.ond, p.osz, p.ost);
+            uint end = min((c + 1) * p.chunk, p.n_red);
+            T bv = T(0);
+            int64_t bi = -1;
+            for (uint i = c * p.chunk; i < end; i++)
+            {
+                int at = base + offset(i, p.rnd, p.rsz, p.rst);
+                T v = p.in[at];
+                int64_t idx = LEVEL0 != 0 ? int64_t(i) : p.in_idx[at];
+                if (better(bv, bi, v, idx))
+                {
+                    bv = v;
+                    bi = idx;
+                }
+            }
+            p.out[w] = bv;
+            p.out_idx[w] = bi;
+        }
+        return;
+    }
     for (uint w = gid.x; w < work; w += p.ngroups)
     {
         uint o = w / p.nchunks;

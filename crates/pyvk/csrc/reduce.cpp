@@ -242,7 +242,9 @@ std::pair<at::Tensor, at::Tensor> run_argreduce(const at::Tensor& self, const Pl
   bool level0 = true;
   std::string kernel = std::string("argreduce_") + dtype_label(self.scalar_type());
   while (true) {
-    int64_t nchunks = choose_chunks(plan.n_out, n_red);
+    // (one thread per output for many outputs of a few elements: see run_reduce)
+    bool per_thread = level0 && plan.n_out >= 256 && n_red <= 32;
+    int64_t nchunks = per_thread ? 1 : choose_chunks(plan.n_out, n_red);
     int64_t chunk = (n_red + nchunks - 1) / nchunks;
     at::Tensor values = at::empty({plan.n_out * nchunks}, self.options());
     at::Tensor indices = at::empty({plan.n_out * nchunks}, self.options().dtype(at::kLong));
@@ -255,10 +257,11 @@ std::pair<at::Tensor, at::Tensor> run_argreduce(const at::Tensor& self, const Pl
     p.n_red = static_cast<uint32_t>(n_red);
     p.chunk = static_cast<uint32_t>(chunk);
     p.nchunks = static_cast<uint32_t>(nchunks);
-    uint32_t groups = static_cast<uint32_t>(std::min<int64_t>(plan.n_out * nchunks, kMaxGroups));
+    int64_t work = plan.n_out * nchunks;
+    uint32_t groups = static_cast<uint32_t>(std::min<int64_t>(per_thread ? (work + 255) / 256 : work, kMaxGroups));
     p.ngroups = groups;
     set_dims(p, outer, red);
-    dispatch(kernel, {op, level0 ? 1u : 0u}, p, groups);
+    dispatch(kernel, {op, level0 ? 1u : 0u, per_thread ? 1u : 0u}, p, groups);
     if (nchunks == 1) {
       return {values, indices};
     }
