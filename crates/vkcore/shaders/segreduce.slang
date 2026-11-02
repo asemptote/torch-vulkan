@@ -9,6 +9,11 @@
 //   acc = INCLUDE_SELF ? dst[off] : identity;  acc = op(acc, vals[...]) ...
 // OP: SEGREDUCE_SUM, _PROD, _MAX, _MIN (NaN propagates), _MEAN ((acc) / count,
 // counting dst when included; integer means round toward -inf).
+// Rows (width > 1): each source element is a row of `width` contiguous values
+// (vals[i * width + col]) and offs its destination row's first element
+// (dst[off + col]); a thread per (sorted position, col). scale_by_count (SUM)
+// multiplies each value by 1 / (its run's length) before adding it, as
+// embedding_dense_backward's scale_grad_by_freq does.
 
 #include "opcodes.slang"
 
@@ -18,8 +23,10 @@ struct Params
     int64_t* offs; // per source element
     T* vals;       // per source element
     uint* order;   // source elements sorted by offset
-    uint n;        // source elements
+    uint n;        // source elements (rows)
     uint stride;
+    uint width;    // values per row (0: 1)
+    uint scale_by_count;
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
@@ -56,17 +63,31 @@ void main(uint3 id: SV_DispatchThreadID)
     // (Every index into order stays in range, also on paths a lane does not
     // take: lavapipe's code performs those loads too.)
     uint last = max(p.n, 1u) - 1u;
-    for (uint s = id.x; s < p.n; s += p.stride)
+    uint width = max(p.width, 1u);
+    for (uint t = id.x; t < p.n * width; t += p.stride)
     {
+        uint s = t / width, col = t - s * width;
         int64_t off = p.offs[p.order[min(s, last)]];
         if (s > 0u && p.offs[p.order[max(s, 1u) - 1u]] == off)
             continue;  // not the start of a run
+        T scale = T(1);
+#ifdef IS_FLOAT
+        if (p.scale_by_count != 0)  // (floating types only)
+        {
+            uint run = 0;
+            for (uint j = s; j < p.n && p.offs[p.order[min(j, last)]] == off; j++)
+                run++;
+            scale = T(1) / T(run);
+        }
+#endif
         bool have = INCLUDE_SELF != 0;
-        T acc = have ? p.dst[off] : T(0);
+        T acc = have ? p.dst[off + col] : T(0);
         uint count = have ? 1u : 0u;
         for (uint j = s; j < p.n && p.offs[p.order[min(j, last)]] == off; j++)
         {
-            T v = p.vals[p.order[j]];
+            T v = p.vals[p.order[min(j, last)] * width + col];
+            if (p.scale_by_count != 0)
+                v = v * scale;
             acc = have ? combine(acc, v) : v;
             have = true;
             count++;
@@ -81,6 +102,6 @@ void main(uint3 id: SV_DispatchThreadID)
             acc = (acc - q * c != T(0) && acc < T(0)) ? q - T(1) : q;  // (not %: see binary.slang's irem)
 #endif
         }
-        p.dst[off] = acc;
+        p.dst[off + col] = acc;
     }
 }

@@ -581,8 +581,9 @@ at::Tensor& put_(at::Tensor& self, const at::Tensor& index, const at::Tensor& so
 struct SegReduceParams {
   uint64_t dst, offs, vals, order;
   uint32_t n, stride;
+  uint32_t width, scale_by_count;  // (rows: see shaders/segreduce.slang)
 };
-static_assert(sizeof(SegReduceParams) == 40, "must match shaders/segreduce.slang");
+static_assert(sizeof(SegReduceParams) == 48, "must match shaders/segreduce.slang");
 
 const char* accum_label(at::ScalarType t) {
   switch (t) {
@@ -680,6 +681,48 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
   uint32_t groups = 0;
   check(vkt_grid_1d(p.n, &groups, &p.stride));
   dispatch(std::string("segreduce_") + accum_label(dst_view.scalar_type()), {op, include_self ? 1u : 0u}, p, groups);
+}
+
+// Gradient of embedding's weight [num_weights, D]: grad_output's rows (its
+// last dim D) summed by index, in index order as on the CPU, without
+// padding_idx (or indices out of range); scale_grad_by_freq scales each row
+// by 1 / (its index's count). One sort of the indices (not of every
+// element's offset, as index_put_ with accumulate would), then segreduce
+// over rows. PyTorch's decomposition took ~70 kernels.
+at::Tensor embedding_dense_backward(const at::Tensor& grad_output, const at::Tensor& indices, int64_t num_weights,
+                                    int64_t padding_idx, bool scale_grad_by_freq) {
+  at::TensorArg indices_arg(indices, "indices", 2);
+  at::checkScalarTypes("embedding_backward", indices_arg, {at::kLong, at::kInt});
+  at::ScalarType t = grad_output.scalar_type();
+  int64_t n = indices.numel(), width = grad_output.dim() > 0 ? grad_output.size(-1) : 1;
+  bool kernel = is_vk(grad_output) && is_vk(indices) && (t == at::kFloat || (t == at::kDouble && vkt_has_float64())) &&
+                grad_output.dim() > 0 && n * width < (int64_t(1) << 31) && num_weights >= 0;
+  if (!kernel) {
+    return on_cpu("aten::embedding_dense_backward", "", grad_output, indices, num_weights, padding_idx,
+                  scale_grad_by_freq)[0]
+        .toTensor();
+  }
+  at::Tensor grad = grad_output.contiguous().view({n, width});  // (as the CPU kernel)
+  // (one row more, where skipped indices go)
+  at::Tensor result = at::zeros({num_weights + 1, width}, grad.options());
+  if (n > 0 && width > 0) {
+    at::Tensor idx = indices.reshape({n}).to(at::kLong);
+    at::Tensor keep = at::logical_and(at::logical_and(at::ge(idx, 0), at::lt(idx, num_weights)), at::ne(idx, padding_idx));
+    at::Tensor offs = at::mul(at::where(keep, idx, at::full({}, num_weights, idx.options())), width).reshape({1, n}).contiguous();
+    at::Tensor order = sort_rows(offs, false);
+    SegReduceParams p{};
+    p.dst = gpu_address_out(result);
+    p.offs = gpu_address(offs);
+    p.vals = gpu_address(grad);
+    p.order = gpu_address(order);
+    p.n = static_cast<uint32_t>(n);
+    p.width = static_cast<uint32_t>(width);
+    p.scale_by_count = scale_grad_by_freq ? 1u : 0u;
+    uint32_t groups = 0;
+    check(vkt_grid_1d(static_cast<uint64_t>(n * width), &groups, &p.stride));
+    dispatch(std::string("segreduce_") + accum_label(t), {op::SEGREDUCE_SUM, 0u}, p, groups);
+  }
+  return result.narrow(0, 0, num_weights);
 }
 
 // out = self, then out[index along dim] op= src (scatter_add, scatter_reduce, scatter(reduce=...)).
@@ -1381,6 +1424,7 @@ at::Tensor& isin_out(const at::Tensor& elements, const at::Tensor& test, bool as
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   using namespace vk;
   m.impl("index_select", &vk::index_select);
+  m.impl("embedding_dense_backward", &vk::embedding_dense_backward);
   m.impl("index_select.out", &index_select_out);
   m.impl("gather.out", &gather_out);
   m.impl("take", &vk::take);
