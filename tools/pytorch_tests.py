@@ -139,6 +139,14 @@ def cpu_twin(nodeid):
     return f"{path}::{cls.replace('PRIVATEUSE1', 'CPU')}::{re.sub(r'_vk(?=_|$)', '_cpu', name)}"
 
 
+# pytest's options that keep it from searching for a configuration file: it
+# would look in every directory above the tests, and on the cluster that
+# means a stat of /home/tox.ini, an automount lookup that once hung two
+# shards for an hour. (There is none to find: the tests run with pytest's
+# defaults.)
+NO_CONFIG = ["-c", os.devnull, "--rootdir", "."]
+
+
 def run_tests(tests, ids, env, results_path, log, extra, timeout):
     """Runs `ids`, restarting after crashes; returns the last exit code."""
     listing = results_path.with_suffix(".ids")
@@ -148,7 +156,7 @@ def run_tests(tests, ids, env, results_path, log, extra, timeout):
         while remaining:
             listing.write_text("\n".join(remaining), encoding="utf-8")
             cmd = [sys.executable, "-c", RUNNER, str(results_path), f"@{listing}", "-q", "-p", "no:cacheprovider",
-                   *extra]
+                   *NO_CONFIG, *extra]
             start = fh.tell()
             try:
                 code = subprocess.call(cmd, cwd=tests, env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=timeout)
@@ -190,7 +198,8 @@ def collect(tests, file, env, extra):
     for i, arg in enumerate(extra):
         if arg in ("-k", "-m") and i + 1 < len(extra):
             filters += [arg, extra[i + 1]]
-    cmd = [sys.executable, "-c", RUNNER, "-", file, "--collect-only", "-q", "-p", "no:cacheprovider", *filters]
+    cmd = [sys.executable, "-c", RUNNER, "-", file, "--collect-only", "-q", "-p", "no:cacheprovider", *NO_CONFIG,
+           *filters]
     out = subprocess.run(cmd, cwd=tests, env=env, capture_output=True, text=True).stdout
     return sorted(line.strip() for line in out.splitlines() if "::" in line and not line.startswith(" "))
 

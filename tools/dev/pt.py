@@ -16,4 +16,7 @@ import torch_vulkan  # noqa: E402,F401
 
 os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.expanduser("~/pytorch-src/test")))
 sys.path.insert(0, os.getcwd())
-sys.exit(pytest.main(["-q", "-p", "no:cacheprovider", "--no-header", "-x", "--tb=short"] + sys.argv[1:]))
+# (-c / --rootdir: no search for a configuration file above the tests; see
+# NO_CONFIG in tools/pytorch_tests.py)
+sys.exit(pytest.main(["-q", "-p", "no:cacheprovider", "--no-header", "-x", "--tb=short", "-c", os.devnull, "--rootdir", "."]
+                     + sys.argv[1:]))
