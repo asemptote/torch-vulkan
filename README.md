@@ -56,7 +56,8 @@ CPU fallbacks) and by the slowest tests of the full runs on lavapipe:
   one sort of the keys, then whole rows folded in index order, as the CPU's
   loops (`segreduce.slang`'s row mode);
 - the activations' backward (gelu, silu, mish, hardswish, hardsigmoid,
-  log_sigmoid, sigmoid, tanh) as one binary kernel each;
+  log_sigmoid, sigmoid, tanh, softplus, elu/selu/celu, hardtanh, leaky_relu,
+  logit) as one binary kernel each;
 - reductions and arg-reductions of a few elements per output: one thread per
   output instead of a workgroup;
 - the one-sided Jacobi SVD: column-major storage, and no rotations for
@@ -66,8 +67,8 @@ CPU fallbacks) and by the slowest tests of the full runs on lavapipe:
 
 Not done: rms_norm stays composed (its fused op `_fused_rms_norm` has no CPU
 backward kernel, and PyTorch only takes that path on CUDA-like devices);
-softplus, elu and the smooth-L1/Huber losses' backward still take a few
-generic kernels; convolution and attention are matrix products already.
+the smooth-L1/Huber losses' backward still take a few generic kernels;
+convolution and attention are matrix products already.
 
 ## PyTorch's own tests (M15)
 
@@ -789,6 +790,6 @@ no fallbacks in the OpInfo sweep).
     kernels on Windows GPUs (the float64 zeta test outlasts the Intel UHD
     620's watchdog and loses the device). (lavapipe's slowest tests, the
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
-16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm,
-    softplus/elu/smooth-L1 backward as single kernels.
+16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
+    the smooth-L1/Huber backward as single kernels.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
