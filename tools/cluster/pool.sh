@@ -4,7 +4,7 @@
 # N = auto: the cores not in use (nproc - load average - 2), for shared
 # workstations. For lavapipe each worker uses one core (LP_NUM_THREADS=1).
 # Workers backfill (BACKFILL=1): they take shards from the end of the queue
-# (the cluster's take them from the start) and stop when the machine gets busy.
+# (the cluster's take them from the start) and wait while the machine is busy.
 set -u
 DRIVER=$1
 RUN=$2
