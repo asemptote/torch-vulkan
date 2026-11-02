@@ -194,11 +194,14 @@ at::Tensor run_reduce(const at::Tensor& self, const Plan& plan, ROp op, Final fi
   int64_t n_red = plan.n_red;
   bool level0 = true;
   while (true) {
-    // Strided reduced dims with many adjacent outputs (e.g. column sums): one
-    // thread per (output, chunk) so neighbouring threads read neighbouring
-    // addresses. Otherwise one workgroup per (output, chunk).
-    bool per_thread = level0 && red.n > 0 && red.stride[0] != 1 && outer.n > 0 && outer.stride[0] == 1 &&
-                      plan.n_out >= 256;
+    // One thread per (output, chunk) for strided reduced dims with many
+    // adjacent outputs (e.g. column sums: neighbouring threads read
+    // neighbouring addresses), and for many outputs of a few elements each
+    // (e.g. a sum over a last dim of 3, where a workgroup per output would
+    // leave all but 3 of its 256 lanes idle: 0.45 s for 1M outputs on
+    // lavapipe). Otherwise one workgroup per (output, chunk).
+    bool per_thread = level0 && red.n > 0 && plan.n_out >= 256 &&
+                      ((red.stride[0] != 1 && outer.n > 0 && outer.stride[0] == 1) || n_red <= 32);
     int64_t nchunks = per_thread ? std::max<int64_t>(1, std::min((int64_t(1) << 16) / plan.n_out, n_red / 64))
                                  : choose_chunks(plan.n_out, n_red);
     int64_t chunk = (n_red + nchunks - 1) / nchunks;
