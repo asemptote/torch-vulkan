@@ -1,22 +1,22 @@
 #!/bin/bash
-# Starts N workers (worker.sh) on this machine, detached, at low priority:
-#   pool.sh DRIVER RUN_DIR N
-# N = auto: the cores not in use (nproc - load average - 2), for shared
-# workstations. For lavapipe each worker uses one core (LP_NUM_THREADS=1).
-# Workers backfill (BACKFILL=1): they take shards from the end of the queue
-# (the cluster's take them from the start) and wait while the machine is busy.
+# Starts backfill workers (worker.sh, BACKFILL=1) on this machine, detached,
+# at low priority:
+#   pool.sh DRIVER RUN_DIR [N [FIRST_RANK]]
+# N defaults to one per core (less FIRST_RANK). Worker i gets RANK
+# FIRST_RANK + i (another pool on the machine holds the ranks before): each runs only
+# while its rank fits in the cores the machine's other users leave free, so
+# the pool shrinks and grows with their load (see worker.sh). Backfill
+# workers take shards from the end of the queue (the cluster's take them from
+# the start). For lavapipe each worker uses one core (LP_NUM_THREADS=1).
 set -u
 DRIVER=$1
 RUN=$2
-N=$3
+FIRST=${4:-0}
+N=${3:-$(($(nproc) - FIRST))}
 HERE=$(cd "$(dirname "$0")" && pwd)
-if [ "$N" = auto ]; then
-  load=$(cut -d' ' -f1 /proc/loadavg)
-  N=$(awk -v c="$(nproc)" -v l="$load" 'BEGIN { n = int(c - l - 2); print (n > 0 ? n : 0) }')
-fi
 mkdir -p "$RUN/pbs-logs"
-for i in $(seq 1 "$N"); do
-  BACKFILL=1 LP_NUM_THREADS=1 setsid nohup "$HERE/worker.sh" "$DRIVER" "$RUN" \
+for i in $(seq "$FIRST" $((FIRST + N - 1))); do
+  RANK=$i BACKFILL=1 LP_NUM_THREADS=1 setsid nohup "$HERE/worker.sh" "$DRIVER" "$RUN" \
     > "$RUN/pbs-logs/worker.$(hostname -s).$DRIVER.$i.log" 2>&1 < /dev/null &
 done
 echo "$(hostname -s): $N $DRIVER workers"

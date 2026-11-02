@@ -43,11 +43,12 @@ import sys
 
 # pytest with torch_vulkan imported first (it registers "vk" before
 # common_device_type lists the device types), test ids from a file, and a
-# plugin recording each test's start and outcome (flushed, so they survive a
-# crash). With TORCH_VK_VALIDATE set, a test during which the validation
+# plugin recording each test's start, outcome and wall time in seconds
+# (elapsed; flushed, so they survive a crash). tools/cluster/plan_shards.py
+# schedules the next run's longest tests first from the elapsed times. With TORCH_VK_VALIDATE set, a test during which the validation
 # layer reported anything gets the outcome "validation" (with the message).
 RUNNER = r"""
-import json, os, sys
+import json, os, sys, time
 import torch_vulkan  # noqa: F401
 from torch_vulkan import _native
 import pytest
@@ -58,12 +59,14 @@ class Recorder:
     def __init__(self, path):
         self.out = open(path, "a", encoding="utf-8")
         self.issues = 0
+        self.started = time.time()
 
     def write(self, **entry):
         self.out.write(json.dumps(entry) + "\n")
         self.out.flush()
 
     def pytest_runtest_logstart(self, nodeid, location):
+        self.started = time.time()
         self.write(start=nodeid)
 
     def pytest_runtest_teardown(self, item):
@@ -94,7 +97,8 @@ class Recorder:
             crash = getattr(report.longrepr, "reprcrash", None)
             message = crash.message if crash is not None else str(report.longrepr)
             message = message.strip().splitlines()[0][:200] if message.strip() else ""
-        self.write(nodeid=report.nodeid, outcome=outcome, message=message)
+        self.write(nodeid=report.nodeid, outcome=outcome, message=message,
+                   elapsed=round(time.time() - self.started, 3))
 
 args = sys.argv[2:]
 if args and args[0].startswith("@"):
