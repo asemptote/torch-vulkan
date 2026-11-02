@@ -63,7 +63,9 @@ SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
 EIG = ("linalg.eig", "linalg.eigvals")
 # Batch norm in evaluation mode: the CPU returns empty save_mean/save_invstd,
 # other devices per-channel ones (PyTorch's meta kernel): the output only.
-FIRST_OUTPUT_ONLY = ("native_batch_norm", "_native_batch_norm_legit")
+# (native_layer_norm: its 16-bit saved statistics are float32 on vk, as
+# PyTorch's meta kernel and tests have them, and 16-bit on the CPU)
+FIRST_OUTPUT_ONLY = ("native_batch_norm", "_native_batch_norm_legit", "native_layer_norm")
 
 
 def op_name(info):

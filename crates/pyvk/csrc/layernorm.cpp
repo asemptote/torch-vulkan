@@ -74,8 +74,10 @@ void launch(uint32_t op, LayerNormParams& p, at::ScalarType t, bool has_w, bool 
 }
 
 // 16-bit inputs: computed in float32 and rounded once. Parameters may be of
-// the input's dtype or float32 (the CPU's mixed rule); the saved statistics
-// are in the input's dtype, or float32 with float32 parameters, as on the CPU.
+// the input's dtype or float32 (the CPU's mixed rule). The saved statistics
+// stay float32, as PyTorch's meta kernel (and CUDA) gives them and as
+// PyTorch's tests (_refs.native_layer_norm) expect, where the CPU gives the
+// input's dtype.
 bool half_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
   if (!is_vk(x) || !at::isReducedFloatingType(x.scalar_type())) {
     return false;
@@ -86,11 +88,6 @@ bool half_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
     }
   }
   return true;
-}
-
-at::ScalarType stat_type(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
-  bool mixed = (w.defined() && w.scalar_type() != x.scalar_type()) || (b.defined() && b.scalar_type() != x.scalar_type());
-  return mixed ? at::kFloat : x.scalar_type();
 }
 
 at::Tensor widened(const at::Tensor& t) {
@@ -109,8 +106,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tenso
   int64_t m = n == 0 ? 0 : input.numel() / n;
   if (half_ok(input, weight, bias) && m > 0 && n > 0) {
     auto [out, mean, rstd] = vk::native_layer_norm(widened(input), normalized_shape, widened(weight), widened(bias), eps);
-    at::ScalarType st = stat_type(input, weight, bias);
-    return {out.to(input.scalar_type()), mean.to(st), rstd.to(st)};
+    return {out.to(input.scalar_type()), mean, rstd};
   }
   if (!kernel_ok(input, weight, bias) || m == 0 || n == 0) {
     auto s = on_cpu("aten::native_layer_norm", "", input, normalized_shape, weight_opt, bias_opt, eps);
