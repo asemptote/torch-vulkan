@@ -478,14 +478,6 @@ def _cdist_backward_impl(grad, x1, x2, p, dist):
     return (grad.unsqueeze(-1) * dd).sum(-2)
 
 
-def _native_group_norm(x, weight, bias, n, c, hxw, group, eps):
-    # (PyTorch's composite kernel views the input, which fails for channels-last
-    # layouts; its reference reshapes)
-    out, mean, rstd = decomposition_table[aten.native_group_norm.default](x, weight, bias, n, c, hxw, group, eps)
-    channels_last = x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last) and not x.is_contiguous()
-    return out.contiguous(memory_format=torch.channels_last if channels_last else torch.contiguous_format), mean, rstd
-
-
 def _pdist_forward(x, p=2):
     n = x.shape[0]
     i, j = torch.triu_indices(n, n, 1, device=x.device)
@@ -1286,7 +1278,6 @@ def _kernels():
         "grid_sampler_3d": _grid_sampler_forward,
         "grid_sampler_2d_backward": _make_grid_sampler_backward("grid_sampler_2d_backward"),
         "grid_sampler_3d_backward": _make_grid_sampler_backward("grid_sampler_3d_backward"),
-        "native_group_norm": _native_group_norm,
         "ldexp.Tensor": _ldexp,
         "bucketize.Scalar": _bucketize_scalar,
         "multi_margin_loss": _multi_margin_loss,
