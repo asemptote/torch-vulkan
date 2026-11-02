@@ -412,13 +412,18 @@ def _make_grid_sampler_backward(name):
             grad_output.to(dt), input.to(dt), grid.to(dt), mode, padding_mode, align_corners, output_mask[1])
         gi = None
         if output_mask[0]:
+            # Rows (n, point, corner) of grad_output[n, :, point] * weight,
+            # summed by input position in (point, corner) order, as the CPU:
+            # one sort of the n * points * corners keys, all channels at once.
             n, c = input.shape[:2]
             points, corners = idx.shape[1], idx.shape[2]
-            g = grad_output.to(dt).reshape(n, c, points, 1) * wgt.reshape(n, 1, points, corners)
-            g = torch.where((idx >= 0).reshape(n, 1, points * corners), g.reshape(n, c, points * corners), 0.0)
-            index = idx.clamp(min=0).reshape(n, 1, points * corners).expand(n, c, points * corners)
-            flat = torch.zeros(n, c, math.prod(input.shape[2:]), device=input.device, dtype=dt)
-            gi = flat.scatter_add(2, index, g).reshape(input.shape).to(input.dtype)
+            plane = math.prod(input.shape[2:])
+            go = grad_output.to(dt).reshape(n, c, points).transpose(1, 2)  # [n, points, c]
+            rows = (go.unsqueeze(2) * wgt.reshape(n, points, corners, 1)).reshape(n * points * corners, c)
+            base = (torch.arange(n, device=idx.device) * plane).reshape(n, 1, 1)
+            keys = torch.where(idx >= 0, idx + base, -1).reshape(-1)
+            gi = torch.ops.torch_vulkan.sum_rows_by_key(keys, rows, n * plane)  # [n * plane, c]
+            gi = gi.reshape(n, plane, c).transpose(1, 2).reshape(input.shape).to(input.dtype)
         return gi, (gg.to(grid.dtype) if output_mask[1] else None)
 
     return backward

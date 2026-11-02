@@ -288,6 +288,8 @@ TORCH_LIBRARY(torch_vulkan, m) {
   m.def("grid_sampler(Tensor input, Tensor grid, int mode, int padding, bool align_corners) -> Tensor");
   m.def("grid_sampler_backward(Tensor grad_output, Tensor input, Tensor grid, int mode, int padding, "
         "bool align_corners, bool want_grid) -> (Tensor, Tensor, Tensor)");
+  // (indexing.cpp)
+  m.def("sum_rows_by_key(Tensor keys, Tensor vals, int num_rows) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {

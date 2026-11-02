@@ -683,6 +683,47 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
   dispatch(std::string("segreduce_") + accum_label(dst_view.scalar_type()), {op, include_self ? 1u : 0u}, p, groups);
 }
 
+// result[k] = sum of vals' rows i with keys[i] == k, in i order (as the
+// CPU's sequential loops): keys [T] int64 (outside [0, num_rows): skipped),
+// vals [T, W] float32/float64 contiguous; result [num_rows, W]. One sort of
+// the T keys, then segreduce over rows of W; scale_by_count scales each row
+// by 1 / (its key's count). (embedding's backward; grid_sampler's backward
+// through the torch_vulkan::sum_rows_by_key op)
+at::Tensor sum_rows_by_key(const at::Tensor& keys, const at::Tensor& vals, int64_t num_rows, bool scale_by_count) {
+  TORCH_CHECK(keys.dim() == 1 && vals.dim() == 2 && vals.size(0) == keys.size(0) && num_rows >= 0 &&
+                  (keys.scalar_type() == at::kLong) && accum_label(vals.scalar_type()) != nullptr &&
+                  at::isFloatingType(vals.scalar_type()) && is_vk(keys) && is_vk(vals),
+              "sum_rows_by_key: expected int64 keys [T] and float vals [T, W] on vk, got ", keys.sizes(), " ",
+              keys.scalar_type(), " and ", vals.sizes(), " ", vals.scalar_type());
+  int64_t n = keys.numel(), width = vals.size(1);
+  TORCH_CHECK(n * width < (int64_t(1) << 31) && (num_rows + 1) * width < (int64_t(1) << 62),
+              "sum_rows_by_key: more elements than 32-bit offsets address");
+  at::Tensor v = vals.contiguous();
+  // (one row more, where skipped keys go)
+  at::Tensor result = at::zeros({num_rows + 1, width}, v.options());
+  if (n > 0 && width > 0) {
+    at::Tensor keep = at::logical_and(at::ge(keys, 0), at::lt(keys, num_rows));
+    at::Tensor offs = at::mul(at::where(keep, keys, at::full({}, num_rows, keys.options())), width).reshape({1, n}).contiguous();
+    at::Tensor order = sort_rows(offs, false);
+    SegReduceParams p{};
+    p.dst = gpu_address_out(result);
+    p.offs = gpu_address(offs);
+    p.vals = gpu_address(v);
+    p.order = gpu_address(order);
+    p.n = static_cast<uint32_t>(n);
+    p.width = static_cast<uint32_t>(width);
+    p.scale_by_count = scale_by_count ? 1u : 0u;
+    uint32_t groups = 0;
+    check(vkt_grid_1d(static_cast<uint64_t>(n * width), &groups, &p.stride));
+    dispatch(std::string("segreduce_") + accum_label(v.scalar_type()), {op::SEGREDUCE_SUM, 0u}, p, groups);
+  }
+  return result.narrow(0, 0, num_rows);
+}
+
+at::Tensor sum_rows_by_key_op(const at::Tensor& keys, const at::Tensor& vals, int64_t num_rows) {
+  return sum_rows_by_key(keys, vals, num_rows, false);
+}
+
 // Gradient of embedding's weight [num_weights, D]: grad_output's rows (its
 // last dim D) summed by index, in index order as on the CPU, without
 // padding_idx (or indices out of range); scale_grad_by_freq scales each row
@@ -703,26 +744,10 @@ at::Tensor embedding_dense_backward(const at::Tensor& grad_output, const at::Ten
         .toTensor();
   }
   at::Tensor grad = grad_output.contiguous().view({n, width});  // (as the CPU kernel)
-  // (one row more, where skipped indices go)
-  at::Tensor result = at::zeros({num_weights + 1, width}, grad.options());
-  if (n > 0 && width > 0) {
-    at::Tensor idx = indices.reshape({n}).to(at::kLong);
-    at::Tensor keep = at::logical_and(at::logical_and(at::ge(idx, 0), at::lt(idx, num_weights)), at::ne(idx, padding_idx));
-    at::Tensor offs = at::mul(at::where(keep, idx, at::full({}, num_weights, idx.options())), width).reshape({1, n}).contiguous();
-    at::Tensor order = sort_rows(offs, false);
-    SegReduceParams p{};
-    p.dst = gpu_address_out(result);
-    p.offs = gpu_address(offs);
-    p.vals = gpu_address(grad);
-    p.order = gpu_address(order);
-    p.n = static_cast<uint32_t>(n);
-    p.width = static_cast<uint32_t>(width);
-    p.scale_by_count = scale_grad_by_freq ? 1u : 0u;
-    uint32_t groups = 0;
-    check(vkt_grid_1d(static_cast<uint64_t>(n * width), &groups, &p.stride));
-    dispatch(std::string("segreduce_") + accum_label(t), {op::SEGREDUCE_SUM, 0u}, p, groups);
-  }
-  return result.narrow(0, 0, num_weights);
+  at::Tensor idx = indices.reshape({n}).to(at::kLong);
+  // (padding_idx's rows skipped, as keys out of range)
+  at::Tensor keys = at::where(at::ne(idx, padding_idx), idx, at::full({}, -1, idx.options()));
+  return sum_rows_by_key(keys, grad, num_weights, scale_grad_by_freq);
 }
 
 // out = self, then out[index along dim] op= src (scatter_add, scatter_reduce, scatter(reduce=...)).
@@ -1474,4 +1499,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("eye.out", &eye_out);
   m.impl("equal", &vk::equal);
   m.impl("isin.Tensor_Tensor_out", &isin_out);
+}
+
+TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
+  m.impl("sum_rows_by_key", &vk::sum_rows_by_key_op);
 }
