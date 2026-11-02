@@ -95,6 +95,7 @@ fn main() {
             "csrc/softmax.cpp",
             "csrc/layernorm.cpp",
             "csrc/normgrad.cpp",
+            "csrc/loss.cpp",
         ])
         // Every object file registers aten kernels from static initializers
         // and nothing references them by symbol, so link the archive whole.
