@@ -186,7 +186,41 @@ at::Tensor upsample_linear(const at::Tensor& x, at::IntArrayRef output_size, boo
     p.osz[d] = static_cast<uint32_t>(output_size[d]);
     p.scale[d] = pack_param(scales[d], x.scalar_type());
   }
-  dispatch(std::string("resample_") + dtype_label(x.scalar_type()), {}, p, static_cast<uint32_t>(groups));
+  dispatch(std::string("resample_") + dtype_label(x.scalar_type()), {op::RESAMPLE_FORWARD}, p,
+           static_cast<uint32_t>(groups));
+  return out;
+}
+
+// Backward of linear interpolation along one dim: g [A, n_out, B] -> [A,
+// n_in, B], with the forward's scale (shaders/resample.slang, RESAMPLE_BACKWARD).
+at::Tensor upsample_linear_backward_dim(const at::Tensor& g, int64_t n_in, bool align_corners, double scale) {
+  TORCH_CHECK(g.dim() == 3 && (g.scalar_type() == at::kFloat || g.scalar_type() == at::kDouble) && n_in > 0,
+              "upsample_linear_backward_dim: expected a float32/float64 [A, n_out, B] tensor");
+  at::Tensor in = g.contiguous();
+  at::Tensor out = at::empty({g.size(0), n_in, g.size(2)}, g.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  if (g.size(1) == 0) {
+    return out.zero_();
+  }
+  TORCH_CHECK(out.numel() < (int64_t(1) << 32) && in.numel() < (int64_t(1) << 32),
+              "upsample_linear_backward_dim: more elements than 32-bit offsets address");
+  ResampleParams p{};
+  p.in = gpu_address(in);
+  p.out = gpu_address_out(out);
+  p.total = static_cast<uint32_t>(out.numel());
+  int64_t groups = std::min<int64_t>((out.numel() + kGroup - 1) / kGroup, kMaxGroups);
+  p.ngroups = static_cast<uint32_t>(groups);
+  p.align = align_corners ? 1u : 0u;
+  p.ndim = 1;
+  p.isz[0] = static_cast<uint32_t>(g.size(0));
+  p.isz[1] = static_cast<uint32_t>(n_in);
+  p.isz[2] = static_cast<uint32_t>(g.size(2));
+  p.osz[1] = static_cast<uint32_t>(g.size(1));
+  p.scale[0] = pack_param(scale, g.scalar_type());
+  dispatch(std::string("resample_") + dtype_label(g.scalar_type()), {op::RESAMPLE_BACKWARD}, p,
+           static_cast<uint32_t>(groups));
   return out;
 }
 
@@ -285,6 +319,7 @@ TORCH_LIBRARY(torch_vulkan, m) {
   m.def("avg_pool_backward(Tensor grad_output, int[] input_size, int[] kernel_size, int[] stride, int[] padding, "
         "int divisor_override, bool count_include_pad) -> Tensor");
   m.def("upsample_linear(Tensor x, int[] output_size, bool align_corners, float[] scales, int ndim) -> Tensor");
+  m.def("upsample_linear_backward_dim(Tensor g, int n_in, bool align_corners, float scale) -> Tensor");
   m.def("grid_sampler(Tensor input, Tensor grid, int mode, int padding, bool align_corners) -> Tensor");
   m.def("grid_sampler_backward(Tensor grad_output, Tensor input, Tensor grid, int mode, int padding, "
         "bool align_corners, bool want_grid) -> (Tensor, Tensor, Tensor)");
@@ -298,6 +333,7 @@ TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
   m.impl("avg_pool_forward", &vk::avg_pool_forward);
   m.impl("avg_pool_backward", &vk::avg_pool_backward);
   m.impl("upsample_linear", &vk::upsample_linear);
+  m.impl("upsample_linear_backward_dim", &vk::upsample_linear_backward_dim);
   m.impl("grid_sampler", &vk::grid_sampler);
   m.impl("grid_sampler_backward", &vk::grid_sampler_backward);
 }

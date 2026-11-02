@@ -10,6 +10,14 @@
 // its floor i0 (at most in - 1) and i1 = i0 + 1 (i0 at the last input), with
 // weights 1 - l and l = clamp(position - i0, 0, 1). The scales are computed
 // by the host in T, as the CPU does in its opmath type.
+//
+// RESAMPLE_BACKWARD: one dim's backward, g [A, n_out, B] -> gx [A, n_in, B]
+// (isz = A, n_in, B; osz.y = n_out; scale0): one thread per input position
+// sums g over the outputs whose taps include it (also with weight 0, as the
+// CPU adds those), in output order, w0 and w1 separately where both taps
+// are this input.
+
+#include "opcodes.slang"
 
 struct Params
 {
@@ -27,6 +35,8 @@ struct Params
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
+
+[vk::constant_id(0)] const int OP = RESAMPLE_FORWARD;
 
 T param(uint64_t bits)
 {
@@ -47,10 +57,54 @@ void taps(uint o, uint n_in, uint n_out, T scale, out uint i0, out uint i1, out 
     w0 = T(1) - w1;
 }
 
+// First and last output whose taps can include input i (a superset).
+void output_range(uint i, uint n_in, uint n_out, T scale, out uint lo, out uint hi)
+{
+    lo = 0;
+    hi = n_out - 1;
+    if (!(scale > T(0)))
+        return;  // (scale 0: every output samples input 0)
+    T a = p.align != 0 ? (T(i) - T(1)) / scale : (T(i) - T(0.5)) / scale - T(0.5);
+    T b = p.align != 0 ? (T(i) + T(1)) / scale : (T(i) + T(1.5)) / scale - T(0.5);
+    if (i > 1)  // (outputs before the first input's centre clamp to 0: taps 0 and 1)
+        lo = uint(clamp(floor(a) - T(1), T(0), T(n_out - 1)));
+    if (i + 1 < n_in)  // (outputs past the last input clamp to it)
+        hi = uint(clamp(ceil(b) + T(1), T(0), T(n_out - 1)));
+}
+
+void backward(uint t)
+{
+    uint B = p.isz.z, n_in = p.isz.y, n_out = p.osz.y;
+    uint a = t / (n_in * B), r = t - a * (n_in * B);
+    uint i = r / B, b = r - i * B;
+    T scale = param(p.scale0);
+    uint lo, hi;
+    output_range(i, n_in, n_out, scale, lo, hi);
+    T acc = T(0);
+    for (uint o = lo; o <= hi; o++)
+    {
+        uint i0, i1;
+        T w0, w1;
+        taps(o, n_in, n_out, scale, i0, i1, w0, w1);
+        T g = p.in[(a * n_out + o) * B + b];
+        if (i0 == i)
+            acc += w0 * g;
+        if (i1 == i)
+            acc += w1 * g;
+    }
+    p.out[t] = acc;
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
+    if (OP == RESAMPLE_BACKWARD)
+    {
+        for (uint t = gid.x * 256 + tid.x; t < p.total; t += p.ngroups * 256)
+            backward(t);
+        return;
+    }
     uint ov = p.osz.x * p.osz.y * p.osz.z;
     uint iv = p.isz.x * p.isz.y * p.isz.z;
     for (uint t = gid.x * 256 + tid.x; t < p.total; t += p.ngroups * 256)

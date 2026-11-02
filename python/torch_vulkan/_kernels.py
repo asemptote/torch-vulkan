@@ -97,8 +97,10 @@ def _linear_matrix(n_in, n_out, align_corners, scale, like):
 
 def _make_upsample_linear(k):
     """upsample_linear1d / bilinear2d / trilinear3d: one thread per output
-    (shaders/resample.slang). The op first runs on a meta tensor: PyTorch's
-    checks, with the CPU's messages, and the output size."""
+    (shaders/resample.slang), after the CPU's checks with its messages. (Not
+    the meta kernel: it is PyTorch's Python decomposition, 65 ms a call where
+    the kernel takes 3; the result is the input's leading dims and
+    output_size.)"""
     op = [aten.upsample_linear1d, aten.upsample_bilinear2d, aten.upsample_trilinear3d][k - 1].default
 
     def forward(x, output_size, align_corners, *scales):
@@ -115,8 +117,7 @@ def _make_upsample_linear(k):
                                f"output ({dims(output_size)})")
         if x.numel() == 0 and math.prod(x.shape[1:]) == 0:
             raise RuntimeError(f"Non-empty {k + 2}D data tensor expected but got a tensor with sizes {list(x.shape)}")
-        out_shape = op(torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device="meta"), output_size,
-                       align_corners, *scales).shape
+        out_shape = (*x.shape[:-k], *output_size)
         if not x.is_floating_point():
             return _on_cpu(op._schema.name.split("::")[1], x, output_size, align_corners, *scales)
         spatial, out = list(x.shape[-k:]), list(out_shape[-k:])
@@ -137,6 +138,23 @@ def _make_upsample_backward(name, has_align):
             align_corners, scales = None, list(rest)
         if not any(s is not None for s in scales):
             scales = None
+        if name in ("linear1d", "bilinear2d", "trilinear3d") and grad_output.is_floating_point():
+            # One gather pass per dim (shaders/resample.slang's backward),
+            # where the dense interpolation matrices multiplied every input
+            # by every output.
+            k = len(output_size)
+            dt = _pool_dtype(grad_output.dtype)
+            g = grad_output.to(dt)
+            for d in reversed(range(k)):
+                n_in = input_size[2 + d]
+                scale = _linear_scale(n_in, output_size[d], align_corners, scales[d] if scales else None, dt)
+                lead = math.prod(g.shape[:g.dim() - k + d])
+                trail = math.prod(g.shape[g.dim() - k + d + 1:])
+                shape = list(g.shape)
+                shape[g.dim() - k + d] = n_in
+                g = torch.ops.torch_vulkan.upsample_linear_backward_dim(
+                    g.reshape(lead, output_size[d], trail), n_in, align_corners, scale).reshape(shape)
+            return g.to(grad_output.dtype).contiguous()
         mats = _upsample_matrices(name, input_size, output_size, align_corners, scales, grad_output)
         return _apply_dims(grad_output, [m.t() for m in mats]).contiguous()
 
