@@ -191,6 +191,43 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
 }
 
 }  // namespace
+
+std::pair<at::Tensor, at::Tensor> slice_moments(const at::Tensor& x3) {
+  int64_t K = x3.size(0), O = x3.size(1), L = x3.size(2);
+  at::Tensor mean = at::empty({O}, x3.options()), var = at::empty({O}, x3.options());
+  NormGradParams p{};
+  p.x = gpu_address(x3);
+  p.sum_g = gpu_address_out(mean);
+  p.sum_gx = gpu_address_out(var);
+  p.outer = static_cast<uint32_t>(K);
+  p.slices = static_cast<uint32_t>(O);
+  p.inner = static_cast<uint32_t>(L);
+  int64_t groups = std::min<int64_t>(O, kMaxGroups);
+  p.ngroups = static_cast<uint32_t>(groups);
+  dispatch(std::string("normgrad_") + dtype_label(x3.scalar_type()), {op::NORMGRAD_MOMENTS, 0u, 1u}, p,
+           static_cast<uint32_t>(groups));
+  return {mean, var};
+}
+
+at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Tensor& c) {
+  int64_t K = x3.size(0), O = x3.size(1), L = x3.size(2);
+  at::Tensor ac = a.contiguous(), cc = c.contiguous();
+  at::Tensor out = at::empty(x3.sizes(), x3.options());
+  NormGradParams p{};
+  p.x = gpu_address(x3);
+  p.a = gpu_address(ac);
+  p.c = gpu_address(cc);
+  p.out = gpu_address_out(out);
+  p.outer = static_cast<uint32_t>(K);
+  p.slices = static_cast<uint32_t>(O);
+  p.inner = static_cast<uint32_t>(L);
+  int64_t groups = std::clamp<int64_t>((K * O * L + 255) / 256, 1, kMaxGroups);
+  p.ngroups = static_cast<uint32_t>(groups);
+  dispatch(std::string("normgrad_") + dtype_label(x3.scalar_type()), {op::NORMGRAD_AFFINE, 0u, 1u}, p,
+           static_cast<uint32_t>(groups));
+  return out;
+}
+
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

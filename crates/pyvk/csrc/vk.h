@@ -146,6 +146,12 @@ at::Generator new_generator();
 // ascending (descending: largest first), ties in original order. sorting.cpp.
 at::Tensor sort_rows(const at::Tensor& x, bool descending);
 
+// For x3 [K, O, L] contiguous, float32 or float64 (normgrad.cpp): each
+// slice's (over K and L) mean and biased variance, two-pass; and
+// x3 * a[o] + c[o].
+std::pair<at::Tensor, at::Tensor> slice_moments(const at::Tensor& x3);
+at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Tensor& c);
+
 // A parameter slot for a kernel whose element type T is `t`: an int64 for
 // integer and bool kernels, double bits for float64/complex128, float bits
 // (in the low word) otherwise, so that only float64 kernels need a double

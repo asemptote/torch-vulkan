@@ -12,8 +12,10 @@
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <tuple>
 
 namespace vk {
 
@@ -58,12 +60,23 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
   // Statistics in float32 at least (as the CPU does for reduced precision).
   at::ScalarType acc = x.scalar_type() == at::kDouble ? at::kDouble : at::kFloat;
   at::Tensor xf = x.to(acc);
+  // (dedicated kernels for contiguous inputs: normgrad.slang's moments and
+  // affine; others, e.g. channels-last, keep their layout through the
+  // element-wise ops)
+  int64_t C = x.size(1), n = x.numel() / std::max<int64_t>(C, 1);
+  bool kernels = xf.is_contiguous() && dtype_label(acc) != nullptr && x.numel() > 0 &&
+                 x.numel() < (int64_t(1) << 31);
+  at::Tensor x3 = kernels ? xf.view({x.size(0), C, n / x.size(0)}) : at::Tensor();
   at::Tensor mean, invstd, save_mean, save_invstd;
   if (training) {
     auto dims = reduce_dims(x);
-    int64_t n = x.numel() / x.size(1);
-    mean = xf.mean(dims);
-    at::Tensor var = (xf - mean.view(shape)).square().mean(dims);  // biased
+    at::Tensor var;
+    if (kernels) {
+      std::tie(mean, var) = slice_moments(x3);
+    } else {
+      mean = xf.mean(dims);
+      var = (xf - mean.view(shape)).square().mean(dims);  // biased
+    }
     invstd = at::rsqrt(var + eps);
     save_mean = mean;
     save_invstd = invstd;
@@ -71,7 +84,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
       running_mean->mul_(1 - momentum).add_(mean.to(running_mean->scalar_type()), momentum);
     }
     if (running_var.has_value() && running_var->defined()) {
-      at::Tensor unbiased = n > 1 ? var * (static_cast<double>(n) / (n - 1)) : var;
+      // (n = 1: 0 * inf, NaN, as on the CPU)
+      at::Tensor unbiased = var * (static_cast<double>(n) / static_cast<double>(n - 1));
       running_var->mul_(1 - momentum).add_(unbiased.to(running_var->scalar_type()), momentum);
     }
   } else {
@@ -92,8 +106,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
   if (bias.has_value() && bias->defined()) {
     shift = shift + bias->to(acc);
   }
-  at::Tensor out = (xf * scale.view(shape) + shift.view(shape)).to(x.scalar_type());
-  return {out, save_mean, save_invstd};
+  at::Tensor out = kernels ? slice_affine(x3, scale, shift).view(x.sizes()).to(x.scalar_type())
+                           : (xf * scale.view(shape) + shift.view(shape)).to(x.scalar_type());
+  // (saved statistics in the input's dtype, or float32 for a 16-bit input
+  // with float32 parameters, as on the CPU)
+  at::ScalarType stat = params == at::ScalarType::Undefined || params == x.scalar_type() ? x.scalar_type() : at::kFloat;
+  return {out, save_mean.to(stat), save_invstd.to(stat)};
 }
 
 bool bn_ok(const at::Tensor& x) {

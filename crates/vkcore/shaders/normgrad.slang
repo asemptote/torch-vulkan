@@ -9,6 +9,10 @@
 //   NORMGRAD_APPLY_BN: gx = ((g - (x - center[o]) b[o]) - c[o]) a[o]
 //                      (PyTorch's batch norm backward; TRAIN = 0: g a[o])
 //   NORMGRAD_APPLY_GN: gx = a[o] g + b[o] x + c[o] (group norm's)
+//   NORMGRAD_MOMENTS:  (batch norm forward) one workgroup per slice: its
+//                      mean into sum_g[o] and biased variance into
+//                      sum_gx[o], in two passes
+//   NORMGRAD_AFFINE:   out = x a[o] + c[o] (batch norm's output)
 // The per-slice coefficients a, b, c come from the host.
 
 #include "opcodes.slang"
@@ -60,6 +64,34 @@ void main(uint3 tid3: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
     uint tid = tid3.x;
     uint L = p.inner, O = p.slices;
+    if (OP == NORMGRAD_MOMENTS)
+    {
+        uint count = p.outer * L;
+        for (uint o = gid.x; o < O; o += p.ngroups)
+        {
+            T s = T(0);
+            for (uint i = tid; i < count; i += G)
+            {
+                uint k = i / L, j = i - k * L;
+                s += p.x[(k * O + o) * L + j];
+            }
+            T mean = reduce_sum(s, tid) / T(count);
+            T q = T(0);
+            for (uint i = tid; i < count; i += G)
+            {
+                uint k = i / L, j = i - k * L;
+                T d = p.x[(k * O + o) * L + j] - mean;
+                q += d * d;
+            }
+            T var = reduce_sum(q, tid) / T(count);
+            if (tid == 0)
+            {
+                p.sum_g[o] = mean;
+                p.sum_gx[o] = var;
+            }
+        }
+        return;
+    }
     if (OP == NORMGRAD_STATS)
     {
         uint count = p.outer * L;
@@ -89,6 +121,11 @@ void main(uint3 tid3: SV_GroupThreadID, uint3 gid: SV_GroupID)
     for (uint i = gid.x * G + tid; i < total; i += p.ngroups * G)
     {
         uint o = (i / L) % O;
+        if (OP == NORMGRAD_AFFINE)
+        {
+            p.out[i] = p.x[i] * p.a[o] + p.c[o];
+            continue;
+        }
         T gv = p.g[i];
         if (OP == NORMGRAD_APPLY_BN)
         {
