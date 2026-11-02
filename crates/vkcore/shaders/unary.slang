@@ -46,7 +46,7 @@ T apply(T x)
     case UNARY_FLOOR: return floor(x);
     case UNARY_CEIL: return ceil(x);
     case UNARY_TRUNC: return trunc(x);
-    case UNARY_ROUND: return round(x);  // half to even
+    case UNARY_ROUND: return m_round_even(x);
     case UNARY_FRAC: return x - trunc(x);
     case UNARY_EXP: return m_exp(x);
     case UNARY_LOG: return m_log(x);

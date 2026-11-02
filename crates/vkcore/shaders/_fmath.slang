@@ -302,6 +302,18 @@ FT m_copysign(FT a, FT b)
     return bit_cast<FT>((bit_cast<UBITS>(a) & ~mask) | (bit_cast<UBITS>(b) & mask));
 }
 
+// x rounded to the nearest integer, ties to even (torch.round), with x's
+// sign (-0.4 gives -0). Not the built-in round: SPIR-V's Round leaves the
+// direction of ties to the driver (lavapipe on an AVX2 CPU rounded 3.5 to 3).
+FT m_round_even(FT x)
+{
+    FT r = floor(x);
+    FT d = x - r;
+    if (d > FT(0.5) || (d == FT(0.5) && floor(r * FT(0.5)) * FT(2) != r))
+        r += FT(1);
+    return m_copysign(r, x);
+}
+
 // log(1 + e^x) without overflow.
 FT m_softplus(FT x)
 {
