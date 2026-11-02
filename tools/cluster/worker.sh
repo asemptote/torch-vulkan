@@ -15,7 +15,9 @@
 # its end, so the two sides meet in the middle, and give way to the
 # machine's other users: worker k runs only while
 #   others + k + 1 <= cores
-# where others is the load average minus our own running test processes, so
+# where others is the cores the machine's other processes use (pool.sh's CPU
+# monitor writes it to /tmp/tv-others.USER; without a fresh one, the load
+# average minus our own running test processes), so
 # the highest ranks step aside first as other users' load rises and come back
 # in order as it falls (resuming needs one spare core more, so they do not
 # flap). A worker that loses its slot mid-shard stops the shard's processes
@@ -36,11 +38,15 @@ mkdir -p "$RUN/claimed" "$RUN/done"
 # Exit status 0 if this worker's rank fits beside the other users' load; $1
 # extra spare cores required (1 to resume, 0 to keep running).
 fits() {
-  local ours
-  # (our running test processes: python -c RUNNER RESULTS.jsonl @LISTING, not stopped)
-  ours=$(ps -u "$(id -un)" -o stat=,args= | grep -E '\.jsonl @' | grep -vc '^T')
-  awk -v o="$ours" -v r="$RANK" -v c="$(nproc)" -v h="$1" \
-    '{ others = $1 - o; if (others < 0) others = 0; exit !(others + r + 1 + h <= c) }' /proc/loadavg
+  local others ours monitor="/tmp/tv-others.$(id -un)"
+  if [ -f "$monitor" ] && [ $(($(date +%s) - $(stat -c %Y "$monitor"))) -lt 120 ]; then
+    others=$(cat "$monitor")
+  else
+    # (our running test processes: python -c RUNNER RESULTS.jsonl @LISTING, not stopped)
+    ours=$(ps -u "$(id -un)" -o stat=,args= | grep -E '\.jsonl @' | grep -vc '^T')
+    others=$(awk -v o="$ours" '{ x = $1 - o; print (x > 0 ? x : 0) }' /proc/loadavg)
+  fi
+  awk -v x="$others" -v r="$RANK" -v c="$(nproc)" -v h="$1" 'BEGIN { exit !(x + r + 1 + h <= c) }'
 }
 
 queue_empty() { [ -z "$(ls "$RUN/queue" 2>/dev/null)" ]; }
