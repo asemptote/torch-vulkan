@@ -11,7 +11,7 @@
 #   - backfill on the workstations (pool.sh): one ranked worker per core on
 #     ws0, ws2 and ws3 for the lavapipe run (each running only while
 #     its rank fits beside the machine's other users' load, see worker.sh),
-#     and ws3's Tesla M4 on the NVIDIA run.
+#     and ws3's Tesla M4 on the NVIDIA run if WS3_GPU_WORKERS > 0.
 # The cluster's workers take shards from the start of each queue and the
 # workstations' from its end, so they meet in the middle. With --from PREV
 # (an earlier run's name), plan_shards.py plans each queue longest first from
@@ -25,7 +25,8 @@
 # Settings (environment): DEV_SSH (ssh options, default "-J
 # gateway.example.edu"), RUNS (/shared/scratch/me/torch-vulkan-runs),
 # LAVAPIPE_SHARDS (192), NVIDIA_SHARDS (64), PBS_JOBS (48), GPU_WORKERS (16),
-# WS0_WORKERS, WS2_WORKERS, WS3_WORKERS (one per core), WS3_GPU_WORKERS (2).
+# WS0_WORKERS, WS2_WORKERS, WS3_WORKERS (one per core), WS3_GPU_WORKERS (0: the
+# Tesla M4 has 4 GB, and full runs need more; it stays for quick checks, dev.sh DRIVER=nvidia-host).
 set -euo pipefail
 CMD=${1:?usage: queue-run.sh start|status NAME [TEST_FILE...]}
 NAME=${2:?usage: queue-run.sh start|status NAME [TEST_FILE...]}
@@ -70,7 +71,7 @@ test_sort_and_select.py test_view_ops.py}
     on ws0 "bash $TV/pool.sh lavapipe $LAV ${WS0_WORKERS:-}"
     on ws2 "bash $TV/pool.sh lavapipe $LAV ${WS2_WORKERS:-}"
     # (ws3's GPU workers rank first: lavapipe workers there rank after them)
-    G=${WS3_GPU_WORKERS:-2}
+    G=${WS3_GPU_WORKERS:-0}
     on ws3 "bash $TV/pool.sh nvidia $NV $G 0; bash $TV/pool.sh lavapipe $LAV ${WS3_WORKERS:-\$((\$(nproc) - $G))} $G"
     ;;
   status)

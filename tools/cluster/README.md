@@ -80,13 +80,24 @@ shards on the shared file system: `$RUNS/NAME` for lavapipe and
 
 - Cluster workers take shards from the start of each queue: the PBS lavapipe
   array, plus an H100 job and an L40S job (separate queues).
-- Workstation workers (`pool.sh`) take shards from the end: ws0's and ws3's
-  cores on lavapipe, ws3's Tesla M4 on the NVIDIA run, and ws2's free
-  cores. Each one stops when its machine gets busy.
+- Workstation workers (`pool.sh`) take shards from the end, one per core on
+  ws0, ws2 and ws3 (lavapipe). Each is ranked: worker k runs only while
+  the cores other processes use (a per-machine `top` monitor) plus k + 1
+  fit in the machine. As other users' load rises, the highest ranks pause
+  their shards and come back in order as it falls; a shard paused for 20
+  minutes goes back to the queue. ws3's Tesla M4 can join the NVIDIA run
+  (`WS3_GPU_WORKERS`), but its 4 GB is too small for some tests, so by
+  default it is left for quick checks (`dev.sh` with `DRIVER=nvidia-host`).
 
 The two sides meet in the middle, so whatever starts soonest does the most,
 and a busy cluster queue no longer holds the run up. Every worker claims a
 shard by renaming its file into `claimed/` (`worker.sh`).
+
+With `--from PREV`, `plan_shards.py` plans each queue from an earlier run:
+its tests and their recorded times (the runner records each test's wall
+time), packed longest first into one-file shards of about 5 minutes, and
+numbered from the longest. The cluster then starts the slowest tests first
+instead of finishing on them, and each shard needs one pytest start-up.
 `queue-run.sh status NAME` shows the progress per machine. Results merge as
 for fixed shards.
 
