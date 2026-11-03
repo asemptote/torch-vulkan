@@ -415,10 +415,35 @@ at::Tensor to_csc(const at::Tensor& self, std::optional<int64_t> dense_dim) {
 
 at::Tensor to_csc_op(const at::Tensor& self, std::optional<int64_t> dense_dim) { return to_csc(self, dense_dim); }
 
+at::Tensor to_layout(const at::Tensor& self, std::optional<at::Layout> layout, at::OptionalIntArrayRef blocksize,
+                     std::optional<int64_t> dense_dim);
+
+// A compressed matrix (CSR, CSC, BSR, BSC) as COO: CSR's indices directly,
+// the others through dense.
+at::Tensor compressed_as_coo(const at::Tensor& t) {
+  if (t.layout() == at::kSparseCsr && t.dim() == 2 && t.dense_dim() == 0) return csr_as_coo(t);
+  return t.to_dense().to_sparse(2);
+}
+
+bool compressed_layout(const at::Tensor& t) {
+  at::Layout l = t.layout();
+  return l == at::kSparseCsr || l == at::kSparseCsc || l == at::kSparseBsr || l == at::kSparseBsc;
+}
+
 at::Tensor& csr_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
                           const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
-  if (mat1.layout() == at::kSparseCsr && mat2.layout() == at::kStrided && mat1.dim() == 2 && mat1.dense_dim() == 0) {
-    return addmm_out(self, csr_as_coo(mat1), mat2, beta, alpha, out);
+  if (compressed_layout(mat1) && mat2.layout() == at::kStrided && mat1.dim() == 2 && mat1.dense_dim() == 0 &&
+      out.layout() == at::kStrided) {
+    return addmm_out(self.layout() == at::kStrided ? self : self.to_dense(), compressed_as_coo(mat1), mat2, beta,
+                     alpha, out);
+  }
+  if (mat1.layout() == at::kStrided && compressed_layout(mat2) && out.layout() == at::kStrided && mat2.dim() == 2) {
+    // dense @ compressed = (compressed^T @ dense^T)^T
+    at::Tensor r = at::add(self.layout() == at::kStrided ? self * beta : self.to_dense() * beta,
+                           vk::mm(mat1, compressed_as_coo(mat2)), alpha);
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
   }
   if (mat1.layout() == at::kSparseCsr && mat2.layout() == at::kSparseCsr && out.layout() == at::kSparseCsr) {
     at::Tensor dense = at::addmm(self.layout() == at::kStrided ? self : self.to_dense(), mat1, mat2.to_dense(), beta, alpha);
@@ -442,14 +467,16 @@ at::Tensor csr_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::T
 }
 
 at::Tensor csr_mm(const at::Tensor& self, const at::Tensor& mat2) {
-  if (self.layout() == at::kSparseCsr && mat2.layout() == at::kStrided) {
-    return vk::mm(csr_as_coo(self), mat2);
+  TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: expected 2-D tensors");
+  at::Tensor a = compressed_layout(self) ? compressed_as_coo(self) : self;
+  at::Tensor b = compressed_layout(mat2) ? compressed_as_coo(mat2) : mat2;
+  if (self.layout() == at::kStrided || mat2.layout() == at::kStrided) {
+    return vk::mm(a, b);  // (a dense result)
   }
-  if (self.layout() == at::kStrided && mat2.layout() == at::kSparseCsr) {
-    return vk::mm(self, csr_as_coo(mat2));
-  }
-  return vk::mm(self.layout() == at::kSparseCsr ? csr_as_coo(self) : self,
-                mat2.layout() == at::kSparseCsr ? csr_as_coo(mat2) : mat2).to_sparse_csr();
+  // two compressed operands: the result in the first one's layout, as PyTorch's
+  at::Tensor r = vk::mm(a, b);
+  at::Tensor dense = r.layout() == at::kStrided ? r : r.to_dense();
+  return to_layout(dense, self.layout(), std::nullopt, std::nullopt);
 }
 
 }  // namespace

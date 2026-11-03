@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double
+// axis T: f32=float f64=double i64=I64
 //
 // Max pooling over up to 3 spatial dims (2-D pooling has depth 1), on
 // contiguous [planes, D, H, W] tensors, with the CPU kernel's semantics:
@@ -15,13 +15,15 @@
 //                      the CPU's avg_pool: the window runs from o * s - pad
 //                      to min(that + k, n + pad), the divisor is
 //                      divisor_override, else its size (count_include_pad),
-//                      else the size of its part inside the input; truncated
-//                      for integer inputs (computed in float64).
+//                      else the size of its part inside the input; integer
+//                      inputs in int64 (the i64 variant), divided with
+//                      truncation as the CPU's integer division.
 //   POOL_AVG_BACKWARD: gin[p, i] = the sum of gout[p, o] / divisor(o) over the
 //                      outputs whose windows cover i, in output order.
 // Average pooling has no dilation; its settings take the dilation slots:
 // dl = (divisor_override or 0, count_include_pad, truncate).
 
+#include "_int64.slang"  // (the i64 variant's T)
 #include "opcodes.slang"
 #include "_wide.slang"
 
@@ -48,8 +50,19 @@ T neg_inf()
 {
 #if defined(T_f64)
     return bit_cast<double>(0xfff0000000000000ull);
+#elif defined(T_i64)
+    return i64_min();
 #else
     return bit_cast<float>(0xff800000u);
+#endif
+}
+
+bool is_nan(T v)
+{
+#if defined(T_i64)
+    return false;
+#else
+    return isnan(v);
 #endif
 }
 
@@ -107,7 +120,11 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                     for (int ix = wx.x; ix < wx.y; ix++)
                         sum += p.a[plane * iv + (uint(iz) * p.isz.y + uint(iy)) * p.isz.z + uint(ix)];
             T q = sum / avg_divisor(wz, wy, wx);
+#if defined(T_i64)
+            p.out[t] = q;  // (integer division truncates)
+#else
             p.out[t] = p.dl.z != 0 ? trunc(q) : q;
+#endif
         }
         else if (OP == POOL_AVG_BACKWARD)
         {
@@ -162,7 +179,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                         T v = p.a[plane * iv + index];
                         if (at < 0)
                             at = int(index);
-                        if (v > best || isnan(v))
+                        if (v > best || is_nan(v))
                         {
                             best = v;
                             at = int(index);

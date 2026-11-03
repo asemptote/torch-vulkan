@@ -324,15 +324,12 @@ def _as_3d(v, fill):
 
 def _pool_dtype(t):
     """The dtype shaders/pool.slang computes `t` in: 16-bit floats in float32,
-    integers in float64 (exact to 2^53)."""
+    integers in int64 (exact, divided with truncation as the CPU's)."""
     if t in (torch.float32, torch.float64):
         return t
     if t in (torch.float16, torch.bfloat16):
         return torch.float32
-    if not _native_has_float64():
-        raise TypeError(f"{t} pooling and resampling on vk need float64 arithmetic, which this GPU lacks "
-                        "(shaderFloat64); please convert to float32")
-    return torch.float64
+    return torch.int64
 
 
 def _pool_memory_format(x, k):

@@ -57,8 +57,9 @@ void launch(uint32_t op, at::ScalarType t, PoolParams& p, int64_t total) {
 std::tuple<at::Tensor, at::Tensor> max_pool_forward(const at::Tensor& x, at::IntArrayRef output_size,
                                                     at::IntArrayRef kernel_size, at::IntArrayRef stride,
                                                     at::IntArrayRef padding, at::IntArrayRef dilation) {
-  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble),
-              "max_pool_forward: expected a float32/float64 [planes, D, H, W] tensor");
+  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble ||
+                                x.scalar_type() == at::kLong),
+              "max_pool_forward: expected a float32/float64/int64 [planes, D, H, W] tensor");
   at::Tensor in = x.contiguous();
   std::vector<int64_t> shape = {x.size(0), output_size[0], output_size[1], output_size[2]};
   at::Tensor out = at::empty(shape, x.options());
@@ -103,13 +104,14 @@ void set_avg(PoolParams& p, int64_t divisor_override, bool count_include_pad, bo
   p.dl[2] = truncate ? 1u : 0u;
 }
 
-// x [planes, D, H, W] -> [planes, *output_size]; truncate: integer inputs
-// (passed as float64), whose CPU kernel divides with truncation.
+// x [planes, D, H, W] -> [planes, *output_size]; integer inputs as int64,
+// divided with truncation as the CPU's kernel.
 at::Tensor avg_pool_forward(const at::Tensor& x, at::IntArrayRef output_size, at::IntArrayRef kernel_size,
                             at::IntArrayRef stride, at::IntArrayRef padding, int64_t divisor_override,
                             bool count_include_pad, bool truncate) {
-  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble),
-              "avg_pool_forward: expected a float32/float64 [planes, D, H, W] tensor");
+  TORCH_CHECK(x.dim() == 4 && (x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble ||
+                                x.scalar_type() == at::kLong),
+              "avg_pool_forward: expected a float32/float64/int64 [planes, D, H, W] tensor");
   at::Tensor in = x.contiguous();
   at::Tensor out = at::empty({x.size(0), output_size[0], output_size[1], output_size[2]}, x.options());
   if (out.numel() == 0) {
