@@ -119,3 +119,78 @@ def test_csr():
     for g, w in zip(idx, [c.crow_indices(), c.col_indices(), torch._convert_indices_from_csr_to_coo(c.crow_indices(), c.col_indices()),
                           torch._convert_indices_from_coo_to_csr(torch.tensor([0, 0, 2, 3, 3, 5]), 6)]):
         assert torch.equal(g.cpu(), w)
+
+
+def test_coo_softmax_sum_backward_bmm_hspmm():
+    torch.manual_seed(0)
+    s = torch.sparse_coo_tensor(INDICES, VALUES, (4, 3)).coalesce()
+    h = torch.randn(3, 4, 5).relu().to_sparse(2)  # (one dense dim)
+    sv, hv = vk(s, h)
+    with on_gpu():
+        for dim in (0, 1):
+            same(torch.sparse.softmax(sv, dim), torch.sparse.softmax(s, dim))
+            same(torch.sparse.log_softmax(sv, dim), torch.sparse.log_softmax(s, dim))
+        same(torch.sparse.softmax(hv, 2), torch.sparse.softmax(h, 2))
+        same(torch.sparse.softmax(hv, 0), torch.sparse.softmax(h, 0))
+    # gradients: softmax, and sum over sparse and dense dims
+    for fn in (lambda t: torch.sparse.softmax(t, 1), lambda t: torch.sparse.log_softmax(t, 0),
+               lambda t: torch.sparse.sum(t, [0]), lambda t: torch.sparse.sum(t, [1, 2]),
+               lambda t: torch.sparse.sum(t, [0, 1])):
+        grads = []
+        for t in (h, hv):
+            x = t.detach().clone().requires_grad_(True)
+            y = fn(x)
+            (y.to_dense() if y.layout != torch.strided else y).pow(2).sum().backward()
+            grads.append(x.grad)
+        same(grads[1], grads[0])
+    # bmm, hspmm, and the vector norm
+    b3 = torch.randn(2, 4, 3).relu().to_sparse()
+    m = torch.randn(2, 3, 5)
+    same(torch.bmm(*vk(b3, m)), torch.bmm(b3, m))
+    d = torch.randn(3, 6)
+    same(torch.hspmm(sv, d.to("vk")), torch.hspmm(s, d))
+    assert abs(torch.linalg.vector_norm(sv).item() - torch.linalg.vector_norm(s).item()) < 1e-5
+
+
+def test_broadcasting_mul_and_explicit_zeros():
+    torch.manual_seed(0)
+    s = torch.randn(3, 4, 5).relu().to_sparse(2)
+    for d in (torch.randn(5), torch.randn(4, 5), torch.randn(2, 3, 4, 5), torch.tensor(2.5)):
+        same(s.to("vk") * d.to("vk"), s * d)
+        same(d.to("vk") * s.to("vk"), d * s)
+    y = torch.randn(3, 4, 1).relu().to_sparse(2)
+    same(s.to("vk") * y.to("vk"), s * y)
+    # blocked layouts keep explicit zeros through conversions and gradients
+    x = torch.tensor([[1.0, 2, 0], [3, 0, 4]])
+    for layout, bs in ((torch.sparse_bsc, (2, 1)), (torch.sparse_bsr, (1, 3)), (torch.sparse_csc, None)):
+        c = x.to_sparse(layout=layout, blocksize=bs) if bs else x.to_sparse(layout=layout)
+        compressed = c.ccol_indices() if layout in (torch.sparse_csc, torch.sparse_bsc) else c.crow_indices()
+        plain = c.row_indices() if layout in (torch.sparse_csc, torch.sparse_bsc) else c.col_indices()
+        g = torch.arange(6.0).reshape(2, 3) + 1
+        grads = []
+        for dev in ("cpu", "vk"):
+            for f in (lambda t: t.to_dense(masked_grad=True), lambda t: t.to_sparse().to_dense(masked_grad=True)):
+                v = c.values().to(dev).clone().requires_grad_(True)
+                t = torch.sparse_compressed_tensor(compressed.to(dev), plain.to(dev), v, c.shape, layout=layout)
+                grads.append(torch.autograd.grad(f(t), v, g.to(dev))[0].cpu())
+        for a, b in zip(grads[:2], grads[2:]):
+            assert torch.equal(a, b), (layout, a, b)
+        same(c.to("vk").to_sparse(), c.to_sparse())
+
+
+def test_csr_products_and_sampled_addmm():
+    torch.manual_seed(0)
+    a, b, v = torch.randn(6, 5).relu(), torch.randn(5, 4), torch.randn(5)
+    bias = torch.randn(6, 4)
+    for layout in (torch.sparse_csr, torch.sparse_csc):
+        ca = a.to_sparse(layout=layout)
+        same(torch.addmm(*vk(bias, ca, b), beta=0.5, alpha=2), torch.addmm(bias, ca, b, beta=0.5, alpha=2), 1e-4)
+        same(torch.addmv(*vk(bias[:, 0], ca, v), beta=0.5), torch.addmv(bias[:, 0], ca, v, beta=0.5), 1e-4)
+        cb = b.to_sparse(layout=layout)
+        same(torch.mm(*vk(ca, cb)), torch.mm(ca, cb), 1e-4)  # (CSR, from either layout)
+    # batched sampled_addmm, and the dense op's errors for bad shapes
+    m = (torch.randn(2, 4, 4) * (torch.rand(4, 4) > 0.5)).to_sparse_csr()  # (the same pattern per batch)
+    x, y = torch.randn(2, 4, 3), torch.randn(2, 3, 4)
+    same(torch.sparse.sampled_addmm(*vk(m, x, y), beta=0.5), torch.sparse.sampled_addmm(m, x, y, beta=0.5), 1e-4)
+    with pytest.raises(RuntimeError, match="shapes cannot be multiplied"):
+        torch.mm(*vk(a.to_sparse_csr(), a))
