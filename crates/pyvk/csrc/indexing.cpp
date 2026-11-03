@@ -216,7 +216,7 @@ at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& in
   at::assert_no_internal_overlap(out);  // (as the CPU: after resizing out)
   at::assert_no_overlap(out, self);
   at::assert_no_partial_overlap(out, index);
-  if (index.numel() == 0) {  // (unchecked dims and dtype, as the CPU)
+  if (index.numel() == 0 && is_vk(index) && is_vk(out)) {  // (unchecked dims and dtype, as the CPU)
     return out;
   }
   if (!movable(self) || !is_vk(index) || !is_vk(out) || !index_dtype_ok(index) ||

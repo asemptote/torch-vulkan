@@ -157,7 +157,7 @@ def _pinv_impl(input, atol, rtol, hermitian):
     if input.numel() == 0:
         shape = list(input.shape)
         shape[-1], shape[-2] = shape[-2], shape[-1]
-        return input.new_zeros(shape)
+        return input.new_zeros(shape) + input.sum() * 0  # (zeros that keep the autograd graph, as PyTorch's)
     a, r = _tolerance(input, atol, rtol, "linalg.pinv")
     if not hermitian:
         U, S, Vh = torch.linalg.svd(input, full_matrices=False)

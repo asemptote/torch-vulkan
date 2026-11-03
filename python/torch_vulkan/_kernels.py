@@ -571,6 +571,10 @@ def _tri_indices(upper, row, col, offset=0, *, dtype=None, layout=None, device=N
     if row < 0 or col < 0:
         raise RuntimeError(f"{'triu' if upper else 'tril'}_indices expects row and col to be non-negative, got {row} and {col}")
     dtype = torch.int64 if dtype is None else dtype
+    if dtype not in (torch.int32, torch.int64):
+        from . import _checks
+        raise NotImplementedError(f'"{"triu" if upper else "tril"}_indices" not implemented for '
+                                  f"'{_checks._C10_NAMES[str(dtype)[6:]]}'")
     first = [max(0, r + offset) if upper else 0 for r in range(row)]
     count = [max(0, col - f) if upper else min(col, max(0, r + offset + 1)) for r, f in enumerate(first)]
     n = sum(count)

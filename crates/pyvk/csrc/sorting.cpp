@@ -639,6 +639,9 @@ at::Tensor row_ranks(const at::Tensor& x2) {
 // if `self` is empty (outputs set).
 bool unique_dim_empty(const at::Tensor& self, int64_t dim, std::tuple<at::Tensor, at::Tensor, at::Tensor>& out) {
   if (self.numel() != 0) return false;
+  int64_t zero_dims = 0;
+  for (int64_t s : self.sizes()) zero_dims += s == 0;
+  TORCH_CHECK(zero_dims <= 1, "Number of zero sized dimensions is more than one, so unique cannot be applied ");
   TORCH_CHECK(self.size(dim) == 0, "There are 0 sized dimensions, and they aren't selected, so unique cannot be applied");
   at::TensorOptions lopts = self.options().dtype(at::kLong);
   out = {at::empty(self.sizes(), self.options()), at::empty({0}, lopts), at::empty({0}, lopts)};
@@ -663,6 +666,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_dim(const at::Tensor& self
   dim = c10::maybe_wrap_dim(dim, self.dim());
   std::tuple<at::Tensor, at::Tensor, at::Tensor> out;
   if (unique_dim_empty(self, dim, out)) return out;
+  if (at::isFloatingType(self.scalar_type()) && at::isnan(self).any().item<bool>()) {
+    // (with NaNs the CPU's comparison sort is not an order: its result is
+    // whatever std::sort leaves, which only the CPU reproduces)
+    auto stack = on_cpu("aten::unique_dim", "", self, dim, sorted, return_inverse, return_counts);
+    return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
+  }
   int64_t n = self.size(dim);
   at::TensorOptions lopts = self.options().dtype(at::kLong);
   at::Tensor x2 = self.movedim(dim, 0).reshape({n, -1});

@@ -87,6 +87,8 @@ def _half_via_float(op, args, kwargs):
     name = op._schema.name.split("::", 1)[1]
     if name.startswith(_HALF_ON_CPU):
         return NotImplemented
+    if small and any(_is_vk(x) and x.dtype in _SMALL_INT and x.numel() >= 1 << 29 for x in flat):
+        return NotImplemented  # (an int32 copy beyond 2 GiB, more than some devices' largest buffer)
     if small:
         lo = max(_SMALL_INT[d][0] for d in small)
         hi = min(_SMALL_INT[d][1] for d in small)

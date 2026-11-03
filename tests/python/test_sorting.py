@@ -224,7 +224,12 @@ def test_unique_along_dim(dtype):
     xs = [torch.randint(0, 3, (50, 4), generator=g), torch.randint(0, 2, (7, 3, 5), generator=g),
           torch.randint(0, 3, (2000, 3), generator=g), torch.randint(0, 2, (13, 37), generator=g)]
     if dtype.is_floating_point:
-        xs.append(torch.tensor([[1.0, float("nan")], [1.0, float("nan")], [0.0, 2.0], [0.0, -0.0], [0.0, 0.0]]))
+        xs.append(torch.tensor([[1.0, 3.0], [1.0, 3.0], [0.0, 2.0], [0.0, -0.0], [0.0, 0.0]]))
+        # (with NaNs the CPU's sort is not an order: those run on the CPU, for its result)
+        nan = torch.tensor([float("nan"), 0, 0, float("nan"), float("nan"), 1], dtype=dtype)
+        got = torch.unique(nan.to("vk"), dim=0, return_inverse=True, return_counts=True)
+        for g_, w_ in zip(got, torch.unique(nan, dim=0, return_inverse=True, return_counts=True)):
+            check(g_, w_, equal_nan=True)
     for x in [t.to(dtype) for t in xs] + [torch.zeros(0, 3, dtype=dtype)]:
         for dim in range(1 if x.numel() == 0 else x.dim()):
             with on_gpu():

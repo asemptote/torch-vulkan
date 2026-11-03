@@ -710,9 +710,11 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   std::optional<at::ScalarType> floating;  // the one floating dtype of the vk tensors
   bool mixed = false;
   std::vector<at::ScalarType> small_ints;
+  bool too_big = false;  // (a widened int32 copy beyond 2 GiB, more than some devices' largest buffer)
   auto note = [&](const at::Tensor& t) {
     if (is_half_vk(t) && is_small_int(t.scalar_type())) {
       small_ints.push_back(t.scalar_type());
+      too_big = too_big || t.numel() >= (int64_t(1) << 29);
     }
     if (t.defined() && is_vk(t) && t.dim() > 0 &&
         (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
@@ -749,7 +751,7 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
     return false;
   }
   if (!small_ints.empty() &&
-      (small_int_on_cpu(schema.name()) ||
+      (too_big || small_int_on_cpu(schema.name()) ||
        !scalars_fit(schema, torch::jit::Stack(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end()),
                     small_ints))) {
     return false;
