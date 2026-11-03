@@ -211,9 +211,9 @@ FAILING = ("failed", "crashed", "xpassed", "validation")
 # a reason a reader can check.
 EXPECTED = [
     (r"_sparse_|_to_sparse_|test_errors_sparse|test_crow_col_indices_", r"",
-     "sparse layouts are out of scope for this backend (dense tensors only)"),
-    (r"", r"Sparsevk' backend",
-     "sparse layouts are out of scope for this backend (dense tensors only)"),
+     "sparse layouts: COO and CSR are partly supported (M18, see the README), not yet to PyTorch's tests"),
+    (r"", r"Sparse(Csr)?vk' backend",
+     "sparse layouts: COO and CSR are partly supported (M18, see the README), not yet to PyTorch's tests"),
     (r"", r"Quantizedvk' backend",
      "quantized tensors are out of scope for this backend (as sparse layouts: dense tensors only)"),
     (r"", r"not implemented for 'ComplexHalf'",

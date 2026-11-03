@@ -96,6 +96,7 @@ fn main() {
             "csrc/layernorm.cpp",
             "csrc/normgrad.cpp",
             "csrc/loss.cpp",
+            "csrc/sparse.cpp",
         ])
         // Every object file registers aten kernels from static initializers
         // and nothing references them by symbol, so link the archive whole.
