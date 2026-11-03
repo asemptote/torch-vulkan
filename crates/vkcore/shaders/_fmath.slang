@@ -48,6 +48,48 @@ float m_log1p(float x) { return log1p32(x); }
 static const uint TWO_OVER_PI_32[9] = {0x00000000u, 0x28be60dbu, 0x9391054au, 0x7f09d5f4u, 0x7d4d3770u, 0x36d8a566u,
                                        0x4f10e410u, 0x7f9458eau, 0xf7aef158u};
 
+// a * b as a 64-bit value in 32-bit words (lo, hi), from 16-bit halves.
+uint2 mul_wide32(uint a, uint b)
+{
+    uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;
+    uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);
+    return uint2((p00 & 0xffffu) | (mid << 16), p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16));
+}
+
+// v + c for v = (lo, hi), mod 2^64.
+uint2 add_wide32(uint2 v, uint c)
+{
+    uint lo = v.x + c;
+    return uint2(lo, v.y + (lo < c ? 1u : 0u));
+}
+
+// float(v), rounded to nearest even, for the signed 64-bit v = (lo, hi): the
+// top 32 bits of |v| with a sticky bit for the rest, so float's one rounding
+// is the 64-bit conversion's.
+float int64_words_to_float(uint lo, uint hi)
+{
+    bool neg = (hi >> 31) != 0u;
+    if (neg)
+    {
+        lo = ~lo + 1u;
+        hi = ~hi + (lo == 0u ? 1u : 0u);
+    }
+    float f;
+    if (hi == 0u)
+    {
+        f = float(lo);
+    }
+    else
+    {
+        uint lz = 31u - uint(firstbithigh(hi));
+        uint top = lz == 0u ? hi : (hi << lz) | (lo >> (32u - lz));
+        uint rest = lz == 0u ? lo : lo << lz;
+        f = ldexp(float(top | (rest != 0u ? 1u : 0u)), float(32u - lz));
+    }
+    return neg ? -f : f;
+}
+
 // Payne-Hanek for finite |x| >= 800, after N. Juffa: x times 96 bits of 2/pi
 // (chosen by x's exponent) in 2.62 fixed point, rounded to the nearest
 // quadrant.
@@ -61,17 +103,19 @@ float reduce_pio2_32_large(float x, out int n)
     uint hi = s == 0u ? w0 : (w0 << s) | (w1 >> (32u - s));
     uint mid = s == 0u ? w1 : (w1 << s) | (w2 >> (32u - s));
     uint lo = s == 0u ? w2 : (w2 << s) | (w3 >> (32u - s));
-    uint64_t p = uint64_t(ia) * uint64_t(lo);
-    p = uint64_t(ia) * uint64_t(mid) + (p >> 32);
-    p = (uint64_t(ia * hi) << 32) + p;
-    int q = int(uint(p >> 62));
-    p &= 0x3fffffffffffffffull;
-    if ((p & 0x2000000000000000ull) != 0ull)  // fraction >= 1/2: the next quadrant
+    // (the 64-bit fixed-point product as two 32-bit words, p = (lo, hi): no
+    // 64-bit integers, which Mali GPUs lack)
+    uint2 p = mul_wide32(ia, lo);
+    p = add_wide32(mul_wide32(ia, mid), p.y);
+    p.y += ia * hi;
+    int q = int(p.y >> 30);
+    p.y &= 0x3fffffffu;
+    if ((p.y & 0x20000000u) != 0u)  // fraction >= 1/2: the next quadrant
     {
-        p -= 0x4000000000000000ull;
+        p.y -= 0x40000000u;  // (now negative, two's complement)
         q += 1;
     }
-    float r = float(int64_t(p)) * 3.4061215800865545e-19f;  // pi/2 2^-62
+    float r = int64_words_to_float(p.x, p.y) * 3.4061215800865545e-19f;  // pi/2 2^-62
     n = x < 0.0f ? -q : q;
     return x < 0.0f ? -r : r;
 }

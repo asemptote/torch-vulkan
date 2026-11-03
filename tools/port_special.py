@@ -149,11 +149,13 @@ static const bool IS_F64 = true;
 static const FT M_EPS = 2.220446049250313e-16l;
 static const FT M_MAX = 1.7976931348623157e308l;
 static const FT M_TINY = 2.2250738585072014e-308l;
+typedef int64_t poly_int;  // (the polynomials' degree: int64 as on the CPU)
 #else
 static const bool IS_F64 = false;
 static const FT M_EPS = 1.1920928955078125e-7f;
 static const FT M_MAX = 3.4028234663852886e38f;
 static const FT M_TINY = 1.1754943508222875e-38f;
+typedef int poly_int;  // (no 64-bit integers outside float64 kernels: Mali GPUs lack them)
 #endif
 
 static const FT K_PI = LIT(3.14159265358979323846);
@@ -257,6 +259,10 @@ def main():
                           "lanczos_sum_expg_scaled_denom, 12);", code, flags=re.S)
         parts.append(code.strip() + "\n")
     out = "\n".join(parts)
+    # 32-bit loop counters for the short fixed series, and the degree type
+    # poly_int (see HEADER), so that float32 kernels need no 64-bit integers.
+    out = out.replace("uint64_t index", "uint index").replace("int64_t", "poly_int")
+    out = out.replace("typedef poly_int poly_int", "typedef int64_t poly_int")  # (the header's own)
     out = tabulate_erfcx(out)
     out = re.sub(r"\n{3,}", "\n\n", out)
     OUT.write_text(out, encoding="utf-8", newline="\n")

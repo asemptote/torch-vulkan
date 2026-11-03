@@ -59,8 +59,10 @@ FT i1e(FT x)
 }
 
 // The polynomials' degree: NaN degrees are NaN results (handled by the
-// caller), others truncate toward zero as the CPU's int64 cast does.
-int64_t degree(FT n) { return int64_t(n); }
+// caller), others truncate toward zero as the CPU's int64 cast does (in
+// float32 kernels to an int, clamped: degrees past 2^31 are out of reach of
+// the CPU's recurrences too).
+poly_int degree(FT n) { return IS_F64 ? poly_int(n) : poly_int(clamp(n, FT(-2147483648.0), FT(2147483520.0))); }
 
 FT apply(FT x, FT y)
 {
@@ -98,7 +100,7 @@ FT apply(FT x, FT y)
 #if defined(G_poly)
     // Polynomials in x of degree y.
     if (isnan(y)) return y;
-    int64_t n = degree(y);
+    poly_int n = degree(y);
     switch (OP)
     {
     case SPECIAL_CHEBYSHEV_T: return chebyshev_polynomial_t_forward(x, n);

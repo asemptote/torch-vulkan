@@ -9,11 +9,13 @@ static const bool IS_F64 = true;
 static const FT M_EPS = 2.220446049250313e-16l;
 static const FT M_MAX = 1.7976931348623157e308l;
 static const FT M_TINY = 2.2250738585072014e-308l;
+typedef int64_t poly_int;  // (the polynomials' degree: int64 as on the CPU)
 #else
 static const bool IS_F64 = false;
 static const FT M_EPS = 1.1920928955078125e-7f;
 static const FT M_MAX = 3.4028234663852886e38f;
 static const FT M_TINY = 1.1754943508222875e-38f;
+typedef int poly_int;  // (no 64-bit integers outside float64 kernels: Mali GPUs lack them)
 #endif
 
 static const FT K_PI = LIT(3.14159265358979323846);
@@ -1775,7 +1777,7 @@ FT bessel_y1_forward(FT x) {
     return (pp / pq * m_sin(x - FT(LIT(2.356194490192344928846982537459627163))) + FT(LIT(5.0)) / x * (qp / qq) * m_cos(x - FT(LIT(2.356194490192344928846982537459627163)))) * FT(LIT(0.797884560802865355879892119868763737)) / sqrt(x);
 }
 
-FT chebyshev_polynomial_t_forward(FT x, int64_t n) {
+FT chebyshev_polynomial_t_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -1804,7 +1806,7 @@ FT chebyshev_polynomial_t_forward(FT x, int64_t n) {
     FT q = x;
     FT r = x;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x) * q - p;
         p = q;
         q = r;
@@ -1813,7 +1815,7 @@ FT chebyshev_polynomial_t_forward(FT x, int64_t n) {
     return r;
 }
 
-FT chebyshev_polynomial_u_forward(FT x, int64_t n) {
+FT chebyshev_polynomial_u_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -1846,7 +1848,7 @@ FT chebyshev_polynomial_u_forward(FT x, int64_t n) {
     FT q = x + x;
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x) * q - p;
         p = q;
         q = r;
@@ -1855,7 +1857,7 @@ FT chebyshev_polynomial_u_forward(FT x, int64_t n) {
     return r;
 }
 
-FT chebyshev_polynomial_v_forward(FT x, int64_t n) {
+FT chebyshev_polynomial_v_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -1896,7 +1898,7 @@ FT chebyshev_polynomial_v_forward(FT x, int64_t n) {
     FT q = x + x - FT(LIT(1.0));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x) * q - p;
         p = q;
         q = r;
@@ -1905,7 +1907,7 @@ FT chebyshev_polynomial_v_forward(FT x, int64_t n) {
     return r;
 }
 
-FT chebyshev_polynomial_w_forward(FT x, int64_t n) {
+FT chebyshev_polynomial_w_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -1950,7 +1952,7 @@ FT chebyshev_polynomial_w_forward(FT x, int64_t n) {
     FT q = x + x + FT(LIT(1.0));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x) * q - p;
         p = q;
         q = r;
@@ -1959,7 +1961,7 @@ FT chebyshev_polynomial_w_forward(FT x, int64_t n) {
     return r;
 }
 
-FT hermite_polynomial_h_forward(FT x, int64_t n) {
+FT hermite_polynomial_h_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -1980,7 +1982,7 @@ FT hermite_polynomial_h_forward(FT x, int64_t n) {
     FT q = x + x;
     FT r = FT(LIT(0.0));
 
-    for (int64_t k = 2; k < n + n; k += 2) {
+    for (poly_int k = 2; k < n + n; k += 2) {
         r = (x + x) * q - k * p;
         p = q;
         q = r;
@@ -1989,7 +1991,7 @@ FT hermite_polynomial_h_forward(FT x, int64_t n) {
     return r;
 }
 
-FT hermite_polynomial_he_forward(FT x, int64_t n) {
+FT hermite_polynomial_he_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2010,7 +2012,7 @@ FT hermite_polynomial_he_forward(FT x, int64_t n) {
     FT q = x;
     FT r;
 
-    for (int64_t k = 1; k < n; k++) {
+    for (poly_int k = 1; k < n; k++) {
         r = x * q - k * p;
         p = q;
         q = r;
@@ -2019,7 +2021,7 @@ FT hermite_polynomial_he_forward(FT x, int64_t n) {
     return r;
 }
 
-FT laguerre_polynomial_l_forward(FT x, int64_t n) {
+FT laguerre_polynomial_l_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2040,7 +2042,7 @@ FT laguerre_polynomial_l_forward(FT x, int64_t n) {
     FT q = FT(LIT(1.0)) - x;
     FT r = q;
 
-    for (int64_t k = 1; (k < n) && !isnan(q); k++) {
+    for (poly_int k = 1; (k < n) && !isnan(q); k++) {
         r = (((k + k) + (FT(LIT(1.0)) - x)) * q - k * p) / (k + 1);
         p = q;
         q = r;
@@ -2049,7 +2051,7 @@ FT laguerre_polynomial_l_forward(FT x, int64_t n) {
     return r;
 }
 
-FT legendre_polynomial_p_forward(FT x, int64_t n) {
+FT legendre_polynomial_p_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2074,7 +2076,7 @@ FT legendre_polynomial_p_forward(FT x, int64_t n) {
     FT q = x;
     FT r = q;
 
-    for (int64_t k = 1; (k < n) && !isnan(q); k++) {
+    for (poly_int k = 1; (k < n) && !isnan(q); k++) {
         r = ((k + k + 1) * x * q - k * p) / (k + 1);
         p = q;
         q = r;
@@ -2475,7 +2477,7 @@ FT scaled_modified_bessel_k0_forward(FT x) {
     if (x <= FT(LIT(2.0))) {
         FT a = A[0];
 
-        for (uint64_t index = 1; index < 10; index++) {
+        for (uint index = 1; index < 10; index++) {
             p = q;
             q = a;
             a = (x * x - FT(LIT(2.0))) * q - p + A[index];
@@ -2486,7 +2488,7 @@ FT scaled_modified_bessel_k0_forward(FT x) {
 
     FT b = B[0];
 
-    for (uint64_t index = 1; index < 25; index++) {
+    for (uint index = 1; index < 25; index++) {
         p = q;
         q = b;
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
@@ -2552,7 +2554,7 @@ FT scaled_modified_bessel_k1_forward(FT x) {
     if (x <= FT(LIT(2.0))) {
         FT a = A[0];
 
-        for (uint64_t index = 1; index < 11; index++) {
+        for (uint index = 1; index < 11; index++) {
             p = q;
             q = a;
             a = (x * x - FT(LIT(2.0))) * q - p + A[index];
@@ -2563,7 +2565,7 @@ FT scaled_modified_bessel_k1_forward(FT x) {
 
     FT b = B[0];
 
-    for (uint64_t index = 1; index < 25; index++) {
+    for (uint index = 1; index < 25; index++) {
         p = q;
         q = b;
         b = (FT(LIT(8.0)) / x - FT(LIT(2.0))) * q - p + B[index];
@@ -2572,7 +2574,7 @@ FT scaled_modified_bessel_k1_forward(FT x) {
     return (FT(LIT(0.5)) * (b - p) / sqrt(x));
 }
 
-FT shifted_chebyshev_polynomial_t_forward(FT x, int64_t n) {
+FT shifted_chebyshev_polynomial_t_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2605,7 +2607,7 @@ FT shifted_chebyshev_polynomial_t_forward(FT x, int64_t n) {
     FT q = x + x - FT(LIT(1.0));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0)))) * q - p;
         p = q;
         q = r;
@@ -2614,7 +2616,7 @@ FT shifted_chebyshev_polynomial_t_forward(FT x, int64_t n) {
     return r;
 }
 
-FT shifted_chebyshev_polynomial_u_forward(FT x, int64_t n) {
+FT shifted_chebyshev_polynomial_u_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2651,7 +2653,7 @@ FT shifted_chebyshev_polynomial_u_forward(FT x, int64_t n) {
     FT q = x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0)));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0)))) * q - p;
         p = q;
         q = r;
@@ -2660,7 +2662,7 @@ FT shifted_chebyshev_polynomial_u_forward(FT x, int64_t n) {
     return r;
 }
 
-FT shifted_chebyshev_polynomial_v_forward(FT x, int64_t n) {
+FT shifted_chebyshev_polynomial_v_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2701,7 +2703,7 @@ FT shifted_chebyshev_polynomial_v_forward(FT x, int64_t n) {
     FT q = x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0))) - FT(LIT(1.0));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0)))) * q - p;
         p = q;
         q = r;
@@ -2710,7 +2712,7 @@ FT shifted_chebyshev_polynomial_v_forward(FT x, int64_t n) {
     return r;
 }
 
-FT shifted_chebyshev_polynomial_w_forward(FT x, int64_t n) {
+FT shifted_chebyshev_polynomial_w_forward(FT x, poly_int n) {
     if (n < 0) {
         return FT(LIT(0.0));
     }
@@ -2751,7 +2753,7 @@ FT shifted_chebyshev_polynomial_w_forward(FT x, int64_t n) {
     FT q = x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0))) + FT(LIT(1.0));
     FT r = q;
 
-    for (int64_t k = 2; (k <= n) && !isnan(q); k++) {
+    for (poly_int k = 2; (k <= n) && !isnan(q); k++) {
         r = (x + x - FT(LIT(1.0)) + (x + x - FT(LIT(1.0)))) * q - p;
         p = q;
         q = r;
