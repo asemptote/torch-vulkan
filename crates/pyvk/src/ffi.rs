@@ -139,6 +139,12 @@ pub extern "C" fn vkt_has_float64() -> i32 {
     runtime().map(|rt| rt.ctx.caps.shader_float64 as i32).unwrap_or(0)
 }
 
+/// The device's PCI vendor ID (0 without a device).
+#[no_mangle]
+pub extern "C" fn vkt_vendor_id() -> u32 {
+    runtime().map(|rt| rt.ctx.vendor_id).unwrap_or(0)
+}
+
 /// Optional device features as bits (csrc/vk.h `Feature`): 1 float64,
 /// 2 int16 (with 16-bit storage), 4 float16 (with 16-bit storage), 8 int8
 /// (with 8-bit storage).

@@ -165,6 +165,8 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-env-changed=VKCORE_PREBUILT_SPIRV");
     if let Some(dir) = env::var_os("VKCORE_PREBUILT_SPIRV") {
+        // (the directory: a kernel added or removed re-runs this)
+        println!("cargo:rerun-if-changed={}", Path::new(&dir).display());
         prebuilt(Path::new(&dir), &out);
         return;
     }

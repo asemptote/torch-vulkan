@@ -3,6 +3,9 @@
 import contextlib
 import itertools
 import math
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -89,3 +92,30 @@ def test_linear_layer_autograd():
 def test_integer_mm_falls_back_correctly():
     a, b = make((7, 9), torch.int64, 1), make((9, 4), torch.int64, 2)
     check(a.to("vk") @ b.to("vk"), a @ b)
+
+
+GEMM4_SCRIPT = r"""
+import torch, torch_vulkan
+torch.manual_seed(0)
+cases = []
+for m, k, n in [(1, 4, 4), (9, 8, 132), (130, 64, 256), (33, 12, 20), (5, 0, 8)]:
+    a, b = torch.randn(m, k), torch.randn(k, n)
+    cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
+a, b, c = torch.randn(3, 20, 16), torch.randn(3, 16, 36), torch.randn(20, 36)
+cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
+cases.append((torch.addmm(c.to("vk"), a[1].to("vk"), b[1].to("vk"), beta=0.5, alpha=2).cpu(),
+              torch.addmm(c, a[1], b[1], beta=0.5, alpha=2)))
+x = torch.randn(65, 40)  # (views 16-byte aligned or not)
+for v in (x[1:, 4:], x[:, 1:37], x[3:, 2:34]):
+    w = torch.randn(v.shape[1], 24)
+    cases.append(((v.to("vk") @ w.to("vk")).cpu(), v @ w))
+print(max(float((g - w).abs().max() / w.abs().max().clamp_min(1)) for g, w in cases))
+"""
+
+
+def test_float4_gemm_kernel():
+    # shaders/gemm4.slang (the Mali default) on any GPU, through its env switch
+    env = dict(os.environ, TORCH_VK_GEMM="float4")
+    out = subprocess.run([sys.executable, "-c", GEMM4_SCRIPT], env=env, capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert float(out.stdout.strip().splitlines()[-1]) < 1e-5

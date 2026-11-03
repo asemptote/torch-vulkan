@@ -11,6 +11,8 @@
 #include <torch/library.h>
 
 #include <cstddef>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace vk {
@@ -28,7 +30,29 @@ struct GemmParams {
 static_assert(sizeof(GemmParams) == 112 && offsetof(GemmParams, a_sm) == 64, "must match shaders/gemm.slang");
 
 constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
+constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
+
+// Whether float32 products use shaders/gemm4.slang where they can: on Arm
+// GPUs (Mali), unless TORCH_VK_GEMM is "tiled" ("float4" forces it).
+bool prefer_gemm4() {
+  static const bool prefer = [] {
+    const char* env = std::getenv("TORCH_VK_GEMM");
+    if (env != nullptr && std::string(env) == "tiled") return false;
+    if (env != nullptr && std::string(env) == "float4") return true;
+    return vkt_vendor_id() == 0x13B5;
+  }();
+  return prefer;
+}
+
+// gemm4's layout: row-major A and B (unit k and n strides) whose rows and
+// batches start 16-byte aligned, K and N multiples of 4.
+bool gemm4_layout(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t k) {
+  auto aligned = [](const at::Tensor& t) {
+    return t.stride(2) == 1 && t.stride(1) % 4 == 0 && t.stride(0) % 4 == 0 && gpu_address(t) % 16 == 0;
+  };
+  return n % 4 == 0 && k % 4 == 0 && aligned(a) && aligned(b);
+}
 
 bool gemm_dtype(at::ScalarType t) {
   return t == at::kFloat || (t == at::kDouble && vkt_has_float64()) || t == at::kInt || t == at::kLong;
@@ -96,6 +120,12 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     p.cin_sb = static_cast<int32_t>(cin->stride(0));
     p.cin_sm = static_cast<int32_t>(cin->stride(1));
     p.cin_sn = static_cast<int32_t>(cin->stride(2));
+  }
+  if (c.scalar_type() == at::kFloat && prefer_gemm4() && gemm4_layout(a, b, n, k) &&
+      (m + kTile4M - 1) / kTile4M <= kMaxGroups) {
+    dispatch("gemm4_f32", {use_cin ? 1u : 0u}, p, static_cast<uint32_t>((n + kTile4N - 1) / kTile4N),
+             static_cast<uint32_t>((m + kTile4M - 1) / kTile4M), static_cast<uint32_t>(batch));
+    return true;
   }
   dispatch(std::string("gemm_") + dtype_label(c.scalar_type()), {use_cin ? 1u : 0u}, p,
            static_cast<uint32_t>(gx), static_cast<uint32_t>(gy), static_cast<uint32_t>(batch));

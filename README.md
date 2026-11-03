@@ -77,6 +77,14 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   repeats; int8/uint8/int16 ops without their own kernels in int32 on the GPU
   (wrapping arithmetic gives the narrow results). In the OpInfo sweep only
   `to_sparse` still fell back (sparse tensors: M18).
+- **Matrix products for Mali** (`gemm4.slang`): on Arm GPUs, float32
+  products of row-major operands (K and N multiples of 4, 16-byte aligned
+  rows) use a kernel without shared memory (on Mali it is ordinary cached
+  memory) and with 16-byte loads, 2x8 outputs per thread. On the A13 a
+  2048x2048 product takes 0.55-0.66 s (26-31 GFLOP/s), against 0.97 s for
+  the shared-memory tiles of `gemm.slang` and 0.64 s on the 8 CPU cores; on
+  the Intel UHD 620 it is 2.5x slower than the tiles, so it is Arm-only
+  (`TORCH_VK_GEMM=float4` or `tiled` overrides).
 - **Building on the phone** (`tools/build-termux.sh`): Termux's
   `python-torch` (32-bit ARM), Rust and clang, 15 minutes on the A13; there
   is no slangc for Android, so the SPIR-V compiled on another machine is
@@ -864,10 +872,9 @@ no fallbacks in the OpInfo sweep).
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
 16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
     the smooth-L1/Huber backward as single kernels.
-17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: matrix
-    products tuned for Mali (on the A13 a 2048x2048 float32 product takes
-    0.98 s on the GPU and 0.65 s on the 8 CPU cores; element-wise work is
-    twice as fast on the GPU), and on Android this library's typed c10 errors
+17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: Mali
+    products of other layouts and dtypes than row-major float32 (they use
+    the tiles), and on Android this library's typed c10 errors
     (TypeError, IndexError, ...) reach Python as RuntimeError (Android's
     libc++ matches exception types by address, and a Rust cdylib keeps its
     own copies of their type_info).

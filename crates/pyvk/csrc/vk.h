@@ -35,6 +35,7 @@ int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uin
                  uint32_t gy, uint32_t gz);
 int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
 int vkt_has_float64();
+uint32_t vkt_vendor_id();
 uint32_t vkt_capabilities();
 }
 
