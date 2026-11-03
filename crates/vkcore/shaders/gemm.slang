@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // Batched GEMM: C[b] = alpha * A[b] @ B[b] (+ beta * Cin[b] when USE_CIN).
 // Integer variants wrap on overflow, as the CPU's integer matmul does.
@@ -12,6 +12,7 @@
 // Tile shape. On the UHD 620, 64x64 tiles with 4x4 per thread beat
 // 128x128 (8x8), 128x64 and 64x128: larger per-thread blocks spill registers
 // (especially for float64).
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #define BM 64
 #define BN 64
 #define TK 16

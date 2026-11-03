@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t
 //
 // Tree reduction of `in` over its reduced dims, one result per output index.
 // Each workgroup reduces chunk c of output o's reduction range and writes
@@ -8,6 +8,7 @@
 // A (accumulator and output type) is T for floats and int64 for integers and
 // bool, as in PyTorch's sums. OP codes must match csrc/reduce.cpp.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "opcodes.slang"
 #include "_slot.slang"
 
@@ -18,7 +19,7 @@ typedef float A;
 typedef double A;
 #define A_FLOAT 1
 #else
-typedef int64_t A;
+typedef I64 A;  // (int64 in words: _int64.slang)
 #endif
 
 // 128 bytes; every field naturally aligned.
@@ -54,7 +55,7 @@ A param(slot64 bits)
 #elif defined(T_f32)
     return slot_float(bits);
 #else
-    return A(slot_int64(bits));
+    return I64(bits.x, bits.y);
 #endif
 }
 
@@ -91,8 +92,8 @@ A identity()
     if (is_max_like() && OP != OP_ANY) return A(-1.0 / 0.0);
     if (is_min_like() && OP != OP_ALL) return A(1.0 / 0.0);
 #else
-    if (is_max_like() && OP != OP_ANY) return A(0x8000000000000000ull);
-    if (is_min_like() && OP != OP_ALL) return A(0x7fffffffffffffffull);
+    if (is_max_like() && OP != OP_ANY) return i64_min();
+    if (is_min_like() && OP != OP_ALL) return I64(0xffffffffu, 0x7fffffffu);
 #endif
     return A(0);
 }

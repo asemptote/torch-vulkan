@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t f16=half
+// axis T: f32=float f64=double i32=int i64=I64 f16=half
 //
 // Index sequences, strided over out (index i is the linear output index):
 //   IOTA_ARANGE    out = alpha + i * beta
@@ -7,6 +7,7 @@
 //                  float types only). float16 rounds the product and the
 //                  sum to half separately, as PyTorch's c10::Half does.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #define OUT_T T
 #define IN_T T
 #include "_strided.slang"

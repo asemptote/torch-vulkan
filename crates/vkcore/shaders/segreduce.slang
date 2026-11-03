@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // Accumulation into repeated destinations (index_add, scatter_add,
 // scatter_reduce, index_put_ with accumulate, bincount, ...) without atomics:
@@ -15,6 +15,7 @@
 // multiplies each value by 1 / (its run's length) before adding it, as
 // embedding_dense_backward's scale_grad_by_freq does.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "opcodes.slang"
 #include "_wide.slang"
 

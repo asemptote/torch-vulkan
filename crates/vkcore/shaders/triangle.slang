@@ -1,9 +1,10 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t c64=float2 c128=double2
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2
 //
 // tril / triu over a batch of matrices [batch, rows, cols] (any strides):
 // out[b, i, j] = in[b, i, j] where kept, else 0. Kept: j - i <= diag (tril),
 // j - i >= diag (triu, UPPER = 1). In place when in == out.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 struct Params
 {
     T* in;          // 0

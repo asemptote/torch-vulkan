@@ -9,6 +9,7 @@
 pub mod context;
 pub mod kernels;
 pub mod memory;
+pub mod spirv_fix;
 pub mod stream;
 
 use std::sync::{Arc, Mutex};

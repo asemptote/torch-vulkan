@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t
 //
 // Sequential per-row passes, one thread per row of a contiguous [rows, n]
 // input (simple and exact; rows are scanned in order like the CPU does):
@@ -10,6 +10,7 @@
 //       (the smallest on ties) and the last index it occurs at (PyTorch
 //       leaves the index among equal elements unspecified)
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "opcodes.slang"
 #include "_wide.slang"
 #if defined(T_f32) || defined(T_f64)

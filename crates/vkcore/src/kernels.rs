@@ -108,6 +108,11 @@ impl KernelCache {
             let result = d.create_compute_pipelines(self.cache, &[info], None);
             d.destroy_shader_module(module, None);
             let pipeline = result.map_err(|(_, e)| e)?[0];
+            // (Intel's Windows driver has returned success with no pipeline
+            // for kernels its compiler could not handle)
+            if pipeline == vk::Pipeline::null() {
+                return Err(format!("the driver could not compile kernel {name} (no pipeline, no error)").into());
+            }
             let kernel = Arc::new(Kernel { name: name.to_owned(), pipeline });
             self.kernels.insert(key, kernel.clone());
             Ok(kernel)
@@ -283,5 +288,19 @@ mod tests {
             }
         }
         assert!(offenders.is_empty(), "declare Float64: {offenders:?}");
+    }
+
+    /// build.rs removes every OpTypeForwardPointer (spirv_fix.rs).
+    #[test]
+    fn kernels_have_no_forward_pointers() {
+        let offenders: Vec<&str> = SPIRV
+            .iter()
+            .filter(|(_, spirv)| {
+                let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv)).unwrap();
+                crate::spirv_fix::has_forward_pointer(&words)
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(offenders.is_empty(), "forward pointers left in: {offenders:?}");
     }
 }

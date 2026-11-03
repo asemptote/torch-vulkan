@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t c64=float2 c128=double2
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2
 //
 // out (bool, one byte) = predicate of a (and b), strided. OP is a COMPARE_*
 // code: comparisons (complex: eq, ne only), logical ops (nonzero = true) and

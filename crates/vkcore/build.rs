@@ -26,6 +26,13 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+#[path = "src/spirv_fix.rs"]
+mod spirv_fix;
+
+/// Bumped when the post-processing of compiled modules changes (part of every
+/// variant's cache key).
+const POSTPROCESS: &str = "drop-forward-pointers-1";
+
 /// Flags for every kernel.
 const SLANGC_FLAGS: &[&str] = &[
     // SPIR-V 1.3, the newest Vulkan 1.1 accepts: slang then declares
@@ -163,6 +170,7 @@ fn main() {
     slang_codes.hash(&mut includes);
     compiler.hash(&mut includes);
     SLANGC_FLAGS.hash(&mut includes);
+    POSTPROCESS.hash(&mut includes);
     let includes = includes.finish();
 
     // Launch every compilation that is out of date at once, then collect.
@@ -227,6 +235,13 @@ fn main() {
     let mut failures = Vec::new();
     for (name, defines, result, stamp, key) in done {
         if result.status.success() {
+            // (spirv_fix.rs: no forward pointers, which Intel's driver rejects)
+            let spv = out.join(format!("{name}.spv"));
+            let bytes = std::fs::read(&spv).unwrap();
+            let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if let Some(fixed) = spirv_fix::drop_forward_pointers(&words) {
+                std::fs::write(&spv, fixed.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            }
             std::fs::write(stamp, key).unwrap();
         } else {
             failures.push(format!(

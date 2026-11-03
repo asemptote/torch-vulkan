@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // (value, index) reduction for argmax/argmin and max/min along a dim. Same
 // chunking scheme as reduce.slang: each workgroup writes the best
@@ -6,6 +6,7 @@
 // reading indices from in_idx. Ties and NaNs resolve to the smallest index,
 // matching PyTorch (NaN counts as the maximum and the minimum).
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "opcodes.slang"
 #include "_wide.slang"
 

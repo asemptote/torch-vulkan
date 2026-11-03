@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // out = op(a, b), strided with broadcasting. OP is a BINARY_* code; float
 // math comes from _fmath.slang (GPU built-ins for float32, software for

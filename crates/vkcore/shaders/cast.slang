@@ -1,5 +1,5 @@
-// axis SRC: f32=float f64=double i32=int i64=int64_t b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
-// axis DST: f32=float f64=double i32=int i64=int64_t b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
+// axis SRC: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
+// axis DST: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
 //
 // out = DST(a), strided, between dtypes (same-dtype copies use move.slang).
 // Conversion to bool maps nonzero to 1; complex to real keeps the real part
@@ -7,6 +7,10 @@
 // imaginary part to 0. bfloat16 is stored as its 16 bits; both 16-bit float
 // types are converted through float with round-to-nearest-even.
 
+#if defined(SRC_f64) || defined(SRC_c128) || defined(DST_f64) || defined(DST_c128)
+#define I64_DOUBLE 1  // (int64 <-> double conversions: float64 kernels only)
+#endif
+#include "_int64.slang"  // (the i64 variants' type: _int64.slang)
 #define OUT_T DST
 #define IN_T SRC
 #include "_strided.slang"
@@ -84,8 +88,49 @@ int trunc32(float x)
     return abs(x) < 2147483648.0f ? int(x) : 0;
 }
 
+#if defined(SRC_i64) || defined(DST_i64)
+// Conversions to and from int64 (I64, two words), as the CPU's static_casts:
+// narrower integers keep the low bits, floats round to nearest (int64 ->
+// float) or truncate (float -> int64; out of range and NaN give int64 min).
+DV convert_i64(SV x)
+{
+#if defined(SRC_i64) && defined(DST_i64)
+    return x;
+#elif defined(SRC_i64) && defined(DST_b8)
+    return i64_nonzero(x) ? uint8_t(1) : uint8_t(0);
+#elif defined(SRC_i64) && (defined(DST_u8) || defined(DST_i8) || defined(DST_i16) || defined(DST_i32))
+    return DV(i64_low(x));
+#elif defined(SRC_i64) && (defined(DST_f32) || defined(DST_f16) || defined(DST_bf16))
+    return i64_to_float(x);
+#elif defined(SRC_i64) && defined(DST_f64)
+    return i64_to_double(x);
+#elif defined(SRC_i64) && defined(DST_c64)
+    return DV(i64_to_float(x), 0.0f);
+#elif defined(SRC_i64) && defined(DST_c128)
+    return DV(i64_to_double(x), 0.0l);
+#elif defined(SRC_b8)
+    return I64(x != SV(0) ? 1 : 0);  // (any nonzero byte is true)
+#elif defined(SRC_u8)
+    return I64(uint(x), 0u);
+#elif defined(SRC_i8) || defined(SRC_i16) || defined(SRC_i32)
+    return I64(int(x));
+#elif defined(SRC_f32) || defined(SRC_f16) || defined(SRC_bf16)
+    return i64_from_float(float(x));
+#elif defined(SRC_f64)
+    return i64_from_double(x);
+#elif defined(SRC_c64)
+    return i64_from_float(x.x);
+#else  // SRC_c128
+    return i64_from_double(x.x);
+#endif
+}
+#endif
+
 DV convert(SV x)
 {
+#if defined(SRC_i64) || defined(DST_i64)
+    return convert_i64(x);
+#else
 #if defined(SRC_b8)
     x = x != SV(0) ? SV(1) : SV(0);  // any nonzero byte is true (as on the CPU)
 #endif
@@ -139,6 +184,7 @@ DV convert(SV x)
     return DV(x.x);
 #else
     return DV(x);
+#endif
 #endif
 #endif
 }

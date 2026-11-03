@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t
 //
 // Inclusive scan (cumsum / cumprod) along one dim, in three phases driven by
 // the host:
@@ -9,6 +9,7 @@
 // A is T for floats and int64 for integers and bool (PyTorch's cumsum
 // dtype). OP: 0 sum, 1 prod.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "opcodes.slang"
 
 #if defined(T_f32)
@@ -16,7 +17,7 @@ typedef float A;
 #elif defined(T_f64)
 typedef double A;
 #else
-typedef int64_t A;
+typedef I64 A;  // (int64 in words: _int64.slang)
 #endif
 
 struct Params

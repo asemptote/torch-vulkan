@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
 //
 // Sort keys for shaders/sort.slang: each element of x (contiguous [rows, n])
 // becomes an unsigned key whose integer order is PyTorch's sort order (NaN
@@ -6,9 +6,13 @@
 // row. Rows are padded to P (a power of two) and the buffer to `total`
 // entries with keys that sort last. Keys are 64-bit for 8-byte types.
 
-#if defined(T_f64) || defined(T_i64)
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
+#if defined(T_f64)
 typedef uint64_t K;
 #define KMAX 0xffffffffffffffffull
+#elif defined(T_i64)
+typedef U64 K;  // (the layout of uint64_t: _int64.slang)
+#define KMAX U64(0xffffffffu, 0xffffffffu)
 #else
 typedef uint K;
 #define KMAX 0xffffffffu
@@ -43,7 +47,7 @@ K key_of(T v)
     uint64_t u = isnan(v) ? 0x7ff8000000000000ull : bit_cast<uint64_t>(v == 0.0l ? 0.0l : v);
     return (u >> 63) != 0ull ? ~u : (u | 0x8000000000000000ull);
 #elif defined(T_i64)
-    return uint64_t(v) ^ 0x8000000000000000ull;
+    return U64(v.lo, v.hi ^ 0x80000000u);
 #elif defined(T_f32)
     return key_of_float(v);
 #elif defined(T_f16)
@@ -59,6 +63,12 @@ K key_of(T v)
 #endif
 }
 
+#if defined(T_i64)
+K flip(K k) { return U64(~k.lo, ~k.hi); }
+#else
+K flip(K k) { return ~k; }
+#endif
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -69,7 +79,7 @@ void main(uint3 id: SV_DispatchThreadID)
         if (row < p.rows && j < p.n)
         {
             K k = key_of(p.x[row * p.n + j]);
-            p.keys[i] = DESCENDING != 0 ? ~k : k;
+            p.keys[i] = DESCENDING != 0 ? flip(k) : k;
         }
         else
         {

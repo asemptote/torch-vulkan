@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // Random fills of a contiguous tensor with Philox4x32-10: element i draws
 // its bits from counter (i, offset) under key `seed`, so a (seed, offset)
@@ -15,6 +15,7 @@
 // Integer kernels do RNG_RANDOM only (the host computes the others in float
 // and casts).
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "_types.slang"
 #include "_wide.slang"
 #include "opcodes.slang"
@@ -99,7 +100,7 @@ void main(uint3 id: SV_DispatchThreadID)
                 bits = umod_wide(bits, range);
             uint2 v = add_wide(p.a_bits, bits);
 #if defined(T_i64)
-            p.out[i] = T(int64_t(uint64_t(v.x) | (uint64_t(v.y) << 32)));
+            p.out[i] = I64(v.x, v.y);
 #elif defined(T_f64)
             p.out[i] = T(asint(v.y)) * 4294967296.0l + T(v.x);  // (exact parts, one rounding)
 #elif defined(IS_FLOAT)

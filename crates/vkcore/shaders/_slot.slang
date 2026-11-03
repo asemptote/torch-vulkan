@@ -18,8 +18,9 @@ int64_t slot_int64(slot64 s) { return int64_t(uint64_t(s.x) | (uint64_t(s.y) << 
 // The integer scalar type of integer kernels: int64 for int64 kernels, int
 // otherwise (whose results are the int64 computation mod 2^32 anyway).
 #if defined(T_i64)
-typedef int64_t slot_int_t;
-slot_int_t slot_integer(slot64 s) { return slot_int64(s); }
+#include "_int64.slang"
+typedef I64 slot_int_t;
+slot_int_t slot_integer(slot64 s) { return I64(s.x, s.y); }
 #else
 typedef int slot_int_t;
 slot_int_t slot_integer(slot64 s) { return slot_int(s); }

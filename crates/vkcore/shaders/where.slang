@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t b8=uint8_t c64=float2 c128=double2
+// axis T: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2
 //
 // out = cond ? a : b, strided with broadcasting (four-operand layout: out,
 // cond in slot c). A_SCALAR / B_SCALAR replace a / b with the real scalar

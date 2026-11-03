@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // searchsorted / bucketize: for each value v in row r of `vals`
 // (contiguous [rows, q]), the insertion point in row r of the sorted
@@ -7,6 +7,7 @@
 // first i with !(seq[i] < v) (lower bound), as PyTorch compares. OUT32
 // writes int32 instead of int64.
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #include "_wide.slang"
 
 struct Params

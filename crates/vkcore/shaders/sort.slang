@@ -1,4 +1,4 @@
-// axis K: k32=uint k64=uint64_t
+// axis K: k32=uint k64=U64
 //
 // Bitonic sort of (key, index) pairs in rows of P entries (a power of two),
 // all rows at once: comparing the index on equal keys makes the result the
@@ -11,6 +11,7 @@
 // `total` (all rows) is a multiple of 1024; each pair sorts ascending when
 // bit k of its position in the row is 0 (stage k merges runs of length k).
 
+#include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 struct Params
 {
     K* keys;

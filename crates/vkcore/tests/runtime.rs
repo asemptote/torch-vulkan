@@ -177,3 +177,29 @@ fn kernel_cache_reuses_pipelines() -> Result<()> {
     assert_clean();
     Ok(())
 }
+
+/// Every kernel this device can run (those whose capabilities it has) builds
+/// a pipeline, with default specialization constants: the first check on a
+/// new GPU or driver. `cargo test -p vkcore --release every_kernel_builds -- --nocapture`
+/// lists the failures.
+#[test]
+fn every_kernel_builds() -> Result<()> {
+    let rt = Runtime::new()?;
+    let mut cache = rt.kernels.lock().unwrap();
+    let mut failed = Vec::new();
+    let mut refused = 0;
+    for name in vkcore::kernels::KernelCache::names() {
+        match cache.get(name, &[]) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("which this device does not support") => refused += 1,
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+    }
+    drop(cache);
+    eprintln!("{refused} kernels need features this device lacks");
+    assert!(failed.is_empty(), "kernels that did not build:
+{}", failed.join("
+"));
+    assert_clean();
+    Ok(())
+}

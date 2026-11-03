@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // out = op(a), strided. OP (specialization constant 0) is a UNARY_* code
 // from opcodes.txt; parameters alpha, beta, gamma. Float math

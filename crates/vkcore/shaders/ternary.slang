@@ -1,4 +1,4 @@
-// axis T: f32=float f64=double i32=int i64=int64_t
+// axis T: f32=float f64=double i32=int i64=I64
 //
 // Three-input element-wise ops, strided with broadcasting:
 //   TERNARY_LERP:     a + w (b - a), w = c (or alpha with C_SCALAR);
