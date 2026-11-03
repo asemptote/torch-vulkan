@@ -590,6 +590,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_runs(const at::Tensor& s, 
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> unique2(const at::Tensor& self, bool sorted, bool return_inverse,
                                                        bool return_counts) {
+  at::ScalarType st = self.scalar_type();
+  if (is_vk(self) && (st == at::kUInt16 || st == at::kUInt32 || st == at::kUInt64)) {
+    // in an order-preserving signed dtype: the values widened (uint16/32), or
+    // uint64's bits with the top one flipped
+    at::Tensor key = st == at::kUInt64 ? at::bitwise_xor(self.view(at::kLong), INT64_MIN)
+                                       : self.to(st == at::kUInt16 ? at::kInt : at::kLong);
+    auto [values, inverse, counts] = unique2(key, sorted, return_inverse, return_counts);
+    values = st == at::kUInt64 ? at::bitwise_xor(values, INT64_MIN).view(at::kUInt64) : values.to(st);
+    return {values, inverse, counts};
+  }
   if (!sortable(self)) {
     auto stack = on_cpu("aten::_unique2", "", self, sorted, return_inverse, return_counts);
     return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};

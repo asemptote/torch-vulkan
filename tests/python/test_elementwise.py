@@ -205,3 +205,30 @@ def test_small_integer_ops_without_their_own_kernels(dtype):
             assert got == want
         else:
             check(got, want)
+
+
+def test_unsigned_casts_and_unique():
+    # uint16/32/64 convert through their signed twins, as the CPU's casts
+    unsigned = [torch.uint16, torch.uint32, torch.uint64]
+    vals = torch.tensor([0, 1, 255, 65535, 65536, 2**31, 2**32 - 1, 2**32, 2**53, 2**63 - 1])
+    floats = torch.tensor([0.0, 1.5, 255.9, 65535.0, 3e9, 2.0**40, 9.3e18])
+    for u, other in itertools.product(unsigned, [torch.float32, torch.int64, torch.int16, torch.uint8, torch.bool] + unsigned):
+        if u == other:
+            continue
+        src = vals.to(u) if u != torch.uint64 else torch.cat([vals, torch.tensor([-1, -2**63])]).view(torch.uint64)
+        with on_gpu():
+            got = src.to("vk").to(other)
+        want = src.to(other)
+        if other.is_floating_point:
+            torch.testing.assert_close(got.cpu(), want, rtol=1e-6, atol=0)
+        else:
+            assert torch.equal(got.cpu().view(torch.uint8), want.view(torch.uint8)), (u, other)
+        f = floats[floats < {torch.uint16: 65536, torch.uint32: 2**32, torch.uint64: 1.8e19}[u]]
+        with on_gpu():
+            got = f.to("vk").to(u)
+        assert torch.equal(got.cpu().view(torch.uint8), f.to(u).view(torch.uint8)), u
+    x = torch.cat([vals, vals[:3]]).to(torch.uint64)
+    with on_gpu():
+        got = torch.unique(x.to("vk"), return_inverse=True, return_counts=True)
+    for g, w in zip(got, torch.unique(x, return_inverse=True, return_counts=True)):
+        assert torch.equal(g.cpu(), w)

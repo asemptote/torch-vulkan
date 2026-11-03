@@ -347,6 +347,51 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
 
 // ---------------------------------------------------------------- copies
 
+// uint16/32/64 have no cast kernels of their own: their bits are those of
+// int16/32/64, so conversions go through the signed twins, as the CPU's
+// static_casts on x86 (integers keep their low bits; floats truncate through
+// int32 for uint16, through int64 for uint32, and from 2^63 up with the top
+// bit set for uint64). Returns false if neither side is one of them.
+at::ScalarType signed_twin(at::ScalarType s) {
+  switch (s) {
+    case at::kUInt16: return at::kShort;
+    case at::kUInt32: return at::kInt;
+    case at::kUInt64: return at::kLong;
+    default: return s;
+  }
+}
+
+bool copy_unsigned(const at::Tensor& dst, const at::Tensor& src) {
+  at::ScalarType st = src.scalar_type(), dt = dst.scalar_type();
+  if (signed_twin(st) == st && signed_twin(dt) == dt) return false;
+  // the source's values in a dtype that holds them (uint64: its int64 bits)
+  at::Tensor v = src;
+  if (st == at::kUInt16) v = at::bitwise_and(src.view(at::kShort).to(at::kInt), 0xFFFF);
+  if (st == at::kUInt32) v = at::bitwise_and(src.view(at::kInt).to(at::kLong), 0xFFFFFFFFLL);
+  if (st == at::kUInt64) {
+    at::Tensor bits = src.view(at::kLong);
+    if (at::isFloatingType(dt) || at::isComplexType(dt)) {  // 2^63 and up: the sign bit as +2^63
+      at::ScalarType ft = at::isComplexType(dt) ? at::toRealValueType(dt) : dt;
+      at::Tensor low = at::bitwise_and(bits, INT64_MAX).to(ft);
+      v = at::where(at::lt(bits, 0), low + 9.223372036854775808e18, low);
+    } else {
+      v = bits;
+    }
+  }
+  at::ScalarType target = signed_twin(dt);
+  if (target != dt && at::isFloatingType(v.scalar_type())) {
+    if (dt == at::kUInt16) v = v.to(at::kInt);
+    if (dt == at::kUInt32) v = v.to(at::kLong);
+    if (dt == at::kUInt64) {
+      at::Tensor big = at::ge(v, 9.223372036854775808e18);
+      v = at::where(big, at::bitwise_or((v - 9.223372036854775808e18).to(at::kLong), INT64_MIN), v.to(at::kLong));
+    }
+  }
+  at::Tensor out = target != dt ? dst.view(target) : dst;
+  out.copy_(v.expand(dst.sizes()));
+  return true;
+}
+
 // dst (vk) <- src (vk), with broadcasting and dtype conversion.
 void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
   bool chalf_src = src.scalar_type() == at::kComplexHalf, chalf_dst = dst.scalar_type() == at::kComplexHalf;
@@ -380,6 +425,7 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
       return;
     }
   }
+  if (copy_unsigned(dst, src)) return;
   const char* from = storage_label(src.scalar_type());
   const char* to = storage_label(dst.scalar_type());
   if (from == nullptr || to == nullptr || src.scalar_type() == dst.scalar_type()) {
