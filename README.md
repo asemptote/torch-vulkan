@@ -94,13 +94,19 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   is no slangc for Android, so the SPIR-V compiled on another machine is
   used as is (`VKCORE_PREBUILT_SPIRV`, crates/vkcore/build.rs). The GPU is
   reached through Android's own Vulkan loader (Termux's finds only
-  llvmpipe). On the A13's Mali-G57 the local suite passes 616 tests (318
-  float64 ones skipped); of the 6 others, 4 are Android's error types (see
-  the roadmap) and 2 are references the phone's ARM CPU computes
-  differently (complex log2 at 0, float16 linspace). Run the tests with
-  `OMP_NUM_THREADS=1` there: Termux's multithreaded CPU convolution, the
-  tests' reference, gives a wrong result for about 2% of small conv1d calls
-  (repeated calls on the same input differ), which looked like a GPU bug.
+  llvmpipe). On the A13's Mali-G57 the local suite passes but for the
+  float64 tests (skipped) and two references the phone's ARM CPU computes
+  differently (complex log2 at 0, float16 linspace).
+- **Typed errors on Android**: Android's libc++ matches exception types by
+  type_info address, and this library (a Rust cdylib, its C++ symbols kept
+  local) has its own copies of c10's: a `TypeError` or `IndexError` raised
+  here reached Python as `RuntimeError`. On Android the typed checks
+  (`TORCH_CHECK_TYPE`/`INDEX`/`VALUE`/`NOT_IMPLEMENTED`, `vk.h`) throw with
+  the type_info libtorch_python's handlers use, found with `dlsym`.
+- Run the phone's tests with `OMP_NUM_THREADS=1`: Termux's multithreaded CPU
+  convolution, the tests' reference, gives a wrong result for about 2% of
+  small conv1d calls (repeated calls on the same input differ), which looked
+  like a GPU bug.
 
 ## Sparse tensors (M18)
 
@@ -897,10 +903,7 @@ no fallbacks in the OpInfo sweep).
     the smooth-L1/Huber backward as single kernels.
 17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: Mali
     products of other dtypes than float32 and of K or N not multiples of 4
-    (they use the tiles), and on Android this library's typed c10 errors
-    (TypeError, IndexError, ...) reach Python as RuntimeError (Android's
-    libc++ matches exception types by address, and a Rust cdylib keeps its
-    own copies of their type_info).
+    (they use the tiles).
 18. ~~**M18 sparse tensors**~~: done (see above). Not yet: sparse kernels
     for the sparse-sparse product and compressed reductions.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

@@ -28,6 +28,59 @@
 
 namespace vk {
 
+#if defined(__ANDROID__)
+// ---------------------------------------------------------------- typed errors on Android (vk.h)
+
+}  // namespace vk
+
+#include <dlfcn.h>
+
+#include <new>
+#include <typeinfo>
+
+extern "C" void* __cxa_allocate_exception(size_t) noexcept;
+extern "C" [[noreturn]] void __cxa_throw(void*, std::type_info*, void (*)(void*));
+
+namespace vk {
+namespace {
+
+// The type_info `symbol` names as libtorch_python's catch clauses see it:
+// the globally visible definition if there is one, else libtorch_python's
+// own (each library loaded locally binds to the first definition in its
+// own dependency order, libtorch_python's being itself).
+std::type_info* python_type_info(const char* symbol) {
+  void* p = dlsym(RTLD_DEFAULT, symbol);
+  if (p == nullptr) {
+    void* lib = dlopen("libtorch_python.so", RTLD_NOW | RTLD_NOLOAD);
+    if (lib != nullptr) p = dlsym(lib, symbol);
+  }
+  return static_cast<std::type_info*>(p);
+}
+
+template <typename E>
+[[noreturn]] void throw_with(const char* symbol, const char* func, const char* file, uint32_t line, std::string msg) {
+  static std::type_info* info = python_type_info(symbol);
+  c10::SourceLocation where{func, file, line};
+  if (info == nullptr) throw E(where, std::move(msg));  // (as before: RuntimeError in Python)
+  void* object = __cxa_allocate_exception(sizeof(E));
+  new (object) E(where, std::move(msg));
+  __cxa_throw(object, info, [](void* p) { static_cast<E*>(p)->~E(); });
+}
+
+}  // namespace
+
+void throw_typed(TypedError kind, const char* func, const char* file, uint32_t line, std::string msg) {
+  switch (kind) {
+    case TypedError::Index: throw_with<c10::IndexError>("_ZTIN3c1010IndexErrorE", func, file, line, std::move(msg));
+    case TypedError::Type: throw_with<c10::TypeError>("_ZTIN3c109TypeErrorE", func, file, line, std::move(msg));
+    case TypedError::Value: throw_with<c10::ValueError>("_ZTIN3c1010ValueErrorE", func, file, line, std::move(msg));
+    case TypedError::NotImplemented:
+      throw_with<c10::NotImplementedError>("_ZTIN3c1019NotImplementedErrorE", func, file, line, std::move(msg));
+  }
+  throw c10::Error(c10::SourceLocation{func, file, line}, std::move(msg));
+}
+#endif
+
 // ---------------------------------------------------------------- allocator
 
 namespace {

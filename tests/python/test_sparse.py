@@ -187,7 +187,9 @@ def test_csr_products_and_sampled_addmm():
         same(torch.addmm(*vk(bias, ca, b), beta=0.5, alpha=2), torch.addmm(bias, ca, b, beta=0.5, alpha=2), 1e-4)
         same(torch.addmv(*vk(bias[:, 0], ca, v), beta=0.5), torch.addmv(bias[:, 0], ca, v, beta=0.5), 1e-4)
         cb = b.to_sparse(layout=layout)
-        same(torch.mm(*vk(ca, cb)), torch.mm(ca, cb), 1e-4)  # (CSR, from either layout)
+        # (CSR from either layout, as PyTorch's; the reference through dense,
+        # as CPU builds without MKL have no sparse @ sparse)
+        same(torch.mm(*vk(ca, cb)), torch.mm(ca.to_dense(), cb.to_dense()).to_sparse_csr(), 1e-4)
     # batched sampled_addmm, and the dense op's errors for bad shapes
     m = (torch.randn(2, 4, 4) * (torch.rand(4, 4) > 0.5)).to_sparse_csr()  # (the same pattern per batch)
     x, y = torch.randn(2, 4, 3), torch.randn(2, 3, 4)

@@ -20,6 +20,32 @@
 #include <algorithm>
 #include <vector>
 
+#if defined(__ANDROID__)
+// Android's libc++ matches exception types by type_info address, and this
+// library (a Rust cdylib, its C++ symbols kept local) has its own copies of
+// c10's typed errors' type_info: a c10::TypeError thrown here reached Python
+// as RuntimeError, matched only as its base c10::Error. These checks throw
+// with the type_info libtorch_python's handlers compare against instead
+// (backend.cpp), so the Python exception types are PyTorch's.
+namespace vk {
+enum class TypedError { Index, Type, Value, NotImplemented };
+[[noreturn]] void throw_typed(TypedError kind, const char* func, const char* file, uint32_t line, std::string msg);
+}  // namespace vk
+#define VK_TYPED_CHECK(kind, cond, ...)                                          \
+  if (C10_UNLIKELY_OR_CONST(!(cond))) {                                          \
+    ::vk::throw_typed(kind, __func__, __FILE__, static_cast<uint32_t>(__LINE__), \
+                      std::string(TORCH_CHECK_MSG(cond, "", ##__VA_ARGS__)));    \
+  }
+#undef TORCH_CHECK_INDEX
+#undef TORCH_CHECK_TYPE
+#undef TORCH_CHECK_VALUE
+#undef TORCH_CHECK_NOT_IMPLEMENTED
+#define TORCH_CHECK_INDEX(cond, ...) VK_TYPED_CHECK(::vk::TypedError::Index, cond, __VA_ARGS__)
+#define TORCH_CHECK_TYPE(cond, ...) VK_TYPED_CHECK(::vk::TypedError::Type, cond, __VA_ARGS__)
+#define TORCH_CHECK_VALUE(cond, ...) VK_TYPED_CHECK(::vk::TypedError::Value, cond, __VA_ARGS__)
+#define TORCH_CHECK_NOT_IMPLEMENTED(cond, ...) VK_TYPED_CHECK(::vk::TypedError::NotImplemented, cond, __VA_ARGS__)
+#endif
+
 extern "C" {
 struct VktAlloc {
   void* handle;
