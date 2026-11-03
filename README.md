@@ -82,14 +82,13 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   is no slangc for Android, so the SPIR-V compiled on another machine is
   used as is (`VKCORE_PREBUILT_SPIRV`, crates/vkcore/build.rs). The GPU is
   reached through Android's own Vulkan loader (Termux's finds only
-  llvmpipe). On the A13's Mali-G57 the local suite passes 613 tests (318
-  float64 ones skipped); of the 9 others, 4 are Android's error types (see
-  the roadmap), 2 references the phone's ARM CPU computes differently
-  (complex log2 at 0, float16 linspace), and 3 (convolutions, a small
-  training loop) hit an intermittent wrong result on Mali that is not
-  understood yet: a few percent of small conv1d/conv2d calls in some runs
-  (none in others), deterministic for a given input buffer, not fixed by
-  waiting after every kernel or by uncached memory.
+  llvmpipe). On the A13's Mali-G57 the local suite passes 616 tests (318
+  float64 ones skipped); of the 6 others, 4 are Android's error types (see
+  the roadmap) and 2 are references the phone's ARM CPU computes
+  differently (complex log2 at 0, float16 linspace). Run the tests with
+  `OMP_NUM_THREADS=1` there: Termux's multithreaded CPU convolution, the
+  tests' reference, gives a wrong result for about 2% of small conv1d calls
+  (repeated calls on the same input differ), which looked like a GPU bug.
 
 ## Sparse tensors (M18)
 
