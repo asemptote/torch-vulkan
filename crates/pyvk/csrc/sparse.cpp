@@ -264,7 +264,6 @@ TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
   m.impl("zero_", TORCH_FN(zero_sparse_));
   m.impl("_to_dense", TORCH_FN(sparse_to_dense));
   m.impl("_to_sparse.sparse_dim", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, int64_t)>(sparse_coo_to_sparse)));
-  m.impl("_to_sparse", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, std::optional<at::Layout>, at::OptionalIntArrayRef, std::optional<int64_t>)>(sparse_coo_to_sparse)));
   m.impl("sum", TORCH_FN(sum_coo));
   m.impl("cat", TORCH_FN(cat_sparse));
   m.impl("permute", TORCH_FN(permute_sparse_coo));
@@ -468,9 +467,6 @@ TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
   m.impl("resize_as_sparse_", TORCH_FN(resize_as_sparse_compressed_));
   m.impl("zero_", TORCH_FN(zero_sparse_csr_));
   m.impl("_to_dense", TORCH_FN(sparse_compressed_to_dense));
-  m.impl("_to_sparse.sparse_dim", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, int64_t)>(sparse_compressed_to_sparse)));
-  m.impl("_to_sparse", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, std::optional<at::Layout>, at::OptionalIntArrayRef,
-                                                            std::optional<int64_t>)>(sparse_compressed_to_sparse)));
   m.impl("sum", TORCH_FN(sum_csr));
   m.impl("sparse_mask", TORCH_FN(sparse_mask_sparse_compressed));
   m.impl("select.int", TORCH_FN(select_sparse_csr));
@@ -555,11 +551,31 @@ at::Tensor compressed_via_dense(const at::Tensor& self, at::Layout layout, at::O
                                               r.sizes(), r.values().options().layout(layout));
 }
 
+// The conversions PyTorch does not do, with its errors.
+void check_conversion(const at::Tensor& self, at::Layout dst) {
+  at::Layout src = self.layout();
+  bool dst_blocked = dst == at::kSparseBsr || dst == at::kSparseBsc;
+  if ((src == at::kSparseBsr || src == at::kSparseBsc) && (dst == at::kSparseCsr || dst == at::kSparseCsc)) {
+    TORCH_CHECK(false, "sparse_compressed_to_sparse_", dst == at::kSparseCsr ? "csr" : "csc",
+                ": expected SparseCsr or SparseCsc layout but got ", src);
+  }
+  if (src == at::kSparse && dst != at::kSparse) {
+    TORCH_CHECK(self.sparse_dim() == 2, "sparse_coo_to_sparse: conversion from Sparse to ", dst,
+                " for input tensors with sparse_dim()!=2 is not supported");
+  }
+  if ((src == at::kSparseCsr || src == at::kSparseCsc) && dst_blocked) {
+    TORCH_CHECK(self.dim() - self.dense_dim() == 2, "sparse_compressed_to_sparse: conversion from ", src, " to ", dst,
+                " for batched inputs is not supported");
+  }
+}
+
 at::Tensor to_csr_any(const at::Tensor& self, std::optional<int64_t> dense_dim) {
+  check_conversion(self, at::kSparseCsr);
   if (self.layout() == at::kSparseCsr && (!dense_dim.has_value() || *dense_dim == self.dense_dim())) return self.clone();
   return compressed_via_dense(self, at::kSparseCsr, std::nullopt, dense_dim);
 }
 at::Tensor to_csc_any(const at::Tensor& self, std::optional<int64_t> dense_dim) {
+  check_conversion(self, at::kSparseCsc);
   if (self.layout() == at::kSparseCsc && (!dense_dim.has_value() || *dense_dim == self.dense_dim())) return self.clone();
   if (self.dim() == 2 && (!dense_dim.has_value() || *dense_dim == 0) && self.layout() != at::kSparseBsr &&
       self.layout() != at::kSparseBsc && (self.layout() != at::kSparseCsr || self.dense_dim() == 0) &&
@@ -574,9 +590,11 @@ at::Tensor to_csc_any(const at::Tensor& self, std::optional<int64_t> dense_dim) 
   return compressed_via_dense(self, at::kSparseCsc, std::nullopt, dense_dim);
 }
 at::Tensor to_bsr_any(const at::Tensor& self, at::IntArrayRef blocksize, std::optional<int64_t> dense_dim) {
+  check_conversion(self, at::kSparseBsr);
   return compressed_via_dense(self, at::kSparseBsr, blocksize, dense_dim);
 }
 at::Tensor to_bsc_any(const at::Tensor& self, at::IntArrayRef blocksize, std::optional<int64_t> dense_dim) {
+  check_conversion(self, at::kSparseBsc);
   return compressed_via_dense(self, at::kSparseBsc, blocksize, dense_dim);
 }
 
@@ -667,6 +685,7 @@ at::Tensor contiguous_compressed(const at::Tensor& r) {
 // dense or COO [*batch, rows, cols, *dense] -> CSR: unbatched through COO
 // (its rows compressed by convert_coo_to_csr), batched by PyTorch's code.
 at::Tensor to_csr_from(const at::Tensor& self, std::optional<int64_t> dense_dim) {
+  check_conversion(self, at::kSparseCsr);
   int64_t dd = dense_dim.value_or(self.layout() == at::kSparse ? self.dense_dim() : 0);
   if (self.dim() - dd == 2) {
     at::Tensor coo = (self.layout() == at::kSparse ? self : self.to_sparse(2)).coalesce();
@@ -695,12 +714,146 @@ at::Tensor dense_to_bsc(const at::Tensor& self, at::IntArrayRef blocksize, std::
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
-  m.impl("_to_sparse_csc", TORCH_FN(vk::dense_to_csc));
-  m.impl("_to_sparse_bsr", TORCH_FN(vk::dense_to_bsr));
-  m.impl("_to_sparse_bsc", TORCH_FN(vk::dense_to_bsc));
-  m.impl("_to_sparse_csr", TORCH_FN(vk::to_csr_from));
 }
 
 TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
   m.impl("_to_sparse_csr", TORCH_FN(vk::to_csr_from));
+}
+
+// ---------------------------------------------------------------- to_sparse between every layout
+
+namespace vk {
+namespace {
+
+at::Tensor to_layout(const at::Tensor& self, std::optional<at::Layout> layout, at::OptionalIntArrayRef blocksize,
+                     std::optional<int64_t> dense_dim) {
+  at::Layout l = layout.value_or(at::kSparse);
+  if (l == at::kSparse) {
+    if (self.layout() == at::kSparse) {
+      return at::native::sparse_coo_to_sparse(self, layout, blocksize, dense_dim);
+    }
+    // compressed -> COO: CSR by PyTorch's code, the others through dense
+    if (self.layout() == at::kSparseCsr && !blocksize.has_value()) {
+      return at::native::sparse_compressed_to_sparse(self, layout, blocksize, dense_dim);
+    }
+    int64_t dd = dense_dim.value_or(self.dense_dim());
+    return self.to_dense().to_sparse(self.dim() - dd);
+  }
+  switch (l) {
+    case at::kSparseCsr: return to_csr_any(self, dense_dim);
+    case at::kSparseCsc: return to_csc_any(self, dense_dim);
+    default:
+      TORCH_CHECK(blocksize.has_value(), "to_sparse: blocksize needed for ", l);
+      return l == at::kSparseBsr ? to_bsr_any(self, *blocksize, dense_dim) : to_bsc_any(self, *blocksize, dense_dim);
+  }
+}
+
+at::Tensor compressed_to_coo(const at::Tensor& self, int64_t sparse_dim) {
+  if (self.layout() == at::kSparseCsr) return at::native::sparse_compressed_to_sparse(self, sparse_dim);
+  return self.to_dense().to_sparse(sparse_dim);
+}
+
+}  // namespace
+}  // namespace vk
+
+TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
+  m.impl("_to_sparse", TORCH_FN(vk::to_layout));
+}
+
+TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
+  m.impl("_to_sparse", TORCH_FN(vk::to_layout));
+  m.impl("_to_sparse.sparse_dim", TORCH_FN(vk::compressed_to_coo));
+}
+
+// ---------------------------------------------------------------- dense -> any compressed layout
+
+namespace vk {
+namespace {
+
+// x [*batch, M, N, *dense] as CSR/CSC/BSR/BSC with `blocksize` (R, C) (1x1
+// for CSR/CSC, whose values then have no block dims): the blocks with a
+// nonzero element, row-major (CSR/BSR) or column-major (CSC/BSC), each
+// batch's compressed indices from the counts of its rows (columns). Every
+// batch must have the same number of blocks, as PyTorch requires.
+at::Tensor dense_to_compressed(const at::Tensor& x, at::Layout layout, at::OptionalIntArrayRef blocksize,
+                               std::optional<int64_t> dense_dim) {
+  int64_t dd = dense_dim.value_or(0);
+  int64_t nb = x.dim() - 2 - dd;  // batch dims
+  TORCH_CHECK(nb >= 0, "to_sparse: expected a tensor with at least ", 2 + dd, " dims, got ", x.dim());
+  bool blocked = layout == at::kSparseBsr || layout == at::kSparseBsc;
+  bool by_col = layout == at::kSparseCsc || layout == at::kSparseBsc;
+  int64_t R = 1, C = 1;
+  if (blocked) {
+    TORCH_CHECK(blocksize.has_value() && blocksize->size() == 2, "to_sparse: blocksize needs 2 elements for ", layout);
+    R = (*blocksize)[0];
+    C = (*blocksize)[1];
+  }
+  int64_t M = x.size(nb), N = x.size(nb + 1);
+  TORCH_CHECK(R > 0 && C > 0 && M % R == 0 && N % C == 0, "to_sparse: tensor sizes (", M, ", ", N,
+              ") must be divisible by the blocksize (", R, ", ", C, ")");
+  int64_t MB = M / R, NB = N / C;
+  std::vector<int64_t> bshape(x.sizes().begin(), x.sizes().begin() + nb);
+  std::vector<int64_t> dshape(x.sizes().begin() + nb + 2, x.sizes().end());
+  int64_t B = 1, D = 1;
+  for (int64_t s : bshape) B *= s;
+  for (int64_t s : dshape) D *= s;
+  // [B, MB, R, NB, C, D] -> [B, MB, NB, R, C, D]
+  std::vector<int64_t> v = {B, MB, R, NB, C, D};
+  at::Tensor blocks = x.reshape(v).permute({0, 1, 3, 2, 4, 5});
+  at::Tensor mask = at::ne(blocks, 0).flatten(3).any(3);  // [B, MB, NB]
+  if (by_col) {
+    blocks = blocks.transpose(1, 2);
+    mask = mask.transpose(1, 2);
+  }
+  int64_t outer = by_col ? NB : MB;
+  at::Tensor nz = at::nonzero(mask);  // [nnz, 3]: batch, outer, inner (sorted)
+  int64_t nnz = nz.size(0);
+  TORCH_CHECK(B == 0 || nnz % std::max<int64_t>(B, 1) == 0, "Expect the same number of specified elements per batch.");
+  at::TensorOptions lopts = x.options().dtype(at::kLong);
+  at::Tensor b = nz.select(1, 0), o = nz.select(1, 1), in = nz.select(1, 2);
+  at::Tensor counts = at::zeros({B * outer}, lopts).index_add_(0, b * outer + o, at::ones({nnz}, lopts));
+  at::Tensor per_batch = counts.view({B, outer}).sum(1);
+  if (B > 1) {
+    TORCH_CHECK(at::eq(per_batch, per_batch[0]).all().item<bool>(), "Expect the same number of specified elements per batch.");
+  }
+  at::Tensor compressed = at::cat({at::zeros({B, 1}, lopts), at::cumsum(counts.view({B, outer}), 1)}, 1);
+  int64_t per = B == 0 ? 0 : nnz / B;
+  at::Tensor vals = blocks.reshape({B * MB * NB, R, C, D})
+                        .index_select(0, (b * outer + o) * (by_col ? MB : NB) + in);  // [nnz, R, C, D]
+  std::vector<int64_t> vshape = bshape;
+  vshape.push_back(per);
+  if (blocked) {
+    vshape.push_back(R);
+    vshape.push_back(C);
+  }
+  vshape.insert(vshape.end(), dshape.begin(), dshape.end());
+  std::vector<int64_t> cshape = bshape, pshape = bshape;
+  cshape.push_back(outer + 1);
+  pshape.push_back(per);
+  return at::_sparse_compressed_tensor_unsafe(compressed.reshape(cshape).contiguous(), in.reshape(pshape).contiguous(),
+                                              vals.reshape(vshape).contiguous(), x.sizes(),
+                                              x.options().layout(layout));
+}
+
+at::Tensor dense_csr(const at::Tensor& x, std::optional<int64_t> dd) {
+  return dense_to_compressed(x, at::kSparseCsr, std::nullopt, dd);
+}
+at::Tensor dense_csc(const at::Tensor& x, std::optional<int64_t> dd) {
+  return dense_to_compressed(x, at::kSparseCsc, std::nullopt, dd);
+}
+at::Tensor dense_bsr(const at::Tensor& x, at::IntArrayRef bs, std::optional<int64_t> dd) {
+  return dense_to_compressed(x, at::kSparseBsr, bs, dd);
+}
+at::Tensor dense_bsc(const at::Tensor& x, at::IntArrayRef bs, std::optional<int64_t> dd) {
+  return dense_to_compressed(x, at::kSparseBsc, bs, dd);
+}
+
+}  // namespace
+}  // namespace vk
+
+TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  m.impl("_to_sparse_csr", TORCH_FN(vk::dense_csr));
+  m.impl("_to_sparse_csc", TORCH_FN(vk::dense_csc));
+  m.impl("_to_sparse_bsr", TORCH_FN(vk::dense_bsr));
+  m.impl("_to_sparse_bsc", TORCH_FN(vk::dense_bsc));
 }
