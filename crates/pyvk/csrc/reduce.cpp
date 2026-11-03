@@ -450,7 +450,9 @@ at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim
   check_iterator_out_device(self, out);
   TORCH_CHECK(out.scalar_type() == at::kBool || out.scalar_type() == at::kByte, Op == kAny ? "any" : "all",
               " only supports bool tensor for result, got: ", out.scalar_type());
-  if (complex_vk(self) && is_vk(out)) {
+  if ((complex_vk(self) || (self.scalar_type() == at::kByte && out.scalar_type() == at::kByte)) && is_vk(self) &&
+      is_vk(out)) {
+    // (complex as != 0; uint8, whose result the CPU gives as uint8, likewise)
     return any_all_dims_out<Op>(at::ne(self, 0), dim, keepdim, out);
   }
   if (dim.has_value() && dim->empty() && is_vk(out)) {  // dim=[]: no dims reduced, as the CPU

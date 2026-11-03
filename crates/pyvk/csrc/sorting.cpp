@@ -378,10 +378,14 @@ std::tuple<at::Tensor&, at::Tensor&> mode_out(const at::Tensor& self, int64_t di
 
 template <uint32_t Op>
 void cum_helper(const at::Tensor& self, at::Tensor& values, at::Tensor& indices, int64_t dim) {
-  if (is_vk(self) && at::isReducedFloatingType(self.scalar_type()) && is_vk(values) && is_vk(indices)) {
-    // (16-bit floats: scanned as float32; the values selected are exact)
-    at::Tensor v = at::empty(values.sizes(), values.options().dtype(at::kFloat));
-    cum_helper<Op>(self.to(at::kFloat), v, indices, dim);
+  at::ScalarType t = self.scalar_type();
+  bool small_int = t == at::kChar || t == at::kByte || t == at::kShort;
+  if (is_vk(self) && (at::isReducedFloatingType(t) || small_int) && storage_label(t) != nullptr && is_vk(values) &&
+      is_vk(indices)) {
+    // (16-bit floats as float32, small integers as int32: the values selected are exact)
+    at::ScalarType wide = small_int ? at::kInt : at::kFloat;
+    at::Tensor v = at::empty(values.sizes(), values.options().dtype(wide));
+    cum_helper<Op>(self.to(wide), v, indices, dim);
     values.copy_(v);
     return;
   }

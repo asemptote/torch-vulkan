@@ -600,17 +600,64 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
   }
 }
 
-// ---------------------------------------------------------------- 16-bit floats through float32
+// ---------------------------------------------------------------- 16-bit floats through float32, small ints through int32
 
 namespace {
 
+bool is_small_int(at::ScalarType s) {
+  return s == at::kChar || s == at::kByte || s == at::kShort;
+}
+
+// A float16/bfloat16 (widened to float32) or int8/uint8/int16 (to int32) vk tensor.
 bool is_half_vk(const at::Tensor& t) {
-  return t.defined() && is_vk(t) && (t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16) &&
-         storage_label(t.scalar_type()) != nullptr;
+  if (!t.defined() || !is_vk(t) || storage_label(t.scalar_type()) == nullptr) return false;
+  at::ScalarType s = t.scalar_type();
+  return s == at::kHalf || s == at::kBFloat16 || is_small_int(s);
 }
 
 at::Tensor widen_half_arg(const at::Tensor& t) {
-  return is_half_vk(t) ? at::_to_copy(t, t.options().dtype(at::kFloat)) : t;
+  if (!is_half_vk(t)) return t;
+  return at::_to_copy(t, t.options().dtype(is_small_int(t.scalar_type()) ? at::kInt : at::kFloat));
+}
+
+// Ops whose integer results depend on the dtype's width beyond wrapping
+// arithmetic: their small-int tensors stay the CPU's.
+bool small_int_on_cpu(const std::string& name) {
+  std::string base = name.rfind("aten::", 0) == 0 ? name.substr(6) : name;
+  return base.rfind("random", 0) == 0;
+}
+
+// Whether the op's integer Scalar arguments (and 0-dim CPU integer tensors)
+// fit every small integer dtype among its vk tensors: wrapping arithmetic
+// then gives the narrow results from int32 ones, while an out-of-range
+// scalar, which the CPU first converts to the narrow dtype (clamp,
+// threshold, comparisons), would not.
+bool scalars_fit(const c10::FunctionSchema& schema, const torch::jit::Stack& args,
+                 const std::vector<at::ScalarType>& narrow) {
+  int64_t lo = std::numeric_limits<int64_t>::min(), hi = std::numeric_limits<int64_t>::max();
+  for (at::ScalarType s : narrow) {
+    lo = std::max<int64_t>(lo, s == at::kChar ? -128 : s == at::kByte ? 0 : -32768);
+    hi = std::min<int64_t>(hi, s == at::kChar ? 127 : s == at::kByte ? 255 : 32767);
+  }
+  auto fits = [&](const c10::IValue& v) {
+    if (v.isInt()) return v.toInt() >= lo && v.toInt() <= hi;
+    if (v.isTensor()) {
+      const at::Tensor& t = v.toTensor();
+      if (t.defined() && t.dim() == 0 && t.device().is_cpu() && at::isIntegralType(t.scalar_type(), false)) {
+        int64_t x = t.item<int64_t>();
+        return x >= lo && x <= hi;
+      }
+    }
+    return true;
+  };
+  for (size_t i = 0; i < args.size() && i < schema.arguments().size(); ++i) {
+    const c10::IValue& v = args[i];
+    c10::TypePtr type = schema.arguments()[i].type();
+    if (auto opt = type->cast<c10::OptionalType>()) type = opt->getElementType();
+    bool scalar = type->kind() == c10::TypeKind::NumberType;  // (Scalar)
+    if ((scalar || v.isTensor()) && !fits(v)) return false;
+  }
+  return true;
 }
 
 // Ops left to the CPU even with 16-bit floats (keep in step with _decomp.py's
@@ -637,9 +684,10 @@ at::Tensor meta_like(const at::Tensor& t) {
   return t.defined() && is_vk(t) ? at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta)) : t;
 }
 
-// Runs `op` with its float16/bfloat16 "vk" tensors widened to float32, on the
-// GPU, instead of on the CPU: results are rounded once from float32, as CUDA
-// computes most 16-bit ops. The op first runs on meta tensors of the original
+// Runs `op` with its float16/bfloat16 "vk" tensors widened to float32 (and
+// int8/uint8/int16 ones to int32), on the GPU, instead of on the CPU: results
+// are rounded once from float32, as CUDA computes most 16-bit ops (small
+// integers wrap as they would in their own width). The op first runs on meta tensors of the original
 // dtypes, which applies PyTorch's dtype checks and gives the result dtypes.
 // False (stack untouched) where this does not apply: no 16-bit vk tensor,
 // floating vk tensors of more than one dtype (mixed-dtype errors, which not
@@ -661,7 +709,11 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   bool any = false;
   std::optional<at::ScalarType> floating;  // the one floating dtype of the vk tensors
   bool mixed = false;
+  std::vector<at::ScalarType> small_ints;
   auto note = [&](const at::Tensor& t) {
+    if (is_half_vk(t) && is_small_int(t.scalar_type())) {
+      small_ints.push_back(t.scalar_type());
+    }
     if (t.defined() && is_vk(t) && t.dim() > 0 &&
         (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
       mixed = mixed || (floating.has_value() && *floating != t.scalar_type());
@@ -696,6 +748,12 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   if (!any || mixed) {
     return false;
   }
+  if (!small_ints.empty() &&
+      (small_int_on_cpu(schema.name()) ||
+       !scalars_fit(schema, torch::jit::Stack(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end()),
+                    small_ints))) {
+    return false;
+  }
   torch::jit::Stack meta(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
   for (c10::IValue& v : meta) {
     if (v.isTensor()) {
@@ -718,6 +776,13 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   for (size_t i = 0; i < n; ++i) {
     c10::IValue& v = (*stack)[base + i];
     const auto* ai = schema.arguments()[i].alias_info();
+    if (schema.arguments()[i].name() == "dtype" && v.isInt()) {
+      // (a dtype= of a narrow type: the widened one, the result cast back below)
+      auto d = static_cast<at::ScalarType>(v.toInt());
+      if (is_small_int(d)) v = static_cast<int64_t>(at::kInt);
+      if (d == at::kHalf || d == at::kBFloat16) v = static_cast<int64_t>(at::kFloat);
+      continue;
+    }
     if (v.isTensor() && is_half_vk(v.toTensor())) {
       at::Tensor orig = v.toTensor();
       at::Tensor w = widen_half_arg(orig);

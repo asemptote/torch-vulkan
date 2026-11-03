@@ -119,6 +119,11 @@ def _make_upsample_linear(k):
         if x.numel() == 0 and math.prod(x.shape[1:]) == 0:
             raise RuntimeError(f"Non-empty {k + 2}D data tensor expected but got a tensor with sizes {list(x.shape)}")
         out_shape = (*x.shape[:-k], *output_size)
+        if x.dtype == torch.uint8 and k == 2:
+            # (the CPU's one integer dtype: in float32, rounded half up as its
+            # fixed-point kernel rounds; its weights are fixed-point, so a
+            # result can differ by one)
+            return (forward(x.float(), output_size, align_corners, *scales) + 0.5).floor().clamp(0, 255).to(x.dtype)
         if not x.is_floating_point():
             return _on_cpu(op._schema.name.split("::")[1], x, output_size, align_corners, *scales)
         spatial, out = list(x.shape[-k:]), list(out_shape[-k:])
@@ -747,9 +752,10 @@ def _make_aa(kind):
     def forward(x, output_size, align_corners, scales_h=None, scales_w=None):
         if not x.is_floating_point():
             # uint8 (the only integer dtype the CPU takes): in float32, then
-            # rounded to the nearest integer and clamped, as the CPU's kernel.
+            # rounded half up and clamped, as the CPU's fixed-point kernel
+            # (whose weights are fixed-point: a result can differ by one).
             y = forward(x.float(), output_size, align_corners, scales_h, scales_w)
-            return y.round().clamp(0, 255).to(x.dtype)
+            return (y + 0.5).floor().clamp(0, 255).to(x.dtype)
         mats = matrices(x.shape, output_size, align_corners, scales_h, scales_w, x)
         return _apply_dims(x, mats).contiguous()
 

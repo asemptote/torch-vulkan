@@ -1416,10 +1416,13 @@ at::Tensor& eye_out(int64_t n, at::Tensor& out) {
 // ---------------------------------------------------------------- equal, isin
 
 bool equal(const at::Tensor& self, const at::Tensor& other) {
-  if (is_vk(self) && is_vk(other) && at::isReducedFloatingType(self.scalar_type()) &&
-      self.scalar_type() == other.scalar_type()) {
-    // (16-bit floats: compared as float32, which widening keeps exact)
-    return vk::equal(self.to(at::kFloat), other.to(at::kFloat));
+  at::ScalarType t = self.scalar_type();
+  bool small_int = t == at::kChar || t == at::kByte || t == at::kShort;
+  if (is_vk(self) && is_vk(other) && (at::isReducedFloatingType(t) || small_int) && t == other.scalar_type() &&
+      storage_label(t) != nullptr) {
+    // (16-bit floats compared as float32, small integers as int32: widening keeps them exact)
+    at::ScalarType wide = small_int ? at::kInt : at::kFloat;
+    return vk::equal(self.to(wide), other.to(wide));
   }
   if (!is_vk(self) || !is_vk(other) || dtype_label(self.scalar_type()) == nullptr ||
       dtype_label(other.scalar_type()) == nullptr) {

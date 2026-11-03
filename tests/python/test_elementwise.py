@@ -184,3 +184,24 @@ def test_small_dtypes_compute_widened(dtype):
         want += [a / b, a.exp(), torch.sqrt(a.abs())]
     for gv, w in zip(got, want):
         check(gv, w)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int16])
+def test_small_integer_ops_without_their_own_kernels(dtype):
+    # (computed in int32 on the GPU: wrapping arithmetic gives the narrow results)
+    g = torch.Generator().manual_seed(5)
+    lo = 0 if dtype == torch.uint8 else -100
+    a, b = (torch.randint(lo, 100, (6, 7), generator=g).to(dtype) for _ in range(2))
+    ops = [lambda x, y: torch.clamp(x, -5 if lo else 5, 50), lambda x, y: torch.amax(x, 1), lambda x, y: x.argmin(0),
+           lambda x, y: torch.cummax(x, 1).values, lambda x, y: torch.cumsum(x, 0, dtype=dtype),
+           lambda x, y: x @ y.t(), lambda x, y: torch.addcmul(x, x, y, value=3), lambda x, y: torch.where(x > y, x, y),
+           lambda x, y: x.tril(1), lambda x, y: torch.isin(x, y), lambda x, y: torch.logical_xor(x, y),
+           lambda x, y: torch.equal(x, x.clone()), lambda x, y: x.all(1), lambda x, y: x.prod(1)]
+    for f in ops:
+        with on_gpu():
+            got = f(a.to("vk"), b.to("vk"))
+        want = f(a, b)
+        if isinstance(want, bool):
+            assert got == want
+        else:
+            check(got, want)

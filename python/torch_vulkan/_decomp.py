@@ -64,20 +64,42 @@ def _is_vk(x):
     return isinstance(x, torch.Tensor) and x.device.type == "vk"
 
 
+_SMALL_INT = {torch.int8: (-128, 127), torch.uint8: (0, 255), torch.int16: (-32768, 32767)}
+
+
 def _half_via_float(op, args, kwargs):
-    """The op with its float16/bfloat16 "vk" tensors widened to float32, on the
-    GPU, results rounded once (as CUDA computes most 16-bit ops); NotImplemented
-    where that does not apply. As backend.cpp's half_via_float: the floating
-    vk tensors must all be of one 16-bit dtype (mixed-dtype errors stay the
-    CPU's), no view results, and the op must run on meta tensors of the
-    original dtypes, which applies PyTorch's checks and gives the result
+    """The op with its float16/bfloat16 "vk" tensors widened to float32 (and
+    int8/uint8/int16 ones to int32), on the GPU, results rounded once (as CUDA
+    computes most 16-bit ops; small integers wrap as in their own width);
+    NotImplemented where that does not apply. As backend.cpp's
+    half_via_float: the floating vk tensors must all be of one dtype
+    (mixed-dtype errors stay the CPU's), integer scalars must fit the small
+    integer dtypes, no view results, and the op must run on meta tensors of
+    the original dtypes, which applies PyTorch's checks and gives the result
     dtypes."""
-    floating = {x.dtype for x in tree_flatten((args, kwargs))[0]
-                if _is_vk(x) and (x.is_floating_point() or x.is_complex())}
-    if len(floating) != 1 or next(iter(floating)) not in _HALF:
+    flat = tree_flatten((args, kwargs))[0]
+    floating = {x.dtype for x in flat if _is_vk(x) and (x.is_floating_point() or x.is_complex())}
+    small = {x.dtype for x in flat if _is_vk(x) and x.dtype in _SMALL_INT}
+    if len(floating) > 1 or (floating and next(iter(floating)) not in _HALF and not small) or not (floating or small):
         return NotImplemented
-    if op._schema.name.split("::", 1)[1].startswith(_HALF_ON_CPU):
+    if floating and next(iter(floating)) not in _HALF:
+        floating = set()  # (only the small integers widen)
+    name = op._schema.name.split("::", 1)[1]
+    if name.startswith(_HALF_ON_CPU):
         return NotImplemented
+    if small:
+        lo = max(_SMALL_INT[d][0] for d in small)
+        hi = min(_SMALL_INT[d][1] for d in small)
+        ints = []  # (the Scalar arguments' integers, and 0-dim CPU integer tensors)
+        for i, a in enumerate(op._schema.arguments):
+            v = args[i] if i < len(args) else kwargs.get(a.name)
+            if "Scalar" in str(a.type) and isinstance(v, int) and not isinstance(v, bool):
+                ints.append(v)
+            elif (isinstance(v, torch.Tensor) and v.dim() == 0 and v.device.type == "cpu" and v.dtype != torch.bool
+                  and not v.is_floating_point() and not v.is_complex()):
+                ints.append(int(v))
+        if name.startswith("random") or any(not lo <= v <= hi for v in ints):
+            return NotImplemented
     if any(r.alias_info is not None and not r.alias_info.is_write for r in op._schema.returns):
         return NotImplemented
 
@@ -90,9 +112,20 @@ def _half_via_float(op, args, kwargs):
         return NotImplemented
 
     def widen(x):
-        return x.to(torch.float32) if _is_vk(x) and x.dtype in _HALF else x
+        if _is_vk(x) and x.dtype in _HALF:
+            return x.to(torch.float32)
+        return x.to(torch.int32) if _is_vk(x) and x.dtype in _SMALL_INT else x
 
     wide_args, wide_kwargs = tree_map(widen, args), tree_map(widen, kwargs)
+    # (a dtype= of a narrow type: the widened one, the result cast back below)
+    for i, a in enumerate(op._schema.arguments):
+        if a.name == "dtype":
+            narrow = wide_args[i] if i < len(wide_args) else wide_kwargs.get("dtype")
+            wide = torch.int32 if narrow in _SMALL_INT else torch.float32 if narrow in _HALF else narrow
+            if i < len(wide_args):
+                wide_args = (*wide_args[:i], wide, *wide_args[i + 1:])
+            elif "dtype" in wide_kwargs:
+                wide_kwargs = {**wide_kwargs, "dtype": wide}
     try:
         result = op(*wide_args, **wide_kwargs)
     except Exception:  # noqa: BLE001 (e.g. a dtype= the widened tensors contradict: the CPU decides)
