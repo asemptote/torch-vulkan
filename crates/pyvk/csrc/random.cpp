@@ -2,7 +2,9 @@
 // registered as the device's default and new generators, and the random
 // fills (uniform_, normal_, random_, bernoulli_, exponential_, geometric_,
 // cauchy_, log_normal_) plus ops built on them (normal with tensor
-// parameters, multinomial, randperm, native_dropout).
+// parameters, multinomial, randperm, native_dropout), and the samplers with
+// per-element parameters (_standard_gamma, poisson, binomial,
+// _sample_dirichlet) with the gamma and Dirichlet reparameterized gradients.
 //
 // shaders/rng.slang draws element i's bits from Philox4x32-10 with counter
 // (i, offset) and key seed. The generator hands out one offset per call, so
@@ -526,6 +528,112 @@ at::Tensor native_dropout_backward(const at::Tensor& grad, const at::Tensor& mas
 }
 
 }  // namespace
+// ---------------------------------------------------------------- per-element samplers (shaders/sample.slang)
+
+struct SampleParams {
+  uint64_t out, a, b, c, seed, offset;
+  uint32_t n, stride;
+};
+static_assert(sizeof(SampleParams) == 56, "must match shaders/sample.slang");
+
+// sample.slang's `op` over `inputs` broadcast to `shape`, computed in float32
+// (float64 for double results, or `wide` on GPUs with float64) and returned
+// as `dtype`. `gen` is the generator for the random ops, nullptr for the
+// gradients.
+at::Tensor sample_kernel(uint32_t op, at::IntArrayRef shape, at::ScalarType dtype, std::vector<at::Tensor> inputs,
+                         const std::optional<at::Generator>* gen, bool wide = false) {
+  at::ScalarType compute =
+      dtype == at::kDouble || (wide && has_feature(kFeatureFloat64)) ? at::kDouble : at::kFloat;
+  at::Tensor out = at::empty(shape, inputs[0].options().dtype(compute));
+  if (out.numel() == 0) {
+    return out.to(dtype);
+  }
+  TORCH_CHECK(out.numel() < (int64_t(1) << 32), "torch_vulkan: sampling more than 2^32 elements");
+  for (auto& t : inputs) {
+    t = t.to(compute).expand(shape).contiguous();
+  }
+  SampleParams p{};
+  p.out = gpu_address_out(out);
+  p.a = gpu_address(inputs[0]);
+  p.b = inputs.size() > 1 ? gpu_address(inputs[1]) : p.a;
+  p.c = inputs.size() > 2 ? gpu_address(inputs[2]) : p.a;
+  if (gen != nullptr) {
+    auto [seed, offset] = generator(*gen)->next_call();
+    p.seed = seed;
+    p.offset = offset;
+  }
+  p.n = static_cast<uint32_t>(out.numel());
+  uint32_t groups = 0;
+  check(vkt_grid_1d(p.n, &groups, &p.stride));
+  dispatch(std::string("sample_") + dtype_label(compute), {op}, p, groups);
+  return dtype == compute ? out : out.to(dtype);
+}
+
+bool sample_ok(std::initializer_list<const at::Tensor*> ts, bool half_ok) {
+  for (const at::Tensor* t : ts) {
+    at::ScalarType s = t->scalar_type();
+    bool dtype = s == at::kFloat || s == at::kDouble || (half_ok && (s == at::kHalf || s == at::kBFloat16));
+    if (!is_vk(*t) || !dtype) return false;
+  }
+  return true;
+}
+
+at::Tensor standard_gamma(const at::Tensor& self, std::optional<at::Generator> gen) {
+  if (!sample_ok({&self}, false)) {
+    return on_cpu("aten::_standard_gamma", "", self, gen)[0].toTensor();
+  }
+  return sample_kernel(op::SAMPLE_GAMMA, self.sizes(), self.scalar_type(), {self}, &gen);
+}
+
+at::Tensor poisson(const at::Tensor& self, std::optional<at::Generator> gen) {
+  if (!sample_ok({&self}, true)) {
+    return on_cpu("aten::poisson", "", self, gen)[0].toTensor();
+  }
+  TORCH_CHECK(self.numel() == 0 || at::ge(self, 0).all().item<bool>(),
+              "invalid Poisson rate, expected rate to be non-negative");
+  return sample_kernel(op::SAMPLE_POISSON, self.sizes(), self.scalar_type(), {self}, &gen);
+}
+
+at::Tensor binomial(const at::Tensor& count, const at::Tensor& prob, std::optional<at::Generator> gen) {
+  if (!sample_ok({&count, &prob}, false) || count.scalar_type() != prob.scalar_type()) {
+    return on_cpu("aten::binomial", "", count, prob, gen)[0].toTensor();
+  }
+  return sample_kernel(op::SAMPLE_BINOMIAL, count.sizes(), count.scalar_type(), {count, prob}, &gen);
+}
+
+// Dirichlet samples as the softmax of log-gamma samples (no underflow of
+// small-shape gamma samples in float32), within [smallest normal, 1) as the
+// CPU clamps them.
+at::Tensor sample_dirichlet(const at::Tensor& alpha, std::optional<at::Generator> gen) {
+  if (!sample_ok({&alpha}, false) || alpha.dim() == 0) {
+    return on_cpu("aten::_sample_dirichlet", "", alpha, gen)[0].toTensor();
+  }
+  at::ScalarType t = alpha.scalar_type();
+  at::Tensor log_gamma = sample_kernel(op::SAMPLE_LOG_GAMMA, alpha.sizes(), t, {alpha}, &gen);
+  at::Tensor ret = at::softmax(log_gamma, -1);
+  double tiny = t == at::kDouble ? std::numeric_limits<double>::min() : std::numeric_limits<float>::min();
+  double below_one = t == at::kDouble ? std::nextafter(1.0, 0.0) : static_cast<double>(std::nextafter(1.0f, 0.0f));
+  return ret.clamp_(tiny, below_one);
+}
+
+at::Tensor standard_gamma_grad(const at::Tensor& self, const at::Tensor& output) {
+  if (!sample_ok({&self, &output}, false) || self.scalar_type() != output.scalar_type()) {
+    return on_cpu("aten::_standard_gamma_grad", "", self, output)[0].toTensor();
+  }
+  std::vector<int64_t> shape = at::infer_size(self.sizes(), output.sizes());
+  return sample_kernel(op::SAMPLE_GAMMA_GRAD, shape, self.scalar_type(), {self, output}, nullptr);
+}
+
+at::Tensor dirichlet_grad(const at::Tensor& x, const at::Tensor& alpha, const at::Tensor& total) {
+  if (!sample_ok({&x, &alpha, &total}, false) || x.scalar_type() != alpha.scalar_type() ||
+      x.scalar_type() != total.scalar_type() || x.sizes() != alpha.sizes() || x.sizes() != total.sizes()) {
+    return on_cpu("aten::_dirichlet_grad", "", x, alpha, total)[0].toTensor();
+  }
+  // (in double where the GPU has it, as PyTorch: see sample.slang's beta_grad_alpha_mid)
+  return sample_kernel(op::SAMPLE_DIRICHLET_GRAD, x.sizes(), x.scalar_type(), {x, alpha, total}, nullptr, true);
+}
+
+
 }  // namespace vk
 
 // Python-facing seeding of the default generator (torch.vk.manual_seed, ...).
@@ -585,4 +693,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("randperm.generator_out", &randperm_out);
   m.impl("native_dropout", &vk::native_dropout);
   m.impl("native_dropout_backward", &vk::native_dropout_backward);
+  m.impl("_standard_gamma", &standard_gamma);
+  m.impl("poisson", &vk::poisson);
+  m.impl("binomial", &vk::binomial);
+  m.impl("_sample_dirichlet", &sample_dirichlet);
+  m.impl("_standard_gamma_grad", &standard_gamma_grad);
+  m.impl("_dirichlet_grad", &dirichlet_grad);
 }

@@ -1,5 +1,6 @@
 // Sorting, searching and order statistics for device "vk" (M10): sort,
-// topk, kthvalue, median, nanmedian, mode, unique, unique_consecutive,
+// topk, kthvalue, median, nanmedian, mode, unique, unique_consecutive (also
+// along a dim),
 // searchsorted, bucketize, cummax/cummin, logcumsumexp, and small reductions
 // built from existing kernels (aminmax, var_mean, std_mean, nansum, trace).
 //
@@ -598,8 +599,105 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique2(const at::Tensor& self, b
   return unique_runs(s, order, self.sizes(), return_inverse, return_counts);
 }
 
+// ---------------------------------------------------------------- unique along a dim
+
+// Dense lexicographic ranks of the rows of x2 [n, m] (equal rows, under ==,
+// share a rank; NaNs are unequal to everything): every column ranked at once
+// by sorting the columns, then adjacent column pairs combined into one key
+// (rank * n + rank, below n^2) and re-ranked, halving the columns each round.
+at::Tensor row_ranks(const at::Tensor& x2) {
+  int64_t n = x2.size(0);
+  at::TensorOptions lopts = x2.options().dtype(at::kLong);
+  // [m, n]: column c's values in row order; rank each row of it.
+  auto rank_rows = [&](const at::Tensor& cols) {
+    at::Tensor order = sort_rows(cols.contiguous(), false).to(at::kLong);
+    at::Tensor sorted = cols.gather(1, order);
+    at::Tensor step = at::zeros(cols.sizes(), lopts);
+    if (n > 1) {
+      step.narrow(1, 1, n - 1).copy_(at::ne(sorted.narrow(1, 1, n - 1), sorted.narrow(1, 0, n - 1)));
+    }
+    return at::empty(cols.sizes(), lopts).scatter_(1, order, at::cumsum(step, 1));
+  };
+  at::Tensor ranks = rank_rows(x2.t());
+  while (ranks.size(0) > 1) {
+    int64_t m = ranks.size(0), half = m / 2;
+    at::Tensor pairs = ranks.narrow(0, 0, 2 * half).reshape({half, 2, n});
+    at::Tensor keys = pairs.select(1, 0) * n + pairs.select(1, 1);
+    if (m % 2 == 1) {
+      keys = at::cat({keys, ranks.narrow(0, m - 1, 1)});
+    }
+    ranks = rank_rows(keys);
+  }
+  return ranks.reshape({n});
+}
+
+// The checks and empty results the CPU gives for unique along `dim`; true
+// if `self` is empty (outputs set).
+bool unique_dim_empty(const at::Tensor& self, int64_t dim, std::tuple<at::Tensor, at::Tensor, at::Tensor>& out) {
+  if (self.numel() != 0) return false;
+  TORCH_CHECK(self.size(dim) == 0, "There are 0 sized dimensions, and they aren't selected, so unique cannot be applied");
+  at::TensorOptions lopts = self.options().dtype(at::kLong);
+  out = {at::empty(self.sizes(), self.options()), at::empty({0}, lopts), at::empty({0}, lopts)};
+  return true;
+}
+
+// Rows `keep` (int64 indices along dim 0 of x2) as a tensor shaped like self
+// with `dim` resized.
+at::Tensor rows_along(const at::Tensor& self, int64_t dim, const at::Tensor& x2, const at::Tensor& keep) {
+  std::vector<int64_t> moved(self.sizes().begin(), self.sizes().end());
+  moved.erase(moved.begin() + dim);
+  moved.insert(moved.begin(), keep.numel());
+  return x2.index_select(0, keep).reshape(moved).movedim(0, dim);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_dim(const at::Tensor& self, int64_t dim, bool sorted,
+                                                          bool return_inverse, bool return_counts) {
+  if (!sortable(self) || self.dim() == 0) {
+    auto stack = on_cpu("aten::unique_dim", "", self, dim, sorted, return_inverse, return_counts);
+    return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
+  }
+  dim = c10::maybe_wrap_dim(dim, self.dim());
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> out;
+  if (unique_dim_empty(self, dim, out)) return out;
+  int64_t n = self.size(dim);
+  at::TensorOptions lopts = self.options().dtype(at::kLong);
+  at::Tensor x2 = self.movedim(dim, 0).reshape({n, -1});
+  at::Tensor key = row_ranks(x2);  // the rows' places among the distinct rows, in order
+  int64_t u = key.max().item<int64_t>() + 1;
+  at::Tensor first = at::full({u}, n, lopts).scatter_reduce_(0, key, at::arange(n, lopts), "amin");
+  // (inverse and counts whether asked for or not, as the CPU)
+  at::Tensor counts = at::zeros({u}, lopts).index_add_(0, key, at::ones({n}, lopts));
+  return {rows_along(self, dim, x2, first), key, counts};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_dim_consecutive(const at::Tensor& self, int64_t dim,
+                                                                      bool return_inverse, bool return_counts) {
+  if (!sortable(self) || self.dim() == 0) {
+    auto stack = on_cpu("aten::unique_dim_consecutive", "", self, dim, return_inverse, return_counts);
+    return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
+  }
+  dim = c10::maybe_wrap_dim(dim, self.dim());
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> out;
+  if (unique_dim_empty(self, dim, out)) return out;
+  int64_t n = self.size(dim);
+  at::TensorOptions lopts = self.options().dtype(at::kLong);
+  at::Tensor x2 = self.movedim(dim, 0).reshape({n, -1});
+  at::Tensor head = at::ones({n}, self.options().dtype(at::kBool));
+  if (n > 1) {
+    head.narrow(0, 1, n - 1).copy_(at::ne(x2.narrow(0, 1, n - 1), x2.narrow(0, 0, n - 1)).any(1));
+  }
+  at::Tensor starts = at::nonzero(head).reshape({-1});
+  // (inverse and counts whether asked for or not, as the CPU)
+  at::Tensor inverse = at::cumsum(head, 0, at::kLong) - 1;
+  at::Tensor ends = at::cat({starts.narrow(0, 1, starts.numel() - 1), at::full({1}, n, lopts)});
+  return {rows_along(self, dim, x2, starts), inverse, ends - starts};
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_consecutive(const at::Tensor& self, bool return_inverse,
                                                                   bool return_counts, std::optional<int64_t> dim) {
+  if (dim.has_value() && sortable(self) && self.dim() > 0) {
+    return vk::unique_dim_consecutive(self, *dim, return_inverse, return_counts);
+  }
   if (dim.has_value() || !sortable(self)) {
     auto stack = on_cpu("aten::unique_consecutive", "", self, return_inverse, return_counts, dim);
     return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
@@ -694,6 +792,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("bucketize.Tensor_out", &bucketize_out);
   m.impl("_unique2", &unique2);
   m.impl("unique_consecutive", &vk::unique_consecutive);
+  m.impl("unique_dim", &vk::unique_dim);
+  m.impl("unique_dim_consecutive", &vk::unique_dim_consecutive);
   m.impl("aminmax.out", &aminmax_out);
   m.impl("var_mean.correction", &vk::var_mean);
   m.impl("std_mean.correction", &vk::std_mean);

@@ -421,6 +421,33 @@ def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
     return out.to(input.dtype)
 
 
+def _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask):
+    """grid_sampler_2d's bicubic backward as autograd of its decomposition (Vulkan
+    gathers forward, scatter-adds backward): the gradients flow through the
+    cubic coefficients and the sampled values, as the CPU's (none through the
+    tap indices). Autograd is re-enabled here, since an op's backward kernel
+    runs below it."""
+    decomp = decomposition_table[torch.ops.aten.grid_sampler_2d.default]
+    tls_exclude = torch._C._dispatch_tls_local_exclude_set()
+    for key in (torch._C.DispatchKey.AutogradPrivateUse1, torch._C.DispatchKey.ADInplaceOrView):
+        tls_exclude = tls_exclude.remove(key)
+    with torch._C._ForceDispatchKeyGuard(torch._C._dispatch_tls_local_include_set(), tls_exclude), torch.enable_grad():
+        x = input.detach().requires_grad_(bool(output_mask[0]))
+        g = grid.detach().requires_grad_(bool(output_mask[1]))
+        wrt = [t for t in (x, g) if t.requires_grad]
+        if not wrt:
+            return None, None
+        out = decomp(x, g, 2, padding_mode, align_corners)
+        grads = list(torch.autograd.grad(out, wrt, grad_output, allow_unused=True))
+    gi = grads.pop(0) if output_mask[0] else None
+    gg = grads.pop(0) if output_mask[1] else None
+    if output_mask[0] and gi is None:
+        gi = torch.zeros_like(input)
+    if output_mask[1] and gg is None:
+        gg = torch.zeros_like(grid)
+    return gi, gg
+
+
 def _make_grid_sampler_backward(name):
     def backward(grad_output, input, grid, mode, padding_mode, align_corners, output_mask):
         _checks.grid_sampler(input, grid, mode, 2 if "2d" in name else 3)
@@ -428,8 +455,8 @@ def _make_grid_sampler_backward(name):
         if list(grad_output.shape) != expected:
             raise ValueError(f"{name}(): expected grad_output to have sizes {expected}, but got grad_output with "
                              f"sizes {list(grad_output.shape)}")
-        if mode not in (0, 1):  # bicubic
-            return _on_cpu(name, grad_output, input, grid, mode, padding_mode, align_corners, output_mask)
+        if mode not in (0, 1):  # bicubic (2-D only): differentiate PyTorch's decomposition
+            return _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask)
         # (shaders/gridsample.slang: grad_grid, and each output point's corners
         # with their weights, which one scatter-add turns into grad_input)
         dt = _grid_dtype(input.dtype)
@@ -506,6 +533,28 @@ def _cdist_backward_impl(grad, x1, x2, p, dist):
         dd = torch.where((d == 0) | (diff == 0), torch.zeros_like(diff),
                          torch.sign(diff) * diff.abs().pow(p - 1) / d.pow(p - 1))
     return (grad.unsqueeze(-1) * dd).sum(-2)
+
+
+# ---------------------------------------------------------------- repeat_interleave
+
+def _repeat_interleave_tensor(repeats, output_size=None):
+    """i repeated repeats[i] times, for each i: each output position's i is
+    the number of cumulative repeat counts at or below it."""
+    if repeats.dim() != 1:
+        raise RuntimeError("repeat_interleave only accept 1D vector as repeat")
+    if repeats.dtype not in (torch.int32, torch.int64):
+        op = torch.ops.aten.repeat_interleave.Tensor  # (the CPU's error)
+        return _decomp._cpu_fallback(op, op.name(), (repeats,), {"output_size": output_size})
+    if repeats.numel() == 0:
+        return torch.empty(0, dtype=repeats.dtype, device=repeats.device)
+    ends = repeats.to(torch.int64).cumsum(0)
+    total, smallest = torch.stack([ends[-1], repeats.min().to(torch.int64)]).tolist()
+    if smallest < 0:
+        raise RuntimeError("repeats can not be negative")
+    if output_size is not None and output_size != total:
+        raise RuntimeError("allocated size does not match required size")
+    positions = torch.arange(total, device=repeats.device)
+    return torch.searchsorted(ends, positions, right=True).to(repeats.dtype)
 
 
 # ---------------------------------------------------------------- triu_indices / tril_indices
@@ -1364,6 +1413,7 @@ def _kernels():
         "_cdist_forward": _cdist_forward,
         "_cdist_backward": _cdist_backward,
         "_pdist_forward": _pdist_forward,
+        "repeat_interleave.Tensor": _repeat_interleave_tensor,
         "triu_indices": functools.partial(_tri_indices, True),
         "tril_indices": functools.partial(_tri_indices, False),
         "_pdist_backward": _pdist_backward,

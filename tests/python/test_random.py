@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 import torch_vulkan as tv
-from _util import on_gpu
+from _util import WIDE, check, on_gpu
 
 N = 1 << 20
 
@@ -153,3 +153,63 @@ def test_normal_tensor_parameters():
     z = z.cpu().double()
     assert (z.mean(0) - torch.tensor([0.0, 10.0, -5.0], dtype=torch.float64)).abs().max() < 0.02
     assert (z.std(0) - std.double()).abs().max() < 0.02
+
+
+def _ks(a, b):
+    """Kolmogorov-Smirnov distance of two samples."""
+    a, b = a.double().sort().values, b.double().sort().values
+    v = torch.cat([a, b]).sort().values
+    return (torch.searchsorted(a, v, right=True) / len(a) - torch.searchsorted(b, v, right=True) / len(b)).abs().max().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_gamma_poisson_binomial_dirichlet(dtype):
+    # Against the CPU's samples of the same distributions (2e5 each: a KS
+    # distance above 0.01 is a real difference).
+    torch.manual_seed(9)
+    n = 200000
+    full = lambda v: torch.full((n,), v, dtype=dtype)
+    cases = [(f"gamma {a}", lambda d, a=a: torch._standard_gamma(full(a).to(d))) for a in [1e-3, 0.5, 1.0, 10.0, 1e3]]
+    cases += [(f"poisson {r}", lambda d, r=r: torch.poisson(full(r).to(d))) for r in [0.3, 9.99, 10.0, 1e4]]
+    cases += [(f"binomial {c} {p}", lambda d, c=c, p=p: torch.binomial(full(c).to(d), full(p).to(d)))
+              for c, p in [(10, 0.3), (100, 0.05), (1000, 0.97), (1e6, 0.4)]]
+    alpha = torch.tensor([0.01, 0.5, 7.0], dtype=dtype).expand(n // 4, -1).contiguous()
+    for k in range(3):
+        cases.append((f"dirichlet {k}", lambda d, k=k: torch._sample_dirichlet(alpha.to(d))[:, k]))
+    for name, f in cases:
+        with on_gpu():
+            got = f("vk")
+        assert torch.isfinite(got).all(), name
+        assert _ks(got.cpu(), f("cpu")) < 0.01, name
+    with on_gpu():
+        edge = [torch._standard_gamma(torch.tensor([0.0, 1e-30, float("inf")], dtype=dtype, device="vk")),
+                torch.binomial(torch.tensor([5.0, -1.0, 5.0, 0.0], dtype=dtype, device="vk"),
+                               torch.tensor([0.5, 0.5, 1.5, -1.0], dtype=dtype, device="vk")),
+                torch._sample_dirichlet(torch.tensor([[1e-30, 1e-30], [0.0, 0.0]], dtype=dtype, device="vk"))]
+    tiny = torch.finfo(dtype).tiny
+    check(edge[0], torch.tensor([tiny, tiny, float("inf")], dtype=dtype))
+    assert edge[1].cpu()[1:].tolist() == [0.0, 5.0, 0.0]
+    check(edge[2], torch.full((2, 2), 0.5, dtype=dtype))
+    with pytest.raises(RuntimeError, match="non-negative"):
+        torch.poisson(torch.tensor([-1.0], dtype=dtype, device="vk"))
+
+
+def test_gamma_and_dirichlet_gradients():
+    torch.manual_seed(10)
+    alpha = torch.cat([torch.rand(3000) * 0.9 + 0.05, torch.rand(3000) * 10 + 0.5, torch.rand(3000) * 100 + 8]).to(WIDE)
+    x = torch._standard_gamma(alpha)
+    with on_gpu():
+        got = torch._standard_gamma_grad(alpha.to("vk"), x.to("vk"))
+    check(got, torch._standard_gamma_grad(alpha, x), rtol=1e-3, atol=1e-6)
+    a = torch.cat([torch.rand(3000) * 0.9 + 0.05, torch.rand(3000) * 10 + 0.5, torch.rand(3000) * 50 + 7]).to(WIDE)
+    total = a + torch.cat([torch.rand(3000) * 0.9 + 0.05, torch.rand(3000) * 10 + 0.5, torch.rand(3000) * 50 + 7]).to(WIDE)
+    xs = torch.distributions.Beta(a, total - a).sample().clamp(1e-4, 1 - 1e-4)
+    with on_gpu():
+        got = torch._dirichlet_grad(xs.to("vk"), a.to("vk"), total.to("vk"))
+    # (float32 without float64: its rare cancellation near the Beta mean costs ~1%)
+    check(got, torch._dirichlet_grad(xs, a, total), rtol=2e-2 if WIDE == torch.float32 else 1e-6, atol=1e-5)
+    conc = torch.full((5000,), 2.0, device="vk", requires_grad=True)
+    with on_gpu():
+        torch.distributions.Gamma(conc, 1.0).rsample().sum().backward()
+        torch.distributions.Dirichlet(torch.tensor([1.0, 2.0, 3.0], device="vk", requires_grad=True)).rsample((100,)).sum().backward()
+    assert torch.isfinite(conc.grad).all()

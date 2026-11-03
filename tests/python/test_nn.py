@@ -132,6 +132,10 @@ def test_upsample_and_grid_sample():
     for mode, pad in itertools.product(["bilinear", "nearest"], ["zeros", "border", "reflection"]):
         compare_with_cpu(lambda x: F.grid_sample(x, grid.to(x.device), mode=mode, padding_mode=pad,
                                                  align_corners=False), x)
+    # bicubic: grad_input and grad_grid
+    for pad, ac in itertools.product(["zeros", "border", "reflection"], [False, True]):
+        compare_with_cpu(lambda x, g: F.grid_sample(x, g, mode="bicubic", padding_mode=pad, align_corners=ac),
+                         x, grid.clone(), tol=dict(rtol=1e-4, atol=1e-4))
 
 
 def test_embedding_and_small_model_training():

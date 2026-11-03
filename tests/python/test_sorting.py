@@ -216,3 +216,24 @@ def test_large_sort():
     wv, wi = torch.sort(x, stable=True)
     check(v, wv)
     check(i, wi)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool, torch.float16, torch.int32])
+def test_unique_along_dim(dtype):
+    g = torch.Generator().manual_seed(4)
+    xs = [torch.randint(0, 3, (50, 4), generator=g), torch.randint(0, 2, (7, 3, 5), generator=g),
+          torch.randint(0, 3, (2000, 3), generator=g), torch.randint(0, 2, (13, 37), generator=g)]
+    if dtype.is_floating_point:
+        xs.append(torch.tensor([[1.0, float("nan")], [1.0, float("nan")], [0.0, 2.0], [0.0, -0.0], [0.0, 0.0]]))
+    for x in [t.to(dtype) for t in xs] + [torch.zeros(0, 3, dtype=dtype)]:
+        for dim in range(1 if x.numel() == 0 else x.dim()):
+            with on_gpu():
+                got = [torch.unique(x.to("vk"), dim=dim, return_inverse=True, return_counts=True),
+                       torch.unique_consecutive(x.to("vk"), dim=dim, return_inverse=True, return_counts=True)]
+            want = [torch.unique(x, dim=dim, return_inverse=True, return_counts=True),
+                    torch.unique_consecutive(x, dim=dim, return_inverse=True, return_counts=True)]
+            for gs, ws in zip(got, want):
+                for g_, w_ in zip(gs, ws):
+                    check(g_, w_, equal_nan=True)
+    with pytest.raises(RuntimeError, match="0 sized dimensions"):
+        torch.unique(torch.zeros(3, 0, device="vk"), dim=0)

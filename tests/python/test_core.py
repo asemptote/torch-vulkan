@@ -44,15 +44,16 @@ def test_factories():
 
 
 def test_cpu_fallback_matches_and_is_counted():
-    x = make((20,), WIDE)
-    x = x.abs() + 0.5
-    x = x.view(4, 5)
-    before = tv.fallback_counts().get("aten::unique_dim", 0)
+    # (uint32, one of PyTorch's barely supported unsigned dtypes, has no sort kernel)
+    x = torch.tensor([3, 1, 4, 1, 5, 9, 2, 6], dtype=torch.uint32)
+    name = "aten::sort.values_stable"
+    before = tv.fallback_counts().get(name, 0)
     with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
-        got = torch.unique(x.to("vk"), dim=0)  # no unique(dim=...) kernel yet
-    check(got, torch.unique(x, dim=0))
-    assert tv.fallback_counts()["aten::unique_dim"] == before + 1
-    check(x.to("vk").sum(), x.sum())
+        got = torch.sort(x.to("vk")).values
+    check(got, torch.sort(x).values)
+    assert tv.fallback_counts()[name] == before + 1
+    y = make((20,), WIDE)
+    check(y.to("vk").sum(), y.sum())
 
 
 def test_autograd():

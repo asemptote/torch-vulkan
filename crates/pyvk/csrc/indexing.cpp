@@ -216,12 +216,12 @@ at::Tensor& gather_out(const at::Tensor& self, int64_t dim, const at::Tensor& in
   at::assert_no_internal_overlap(out);  // (as the CPU: after resizing out)
   at::assert_no_overlap(out, self);
   at::assert_no_partial_overlap(out, index);
+  if (index.numel() == 0) {  // (unchecked dims and dtype, as the CPU)
+    return out;
+  }
   if (!movable(self) || !is_vk(index) || !is_vk(out) || !index_dtype_ok(index) ||
       std::max<int64_t>(index.dim(), 1) != std::max<int64_t>(self.dim(), 1)) {
     on_cpu("aten::gather", "out", self, dim, index, sparse_grad, out);
-    return out;
-  }
-  if (index.numel() == 0) {
     return out;
   }
   // (0-dim tensors as 1-element vectors)
