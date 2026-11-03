@@ -131,7 +131,13 @@ fn main() {
         std::fs::read(h).unwrap().hash(&mut common);
     }
     std::fs::read(out_dir.join("opcodes.h")).unwrap().hash(&mut common);
-    format!("{:?}", build.get_compiler().to_command()).hash(&mut common);
+    // (the compiler and its arguments, not its environment, which differs
+    // between otherwise identical builds)
+    let tool = build.get_compiler();
+    tool.path().hash(&mut common);
+    for a in tool.args() {
+        a.hash(&mut common);
+    }
     include.hash(&mut common);
     cxx11_abi.hash(&mut common);
     let cache = out_dir.join("objects");
