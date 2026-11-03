@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "_slot.slang"
+
 #if defined(T_f64) || defined(T_c128)
 #define PARAM_T double
 #define PARAM_DOUBLE 1

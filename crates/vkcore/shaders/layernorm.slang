@@ -10,6 +10,7 @@
 // w and b are optional (HAS_W, HAS_B; absent: 1 and 0).
 
 #include "_fmath.slang"
+#include "_slot.slang"
 #include "opcodes.slang"
 
 struct Params
@@ -25,7 +26,7 @@ struct Params
     uint n;          // 60
     uint ngroups;    // 64
     uint _pad;       // 68
-    uint64_t eps;    // 72  raw slot: T bits (float in the low word)
+    slot64 eps;      // 72  raw slot (_slot.slang): T bits (float in the low word)
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
@@ -37,12 +38,12 @@ struct Params
 static const uint G = 256;
 groupshared T shared_[G];
 
-T param(uint64_t bits)
+T param(slot64 bits)
 {
 #if defined(T_f64)
-    return bit_cast<double>(bits);
+    return slot_double(bits);
 #else
-    return bit_cast<float>(uint(bits));
+    return slot_float(bits);
 #endif
 }
 

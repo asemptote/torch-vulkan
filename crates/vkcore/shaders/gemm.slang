@@ -18,14 +18,16 @@
 #define RM (BM / 16)
 #define RN (BN / 16)
 
+#include "_slot.slang"
+
 struct Params
 {
     T* a;            // 0
     T* b;            // 8
     T* c;            // 16
     T* cin;          // 24
-    uint64_t alpha;  // 32  (raw slots: see param)
-    uint64_t beta;   // 40
+    slot64 alpha;    // 32  (raw slots: see param)
+    slot64 beta;     // 40
     uint m;          // 48
     uint n;          // 52
     uint k;          // 56
@@ -41,14 +43,14 @@ struct Params
 // A raw 64-bit parameter slot as T (packed by the host per T, as in
 // _strided.slang: double bits for float64, float bits in the low word for
 // float32, an int64 otherwise), so that only float64 kernels touch a double.
-T param(uint64_t bits)
+T param(slot64 bits)
 {
 #if defined(T_f64)
-    return bit_cast<double>(bits);
+    return slot_double(bits);
 #elif defined(T_f32)
-    return bit_cast<float>(uint(bits));
+    return slot_float(bits);
 #else
-    return T(int64_t(bits));
+    return T(slot_integer(bits));
 #endif
 }
 

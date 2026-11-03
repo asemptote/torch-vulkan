@@ -9,6 +9,7 @@
 // bool, as in PyTorch's sums. OP codes must match csrc/reduce.cpp.
 
 #include "opcodes.slang"
+#include "_slot.slang"
 
 #if defined(T_f32)
 typedef float A;
@@ -28,7 +29,7 @@ struct Params
     A* mean;        // 16  per-output mean (OP_SQDEV)
     uint ond;       // 24  number of outer (kept) dims, <= 4, innermost first
     uint rnd;       // 28  number of reduced dims, <= 4, innermost first
-    uint64_t alpha; // 32  scale for FINAL (1/N for mean, 1/(N-ddof) for var), a raw slot: see param
+    slot64 alpha;   // 32  scale for FINAL (1/N for mean, 1/(N-ddof) for var), a raw slot: see param
     uint n_out;     // 40
     uint n_red;     // 44  elements reduced per output
     uint chunk;     // 48  elements per workgroup chunk
@@ -46,14 +47,14 @@ struct Params
 // A raw 64-bit parameter slot as A (packed by the host per T: double bits for
 // float64, float bits in the low word for float32, an int64 otherwise), so
 // that only float64 kernels touch a double.
-A param(uint64_t bits)
+A param(slot64 bits)
 {
 #if defined(T_f64)
-    return bit_cast<double>(bits);
+    return slot_double(bits);
 #elif defined(T_f32)
-    return bit_cast<float>(uint(bits));
+    return slot_float(bits);
 #else
-    return A(int64_t(bits));
+    return A(slot_int64(bits));
 #endif
 }
 

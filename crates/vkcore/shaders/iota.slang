@@ -43,7 +43,7 @@ void main(uint3 id: SV_DispatchThreadID)
             v = T(beta()) - T(gamma()) * T(p.n - 1 - i);
         p.out[o.o] = v;
 #else
-        p.out[o.o] = T(alpha_int() + int64_t(i) * beta_int());
+        p.out[o.o] = T(alpha_int() + slot_int_t(i) * beta_int());
 #endif
     }
 }

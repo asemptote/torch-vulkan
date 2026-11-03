@@ -24,14 +24,14 @@ const int WRAP = 1;
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
-    int64_t size = beta_int();
+    int64_t size = slot_int64(p.beta_bits);
     for (uint i = id.x; i < p.n; i += p.stride)
     {
         Offsets o = offsets(i);
         int64_t v = int64_t(p.b[o.b]);
         if (v < (WRAP != 0 ? -size : int64_t(0)) || v >= size)
         {
-            uint* error = (uint*)p.gamma_bits;
+            uint* error = (uint*)uint64_t(slot_int64(p.gamma_bits));
             *error = 1u;
             v = 0;
         }
@@ -39,6 +39,6 @@ void main(uint3 id: SV_DispatchThreadID)
         {
             v += size;
         }
-        p.out[o.o] = (ACCUM != 0 ? p.a[o.a] : int64_t(0)) + v * alpha_int();
+        p.out[o.o] = (ACCUM != 0 ? p.a[o.a] : int64_t(0)) + v * slot_int64(p.alpha_bits);
     }
 }

@@ -22,9 +22,11 @@ const int A_FILL = 0;
 S fill_value()
 {
 #if defined(S_b16)
-    return uint4(uint(p.alpha_bits), uint(p.alpha_bits >> 32), uint(p.beta_bits), uint(p.beta_bits >> 32));
+    return uint4(p.alpha_bits.x, p.alpha_bits.y, p.beta_bits.x, p.beta_bits.y);
+#elif defined(S_b8)
+    return S(slot_int64(p.alpha_bits));
 #else
-    return S(p.alpha_bits);
+    return S(p.alpha_bits.x);
 #endif
 }
 

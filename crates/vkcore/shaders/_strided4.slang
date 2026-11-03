@@ -21,8 +21,8 @@ struct Params4
     A_T* a;
     B_T* b;
     C_T* c;
-    uint64_t alpha_bits;
-    uint64_t beta_bits;
+    slot64 alpha_bits;
+    slot64 beta_bits;
     uint n;
     uint ndim;
     uint stride;
@@ -35,19 +35,19 @@ struct Params4
 
 [[vk::push_constant]] ConstantBuffer<Params4> p;
 
-PARAM_T param(uint64_t bits)
+PARAM_T param(slot64 bits)
 {
 #if defined(PARAM_DOUBLE)
-    return bit_cast<double>(bits);
+    return slot_double(bits);
 #else
-    return bit_cast<float>(uint(bits));
+    return slot_float(bits);
 #endif
 }
 
 PARAM_T alpha() { return param(p.alpha_bits); }
 PARAM_T beta() { return param(p.beta_bits); }
-int64_t alpha_int() { return int64_t(p.alpha_bits); }
-int64_t beta_int() { return int64_t(p.beta_bits); }
+slot_int_t alpha_int() { return slot_integer(p.alpha_bits); }
+slot_int_t beta_int() { return slot_integer(p.beta_bits); }
 
 struct Offsets4
 {

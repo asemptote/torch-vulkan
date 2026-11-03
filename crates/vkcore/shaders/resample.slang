@@ -18,6 +18,7 @@
 // are this input.
 
 #include "opcodes.slang"
+#include "_slot.slang"
 
 struct Params
 {
@@ -29,21 +30,21 @@ struct Params
     uint ndim;        // 28  spatial dims (1-3): the leading padded ones are not mixed in
     uint4 isz;        // 32  input D, H, W
     uint4 osz;        // 48  output D, H, W
-    uint64_t scale0;  // 64  raw slots (T bits; float in the low word) per dim D, H, W
-    uint64_t scale1;  // 72
-    uint64_t scale2;  // 80
+    slot64 scale0;    // 64  raw slots (_slot.slang: T bits; float in the low word) per dim D, H, W
+    slot64 scale1;    // 72
+    slot64 scale2;    // 80
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
 [vk::constant_id(0)] const int OP = RESAMPLE_FORWARD;
 
-T param(uint64_t bits)
+T param(slot64 bits)
 {
 #if defined(T_f64)
-    return bit_cast<double>(bits);
+    return slot_double(bits);
 #else
-    return bit_cast<float>(uint(bits));
+    return slot_float(bits);
 #endif
 }
 
