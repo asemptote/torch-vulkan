@@ -199,14 +199,14 @@ impl Stream {
 
     /// Timeline value of the newest finished batch.
     pub fn completed(&self) -> Result<u64> {
-        Ok(unsafe { self.ctx.device.get_semaphore_counter_value(self.timeline)? })
+        Ok(unsafe { self.ctx.semaphore_counter_value(self.timeline)? })
     }
 
     /// Blocks until the batch with timeline value `value` has finished.
     pub fn wait(&self, value: u64) -> Result<()> {
         let semaphores = [self.timeline];
         let values = [value];
-        unsafe { self.ctx.device.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values), u64::MAX)? };
+        unsafe { self.ctx.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values), u64::MAX)? };
         Ok(())
     }
 

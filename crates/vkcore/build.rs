@@ -17,7 +17,10 @@
 //!   to the SPIR-V.
 //!
 //! slangc is found via the SLANGC env var, then the Vulkan SDK (which bundles
-//! Slang), then PATH.
+//! Slang), then PATH. Where there is no slangc (Android/Termux), set
+//! VKCORE_PREBUILT_SPIRV to a directory of `<kernel>.spv` files compiled
+//! elsewhere (SPIR-V is portable: e.g. another build's OUT_DIR): the table is
+//! made from those instead.
 
 use std::collections::hash_map::DefaultHasher;
 use std::env;
@@ -139,8 +142,32 @@ fn slang_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// kernels.rs from the `.spv` files of a directory compiled elsewhere.
+fn prebuilt(dir: &Path, out: &Path) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("VKCORE_PREBUILT_SPIRV={}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("spv"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "VKCORE_PREBUILT_SPIRV={}: no .spv files", dir.display());
+    let mut table = String::from("pub static SPIRV: &[(&str, &[u8])] = &[\n");
+    for f in files {
+        let name = f.file_stem().unwrap().to_str().unwrap();
+        let abs = std::fs::canonicalize(&f).unwrap();
+        writeln!(table, "    ({name:?}, include_bytes!({:?})),", abs.display().to_string()).unwrap();
+    }
+    table.push_str("];\n");
+    std::fs::write(out.join("kernels.rs"), table).unwrap();
+}
+
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-env-changed=VKCORE_PREBUILT_SPIRV");
+    if let Some(dir) = env::var_os("VKCORE_PREBUILT_SPIRV") {
+        prebuilt(Path::new(&dir), &out);
+        return;
+    }
     let compiler = slangc();
     println!("cargo:rerun-if-env-changed=SLANGC");
     println!("cargo:rerun-if-env-changed=VKCORE_SLANGC_JOBS");

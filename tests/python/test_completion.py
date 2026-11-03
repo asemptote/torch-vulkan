@@ -193,7 +193,12 @@ def test_ctc_loss(dtype):
     check(loss.detach(), want.detach(), **tl_)
     check(vlp.grad, clp.grad, **tl_)
     check(nll, wnll, **tl_)
-    check(alpha, walpha, **tl_)
+    # (log_alpha only where defined: t < input length, s < 2 target length + 1;
+    # the CPU leaves the rest of it uninitialized)
+    valid = torch.zeros(walpha.shape, dtype=torch.bool)
+    for n in range(N):
+        valid[n, :il[n], :2 * tl[n] + 1] = True
+    torch.testing.assert_close(alpha.cpu()[valid], walpha[valid], **tl_)
     check(flat, F.ctc_loss(lp, torch.tensor([1, 2, 2, 3, 1, 4]), il, tl, reduction="none"), **tl_)
 
 

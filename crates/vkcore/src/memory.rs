@@ -262,7 +262,7 @@ impl Pool {
             };
             d.bind_buffer_memory(buffer, memory, 0)?;
             let host = d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
-            let address = d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            let address = self.ctx.buffer_device_address(buffer);
             Ok(Block { buffer, memory, host, address, size, guard, ranges: RangeAllocator::new(size) })
         }
     }

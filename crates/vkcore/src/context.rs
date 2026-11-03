@@ -64,6 +64,9 @@ pub struct Context {
     pub device_name: String,
     pub caps: Capabilities,
     memory: vk::PhysicalDeviceMemoryProperties,
+    /// On Vulkan 1.1 devices, the extension entry points of the 1.2 core
+    /// functions used (buffer device addresses, timeline semaphores).
+    khr: Option<(ash::khr::buffer_device_address::Device, ash::khr::timeline_semaphore::Device)>,
 }
 
 static VALIDATION_ISSUES: AtomicUsize = AtomicUsize::new(0);
@@ -249,7 +252,36 @@ impl Context {
             let queue = device.get_device_queue(queue_family, 0);
             let memory = instance.get_physical_device_memory_properties(physical_device);
 
-            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, caps, memory })
+            let khr = (api < vk::API_VERSION_1_2).then(|| {
+                (ash::khr::buffer_device_address::Device::new(&instance, &device),
+                 ash::khr::timeline_semaphore::Device::new(&instance, &device))
+            });
+            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, caps, memory, khr })
+        }
+    }
+
+    /// vkGetBufferDeviceAddress (core 1.2, or its KHR extension on 1.1).
+    pub unsafe fn buffer_device_address(&self, buffer: vk::Buffer) -> u64 {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+        match &self.khr {
+            Some((bda, _)) => bda.get_buffer_device_address(&info),
+            None => self.device.get_buffer_device_address(&info),
+        }
+    }
+
+    /// vkGetSemaphoreCounterValue (core 1.2, or KHR on 1.1).
+    pub unsafe fn semaphore_counter_value(&self, semaphore: vk::Semaphore) -> std::result::Result<u64, vk::Result> {
+        match &self.khr {
+            Some((_, tls)) => tls.get_semaphore_counter_value(semaphore),
+            None => self.device.get_semaphore_counter_value(semaphore),
+        }
+    }
+
+    /// vkWaitSemaphores (core 1.2, or KHR on 1.1).
+    pub unsafe fn wait_semaphores(&self, info: &vk::SemaphoreWaitInfo, timeout: u64) -> std::result::Result<(), vk::Result> {
+        match &self.khr {
+            Some((_, tls)) => tls.wait_semaphores(info, timeout),
+            None => self.device.wait_semaphores(info, timeout),
         }
     }
 

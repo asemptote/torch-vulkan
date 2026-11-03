@@ -35,16 +35,19 @@ struct Params
 [vk::constant_id(0)]
 const int DESCENDING = 0;
 
+// (-0 made +0 on the bits: Mali's compiler folds f == 0 ? 0 : f into f)
 uint key_of_float(float f)
 {
-    uint u = isnan(f) ? 0x7fc00000u : bit_cast<uint>(f == 0.0f ? 0.0f : f);
+    uint u = bit_cast<uint>(f);
+    u = isnan(f) ? 0x7fc00000u : ((u & 0x7fffffffu) == 0u ? 0u : u);
     return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
 }
 
 K key_of(T v)
 {
 #if defined(T_f64)
-    uint64_t u = isnan(v) ? 0x7ff8000000000000ull : bit_cast<uint64_t>(v == 0.0l ? 0.0l : v);
+    uint64_t u = bit_cast<uint64_t>(v);
+    u = isnan(v) ? 0x7ff8000000000000ull : ((u & 0x7fffffffffffffffull) == 0ull ? 0ull : u);
     return (u >> 63) != 0ull ? ~u : (u | 0x8000000000000000ull);
 #elif defined(T_i64)
     return U64(v.lo, v.hi ^ 0x80000000u);
