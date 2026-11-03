@@ -843,20 +843,18 @@ no fallbacks in the OpInfo sweep).
 
 9. ~~**M9 data movement and indexing**~~: done (see above). (`repeat_interleave`
    with a tensor of repeats and `tril_indices`/`triu_indices` came with M17.)
-10. ~~**M10 sorting, searching and statistics**~~: done (see above). Not
-    yet: `histogram`/`histogramdd`, `segment_reduce` (`unique(dim=...)` came
-    with M17),
-    accumulation for 8/16-bit and complex dtypes, a radix sort for very long
+10. ~~**M10 sorting, searching and statistics**~~: done (see above).
+    (`histogram`/`histogramdd` came with M14, `unique(dim=...)` with M17.)
+    Not yet: accumulation for 8/16-bit and complex dtypes, a radix sort for very long
     rows (bitonic is O(n log^2 n)), parallel scans for single long rows in
     cummax/cummin/logcumsumexp.
-11. ~~**M11 random numbers**~~: done (see above). Not yet: `rrelu` noise and
-    `random_` on complex dtypes (rand/randn on complex do run on the GPU).
-    (`poisson`, `_standard_gamma`, `binomial`, `_sample_dirichlet` came with
-    M17.)
-12. ~~**M12 neural-network ops**~~: done (see above). Not yet: CTC loss,
-    `segment_reduce`, integer convolution and pooling on the GPU (bicubic
-    `grid_sample` backward came with M17). (Native kernels for the hottest composed ops came
-    with M16.)
+11. ~~**M11 random numbers**~~: done (see above). (`rrelu`'s noise came
+    with M12; `poisson`, `_standard_gamma`, `binomial`, `_sample_dirichlet`
+    with M17. `random_` on complex dtypes is an error on the CPU too.)
+12. ~~**M12 neural-network ops**~~: done (see above), CTC loss,
+    `segment_reduce` and integer convolution included (integer pooling
+    without float64 and bicubic `grid_sample`'s backward came with M17,
+    native kernels for the hottest composed ops with M16).
 13. ~~**M13 linear algebra on the GPU**~~: done (see above). Not yet:
     general (nonsymmetric) `eig`/`eigvals`, `ldl_factor`/`ldl_solve`
     (Bunch-Kaufman pivoting), complex matrices (M14).
