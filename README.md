@@ -3,7 +3,7 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M18** (sparse tensors, in progress; M17 done: phone GPUs): device
+Status: **M18** done (sparse tensors; M17: phone GPUs): device
 `"vk"` is a native PyTorch backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
@@ -104,21 +104,42 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
 
 ## Sparse tensors (M18)
 
-Sparse COO and CSR tensors on "vk" (`crates/pyvk/csrc/sparse.cpp`): their
-indices and values are ordinary vk tensors, so PyTorch's device-generic
-sparse code serves as is on `SparsePrivateUse1` / `SparseCsrPrivateUse1`
-(construction, the getters, copies, conversions, the zero-preserving unary
-functions, sums, norms, cat, permute), and the parts PyTorch writes per
-device are tensor ops here, running as Vulkan kernels: coalescing (one
-int64 key per entry, a stable sort, runs summed in index order), sparse +
-sparse and dense + sparse, products with scalars, dense tensors and other
-sparse tensors, `mm`/`addmm`/`mv`/`torch.sparse.mm` with autograd,
-`sparse_mask`, and the COO <-> CSR/CSC index conversions.
+Sparse COO, CSR, CSC, BSR and BSC tensors on "vk"
+(`crates/pyvk/csrc/sparse.cpp`): their indices and values are ordinary vk
+tensors, so PyTorch's device-generic sparse code serves as is on
+`SparsePrivateUse1` / `SparseCsrPrivateUse1` (construction, the getters,
+copies, the zero-preserving unary functions, norms, cat, permute), and the
+parts PyTorch writes per device are tensor ops here, running as Vulkan
+kernels:
 
-Not yet (M18): batched and blocked (BSR/BSC) compressed tensors beyond
-conversions, sparse softmax, `sampled_addmm`, the sparse-sparse product as a
-sparse kernel (it goes through a dense operand), and PyTorch's
-test_sparse.py / test_sparse_csr.py (3759 of their 7824 tests pass on vk).
+- coalescing (one int64 key per entry, a stable sort, runs summed in index
+  order), and PyTorch's `flatten_indices` stub (its coalesced-constructor
+  check) registered for vk;
+- every conversion between dense and the five layouts, batched and hybrid,
+  with PyTorch's structure: from a sparse source the specified elements
+  (explicit zeros included) decide the entries and blocks, from a dense one
+  the nonzeros; the conversions PyTorch refuses fail with its errors;
+- sparse + sparse and dense + sparse (coalesced operands give coalesced
+  sums), products with scalars and with dense and sparse tensors,
+  broadcasting as PyTorch's (a dense operand's batch dims become sparse
+  dims), `sparse_mask` and its gradient projection;
+- `mm`/`addmm`/`addmv`/`bmm`/`hspmm`/`torch.sparse.mm` for any mix of dense
+  and compressed operands, with autograd and the dense ops' errors;
+  `sampled_addmm`, batched and broadcast;
+- sparse `softmax`/`log_softmax` and their gradients (over the specified
+  elements), the gradient of sparse `sum`, sum and prod of compressed
+  tensors over dims, `triangular_solve` with a compressed matrix.
+
+PyTorch's test_sparse.py and test_sparse_csr.py pass on vk but for tests
+whose expectations name other devices (printing's per-device files,
+error-message patterns for CPU/CUDA/MPS, products the CPU refuses), listed
+with their reasons in `tools/pytorch_tests.py`. They run locally, not in
+the cluster's full runs (their slowest gradchecks take minutes each).
+
+Not yet (M18): the sparse-sparse product and the compressed reductions as
+sparse kernels (they go through dense operands, so memory grows with the
+dense size), and per-op overhead on tiny sparse tensors (each op is a few
+kernel launches: about 10x the CPU's time at a handful of elements).
 
 ## Dedicated kernels (M16)
 
@@ -880,5 +901,6 @@ no fallbacks in the OpInfo sweep).
     (TypeError, IndexError, ...) reach Python as RuntimeError (Android's
     libc++ matches exception types by address, and a Rust cdylib keeps its
     own copies of their type_info).
-18. **M18 sparse tensors**: in progress (see above).
+18. ~~**M18 sparse tensors**~~: done (see above). Not yet: sparse kernels
+    for the sparse-sparse product and compressed reductions.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

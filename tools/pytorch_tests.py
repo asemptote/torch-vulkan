@@ -210,11 +210,7 @@ FAILING = ("failed", "crashed", "xpassed", "validation")
 # pattern, reason); counted as "expected", not as failures. Every entry needs
 # a reason a reader can check.
 EXPECTED = [
-    (r"_sparse_|_to_sparse_|test_errors_sparse|test_crow_col_indices_", r"",
-     "sparse layouts: COO and CSR are partly supported (M18, see the README), not yet to PyTorch's tests"),
-    (r"", r"Sparse(Csr)?vk' backend",
-     "sparse layouts: COO and CSR are partly supported (M18, see the README), not yet to PyTorch's tests"),
-    (r"test_sparse_compressed_constructor_shape_and_device_inference___from_list_", r"device\(type='cpu'\) != device\(type='vk'",
+    (r"test_sparse_compressed_constructor_shape_and_device_inference_(_|factory)_from_list_", r"device\(type='cpu'\) != device\(type='vk'",
      "list inputs without a device make a CPU tensor; the test skips this case on CUDA for that reason, not on other devices"),
     (r"test_print_", r"module '__main__' has no attribute '__file__'",
      "printing tests compare to per-device expect files, and there are none for vk"),
@@ -224,6 +220,10 @@ EXPECTED = [
      "vk computes the products with BSR/BSC operands that the test expects CPU and CUDA to refuse"),
     (r"test_sparse_csr_unary_(inplace|out)_abs_vk_complex64", r"Expected 2D tensor",
      "an expected failure on CPU and CUDA as well (abs's OpInfo marks it so for those devices only)"),
+    (r"^(?!test_sparse)(.*(_sparse_|_to_sparse_|test_errors_sparse|test_crow_col_indices_))", r"",
+     "sparse layouts: COO and CSR are partly supported (M18, see the README), outside test_sparse*.py's checks"),
+    (r"^(?!test_sparse)", r"Sparse(Csr)?vk' backend",
+     "sparse layouts: COO and CSR are partly supported (M18, see the README), outside test_sparse*.py's checks"),
     (r"", r"Quantizedvk' backend",
      "quantized tensors are out of scope for this backend (as sparse layouts: dense tensors only)"),
     (r"", r"not implemented for 'ComplexHalf'",
