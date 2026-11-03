@@ -166,6 +166,13 @@ at::Tensor& nan_to_num_out(const at::Tensor& self, std::optional<double> nan, st
     out.copy_(self);  // integers and bools have nothing to replace
     return out;
   }
+  if (at::isComplexType(self.scalar_type()) && is_vk(self) && is_vk(out) && out.scalar_type() == self.scalar_type()) {
+    // the real and imaginary parts separately, as the CPU's
+    at::Tensor parts = at::nan_to_num(at::view_as_real(self.resolve_conj()), nan, posinf, neginf);
+    resize_elementwise_output(out, self.sizes(), &self);
+    out.copy_(at::view_as_complex(parts));
+    return out;
+  }
   if (at::isReducedFloatingType(self.scalar_type())) {
     // (the default replacements are the 16-bit dtype's extremes, not float32's)
     double top = self.scalar_type() == at::kHalf ? 65504.0 : static_cast<double>(std::numeric_limits<c10::BFloat16>::max());

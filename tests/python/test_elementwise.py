@@ -232,3 +232,13 @@ def test_unsigned_casts_and_unique():
         got = torch.unique(x.to("vk"), return_inverse=True, return_counts=True)
     for g, w in zip(got, torch.unique(x, return_inverse=True, return_counts=True)):
         assert torch.equal(g.cpu(), w)
+
+
+def test_complex_nan_to_num():
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor([complex(1, nan), complex(inf, -inf), complex(nan, 2), complex(-inf, 3)], dtype=torch.complex64)
+    for t in (x, x.conj()):
+        for kw in ({}, dict(nan=1.0, posinf=5.0, neginf=-5.0)):
+            with on_gpu():
+                got = torch.nan_to_num(t.to("vk"), **kw)
+            assert torch.equal(got.cpu().resolve_conj(), torch.nan_to_num(t, **kw).resolve_conj())
