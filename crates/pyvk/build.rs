@@ -7,7 +7,15 @@
 //!
 //! Also generates `opcodes.h` (namespace vk::op) from the shaders' operation
 //! codes in crates/vkcore/shaders/opcodes.txt.
+//!
+//! Each C++ file's object is cached in OUT_DIR/objects under a hash of its
+//! source, every header in csrc/, opcodes.h and the compiler settings, so an
+//! edit recompiles only the files it affects (libtorch's headers make each
+//! compile slow and about 1 GB large). Up to NUM_JOBS (cargo's -j) files
+//! compile at once.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -73,10 +81,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     write_opcodes(&out_dir);
 
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .files([
+    const SOURCES: &[&str] = &[
             "csrc/backend.cpp",
             "csrc/launch.cpp",
             "csrc/ops.cpp",
@@ -97,10 +102,10 @@ fn main() {
             "csrc/normgrad.cpp",
             "csrc/loss.cpp",
             "csrc/sparse.cpp",
-        ])
-        // Every object file registers aten kernels from static initializers
-        // and nothing references them by symbol, so link the archive whole.
-        .link_lib_modifier("+whole-archive")
+    ];
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
         .include(&out_dir)
         .include(&include)
         .include(include.join("torch/csrc/api/include"))
@@ -113,7 +118,60 @@ fn main() {
         build.flags(["-std=c++20", "-fvisibility=hidden"]);
         build.define("_GLIBCXX_USE_CXX11_ABI", if cxx11_abi { "1" } else { "0" });
     }
-    build.compile("vk_backend");
+
+    // What every object depends on besides its own source.
+    let mut common = DefaultHasher::new();
+    let mut headers: Vec<PathBuf> = std::fs::read_dir("csrc")
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "h"))
+        .collect();
+    headers.sort();
+    for h in &headers {
+        std::fs::read(h).unwrap().hash(&mut common);
+    }
+    std::fs::read(out_dir.join("opcodes.h")).unwrap().hash(&mut common);
+    format!("{:?}", build.get_compiler().to_command()).hash(&mut common);
+    include.hash(&mut common);
+    cxx11_abi.hash(&mut common);
+    let cache = out_dir.join("objects");
+    std::fs::create_dir_all(&cache).unwrap();
+    let ext = if build.get_compiler().is_like_msvc() { "obj" } else { "o" };
+    let objects: Vec<(String, PathBuf)> = SOURCES
+        .iter()
+        .map(|src| {
+            let mut h = common.clone();
+            std::fs::read(src).unwrap().hash(&mut h);
+            let stem = Path::new(src).file_stem().unwrap().to_str().unwrap();
+            (src.to_string(), cache.join(format!("{stem}-{:016x}.{ext}", h.finish())))
+        })
+        .collect();
+    for e in std::fs::read_dir(&cache).unwrap() {
+        let path = e.unwrap().path();
+        if !objects.iter().any(|(_, o)| *o == path) {
+            let _ = std::fs::remove_file(path);  // (an older version's object)
+        }
+    }
+    let stale: Vec<&(String, PathBuf)> = objects.iter().filter(|(_, o)| !o.exists()).collect();
+    let jobs = std::env::var("NUM_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+    for chunk in stale.chunks(jobs) {
+        std::thread::scope(|scope| {
+            for (src, obj) in chunk {
+                let mut b = build.clone();
+                scope.spawn(move || {
+                    let compiled = b.file(src).compile_intermediates();
+                    std::fs::copy(&compiled[0], obj).unwrap();
+                });
+            }
+        });
+    }
+    // Every object file registers aten kernels from static initializers and
+    // nothing references them by symbol, so link the archive whole.
+    let mut archive = build.clone();
+    for (_, obj) in &objects {
+        archive.object(obj);
+    }
+    archive.link_lib_modifier("+whole-archive").compile("vk_backend");
 
     let lib = torch.join("lib");
     println!("cargo:rustc-link-search=native={}", lib.display());
