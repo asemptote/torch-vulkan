@@ -265,7 +265,6 @@ TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
   m.impl("_to_dense", TORCH_FN(sparse_to_dense));
   m.impl("_to_sparse.sparse_dim", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, int64_t)>(sparse_coo_to_sparse)));
   m.impl("_to_sparse", TORCH_FN(static_cast<at::Tensor (*)(const at::Tensor&, std::optional<at::Layout>, at::OptionalIntArrayRef, std::optional<int64_t>)>(sparse_coo_to_sparse)));
-  m.impl("_to_sparse_csr", TORCH_FN(coo_to_sparse_csr));
   m.impl("sum", TORCH_FN(sum_coo));
   m.impl("cat", TORCH_FN(cat_sparse));
   m.impl("permute", TORCH_FN(permute_sparse_coo));
@@ -525,7 +524,6 @@ TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_convert_indices_from_coo_to_csr", TORCH_FN(vk::convert_coo_to_csr));
   m.impl("_convert_indices_from_csr_to_coo", TORCH_FN(vk::convert_csr_to_coo));
-  m.impl("_to_sparse_csr", TORCH_FN(at::native::dense_to_sparse_csr));
 }
 
 // ---------------------------------------------------------------- more layouts and ops
@@ -655,15 +653,54 @@ TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
 
 namespace vk {
 namespace {
+// A compressed tensor with its indices and values contiguous (per batch, as
+// PyTorch's checks require; PyTorch's device-generic conversions leave them
+// as views of strided COO indices here).
+at::Tensor contiguous_compressed(const at::Tensor& r) {
+  bool rows = r.layout() == at::kSparseCsr || r.layout() == at::kSparseBsr;
+  at::Tensor ci = rows ? r.crow_indices() : r.ccol_indices();
+  at::Tensor pi = rows ? r.col_indices() : r.row_indices();
+  return at::_sparse_compressed_tensor_unsafe(ci.contiguous(), pi.contiguous(), r.values().contiguous(), r.sizes(),
+                                              r.values().options().layout(r.layout()));
+}
+
+// dense or COO [*batch, rows, cols, *dense] -> CSR: unbatched through COO
+// (its rows compressed by convert_coo_to_csr), batched by PyTorch's code.
+at::Tensor to_csr_from(const at::Tensor& self, std::optional<int64_t> dense_dim) {
+  int64_t dd = dense_dim.value_or(self.layout() == at::kSparse ? self.dense_dim() : 0);
+  if (self.dim() - dd == 2) {
+    at::Tensor coo = (self.layout() == at::kSparse ? self : self.to_sparse(2)).coalesce();
+    if (coo.dense_dim() != dd) coo = coo.to_dense().to_sparse(2).coalesce();
+    at::Tensor idx = coo._indices();
+    at::Tensor crow = convert_coo_to_csr(idx.select(0, 0), self.size(0), false);
+    return at::_sparse_compressed_tensor_unsafe(crow, idx.select(0, 1).contiguous(), coo._values().contiguous(),
+                                                self.sizes(), coo._values().options().layout(at::kSparseCsr));
+  }
+  return contiguous_compressed(self.layout() == at::kSparse ? at::native::coo_to_sparse_csr(self, dense_dim)
+                                                            : at::native::dense_to_sparse_csr(self, dense_dim));
+}
+
 at::Tensor dense_to_csc(const at::Tensor& self, std::optional<int64_t> dense_dim) {
   if (self.dim() == 2 && dense_dim.value_or(0) == 0) return to_csc(self, dense_dim);
-  return at::native::dense_to_sparse_csc(self, dense_dim);
+  return contiguous_compressed(at::native::dense_to_sparse_csc(self, dense_dim));
+}
+
+at::Tensor dense_to_bsr(const at::Tensor& self, at::IntArrayRef blocksize, std::optional<int64_t> dense_dim) {
+  return contiguous_compressed(at::native::dense_to_sparse_bsr(self, blocksize, dense_dim));
+}
+at::Tensor dense_to_bsc(const at::Tensor& self, at::IntArrayRef blocksize, std::optional<int64_t> dense_dim) {
+  return contiguous_compressed(at::native::dense_to_sparse_bsc(self, blocksize, dense_dim));
 }
 }  // namespace
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_to_sparse_csc", TORCH_FN(vk::dense_to_csc));
-  m.impl("_to_sparse_bsr", TORCH_FN(at::native::dense_to_sparse_bsr));
-  m.impl("_to_sparse_bsc", TORCH_FN(at::native::dense_to_sparse_bsc));
+  m.impl("_to_sparse_bsr", TORCH_FN(vk::dense_to_bsr));
+  m.impl("_to_sparse_bsc", TORCH_FN(vk::dense_to_bsc));
+  m.impl("_to_sparse_csr", TORCH_FN(vk::to_csr_from));
+}
+
+TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
+  m.impl("_to_sparse_csr", TORCH_FN(vk::to_csr_from));
 }

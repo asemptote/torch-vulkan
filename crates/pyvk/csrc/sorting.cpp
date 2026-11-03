@@ -492,6 +492,9 @@ at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, 
   if (self.numel() == 0) {
     return out;
   }
+  if (sorted.size(-1) == 0) {  // nothing to search: every value goes first, as the CPU
+    return out.zero_();
+  }
   at::Tensor seq = sorted;
   if (sorter) {
     seq = at::gather(sorted, -1, *sorter);
