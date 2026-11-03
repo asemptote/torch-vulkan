@@ -3,8 +3,8 @@
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads
 (float64, complex, FFT, linear algebra), not just neural networks.
 
-Status: **M16 done** (the roadmap's last milestone): device `"vk"` is a native PyTorch
-backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
+Status: **M18** (sparse tensors, in progress; M17 done: phone GPUs): device
+`"vk"` is a native PyTorch backend (C++ on PrivateUse1). Element-wise ops (float32, float64, complex64,
 complex128: arithmetic, comparisons, logical ops, the transcendental and
 special functions, activations, clamp, where/masked_fill, lerp/addcmul/addcdiv),
 copies, casts and fills for every dtype, indexing (advanced indexing,
@@ -23,10 +23,13 @@ nn.Linear), FFTs (all of `torch.fft`, any length) and dense linear algebra
 matrix_exp, triangular solves, general eig, LDL, real and complex, any size
 and batch, no LAPACK) and the special functions (Bessel, incomplete gamma,
 zeta/polygamma, erfcx, orthogonal polynomials) run on the GPU, float16 and
-bfloat16 included (computed in float32, rounded once); every other op runs on
-the CPU through PyTorch's boxed fallback. In the OpInfo sweep
+bfloat16 included (computed in float32, rounded once), and 8/16-bit integers
+(in int32), and sparse COO and CSR tensors (M18); every other op runs on the
+CPU through PyTorch's boxed fallback. In the OpInfo sweep
 (`tools/opinfo_coverage.py`) every op runs fully on the GPU and matches the
-CPU. Tested on an Intel UHD 620 with the validation layer clean.
+CPU. Tested on an Intel UHD 620 with the validation layer clean, on lavapipe
+and NVIDIA GPUs (PyTorch's own tests, M15), and on a phone's Mali-G57
+(M17).
 
 ```python
 import torch, torch_vulkan
@@ -37,6 +40,70 @@ y = (x * 2 + 1).relu()          # three Vulkan kernels, batched
 print(y[:3], y.sum())           # sum is a Vulkan reduction
 torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any
 ```
+
+## Phones and small GPUs (M17)
+
+Aimed at a Mali-G57 (Galaxy A13 5G: Vulkan 1.1, no shaderInt64, no
+shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
+
+- **Vulkan 1.1 devices**: the 1.2 features vkcore needs (buffer device
+  address, scalar block layout, timeline semaphores, the memory model, 8/16-bit
+  storage) taken from their extensions; kernels are SPIR-V 1.3. A kernel that
+  declares a capability the device lacks is refused with an error rather than
+  crashing the driver. `TORCH_VK_API=1.1` forces the 1.1 path and
+  `TORCH_VK_DISABLE=int64,float64,int16,float16,int8,storage16,storage8,denorm`
+  hides features, so every GPU can test the paths of a smaller one.
+- **int64 without shaderInt64, on every GPU**: int64 tensors and
+  accumulators are two 32-bit words (`_int64.slang`'s `I64`, with C++'s
+  wrapping semantics; `_wide.slang` for index data), 64-bit kernel
+  parameters travel as word pairs, float32 trigonometric reduction and the
+  Philox generator use 32x32->64 products. One code path everywhere, so the
+  emulation is what every test run exercises. Only float64/complex128
+  kernels still use native 64-bit integers.
+- **float64 without shaderFloat64 is a TypeError, as on MPS**: creating a
+  float64 or complex128 vk tensor raises ("this GPU has no float64
+  arithmetic ... use float32"); ops whose PyTorch implementations make
+  float64 temporaries for float32 inputs (quantile, pinv, matrix_rank, zeta
+  with a number, empty batch norm, triu/tril_indices, hash_tensor, printing)
+  avoid them there (`_nofloat64.py`, `_kernels.py`). (A bit-exact software
+  binary64 for the GPU was written and set aside on branch `soft-float64`:
+  20-100x slower than float32 and gigabytes of compiler memory per kernel.)
+- **The last CPU fallbacks moved to the GPU**: `_standard_gamma`, `poisson`,
+  `binomial`, `_sample_dirichlet` (the softmax of log-gamma samples, so small
+  shapes do not underflow in float32) and the gamma/Dirichlet reparameterized
+  gradients (`sample.slang`, PyTorch's algorithms); `unique` and
+  `unique_consecutive` along a dim (rows ranked by batched column sorts);
+  bicubic `grid_sample`'s backward; `repeat_interleave` with a tensor of
+  repeats; int8/uint8/int16 ops without their own kernels in int32 on the GPU
+  (wrapping arithmetic gives the narrow results). In the OpInfo sweep only
+  `to_sparse` still fell back (sparse tensors: M18).
+- **Building on the phone** (`tools/build-termux.sh`): Termux's
+  `python-torch` (32-bit ARM), Rust and clang, 15 minutes on the A13; there
+  is no slangc for Android, so the SPIR-V compiled on another machine is
+  used as is (`VKCORE_PREBUILT_SPIRV`, crates/vkcore/build.rs). The GPU is
+  reached through Android's own Vulkan loader (Termux's finds only
+  llvmpipe). On the A13's Mali-G57 the local suite passes 613 tests (318
+  float64 ones skipped); the rest are Android's error types (see the
+  roadmap), references the phone's ARM CPU computes differently (complex
+  log2 at 0, float16 linspace) and two order-dependent checks.
+
+## Sparse tensors (M18)
+
+Sparse COO and CSR tensors on "vk" (`crates/pyvk/csrc/sparse.cpp`): their
+indices and values are ordinary vk tensors, so PyTorch's device-generic
+sparse code serves as is on `SparsePrivateUse1` / `SparseCsrPrivateUse1`
+(construction, the getters, copies, conversions, the zero-preserving unary
+functions, sums, norms, cat, permute), and the parts PyTorch writes per
+device are tensor ops here, running as Vulkan kernels: coalescing (one
+int64 key per entry, a stable sort, runs summed in index order), sparse +
+sparse and dense + sparse, products with scalars, dense tensors and other
+sparse tensors, `mm`/`addmm`/`mv`/`torch.sparse.mm` with autograd,
+`sparse_mask`, and the COO <-> CSR/CSC index conversions.
+
+Not yet (M18): batched and blocked (BSR/BSC) compressed tensors beyond
+conversions, sparse softmax, `sampled_addmm`, the sparse-sparse product as a
+sparse kernel (it goes through a dense operand), and PyTorch's
+test_sparse.py / test_sparse_csr.py (3759 of their 7824 tests pass on vk).
 
 ## Dedicated kernels (M16)
 
@@ -560,7 +627,7 @@ overhead is now close to the CPU's.
 
 | Decision | Choice | Why |
 |---|---|---|
-| GPU API | Vulkan 1.3 via [`ash`](https://crates.io/crates/ash) | float64/int64, raw device pointers, explicit memory types, low dispatch overhead; runs on Intel, AMD, NVIDIA |
+| GPU API | Vulkan 1.1+ via [`ash`](https://crates.io/crates/ash) (1.2/1.3 features as extensions) | raw device pointers, explicit memory types, low dispatch overhead; runs on Intel, AMD, NVIDIA, and phone GPUs (Mali) |
 | Core language | Rust (`crates/vkcore`) | Memory/queue/pipeline management; exposed through a C ABI so only a thin layer is tied to PyTorch's C++ ABI |
 | PyTorch integration | C++ backend on `PrivateUse1` (`crates/pyvk/csrc`), calling the Rust core through a C ABI | PyTorch's backend API is C++-only; only this layer is tied to a PyTorch release |
 | Device name | `vk` | PyTorch already has a built-in `vulkan` device type (its old, unmaintained mobile backend) |
@@ -763,19 +830,21 @@ evidence as its reason, rather than a workaround.
 Goal for M9-M14: every dense aten op runs on Vulkan (`TORCH_VK_STRICT=1` with
 no fallbacks in the OpInfo sweep).
 
-9. ~~**M9 data movement and indexing**~~: done (see above). Not yet:
-   `repeat_interleave` with a tensor of repeats, `tril_indices`/`triu_indices`.
+9. ~~**M9 data movement and indexing**~~: done (see above). (`repeat_interleave`
+   with a tensor of repeats and `tril_indices`/`triu_indices` came with M17.)
 10. ~~**M10 sorting, searching and statistics**~~: done (see above). Not
-    yet: `unique(dim=...)`, `histogram`/`histogramdd`, `segment_reduce`,
+    yet: `histogram`/`histogramdd`, `segment_reduce` (`unique(dim=...)` came
+    with M17),
     accumulation for 8/16-bit and complex dtypes, a radix sort for very long
     rows (bitonic is O(n log^2 n)), parallel scans for single long rows in
     cummax/cummin/logcumsumexp.
-11. ~~**M11 random numbers**~~: done (see above). Not yet: `poisson`,
-    `_standard_gamma`, `binomial`, `_sample_dirichlet`, `rrelu` noise, and
+11. ~~**M11 random numbers**~~: done (see above). Not yet: `rrelu` noise and
     `random_` on complex dtypes (rand/randn on complex do run on the GPU).
+    (`poisson`, `_standard_gamma`, `binomial`, `_sample_dirichlet` came with
+    M17.)
 12. ~~**M12 neural-network ops**~~: done (see above). Not yet: CTC loss,
-    `segment_reduce`, bicubic `grid_sample` backward, integer convolution and
-    pooling on the GPU. (Native kernels for the hottest composed ops came
+    `segment_reduce`, integer convolution and pooling on the GPU (bicubic
+    `grid_sample` backward came with M17). (Native kernels for the hottest composed ops came
     with M16.)
 13. ~~**M13 linear algebra on the GPU**~~: done (see above). Not yet:
     general (nonsymmetric) `eig`/`eigvals`, `ldl_factor`/`ldl_solve`
@@ -792,4 +861,12 @@ no fallbacks in the OpInfo sweep).
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
 16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
     the smooth-L1/Huber backward as single kernels.
+17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: matrix
+    products tuned for Mali (on the A13 a 2048x2048 float32 product takes
+    0.98 s on the GPU and 0.65 s on the 8 CPU cores; element-wise work is
+    twice as fast on the GPU), and on Android this library's typed c10 errors
+    (TypeError, IndexError, ...) reach Python as RuntimeError (Android's
+    libc++ matches exception types by address, and a Rust cdylib keeps its
+    own copies of their type_info).
+18. **M18 sparse tensors**: in progress (see above).
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
