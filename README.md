@@ -66,8 +66,8 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   float64 temporaries for float32 inputs (quantile, pinv, matrix_rank, zeta
   with a number, empty batch norm, triu/tril_indices, hash_tensor, printing)
   avoid them there (`_nofloat64.py`, `_kernels.py`). (A bit-exact software
-  binary64 for the GPU was written and set aside on branch `soft-float64`:
-  20-100x slower than float32 and gigabytes of compiler memory per kernel.)
+  binary64 for the GPU was tried and dropped: 20-100x slower than float32
+  and gigabytes of compiler memory per kernel.)
 - **The last CPU fallbacks moved to the GPU**: `_standard_gamma`, `poisson`,
   `binomial`, `_sample_dirichlet` (the softmax of log-gamma samples, so small
   shapes do not underflow in float32) and the gamma/Dirichlet reparameterized
