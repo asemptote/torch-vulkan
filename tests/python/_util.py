@@ -13,6 +13,11 @@ ALL = NUMERIC + [torch.bool]
 FLOATS = [torch.float32, torch.float64]
 COMPLEX = [torch.complex64, torch.complex128]
 
+# GPUs without float64 arithmetic (shaderFloat64) hold no float64 tensors
+# (conftest.py skips the tests of that dtype there); WIDE is the widest float.
+HAS_FLOAT64 = bool(tv._native.capabilities() & 1)
+WIDE = torch.float64 if HAS_FLOAT64 else torch.float32
+
 
 @contextlib.contextmanager
 def on_gpu():

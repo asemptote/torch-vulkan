@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from _util import check, make, on_gpu
+from _util import HAS_FLOAT64, check, make, on_gpu
 
 SORTABLE = [torch.float32, torch.float64, torch.int32, torch.int64, torch.bool, torch.uint8, torch.int8,
             torch.int16, torch.float16, torch.bfloat16]
@@ -187,9 +187,10 @@ def test_bincount_histc():
     f = torch.randn(300)
     with on_gpu():
         got = [torch.bincount(x.to("vk")), torch.bincount(x.to("vk"), w.to("vk"), minlength=12),
-               torch.bincount(x.to("vk"), x.to("vk").int()), torch.histc(f.to("vk"), 10, -2, 2), torch.histc(f.to("vk"), 7)]
-    want = [torch.bincount(x), torch.bincount(x, w, minlength=12), torch.bincount(x, x.int()), torch.histc(f, 10, -2, 2),
-            torch.histc(f, 7)]
+               *([torch.bincount(x.to("vk"), x.to("vk").int())] if HAS_FLOAT64 else []),  # (float64 counts)
+               torch.histc(f.to("vk"), 10, -2, 2), torch.histc(f.to("vk"), 7)]
+    want = [torch.bincount(x), torch.bincount(x, w, minlength=12), *([torch.bincount(x, x.int())] if HAS_FLOAT64 else []),
+            torch.histc(f, 10, -2, 2), torch.histc(f, 7)]
     for g, k in zip(got, want):
         check(g, k, rtol=1e-6, atol=1e-6)
 

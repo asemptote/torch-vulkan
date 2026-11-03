@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 LA_SIZES = [130, 200, 333]  # >= 128 takes the blocked GPU path; 333 is not a multiple of 64
@@ -57,7 +57,7 @@ def test_det_slogdet(dtype):
 
 
 def test_singular_matrix_reports_info():
-    a = make((150, 150), torch.float64)
+    a = make((150, 150), WIDE)
     a[:, 7] = 0  # singular
     with on_gpu():
         lu, piv, info = torch.linalg.lu_factor_ex(a.to("vk"))
@@ -84,6 +84,7 @@ def test_cholesky(dtype, n):
     assert info.item() == torch.linalg.cholesky_ex(bad)[1].item() > 0
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("upper", [False, True])
 @pytest.mark.parametrize("unit", [False, True])
 def test_solve_triangular(upper, unit):
@@ -109,6 +110,7 @@ def test_tril_triu(dtype, diagonal):
         check(got, want)
 
 
+@pytest.mark.float64
 def test_small_and_batched_linalg_use_cpu_correctly():
     a = make((4, 50, 50), torch.float64) + 50 * torch.eye(50, dtype=torch.float64)
     check(torch.linalg.inv(a.to("vk")), torch.linalg.inv(a), rtol=1e-10, atol=1e-10)

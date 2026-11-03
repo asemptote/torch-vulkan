@@ -257,9 +257,22 @@ bool fill_uninitialized() {
   return at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory();
 }
 
+// GPUs without float64 arithmetic (shaderFloat64: Mali, most phones) hold no
+// float64 or complex128 tensors, as PyTorch's MPS backend: creating one is a
+// TypeError rather than a silent CPU fallback or a slow emulation.
+void check_dtype_supported(at::ScalarType t) {
+  if ((t == at::kDouble || t == at::kComplexDouble) && !vkt_has_float64()) {
+    bool complex = t == at::kComplexDouble;
+    TORCH_CHECK_TYPE(false, "Cannot create a vk tensor of ", complex ? "complex128" : "float64",
+                     " dtype: this GPU has no float64 arithmetic (shaderFloat64). Please use ",
+                     complex ? "complex64" : "float32", " instead.");
+  }
+}
+
 at::Tensor empty_memory_format(at::IntArrayRef size, std::optional<at::ScalarType> dtype, std::optional<at::Layout>,
                                std::optional<at::Device>, std::optional<bool>,
                                std::optional<at::MemoryFormat> memory_format) {
+  check_dtype_supported(c10::dtype_or_default(dtype));
   at::Tensor t = at::detail::empty_generic(size, allocator(), c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
                                            c10::dtype_or_default(dtype), memory_format);
   if (fill_uninitialized()) at::native::fill_empty_deterministic_(t);
@@ -268,6 +281,7 @@ at::Tensor empty_memory_format(at::IntArrayRef size, std::optional<at::ScalarTyp
 
 at::Tensor empty_strided(at::IntArrayRef size, at::IntArrayRef stride, std::optional<at::ScalarType> dtype,
                          std::optional<at::Layout>, std::optional<at::Device>, std::optional<bool>) {
+  check_dtype_supported(c10::dtype_or_default(dtype));
   at::Tensor t = at::detail::empty_strided_generic(size, stride, allocator(),
                                                    c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
                                                    c10::dtype_or_default(dtype));

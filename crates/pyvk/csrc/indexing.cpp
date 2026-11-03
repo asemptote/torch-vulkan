@@ -893,7 +893,7 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
   }
   double lo = min.toDouble(), hi = max.toDouble();
   if (lo == hi && self.numel() > 0) {
-    at::Tensor bounds = at::stack({self.min(), self.max()}).to(at::kDouble).cpu();
+    at::Tensor bounds = at::stack({self.min(), self.max()}).cpu().to(at::kDouble);
     lo = bounds[0].item<double>();
     hi = bounds[1].item<double>();
   }

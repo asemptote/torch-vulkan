@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from _util import COMPLEX, check, make, make_complex, on_gpu
+from _util import COMPLEX, HAS_FLOAT64, WIDE, check, make, make_complex, on_gpu
 
 
 def vk(*ts):
@@ -107,10 +107,10 @@ def test_addbmm_integer_conv_and_pool():
     with on_gpu():
         got = [torch.addbmm(*vk(s, a, b), beta=0.5, alpha=2), F.conv2d(*vk(x, w), padding=1),
                F.conv_transpose2d(*vk(x, w.transpose(0, 1).contiguous()), stride=2),
-               F.avg_pool2d(x.to("vk"), 3, 2, 1), F.avg_pool2d(-x.to("vk"), 2, ceil_mode=True)]
+               *([F.avg_pool2d(x.to("vk"), 3, 2, 1), F.avg_pool2d(-x.to("vk"), 2, ceil_mode=True)] if HAS_FLOAT64 else [])]
     want = [torch.addbmm(s, a, b, beta=0.5, alpha=2), F.conv2d(x, w, padding=1),
-            F.conv_transpose2d(x, w.transpose(0, 1).contiguous(), stride=2), F.avg_pool2d(x, 3, 2, 1),
-            F.avg_pool2d(-x, 2, ceil_mode=True)]
+            F.conv_transpose2d(x, w.transpose(0, 1).contiguous(), stride=2),
+            *([F.avg_pool2d(x, 3, 2, 1), F.avg_pool2d(-x, 2, ceil_mode=True)] if HAS_FLOAT64 else [])]  # (integer pooling: float64)
     for g, w_ in zip(got, want):
         check(g, w_, rtol=1e-5, atol=1e-5)
 
@@ -128,9 +128,9 @@ def test_hash_tensor_and_frexp():
     with on_gpu():
         got = [torch.hash_tensor(x.to("vk")), torch.hash_tensor(x.to("vk"), dim=1, keepdim=True),
                torch.hash_tensor(torch.arange(7).to("vk"), dim=0), *torch.frexp(x.to("vk")),
-               *torch.frexp(sub.to("vk")), *torch.frexp(sub.double().to("vk"))]
+               *torch.frexp(sub.to("vk")), *torch.frexp(sub.to(WIDE).to("vk"))]
     want = [torch.hash_tensor(x), torch.hash_tensor(x, dim=1, keepdim=True), torch.hash_tensor(torch.arange(7), dim=0),
-            *torch.frexp(x), *torch.frexp(sub), *torch.frexp(sub.double())]
+            *torch.frexp(x), *torch.frexp(sub), *torch.frexp(sub.to(WIDE))]
     for g, w in zip(got, want):
         assert g.dtype == w.dtype
         if w.dtype == torch.uint64:

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 def red_tol(dtype, n=1000):
@@ -31,6 +31,7 @@ def test_sum(dtype, dims, keepdim):
     check(got, want, **red_tol(dtype))
 
 
+@pytest.mark.float64
 def test_large_and_noncontiguous_sums():
     x = torch.randn(1 << 22, dtype=torch.float64)
     with on_gpu():
@@ -102,7 +103,7 @@ def test_nan_propagation_in_max():
 
 @pytest.mark.parametrize("ord", [1, 2, float("inf"), float("-inf")])
 def test_vector_norm(ord):
-    x = make((30, 40), torch.float64)
+    x = make((30, 40), WIDE)
     v = x.to("vk")
     with on_gpu():
         got_all, got_dim = torch.linalg.vector_norm(v, ord), torch.linalg.vector_norm(v, ord, dim=1)
@@ -132,6 +133,7 @@ def test_cumsum(dtype, shape, dim):
     check(got, want, **red_tol(dtype, x.size(dim)))
 
 
+@pytest.mark.float64
 def test_cumprod():
     x = 1 + 0.001 * make((4, 3000), torch.float64)
     with on_gpu():

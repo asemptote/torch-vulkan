@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 def mm_tol(dtype, k):
@@ -76,9 +76,9 @@ def test_addmm_baddbmm_addmv(dtype):
 
 def test_linear_layer_autograd():
     torch.manual_seed(0)
-    layer = torch.nn.Linear(50, 20, dtype=torch.float64)
-    x = make((8, 50), torch.float64)
-    layer_vk = torch.nn.Linear(50, 20, dtype=torch.float64, device="vk")
+    layer = torch.nn.Linear(50, 20, dtype=WIDE)
+    x = make((8, 50), WIDE)
+    layer_vk = torch.nn.Linear(50, 20, dtype=WIDE, device="vk")
     layer_vk.load_state_dict(layer.state_dict())
     layer(x).tanh().sum().backward()
     layer_vk(x.to("vk")).tanh().sum().backward()

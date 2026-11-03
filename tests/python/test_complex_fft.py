@@ -37,6 +37,7 @@ def test_complex_arithmetic(dtype):
     check(va.real + va.imag, a.real + a.imag)
 
 
+@pytest.mark.float64
 def test_complex_casts():
     x = make((5, 4), torch.float64)
     c = make_complex((5, 4), torch.complex64)
@@ -69,6 +70,7 @@ def test_rfft_irfft(dtype, n):
     check(back, x, **fft_tol(cdtype, n))
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("norm", ["backward", "ortho", "forward"])
 def test_fftn_dims_and_norms(norm):
     x = make_complex((6, 10, 16), torch.complex128)
@@ -86,6 +88,7 @@ def test_fftn_dims_and_norms(norm):
     check(got, r, **fft_tol(torch.complex128, 960))
 
 
+@pytest.mark.float64
 def test_fft_large_float64_accuracy():
     x = make_complex((1 << 16,), torch.complex128)
     with on_gpu():

@@ -66,6 +66,7 @@ def test_conv_transpose(dims, cin, cout, k, stride, pad, dil, groups, outpad):
     compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, outpad, groups, dil), x, w, b)
 
 
+@pytest.mark.float64
 def test_conv_float64():
     x, w = make((2, 3, 10, 10), torch.float64), make((4, 3, 3, 3), torch.float64, 1)
     compare_with_cpu(lambda x, w: F.conv2d(x, w, padding=1), x, w, tol=dict(rtol=1e-10, atol=1e-10))

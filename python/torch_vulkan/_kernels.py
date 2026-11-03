@@ -11,6 +11,7 @@ backward pass is exactly the adjoint of our forward pass. Average pooling is
 a depthwise convolution with a ones kernel, divided by the window sizes.
 """
 
+import functools
 import math
 
 import torch
@@ -273,7 +274,8 @@ def _adaptive_matrix(n_in, n_out, device):
     for o in range(n_out):
         start, end = (o * n_in) // n_out, -((-(o + 1) * n_in) // n_out)
         m[o, start:end] = 1.0 / (end - start)
-    return m.to(device)
+    # (rounded to the input's precision by _apply_dims; float32 on GPUs without float64)
+    return m.to(device, torch.float64 if device.type != "vk" or _native_has_float64() else torch.float32)
 
 
 def _make_adaptive_avg(k):
@@ -320,7 +322,12 @@ def _pool_dtype(t):
     integers in float64 (exact to 2^53)."""
     if t in (torch.float32, torch.float64):
         return t
-    return torch.float32 if t in (torch.float16, torch.bfloat16) else torch.float64
+    if t in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if not _native_has_float64():
+        raise TypeError(f"{t} pooling and resampling on vk need float64 arithmetic, which this GPU lacks "
+                        "(shaderFloat64); please convert to float32")
+    return torch.float64
 
 
 def _pool_memory_format(x, k):
@@ -501,6 +508,30 @@ def _cdist_backward_impl(grad, x1, x2, p, dist):
     return (grad.unsqueeze(-1) * dd).sum(-2)
 
 
+# ---------------------------------------------------------------- triu_indices / tril_indices
+
+def _tri_indices(upper, row, col, offset=0, *, dtype=None, layout=None, device=None, pin_memory=None):
+    """Row-major (row, col) indices of the upper / lower triangle, in integer
+    arithmetic (PyTorch's decomposition computes them with float64 square
+    roots, which GPUs without float64 lack)."""
+    if row < 0 or col < 0:
+        raise RuntimeError(f"{'triu' if upper else 'tril'}_indices expects row and col to be non-negative, got {row} and {col}")
+    dtype = torch.int64 if dtype is None else dtype
+    first = [max(0, r + offset) if upper else 0 for r in range(row)]
+    count = [max(0, col - f) if upper else min(col, max(0, r + offset + 1)) for r, f in enumerate(first)]
+    n = sum(count)
+    if n == 0:
+        return torch.empty(2, 0, dtype=dtype, device=device)
+    r = torch.arange(row, device=device)
+    first_t = (r + offset).clamp(min=0) if upper else torch.zeros_like(r)
+    count_t = (col - first_t).clamp(min=0) if upper else (r + offset + 1).clamp(0, col)
+    end = count_t.cumsum(0)
+    i = torch.arange(n, device=device)
+    rows = torch.searchsorted(end, i, right=True)
+    cols = first_t[rows] + i - (end - count_t)[rows]
+    return torch.stack([rows, cols]).to(dtype)
+
+
 def _pdist_forward(x, p=2):
     n = x.shape[0]
     i, j = torch.triu_indices(n, n, 1, device=x.device)
@@ -585,7 +616,10 @@ def _multilabel_margin_loss_forward(x, target, reduction):
 
 def _bucketize_scalar(x, boundaries, out_int32=False, right=False):
     # (the CPU's scalar_to_tensor: a 0-dim double or int64 on the boundaries' device)
-    dtype = torch.float64 if isinstance(x, float) else torch.complex128 if isinstance(x, complex) else torch.int64
+    # (single precision on GPUs without float64)
+    f64 = _native_has_float64()
+    dtype = ((torch.float64 if f64 else torch.float32) if isinstance(x, float) else
+             (torch.complex128 if f64 else torch.complex64) if isinstance(x, complex) else torch.int64)
     return torch.bucketize(torch.tensor(x, dtype=dtype, device=boundaries.device), boundaries,
                            out_int32=out_int32, right=right)
 
@@ -848,8 +882,12 @@ def _hash_tensor(self, dim=(), *, keepdim=False, mode=0):
         if self.dim() > 0 and self.shape[d] == 0:
             raise IndexError(f"hash_tensor: Expected reduction dim {d} to have non-zero size.")
     # Elements as 64-bit floats or integers, their bits XOR-reduced.
-    wide = self.to(torch.float64) if self.is_floating_point() else self.to(torch.int64)
-    bits = wide.view(torch.int64)
+    if not self.is_floating_point():
+        bits = self.to(torch.int64)
+    elif self.dtype == torch.float64 or _native_has_float64():
+        bits = self.to(torch.float64).view(torch.int64)
+    else:
+        bits = _float_bits_as_double(self)
     dims = sorted(d % max(self.dim(), 1) for d in dim) if dim else list(range(self.dim()))
     if self.dim() == 0:
         return bits.clone().view(torch.uint64)
@@ -861,6 +899,21 @@ def _hash_tensor(self, dim=(), *, keepdim=False, mode=0):
         for d in dims:
             out = out.unsqueeze(d)
     return out.view(torch.uint64)
+
+
+def _float_bits_as_double(x):
+    """The bits of x (float32 or narrower) converted to float64, as int64,
+    in integer arithmetic (for GPUs without float64): exact, with NaNs
+    quieted as the CPU converts them."""
+    b = x.to(torch.float32).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    sign, e, m = b >> 31, (b >> 23) & 0xFF, b & 0x7FFFFF
+    # Subnormals: m 2^-149 with m's leading bit p (frexp is exact for m < 2^24).
+    p = torch.frexp(m.to(torch.float32)).exponent.to(torch.int64) - 1
+    sub = (e == 0) & (m != 0)
+    e64 = torch.where(e == 0xFF, 0x7FF, torch.where(e == 0, torch.where(sub, p - 149 + 1023, 0), e + 896))
+    m64 = torch.where(sub, (m << (52 - p.clamp(0, 22))) & ((1 << 52) - 1), m << 29)
+    m64 = torch.where((e == 0xFF) & (m != 0), m64 | (1 << 51), m64)
+    return (sign << 63) | (e64 << 52) | m64
 
 
 def _hash_tensor_out(self, dim=(), *, keepdim=False, mode=0, out):
@@ -1311,6 +1364,8 @@ def _kernels():
         "_cdist_forward": _cdist_forward,
         "_cdist_backward": _cdist_backward,
         "_pdist_forward": _pdist_forward,
+        "triu_indices": functools.partial(_tri_indices, True),
+        "tril_indices": functools.partial(_tri_indices, False),
         "_pdist_backward": _pdist_backward,
         "fractional_max_pool2d": fmp2,
         "fractional_max_pool2d_backward": fmp2_b,

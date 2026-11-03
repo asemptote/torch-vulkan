@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 F32, FLOAT = [torch.float32], [torch.float32, torch.float64]
@@ -128,6 +128,7 @@ def test_compare(op, dtype):
     check(got_s, f(a, 0))
 
 
+@pytest.mark.float64
 def test_type_promotion():
     i32, f64, i64 = make((5,), torch.int32), make((5,), torch.float64), make((5,), torch.int64, positive=True)
     with on_gpu():
@@ -139,7 +140,7 @@ def test_type_promotion():
 
 
 def test_inplace_binary_and_slices():
-    x = make((6, 6), torch.float64)
+    x = make((6, 6), WIDE)
     v = x.to("vk")
     with on_gpu():
         v[:, 1] += 1

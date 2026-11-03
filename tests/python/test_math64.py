@@ -10,6 +10,8 @@ import torch
 import torch_vulkan as tv
 from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
 
+pytestmark = pytest.mark.float64
+
 
 F64_DOMAINS = {
     "exp": lambda g: torch.empty(200_000, dtype=torch.float64).uniform_(-745, 710, generator=g),

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 @pytest.mark.parametrize("dtype", ALL + [torch.float16, torch.uint8, torch.complex64])
@@ -33,10 +33,10 @@ def test_factories():
     with on_gpu():
         z = torch.zeros(3, 4, device="vk")
         o = torch.ones(2, dtype=torch.int64, device="vk")
-        f = torch.full((2, 2), 7.5, device="vk", dtype=torch.float64)
+        f = torch.full((2, 2), 7.5, device="vk", dtype=WIDE)
     check(z, torch.zeros(3, 4))
     check(o, torch.ones(2, dtype=torch.int64))
-    check(f, torch.full((2, 2), 7.5, dtype=torch.float64))
+    check(f, torch.full((2, 2), 7.5, dtype=WIDE))
     check(torch.arange(2, 11, 3, device="vk"), torch.arange(2, 11, 3))
     check(torch.eye(3, device="vk"), torch.eye(3))
     r = torch.randn(100, device="vk")
@@ -44,7 +44,7 @@ def test_factories():
 
 
 def test_cpu_fallback_matches_and_is_counted():
-    x = make((20,), torch.float64)
+    x = make((20,), WIDE)
     x = x.abs() + 0.5
     x = x.view(4, 5)
     before = tv.fallback_counts().get("aten::unique_dim", 0)

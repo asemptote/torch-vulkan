@@ -38,6 +38,13 @@ from . import _kernels  # noqa: E402
 # decomposition: average pooling, adaptive pooling, upsampling backward.
 _python_kernels = _kernels.register()
 
+from . import _nofloat64  # noqa: E402
+
+# Composite ops whose PyTorch implementations make float64 temporaries
+# (quantile, pinv, matrix_rank, zeta with a number, batch norm of an empty
+# input), for GPUs without float64.
+_python_kernels += _nofloat64.register()
+
 __all__ = [
     "device_count",
     "device_name",
@@ -150,6 +157,20 @@ def _device_module():
 
 torch._register_device_module("vk", _device_module())
 sys.modules["torch.vk"] = torch.vk
+
+# Printing a float tensor converts it to double on its device
+# (torch._tensor_str.tensor_totype); GPUs without float64 print in float32,
+# as PyTorch does for MPS.
+_tensor_totype = torch._tensor_str.tensor_totype
+
+
+def _vk_tensor_totype(t):
+    if t.device.type == "vk" and not _kernels._native_has_float64():
+        return t.to(dtype=torch.float)
+    return _tensor_totype(t)
+
+
+torch._tensor_str.tensor_totype = _vk_tensor_totype
 
 
 @atexit.register
