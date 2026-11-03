@@ -28,7 +28,9 @@ use std::process::{Child, Command, Output, Stdio};
 
 /// Flags for every kernel.
 const SLANGC_FLAGS: &[&str] = &[
-    "-target", "spirv", "-profile", "spirv_1_5", "-entry", "main", "-stage", "compute", "-O2",
+    // SPIR-V 1.3, the newest Vulkan 1.1 accepts: slang then declares
+    // SPV_KHR_physical_storage_buffer and friends as extensions (core in 1.5).
+    "-target", "spirv", "-profile", "spirv_1_3", "-entry", "main", "-stage", "compute", "-O2",
     // Plain C-like layout for push constants and buffers (scalarBlockLayout,
     // required by vkcore), so host structs match field for field.
     "-fvk-use-scalar-layout",

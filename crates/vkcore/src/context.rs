@@ -27,6 +27,10 @@ pub struct Capabilities {
     pub timeline_semaphore: bool,
     pub storage_buffer_16bit: bool,
     pub storage_buffer_8bit: bool,
+    /// VK_KHR_shader_float_controls (core in 1.2). SPIR-V 1.3 modules declare
+    /// SPV_KHR_float_controls for their denormal modes; without it vkcore
+    /// strips the modes, their capability and that extension.
+    pub float_controls: bool,
     /// Shaders can keep float32 / float64 denormals (otherwise they may flush to zero).
     pub denorm_preserve_f32: bool,
     pub denorm_preserve_f64: bool,
@@ -168,10 +172,12 @@ impl Context {
             let props = instance.get_physical_device_properties(physical_device);
             let device_name = props.device_name_as_c_str()?.to_string_lossy().into_owned();
 
-            let caps = query_capabilities(&instance, physical_device, &props);
+            let exts = device_extensions(&instance, physical_device);
+            let api = effective_api_version(props.api_version);
+            let caps = query_capabilities(&instance, physical_device, &props, api, &exts);
+            // (shaderInt64 and shaderFloat64 are optional: see kernels.rs)
             for (ok, what) in [
                 (caps.buffer_device_address, "bufferDeviceAddress"),
-                (caps.shader_int64, "shaderInt64"),
                 (caps.scalar_block_layout, "scalarBlockLayout"),
                 (caps.timeline_semaphore, "timelineSemaphore"),
             ] {
@@ -186,27 +192,59 @@ impl Context {
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
                 .ok_or("no compute queue")? as u32;
 
-            let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(caps.storage_buffer_16bit);
-            let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
-                .buffer_device_address(true)
-                .scalar_block_layout(true)
-                .timeline_semaphore(true)
+            // The features through their own structures (core since Vulkan
+            // 1.2, extensions before), so that Vulkan 1.1 devices work too;
+            // on those the extensions are enabled by name.
+            let mut bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+            let mut sbl = vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
+            let mut tls = vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+            let mut vmm = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
                 .vulkan_memory_model(caps.vulkan_memory_model)
-                .vulkan_memory_model_device_scope(caps.vulkan_memory_model_device_scope)
-                .shader_float16(caps.shader_float16)
-                .shader_int8(caps.shader_int8)
-                .storage_buffer8_bit_access(caps.storage_buffer_8bit);
+                .vulkan_memory_model_device_scope(caps.vulkan_memory_model_device_scope);
+            let mut f16i8 =
+                vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(caps.shader_float16).shader_int8(caps.shader_int8);
+            let mut s8 = vk::PhysicalDevice8BitStorageFeatures::default().storage_buffer8_bit_access(caps.storage_buffer_8bit);
+            let mut s16 = vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(caps.storage_buffer_16bit);
             let core = vk::PhysicalDeviceFeatures::default()
                 .shader_float64(caps.shader_float64)
-                .shader_int64(true)
+                .shader_int64(caps.shader_int64)
                 .shader_int16(caps.shader_int16);
+            let has = |e: &CStr| exts.iter().any(|x| x.as_c_str() == e);
+            let mut names: Vec<*const std::ffi::c_char> = Vec::new();
+            if api < vk::API_VERSION_1_2 {
+                for (e, wanted) in [
+                    (ash::khr::buffer_device_address::NAME, true),
+                    (ash::ext::scalar_block_layout::NAME, true),
+                    (ash::khr::timeline_semaphore::NAME, true),
+                    (ash::khr::vulkan_memory_model::NAME, caps.vulkan_memory_model),
+                    (ash::khr::shader_float16_int8::NAME, caps.shader_float16 || caps.shader_int8),
+                    (ash::khr::_8bit_storage::NAME, caps.storage_buffer_8bit),
+                    (ash::khr::shader_float_controls::NAME, caps.float_controls),
+                ] {
+                    if wanted && has(e) {
+                        names.push(e.as_ptr());
+                    }
+                }
+            }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
-            let device_info = vk::DeviceCreateInfo::default()
+            let mut device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&queue_info))
+                .enabled_extension_names(&names)
                 .enabled_features(&core)
-                .push_next(&mut f11)
-                .push_next(&mut f12);
+                .push_next(&mut bda)
+                .push_next(&mut sbl)
+                .push_next(&mut tls)
+                .push_next(&mut s16);
+            if caps.vulkan_memory_model {
+                device_info = device_info.push_next(&mut vmm);
+            }
+            if caps.shader_float16 || caps.shader_int8 {
+                device_info = device_info.push_next(&mut f16i8);
+            }
+            if caps.storage_buffer_8bit {
+                device_info = device_info.push_next(&mut s8);
+            }
             let device = instance.create_device(physical_device, &device_info, None)?;
             let queue = device.get_device_queue(queue_family, 0);
             let memory = instance.get_physical_device_memory_properties(physical_device);
@@ -239,18 +277,84 @@ impl Drop for Context {
     }
 }
 
-unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, props: &vk::PhysicalDeviceProperties) -> Capabilities {
-    let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
-    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
-    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut f11).push_next(&mut f12);
+unsafe fn device_extensions(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<std::ffi::CString> {
+    instance
+        .enumerate_device_extension_properties(pd)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e.extension_name_as_c_str().ok().map(|c| c.to_owned()))
+        .collect()
+}
+
+/// The device's API version, or 1.1 with `TORCH_VK_API=1.1` (to exercise the
+/// Vulkan 1.1 path, with extensions by name, on a newer device).
+fn effective_api_version(device: u32) -> u32 {
+    match std::env::var("TORCH_VK_API").as_deref() {
+        Ok("1.1") => device.min(vk::API_VERSION_1_1),
+        _ => device,
+    }
+}
+
+/// Whether `TORCH_VK_DISABLE` (comma-separated: int64, float64, int16,
+/// float16, int8, storage16, storage8, denorm) names `what`: the feature is
+/// then treated as missing, to test the paths for devices without it (Mali
+/// GPUs have neither int64 nor float64).
+fn disabled(what: &str) -> bool {
+    std::env::var("TORCH_VK_DISABLE").is_ok_and(|v| v.split(',').any(|x| x.trim() == what))
+}
+
+unsafe fn query_capabilities(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    props: &vk::PhysicalDeviceProperties,
+    api: u32,
+    exts: &[std::ffi::CString],
+) -> Capabilities {
+    let has = |e: &CStr| exts.iter().any(|x| x.as_c_str() == e);
+    // (each structure only where the device knows it: core in 1.2, or its extension)
+    let promoted = |e: &CStr| api >= vk::API_VERSION_1_2 || has(e);
+    let mut bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+    let mut sbl = vk::PhysicalDeviceScalarBlockLayoutFeatures::default();
+    let mut tls = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+    let mut vmm = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+    let mut f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut s8 = vk::PhysicalDevice8BitStorageFeatures::default();
+    let mut s16 = vk::PhysicalDevice16BitStorageFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut s16);
+    if promoted(ash::khr::buffer_device_address::NAME) {
+        features = features.push_next(&mut bda);
+    }
+    if promoted(ash::ext::scalar_block_layout::NAME) {
+        features = features.push_next(&mut sbl);
+    }
+    if promoted(ash::khr::timeline_semaphore::NAME) {
+        features = features.push_next(&mut tls);
+    }
+    if promoted(ash::khr::vulkan_memory_model::NAME) {
+        features = features.push_next(&mut vmm);
+    }
+    if promoted(ash::khr::shader_float16_int8::NAME) {
+        features = features.push_next(&mut f16i8);
+    }
+    if promoted(ash::khr::_8bit_storage::NAME) {
+        features = features.push_next(&mut s8);
+    }
     instance.get_physical_device_features2(pd, &mut features);
     let core = features.features;
 
-    let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
-    let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
+    let float_controls = promoted(ash::khr::shader_float_controls::NAME);
+    let maintenance4 = api >= vk::API_VERSION_1_3 || has(ash::khr::maintenance4::NAME);
+    let mut sub = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut fc = vk::PhysicalDeviceFloatControlsProperties::default();
     let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut m4 = vk::PhysicalDeviceMaintenance4Properties::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut p11).push_next(&mut p12).push_next(&mut m3).push_next(&mut m4);
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut sub).push_next(&mut m3);
+    if float_controls {
+        properties = properties.push_next(&mut fc);
+    }
+    if maintenance4 {
+        properties = properties.push_next(&mut m4);
+    }
     instance.get_physical_device_properties2(pd, &mut properties);
 
     let memory = instance.get_physical_device_memory_properties(pd);
@@ -260,26 +364,28 @@ unsafe fn query_capabilities(instance: &ash::Instance, pd: vk::PhysicalDevice, p
     let b = |v: vk::Bool32| v == vk::TRUE;
     Capabilities {
         api_version: props.api_version,
-        shader_float64: b(core.shader_float64),
-        shader_int64: b(core.shader_int64),
-        shader_int16: b(core.shader_int16),
-        shader_float16: b(f12.shader_float16),
-        shader_int8: b(f12.shader_int8),
-        buffer_device_address: b(f12.buffer_device_address),
-        scalar_block_layout: b(f12.scalar_block_layout),
-        vulkan_memory_model: b(f12.vulkan_memory_model),
-        vulkan_memory_model_device_scope: b(f12.vulkan_memory_model_device_scope),
-        timeline_semaphore: b(f12.timeline_semaphore),
-        storage_buffer_16bit: b(f11.storage_buffer16_bit_access),
-        storage_buffer_8bit: b(f12.storage_buffer8_bit_access),
-        denorm_preserve_f32: b(p12.shader_denorm_preserve_float32),
-        denorm_preserve_f64: b(p12.shader_denorm_preserve_float64),
-        subgroup_size: p11.subgroup_size,
+        shader_float64: b(core.shader_float64) && !disabled("float64"),
+        shader_int64: b(core.shader_int64) && !disabled("int64"),
+        shader_int16: b(core.shader_int16) && !disabled("int16"),
+        shader_float16: b(f16i8.shader_float16) && !disabled("float16"),
+        shader_int8: b(f16i8.shader_int8) && !disabled("int8"),
+        buffer_device_address: b(bda.buffer_device_address),
+        scalar_block_layout: b(sbl.scalar_block_layout),
+        vulkan_memory_model: b(vmm.vulkan_memory_model),
+        vulkan_memory_model_device_scope: b(vmm.vulkan_memory_model_device_scope),
+        timeline_semaphore: b(tls.timeline_semaphore),
+        storage_buffer_16bit: b(s16.storage_buffer16_bit_access) && !disabled("storage16"),
+        storage_buffer_8bit: b(s8.storage_buffer8_bit_access) && !disabled("storage8"),
+        float_controls,
+        denorm_preserve_f32: float_controls && b(fc.shader_denorm_preserve_float32) && !disabled("denorm"),
+        denorm_preserve_f64: float_controls && b(fc.shader_denorm_preserve_float64) && !disabled("denorm"),
+        subgroup_size: sub.subgroup_size,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
         max_push_constants: props.limits.max_push_constants_size,
         max_allocation_size: m3.max_memory_allocation_size,
-        max_buffer_size: m4.max_buffer_size,
+        // (without maintenance4: no stated limit beyond one allocation's)
+        max_buffer_size: if maintenance4 { m4.max_buffer_size } else { m3.max_memory_allocation_size },
         unified_memory_type,
     }
 }

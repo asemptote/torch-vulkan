@@ -153,9 +153,10 @@ pub fn declared_capabilities(words: &[u32]) -> Vec<u32> {
 }
 
 /// Removes `OpExecutionMode DenormPreserve` for the given float widths (and
-/// the `DenormPreserve` capability once no such mode remains). The kernels are
-/// compiled to preserve denormals; a device that cannot must not see that
-/// request, and then flushes denormals to zero instead.
+/// the `DenormPreserve` capability once no such mode remains, with the
+/// `SPV_KHR_float_controls` extension that SPIR-V 1.3 modules declare for
+/// it). The kernels are compiled to preserve denormals; a device that cannot
+/// must not see that request, and then flushes denormals to zero instead.
 pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool) {
     const OP_EXECUTION_MODE: u32 = 16;
     const DENORM_PRESERVE_MODE: u32 = 4459;
@@ -164,9 +165,11 @@ pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool)
         return;
     }
     let mut out = words[..5].to_vec();
+    const OP_EXTENSION: u32 = 10;
     let mut remaining_modes = 0;
     let mut i = 5;
     let mut capability_at = None;
+    let mut extension_at = None;
     while i < words.len() {
         let count = (words[i] >> 16) as usize;
         let opcode = words[i] & 0xffff;
@@ -186,17 +189,30 @@ pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool)
         if opcode == OP_CAPABILITY && count == 2 && inst[1] == DENORM_PRESERVE_CAPABILITY {
             capability_at = Some(out.len());
         }
+        if opcode == OP_EXTENSION && extension_name(&inst[1..]) == "SPV_KHR_float_controls" {
+            extension_at = Some((out.len(), count));
+        }
         if !drop {
             out.extend_from_slice(inst);
         }
         i += count;
     }
     if remaining_modes == 0 {
-        if let Some(at) = capability_at {
-            out.drain(at..at + 2);
+        // (later position first, so the earlier one stays valid)
+        let mut spans: Vec<(usize, usize)> = capability_at.map(|at| (at, 2)).into_iter().chain(extension_at).collect();
+        spans.sort_by(|a, b| b.0.cmp(&a.0));
+        for (at, n) in spans {
+            out.drain(at..at + n);
         }
     }
     *words = out;
+}
+
+/// The literal string of an instruction operand (UTF-8, nul-terminated, packed
+/// four bytes a word, little-endian).
+fn extension_name(words: &[u32]) -> String {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).take_while(|&b| b != 0).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 impl Drop for KernelCache {
