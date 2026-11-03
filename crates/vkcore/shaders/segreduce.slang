@@ -16,11 +16,12 @@
 // embedding_dense_backward's scale_grad_by_freq does.
 
 #include "opcodes.slang"
+#include "_wide.slang"
 
 struct Params
 {
     T* dst;        // destination, offsets relative to this
-    int64_t* offs; // per source element
+    i64w* offs;    // per source element (int64 as words: _wide.slang)
     T* vals;       // per source element
     uint* order;   // source elements sorted by offset
     uint n;        // source elements (rows)
@@ -67,15 +68,16 @@ void main(uint3 id: SV_DispatchThreadID)
     for (uint t = id.x; t < p.n * width; t += p.stride)
     {
         uint s = t / width, col = t - s * width;
-        int64_t off = p.offs[p.order[min(s, last)]];
-        if (s > 0u && p.offs[p.order[max(s, 1u) - 1u]] == off)
+        i64w offw = p.offs[p.order[min(s, last)]];
+        int off = i64w_int(offw);
+        if (s > 0u && all(p.offs[p.order[max(s, 1u) - 1u]] == offw))
             continue;  // not the start of a run
         T scale = T(1);
 #ifdef IS_FLOAT
         if (p.scale_by_count != 0)  // (floating types only)
         {
             uint run = 0;
-            for (uint j = s; j < p.n && p.offs[p.order[min(j, last)]] == off; j++)
+            for (uint j = s; j < p.n && all(p.offs[p.order[min(j, last)]] == offw); j++)
                 run++;
             scale = T(1) / T(run);
         }
@@ -83,7 +85,7 @@ void main(uint3 id: SV_DispatchThreadID)
         bool have = INCLUDE_SELF != 0;
         T acc = have ? p.dst[off + col] : T(0);
         uint count = have ? 1u : 0u;
-        for (uint j = s; j < p.n && p.offs[p.order[min(j, last)]] == off; j++)
+        for (uint j = s; j < p.n && all(p.offs[p.order[min(j, last)]] == offw); j++)
         {
             T v = p.vals[p.order[min(j, last)] * width + col];
             if (p.scale_by_count != 0)

@@ -11,11 +11,12 @@
 // raises as an IndexError when it next synchronizes.
 
 #include "opcodes.slang"
+#include "_wide.slang"
 
 struct Params
 {
     T* x;              // 0   (forward)
-    int64_t* target;   // 8
+    i64w* target;      // 8   (int64 as words: _wide.slang)
     T* weight;         // 16
     T* out;            // 24  loss [N] (forward) or gx [N, C] (backward)
     T* wsum;           // 32  [N] (forward)
@@ -23,7 +24,7 @@ struct Params
     uint* error;       // 48
     uint n;            // 56
     uint c;            // 60
-    int64_t ignore;    // 64
+    i64w ignore;       // 64
     uint stride;       // 72
     uint _pad;         // 76
 };
@@ -40,9 +41,10 @@ void main(uint3 id: SV_DispatchThreadID)
 {
     for (uint i = id.x; i < p.n; i += p.stride)
     {
-        int64_t t = p.target[i];
-        bool ignored = t == p.ignore;
-        bool valid = !ignored && t >= 0 && t < int64_t(p.c);
+        i64w tw = p.target[i];
+        bool ignored = all(tw == p.ignore);
+        int t = i64w_int(tw);
+        bool valid = !ignored && i64w_fits(tw) && t >= 0 && t < int(p.c);
         if (!ignored && !valid)
             *p.error = 1u;
         uint ti = valid ? uint(t) : 0u;

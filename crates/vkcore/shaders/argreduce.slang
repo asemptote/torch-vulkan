@@ -7,13 +7,14 @@
 // matching PyTorch (NaN counts as the maximum and the minimum).
 
 #include "opcodes.slang"
+#include "_wide.slang"
 
 struct Params
 {
     T* in;              // 0
     T* out;             // 8   values: partials [n_out, nchunks] or results [n_out]
-    int64_t* out_idx;   // 16  indices, same layout
-    int64_t* in_idx;    // 24  indices of `in` when LEVEL0 == 0
+    i64w* out_idx;      // 16  indices, same layout (int64 as words: _wide.slang)
+    i64w* in_idx;       // 24  indices of `in` when LEVEL0 == 0
     uint ond;           // 32
     uint rnd;           // 36
     uint n_out;         // 40
@@ -38,7 +39,7 @@ struct Params
 
 static const uint WG = 256;
 groupshared T svalue[WG];
-groupshared int64_t sindex[WG];
+groupshared int sindex[WG];
 
 #if defined(T_f32) || defined(T_f64)
 bool nan_(T x) { return isnan(x); }
@@ -47,7 +48,7 @@ bool nan_(T x) { return false; }
 #endif
 
 // Whether (vb, ib) should replace (va, ia). An index < 0 marks "empty".
-bool better(T va, int64_t ia, T vb, int64_t ib)
+bool better(T va, int ia, T vb, int ib)
 {
     if (ib < 0) return false;
     if (ia < 0) return true;
@@ -86,12 +87,12 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             int base = offset(o, p.ond, p.osz, p.ost);
             uint end = min((c + 1) * p.chunk, p.n_red);
             T bv = T(0);
-            int64_t bi = -1;
+            int bi = -1;
             for (uint i = c * p.chunk; i < end; i++)
             {
                 int at = base + offset(i, p.rnd, p.rsz, p.rst);
                 T v = p.in[at];
-                int64_t idx = LEVEL0 != 0 ? int64_t(i) : p.in_idx[at];
+                int idx = LEVEL0 != 0 ? int(i) : i64w_int(p.in_idx[at]);
                 if (better(bv, bi, v, idx))
                 {
                     bv = v;
@@ -99,7 +100,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                 }
             }
             p.out[w] = bv;
-            p.out_idx[w] = bi;
+            p.out_idx[w] = i64w_from(bi);
         }
         return;
     }
@@ -110,12 +111,12 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         int base = offset(o, p.ond, p.osz, p.ost);
         uint end = min((c + 1) * p.chunk, p.n_red);
         T bv = T(0);
-        int64_t bi = -1;
+        int bi = -1;
         for (uint i = c * p.chunk + tid.x; i < end; i += WG)
         {
             int at = base + offset(i, p.rnd, p.rsz, p.rst);
             T v = p.in[at];
-            int64_t idx = LEVEL0 != 0 ? int64_t(i) : p.in_idx[at];
+            int idx = LEVEL0 != 0 ? int(i) : i64w_int(p.in_idx[at]);
             if (better(bv, bi, v, idx))
             {
                 bv = v;
@@ -137,7 +138,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         if (tid.x == 0)
         {
             p.out[w] = svalue[0];
-            p.out_idx[w] = sindex[0];
+            p.out_idx[w] = i64w_from(sindex[0]);
         }
         GroupMemoryBarrierWithGroupSync();
     }

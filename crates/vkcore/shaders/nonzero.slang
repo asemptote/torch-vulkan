@@ -3,11 +3,13 @@
 // (int64): element i, if set, writes its coordinates to row csum[i] - 1 of
 // out (count x ndim, int64).
 
+#include "_wide.slang"
+
 struct Params
 {
     uint8_t* mask;
-    int64_t* csum;
-    int64_t* out;
+    i64w* csum;  // (int64 as words: _wide.slang)
+    i64w* out;
     uint n;
     uint ndim;
     uint stride;
@@ -31,12 +33,12 @@ void main(uint3 id: SV_DispatchThreadID)
     {
         if (p.mask[i] == uint8_t(0))
             continue;
-        int64_t row = p.csum[i] - 1;
+        int row = i64w_int(p.csum[i]) - 1;
         uint rem = i;
         for (int d = int(p.ndim) - 1; d >= 0; d--)
         {
             uint s = dim_size(uint(d));
-            p.out[row * p.ndim + d] = int64_t(rem % s);
+            p.out[row * int(p.ndim) + d] = i64w_from(int(rem % s));
             rem /= s;
         }
     }

@@ -18,6 +18,7 @@
 
 #include "_fmath.slang"
 #include "opcodes.slang"
+#include "_wide.slang"
 
 struct Params
 {
@@ -26,7 +27,7 @@ struct Params
     T* out;        // 16  [N, C, P] (forward)
     T* gout;       // 24  [N, C, P] (backward)
     T* ggrid;      // 32  [N, P, k] (backward, when want_grid)
-    int64_t* idx;  // 40  [N, P, 2^k] (backward)
+    i64w* idx;     // 40  [N, P, 2^k] (backward; int64 as words: _wide.slang)
     T* wgt;        // 48  [N, P, 2^k] (backward)
     uint n;        // 56
     uint c;        // 60
@@ -168,7 +169,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             wq[q] = weight;
             if (OP == GRID_BACKWARD)
             {
-                p.idx[(b * p.p + pt) * corners + q] = valid ? int64_t(offset) : int64_t(-1);
+                p.idx[(b * p.p + pt) * corners + q] = i64w_from(valid ? int(offset) : -1);
                 p.wgt[(b * p.p + pt) * corners + q] = valid ? weight : T(0);
             }
         }
@@ -176,7 +177,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         {
             for (uint q = ncorners; q < corners; q++)  // (nearest: one corner; the rest unused)
             {
-                p.idx[(b * p.p + pt) * corners + q] = int64_t(-1);
+                p.idx[(b * p.p + pt) * corners + q] = i64w_from(-1);
                 p.wgt[(b * p.p + pt) * corners + q] = T(0);
             }
         }

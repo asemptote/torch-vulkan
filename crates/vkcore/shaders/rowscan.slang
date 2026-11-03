@@ -11,6 +11,7 @@
 //       leaves the index among equal elements unspecified)
 
 #include "opcodes.slang"
+#include "_wide.slang"
 #if defined(T_f32) || defined(T_f64)
 #include "_fmath.slang"
 #define IS_FLOAT 1
@@ -20,8 +21,8 @@ struct Params
 {
     T* x;
     T* out;
-    int64_t* idx;
-    int64_t* out_idx;  // ROWSCAN_MODE
+    i64w* idx;         // (int64 as words: _wide.slang)
+    i64w* out_idx;     // ROWSCAN_MODE
     uint rows;
     uint n;
     uint stride;
@@ -58,7 +59,7 @@ void main(uint3 id: SV_DispatchThreadID)
         if (OP == ROWSCAN_MODE)
         {
             T best = LOADX(base);
-            int64_t best_idx = p.idx[base];
+            i64w best_idx = p.idx[base];
             uint best_count = 0u, count = 0u;
             for (uint j = 0u; j < p.n; j++)
             {
@@ -77,7 +78,7 @@ void main(uint3 id: SV_DispatchThreadID)
             continue;
         }
         T acc = LOADX(base);
-        int64_t at = 0;
+        int at = 0;
         for (uint j = 0u; j < p.n; j++)
         {
             T v = LOADX(base + j);
@@ -102,10 +103,10 @@ void main(uint3 id: SV_DispatchThreadID)
             if (j == 0u || (!is_nan(acc) && (is_nan(v) || take)))
             {
                 acc = v;
-                at = int64_t(j);
+                at = int(j);
             }
             p.out[base + j] = acc;
-            p.idx[base + j] = at;
+            p.idx[base + j] = i64w_from(at);
         }
     }
 }

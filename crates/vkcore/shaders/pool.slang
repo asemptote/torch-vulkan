@@ -23,12 +23,13 @@
 // dl = (divisor_override or 0, count_include_pad, truncate).
 
 #include "opcodes.slang"
+#include "_wide.slang"
 
 struct Params
 {
     T* a;          // 0   forward: input; backward: grad_output
     T* out;        // 8   forward: output; backward: grad_input
-    int64_t* idx;  // 16  [planes, output size]
+    i64w* idx;     // 16  [planes, output size] (int64 as words: _wide.slang)
     uint total;    // 24  elements written: planes * output size (forward) or input size (backward)
     uint ngroups;  // 28
     uint4 isz;     // 32  input D, H, W (and 0)
@@ -141,7 +142,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             uint oy = r % p.osz.y, oz = r / p.osz.y;
             int z0 = int(oz * p.st.x) - p.pd.x, y0 = int(oy * p.st.y) - p.pd.y, x0 = int(ox * p.st.z) - p.pd.z;
             T best = neg_inf();
-            int64_t at = -1;
+            int at = -1;
             for (uint kz = 0; kz < p.ks.x; kz++)
             {
                 int iz = z0 + int(kz * p.dl.x);
@@ -160,17 +161,17 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                         uint index = (uint(iz) * p.isz.y + uint(iy)) * p.isz.z + uint(ix);
                         T v = p.a[plane * iv + index];
                         if (at < 0)
-                            at = int64_t(index);
+                            at = int(index);
                         if (v > best || isnan(v))
                         {
                             best = v;
-                            at = int64_t(index);
+                            at = int(index);
                         }
                     }
                 }
             }
             p.out[t] = best;
-            p.idx[t] = at;
+            p.idx[t] = i64w_from(at);
         }
         else
         {
@@ -178,7 +179,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             uint ix = r % p.isz.z;
             r /= p.isz.z;
             uint iy = r % p.isz.y, iz = r / p.isz.y;
-            int64_t index = int64_t(t - plane * iv);
+            i64w index = i64w_from(int(t - plane * iv));
             uint2 rz = covering(iz, p.osz.x, p.ks.x, p.st.x, p.pd.x, p.dl.x);
             uint2 ry = covering(iy, p.osz.y, p.ks.y, p.st.y, p.pd.y, p.dl.y);
             uint2 rx = covering(ix, p.osz.z, p.ks.z, p.st.z, p.pd.z, p.dl.z);
@@ -188,7 +189,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                     for (uint ox = rx.x; ox < rx.y; ox++)
                     {
                         uint o = plane * ov + (oz * p.osz.y + oy) * p.osz.z + ox;
-                        if (p.idx[o] == index)
+                        if (all(p.idx[o] == index))
                             sum += p.a[o];
                     }
             p.out[t] = sum;

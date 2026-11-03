@@ -56,6 +56,22 @@ uint2 umod_wide(uint2 a, uint2 b)
     return r;
 }
 
+// An element of an int64 tensor (indices, offsets, targets) as two words.
+// Kernels use these values as 32-bit element offsets (vkcore's limit), so
+// they read the low word, checking the high one where the value comes from
+// the user, and write the sign-extended int.
+typedef uint2 i64w;
+i64w i64w_from(int v) { return uint2(asuint(v), v < 0 ? 0xffffffffu : 0u); }
+int i64w_int(i64w v) { return asint(v.x); }
+bool i64w_fits(i64w v) { return v.y == (asint(v.x) < 0 ? 0xffffffffu : 0u); }  // in int32's range
+
+// The pointer whose 64-bit address is w (lo, hi): an OpBitcast from the two
+// words, which slang's casts would route through a 64-bit integer.
+uint* words_to_uint_ptr(uint2 w)
+{
+    return spirv_asm { result:$$uint* = OpBitcast $w };
+}
+
 // float(v), rounded to nearest even, for the signed 64-bit v: the top 32 bits
 // of |v| with a sticky bit for the rest, so float's one rounding is the
 // 64-bit conversion's.

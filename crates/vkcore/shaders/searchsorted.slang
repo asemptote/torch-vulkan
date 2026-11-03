@@ -7,11 +7,13 @@
 // first i with !(seq[i] < v) (lower bound), as PyTorch compares. OUT32
 // writes int32 instead of int64.
 
+#include "_wide.slang"
+
 struct Params
 {
     T* seq;
     T* vals;
-    int64_t* out;
+    i64w* out;  // (int64 as words: _wide.slang)
     uint m;        // sequence length
     uint q;        // values per row
     uint seq_row;  // elements between sequence rows
@@ -59,6 +61,6 @@ void main(uint3 id: SV_DispatchThreadID)
         if (OUT32 != 0)
             ((int*)p.out)[i] = int(lo);
         else
-            p.out[i] = int64_t(lo);
+            p.out[i] = i64w_from(int(lo));
     }
 }

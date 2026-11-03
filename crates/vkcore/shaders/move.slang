@@ -5,15 +5,17 @@
 //   MOVE_COPY     out = a
 //   MOVE_FILL     out = the value whose bits are in alpha (and beta for 16 bytes)
 //   MOVE_GATHER   out = a[b]: a is the source restrided to out's shape with
-//                 the indexed dims at stride 0, b the element offsets (int64)
+//                 the indexed dims at stride 0, b the element offsets (an
+//                 int64 tensor, read as words: _wide.slang)
 //   MOVE_SCATTER  out[b] = a: out is the destination restrided the same way;
 //                 with A_FILL the value comes from alpha/beta instead of a
 // Duplicate offsets in a scatter write in no particular order, as on CUDA.
 
 #define OUT_T S
 #define IN_T S
-#define B_T int64_t
+#define B_T uint2
 #include "_strided.slang"
+#include "_wide.slang"
 
 [vk::constant_id(0)]
 const int OP = MOVE_COPY;
@@ -43,8 +45,8 @@ void main(uint3 id: SV_DispatchThreadID)
         {
         case MOVE_COPY: p.out[o.o] = p.a[o.a]; break;
         case MOVE_FILL: p.out[o.o] = fill; break;
-        case MOVE_GATHER: p.out[o.o] = p.a[int64_t(o.a) + p.b[o.b]]; break;
-        default: p.out[int64_t(o.o) + p.b[o.b]] = A_FILL != 0 ? fill : p.a[o.a]; break;  // MOVE_SCATTER
+        case MOVE_GATHER: p.out[o.o] = p.a[o.a + i64w_int(p.b[o.b])]; break;
+        default: p.out[o.o + i64w_int(p.b[o.b])] = A_FILL != 0 ? fill : p.a[o.a]; break;  // MOVE_SCATTER
         }
     }
 }
