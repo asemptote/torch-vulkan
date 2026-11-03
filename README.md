@@ -82,8 +82,12 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   rows) use a kernel without shared memory (on Mali it is ordinary cached
   memory) and with 16-byte loads, 2x8 outputs per thread. On the A13 a
   2048x2048 product takes 0.55-0.66 s (26-31 GFLOP/s), against 0.97 s for
-  the shared-memory tiles of `gemm.slang` and 0.64 s on the 8 CPU cores; on
-  the Intel UHD 620 it is 2.5x slower than the tiles, so it is Arm-only
+  the shared-memory tiles of `gemm.slang` and 0.64 s on the 8 CPU cores.
+  Operands in other layouts (`x @ W.t()`'s column-major `W.t()`) are first
+  copied row-major when the product's work is 16x the copy's: `x @ W.t()`
+  at 2048^3 takes 0.57 s against 1.2 s in the tiles (a dot-product kernel
+  reading both operands along k reached only 14 GFLOP/s). On the Intel UHD
+  620 the float4 kernel is 2.5x slower than the tiles, so it is Arm-only
   (`TORCH_VK_GEMM=float4` or `tiled` overrides).
 - **Building on the phone** (`tools/build-termux.sh`): Termux's
   `python-torch` (32-bit ARM), Rust and clang, 15 minutes on the A13; there
@@ -871,8 +875,8 @@ no fallbacks in the OpInfo sweep).
 16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
     the smooth-L1/Huber backward as single kernels.
 17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: Mali
-    products of other layouts and dtypes than row-major float32 (they use
-    the tiles), and on Android this library's typed c10 errors
+    products of other dtypes than float32 and of K or N not multiples of 4
+    (they use the tiles), and on Android this library's typed c10 errors
     (TypeError, IndexError, ...) reach Python as RuntimeError (Android's
     libc++ matches exception types by address, and a Rust cdylib keeps its
     own copies of their type_info).

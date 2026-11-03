@@ -47,11 +47,11 @@ bool prefer_gemm4() {
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
 // batches start 16-byte aligned, K and N multiples of 4.
+bool float4_rows(const at::Tensor& t) {
+  return t.stride(2) == 1 && t.stride(1) % 4 == 0 && t.stride(0) % 4 == 0 && gpu_address(t) % 16 == 0;
+}
 bool gemm4_layout(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t k) {
-  auto aligned = [](const at::Tensor& t) {
-    return t.stride(2) == 1 && t.stride(1) % 4 == 0 && t.stride(0) % 4 == 0 && gpu_address(t) % 16 == 0;
-  };
-  return n % 4 == 0 && k % 4 == 0 && aligned(a) && aligned(b);
+  return n % 4 == 0 && k % 4 == 0 && float4_rows(a) && float4_rows(b);
 }
 
 bool gemm_dtype(at::ScalarType t) {
@@ -95,6 +95,17 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   }
   if (c.numel() == 0) {
     return true;
+  }
+  if (c.scalar_type() == at::kFloat && prefer_gemm4() && n % 4 == 0 && k % 4 == 0 && !gemm4_layout(a, b, n, k)) {
+    // Another layout (as x @ W.t()'s column-major W.t()): a row-major copy of
+    // the operand, then gemm4, when the product's work is 16x the copy's or
+    // more. On the A13: x @ W.t() at 2048^3 0.57 s against 1.2 s in the tiles.
+    int64_t work = batch * m * n * k;
+    bool a_ok = float4_rows(a) || a.numel() * 16 <= work, b_ok = float4_rows(b) || b.numel() * 16 <= work;
+    if (a_ok && b_ok) {
+      at::Tensor a2 = float4_rows(a) ? a : a.contiguous(), b2 = float4_rows(b) ? b : b.contiguous();
+      if (gemm4_layout(a2, b2, n, k)) return gemm(a2, b2, c, cin, alpha, beta);
+    }
   }
   bool use_cin = cin != nullptr && beta != 0.0;
   GemmParams p{};

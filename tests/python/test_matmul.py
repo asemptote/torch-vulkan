@@ -105,6 +105,9 @@ a, b, c = torch.randn(3, 20, 16), torch.randn(3, 16, 36), torch.randn(20, 36)
 cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
 cases.append((torch.addmm(c.to("vk"), a[1].to("vk"), b[1].to("vk"), beta=0.5, alpha=2).cpu(),
               torch.addmm(c, a[1], b[1], beta=0.5, alpha=2)))
+x, w = torch.randn(64, 32), torch.randn(48, 32)  # x @ W.t() and x.t() @ y: copied row-major first
+cases.append(((x.to("vk") @ w.to("vk").t()).cpu(), x @ w.t()))
+cases.append(((x.to("vk").t() @ x.to("vk")).cpu(), x.t() @ x))
 x = torch.randn(65, 40)  # (views 16-byte aligned or not)
 for v in (x[1:, 4:], x[:, 1:37], x[3:, 2:34]):
     w = torch.randn(v.shape[1], 24)
