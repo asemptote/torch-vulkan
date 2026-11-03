@@ -431,6 +431,12 @@ at::Tensor& csr_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const 
 
 at::Tensor csr_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
                      const at::Scalar& alpha) {
+  if (mat1.layout() == at::kSparseCsr && mat2.layout() == at::kSparseCsr) {  // all sparse: a CSR result
+    at::Tensor base = self.layout() == at::kStrided ? self : self.to_dense();
+    at::Tensor dense = at::empty({0}, mat2.values().options().layout(at::kStrided));
+    csr_addmm_out(base, mat1, mat2.to_dense(), beta, alpha, dense);
+    return dense.to_sparse_csr();
+  }
   at::Tensor out = at::empty({0}, mat2.options().layout(at::kStrided).dtype(at::result_type(mat1, mat2)));
   return csr_addmm_out(self, mat1, mat2, beta, alpha, out);
 }
@@ -856,4 +862,78 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_to_sparse_csc", TORCH_FN(vk::dense_csc));
   m.impl("_to_sparse_bsr", TORCH_FN(vk::dense_bsr));
   m.impl("_to_sparse_bsc", TORCH_FN(vk::dense_bsc));
+}
+
+// ---------------------------------------------------------------- more compressed ops
+
+namespace vk {
+namespace {
+
+// sum of a CSR tensor over dims (keepdim, as PyTorch's sparse CSR sum): the
+// dense sum, back to CSR.
+at::Tensor csr_sum_dim(const at::Tensor& self, at::IntArrayRef dim, bool keepdim, std::optional<at::ScalarType> dtype) {
+  at::Tensor d = at::sum(self.to_dense(), dim, keepdim, dtype);
+  return d.dim() >= 2 ? to_csr_from(d, std::nullopt) : d;
+}
+
+// CSR (+) CSR or dense (+) CSR: the entries of both (through COO, explicit
+// zeros kept), or the dense sum.
+at::Tensor& csr_add_out(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha, at::Tensor& out) {
+  if (self.layout() == at::kStrided) {
+    at::Tensor r = at::add(self, other.to_dense(), alpha);
+    if (!out.is_same(self)) at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
+  }
+  TORCH_CHECK(self.sizes() == other.sizes(), "Expected input tensors to have the same shape, but got tensor(", self.sizes(),
+              ") and tensor(", other.sizes(), ")");
+  at::Tensor a = self.to_sparse(), b = other.layout() == at::kStrided ? other.to_sparse() : other.to_sparse();
+  at::Tensor r = to_layout(at::add(a, b, alpha).coalesce(), self.layout(), std::nullopt, self.dense_dim());
+  out.copy_(r);
+  return out;
+}
+
+// beta self + alpha (mat1 @ mat2) at the entries of the CSR self.
+at::Tensor sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
+                         const at::Scalar& alpha) {
+  TORCH_CHECK(self.layout() == at::kSparseCsr && self.dim() == 2, "sampled_addmm: expected a 2-D CSR self");
+  at::Tensor product = at::mm(mat1.layout() == at::kStrided ? mat1 : mat1.to_dense(),
+                              mat2.layout() == at::kStrided ? mat2 : mat2.to_dense());
+  at::Tensor idx = convert_csr_to_coo(self.crow_indices(), self.col_indices(), false, false);
+  at::Tensor picked = at::index(product, {std::optional<at::Tensor>(idx.select(0, 0)), std::optional<at::Tensor>(idx.select(0, 1))});
+  at::Tensor values = at::add(self.values() * beta, picked, alpha);
+  return at::_sparse_compressed_tensor_unsafe(self.crow_indices().clone(), self.col_indices().clone(), values,
+                                              self.sizes(), values.options().layout(at::kSparseCsr));
+}
+
+at::Tensor& sampled_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
+                              const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
+  out.copy_(sampled_addmm(self, mat1, mat2, beta, alpha));
+  return out;
+}
+
+}  // namespace
+}  // namespace vk
+
+TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
+  using namespace at::native;
+  m.impl("angle", TORCH_FN(angle_sparse_csr));
+  m.impl("angle.out", TORCH_FN(angle_sparse_csr_out));
+  m.impl("mul.out", TORCH_FN(mul_out_sparse_csr));
+  m.impl("isneginf.out", TORCH_FN(isneginf_sparse_csr_out));
+  m.impl("isposinf.out", TORCH_FN(isposinf_sparse_csr_out));
+  m.impl("signbit.out", TORCH_FN(signbit_sparse_csr_out));
+  m.impl("resize_", TORCH_FN(resize_sparse_csr_));
+  m.impl("select_copy.int", TORCH_FN(select_copy_sparse_csr));
+  m.impl("_sparse_csr_sum.dim_dtype", TORCH_FN(vk::csr_sum_dim));
+  m.impl("add.out", TORCH_FN(vk::csr_add_out));
+  m.impl("sparse_sampled_addmm", TORCH_FN(vk::sampled_addmm));
+  m.impl("sparse_sampled_addmm.out", TORCH_FN(vk::sampled_addmm_out));
+}
+
+TORCH_LIBRARY_IMPL(aten, SparsePrivateUse1, m) {
+  using namespace at::native;
+  m.impl("isneginf.out", TORCH_FN(isneginf_sparse_out));
+  m.impl("isposinf.out", TORCH_FN(isposinf_sparse_out));
+  m.impl("signbit.out", TORCH_FN(signbit_sparse_out));
 }
