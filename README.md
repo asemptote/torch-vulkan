@@ -816,9 +816,9 @@ evidence as its reason, rather than a workaround.
 1. ~~**M1 core runtime**~~: done (see above). Deferred: finer-grained barriers
    (per-allocation dependency tracking) and a separate transfer queue.
 2. ~~**M2 Python prototype**~~: done; superseded by M3.
-3. ~~**M3 native backend**~~: done (see above). Not yet: bool binary ops
-   (`&`, `*` on masks), multiple devices, pinned memory. (A GPU random-number
-   generator came with M11.)
+3. ~~**M3 native backend**~~: done (see above). Not yet: multiple devices,
+   pinned memory. (A GPU random-number generator came with M11; bool binary
+   ops and 8/16-bit accumulation run on the GPU since.)
 4. ~~**M4 reductions, scans, float64 math**~~: done (see above); the ops
    it left (`logcumsumexp`, `cummax`, `median`, `masked_select`, float64
    `pow`/`atan2`, the arg-reduction thread-per-output mode) came later. Not
@@ -828,8 +828,8 @@ evidence as its reason, rather than a workaround.
    convolutions.
 6. ~~**M6 complex numbers + FFT**~~: done (see above), with an own FFT
    rather than VkFFT (VkFFT's Vulkan backend needs the raw device/queue
-   handles and runtime glslang). Not yet: complex reductions, complex
-   matmul, complex transcendentals, faster FFT kernels.
+   handles and runtime glslang). Not yet: faster FFT kernels. (Complex
+   reductions, scans, matmul and transcendentals came with M14.)
 7. ~~**M7 dense linear algebra**~~: done (see above). Not yet: blocked QR
    (compact-WY updates), batched GPU paths, look-ahead, eigh/SVD on the GPU.
 8. ~~**M8 element-wise completeness**~~ and infrastructure cleanup: done (see
@@ -845,7 +845,7 @@ no fallbacks in the OpInfo sweep).
    with a tensor of repeats and `tril_indices`/`triu_indices` came with M17.)
 10. ~~**M10 sorting, searching and statistics**~~: done (see above).
     (`histogram`/`histogramdd` came with M14, `unique(dim=...)` with M17.)
-    Not yet: accumulation for 8/16-bit and complex dtypes, a radix sort for very long
+    Not yet: a radix sort for very long
     rows (bitonic is O(n log^2 n)), parallel scans for single long rows in
     cummax/cummin/logcumsumexp.
 11. ~~**M11 random numbers**~~: done (see above). (`rrelu`'s noise came
