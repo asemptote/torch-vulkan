@@ -59,6 +59,31 @@ double widen(float x)
 #define TO_WIDE(v) widen(float(v))
 #endif
 
+// The low 32 bits of float x truncated to int64, as the CPU converts: |x| <
+// 2^31 directly; up to 2^63 from the mantissa shifted into place (the
+// magnitude's low word, negated for x < 0); beyond, and NaN, int64's
+// "indefinite" value 0x8000000000000000, whose low word is 0.
+int wrap32(float x)
+{
+    float a = abs(x);
+    if (a < 2147483648.0f)
+        return int(x);
+    if (!(a < 9.223372036854775808e18f))
+        return 0;
+    uint bits = asuint(a);
+    uint sh = ((bits >> 23) & 0xffu) - 150u;  // a = m 2^sh, 24-bit m, sh >= 8 here
+    uint low = sh >= 32u ? 0u : ((bits & 0x7fffffu) | 0x800000u) << sh;
+    return x < 0.0f ? -int(low) : int(low);
+}
+
+// float x truncated to int32 as the CPU converts to int16 (through int32,
+// not int64): out of range, and NaN, int32's "indefinite" 0x80000000, whose
+// low 16 bits are 0.
+int trunc32(float x)
+{
+    return abs(x) < 2147483648.0f ? int(x) : 0;
+}
+
 DV convert(SV x)
 {
 #if defined(SRC_b8)
@@ -71,16 +96,25 @@ DV convert(SV x)
     return x != SV(0) ? uint8_t(1) : uint8_t(0);
 #endif
 #elif defined(DST_u8) || defined(DST_i8) || defined(DST_i16)
-    // Through int64, so out-of-range values wrap as on the CPU (e.g. -3.0 -> 253).
-    // (half through int32, which holds its whole range: Intel's UHD 620
-    // driver saturated half -> int64 -> 8 bits at 127, e.g. 178.6 -> 127 as
-    // uint8, also through float; lavapipe and NVIDIA wrap as the CPU)
-#ifdef SRC_COMPLEX
-    return DV(int64_t(x.x));
-#elif defined(SRC_f16)
-    return DV(int(x));
-#else
+    // As the CPU, through int64, so out-of-range values wrap (e.g. -3.0 ->
+    // 253): only the int64's low word matters, which wrap32 forms without
+    // 64-bit integers (Mali GPUs lack them; float64 sources keep them).
+    // (Half through float: Intel's UHD 620 driver saturated half -> int64 at
+    // 127, e.g. 178.6 -> 127 as uint8; lavapipe and NVIDIA wrap as the CPU.)
+#if defined(SRC_f64)
     return DV(int64_t(x));
+#elif defined(SRC_c128)
+    return DV(int64_t(x.x));
+#elif defined(SRC_COMPLEX) && defined(DST_i16)
+    return DV(trunc32(x.x));
+#elif defined(SRC_COMPLEX)
+    return DV(wrap32(x.x));
+#elif (defined(SRC_f32) || defined(SRC_f16) || defined(SRC_bf16)) && defined(DST_i16)
+    return DV(trunc32(float(x)));
+#elif defined(SRC_f32) || defined(SRC_f16) || defined(SRC_bf16)
+    return DV(wrap32(float(x)));
+#else
+    return DV(int(x));  // (integer sources fit)
 #endif
 #elif defined(DST_PART) && defined(TO_WIDE)
 #ifdef SRC_COMPLEX

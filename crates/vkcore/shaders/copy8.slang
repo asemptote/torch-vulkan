@@ -1,4 +1,5 @@
-// axis S: b1=uint8_t b2=uint16_t b4=uint b8=uint64_t b16=uint4
+// axis S: b1=uint8_t b2=uint16_t b4=uint b8=uint2 b16=uint4
+// (8-byte elements as two words: no 64-bit integers, which Mali GPUs lack)
 //
 // out = a, strided over up to 8 dims, by element size (any dtype of that
 // size). The strided kernels (_strided.slang) take 4 dims and the host loops

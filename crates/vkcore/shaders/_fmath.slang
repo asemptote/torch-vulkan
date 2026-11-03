@@ -17,6 +17,7 @@
 #endif
 
 #if defined(T_f32) || defined(FMATH_F32)
+#include "_wide.slang"
 #include "_math32.slang"
 
 typedef float FT;  // the scalar type of these functions
@@ -47,48 +48,6 @@ float m_log1p(float x) { return log1p32(x); }
 // with Machin's formula).
 static const uint TWO_OVER_PI_32[9] = {0x00000000u, 0x28be60dbu, 0x9391054au, 0x7f09d5f4u, 0x7d4d3770u, 0x36d8a566u,
                                        0x4f10e410u, 0x7f9458eau, 0xf7aef158u};
-
-// a * b as a 64-bit value in 32-bit words (lo, hi), from 16-bit halves.
-uint2 mul_wide32(uint a, uint b)
-{
-    uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;
-    uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
-    uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);
-    return uint2((p00 & 0xffffu) | (mid << 16), p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16));
-}
-
-// v + c for v = (lo, hi), mod 2^64.
-uint2 add_wide32(uint2 v, uint c)
-{
-    uint lo = v.x + c;
-    return uint2(lo, v.y + (lo < c ? 1u : 0u));
-}
-
-// float(v), rounded to nearest even, for the signed 64-bit v = (lo, hi): the
-// top 32 bits of |v| with a sticky bit for the rest, so float's one rounding
-// is the 64-bit conversion's.
-float int64_words_to_float(uint lo, uint hi)
-{
-    bool neg = (hi >> 31) != 0u;
-    if (neg)
-    {
-        lo = ~lo + 1u;
-        hi = ~hi + (lo == 0u ? 1u : 0u);
-    }
-    float f;
-    if (hi == 0u)
-    {
-        f = float(lo);
-    }
-    else
-    {
-        uint lz = 31u - uint(firstbithigh(hi));
-        uint top = lz == 0u ? hi : (hi << lz) | (lo >> (32u - lz));
-        uint rest = lz == 0u ? lo : lo << lz;
-        f = ldexp(float(top | (rest != 0u ? 1u : 0u)), float(32u - lz));
-    }
-    return neg ? -f : f;
-}
 
 // Payne-Hanek for finite |x| >= 800, after N. Juffa: x times 96 bits of 2/pi
 // (chosen by x's exponent) in 2.62 fixed point, rounded to the nearest

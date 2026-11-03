@@ -1,4 +1,5 @@
-// axis S: b1=uint8_t b2=uint16_t b4=uint b8=uint64_t b16=uint4
+// axis S: b1=uint8_t b2=uint16_t b4=uint b8=uint2 b16=uint4
+// (8-byte elements as two words: no 64-bit integers, which Mali GPUs lack)
 //
 // Data movement by element size (any dtype of that size), strided. OP:
 //   MOVE_COPY     out = a
@@ -24,7 +25,7 @@ S fill_value()
 #if defined(S_b16)
     return uint4(p.alpha_bits.x, p.alpha_bits.y, p.beta_bits.x, p.beta_bits.y);
 #elif defined(S_b8)
-    return S(slot_int64(p.alpha_bits));
+    return p.alpha_bits;
 #else
     return S(p.alpha_bits.x);
 #endif

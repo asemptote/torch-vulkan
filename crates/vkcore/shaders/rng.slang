@@ -4,7 +4,7 @@
 // its bits from counter (i, offset) under key `seed`, so a (seed, offset)
 // pair gives the same numbers however the work is split across threads, and
 // the host advances `offset` once per call. OP (parameters a, b as raw
-// 64-bit slots: PARAM_T values, or int64 for RNG_RANDOM):
+// 64-bit slots, _slot.slang: PARAM_T values, or int64 for RNG_RANDOM):
 //   RNG_UNIFORM      a + (b - a) u,  u in [0, 1)
 //   RNG_NORMAL       a + b z,        z standard normal (Box-Muller)
 //   RNG_RANDOM       a + bits mod b  (integers; b == 0 means all 64 bits)
@@ -16,6 +16,7 @@
 // and casts).
 
 #include "_types.slang"
+#include "_wide.slang"
 #include "opcodes.slang"
 #if defined(T_f32) || defined(T_f64)
 #define IS_FLOAT 1
@@ -25,10 +26,10 @@
 struct Params
 {
     T* out;
-    uint64_t seed;
-    uint64_t offset;
-    uint64_t a_bits;
-    uint64_t b_bits;
+    slot64 seed;
+    slot64 offset;
+    slot64 a_bits;
+    slot64 b_bits;
     uint n;
     uint stride;
 };
@@ -42,9 +43,9 @@ uint4 philox(uint4 c, uint2 k)
 {
     for (int r = 0; r < 10; r++)
     {
-        uint64_t p0 = uint64_t(0xD2511F53u) * uint64_t(c.x);
-        uint64_t p1 = uint64_t(0xCD9E8D57u) * uint64_t(c.z);
-        c = uint4(uint(p1 >> 32) ^ c.y ^ k.x, uint(p1), uint(p0 >> 32) ^ c.w ^ k.y, uint(p0));
+        uint2 p0 = mul_wide32(0xD2511F53u, c.x);
+        uint2 p1 = mul_wide32(0xCD9E8D57u, c.z);
+        c = uint4(p1.y ^ c.y ^ k.x, p1.x, p0.y ^ c.w ^ k.y, p0.x);
         k += uint2(0x9E3779B9u, 0xBB67AE85u);
     }
     return c;
@@ -53,9 +54,9 @@ uint4 philox(uint4 c, uint2 k)
 #ifdef IS_FLOAT
 typedef T R;  // the precision distributions are computed in
 #if defined(PARAM_DOUBLE)
-R param(uint64_t bits) { return bit_cast<double>(bits); }
+R param(slot64 bits) { return slot_double(bits); }
 #else
-R param(uint64_t bits) { return bit_cast<float>(uint(bits)); }
+R param(slot64 bits) { return slot_float(bits); }
 #endif
 
 // Uniform in [0, 1) from the bits: 24 bits for float, 53 for double.
@@ -63,7 +64,8 @@ R uniform(uint4 x, int which)
 {
 #if defined(PARAM_DOUBLE)
     uint hi = which == 0 ? x.x : x.z, lo = which == 0 ? x.y : x.w;
-    return R((uint64_t(hi >> 5) << 26) | uint64_t(lo >> 6)) * 1.1102230246251565e-16l;  // 2^-53
+    // ((hi >> 5) 2^26 + (lo >> 6)) 2^-53, both parts and their sum exact in a double
+    return (R(hi >> 5) * 67108864.0l + R(lo >> 6)) * 1.1102230246251565e-16l;
 #else
     return R((which == 0 ? x.x : x.z) >> 8) * 5.9604644775390625e-8f;  // 2^-24
 #endif
@@ -81,20 +83,30 @@ R standard_normal(uint4 x)
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
-    uint2 key = uint2(uint(p.seed), uint(p.seed >> 32));
+    uint2 key = p.seed;
     for (uint i = id.x; i < p.n; i += p.stride)
     {
-        uint4 x = philox(uint4(i, 0u, uint(p.offset), uint(p.offset >> 32)), key);
+        uint4 x = philox(uint4(i, 0u, p.offset.x, p.offset.y), key);
         if (OP == RNG_RANDOM)
         {
             // As the CPU: 64 random bits from a range of 2^28 on (32 bits
             // modulo a larger range skew it), range 0 being the full 2^64.
-            uint64_t range = p.b_bits;
-            uint64_t bits = range != 0ull && range < 0x10000000ull ? uint64_t(x.x) % range
-                                                                    : ((uint64_t(x.x) << 32) | uint64_t(x.y));
-            if (range >= 0x10000000ull)
-                bits %= range;
-            p.out[i] = T(int64_t(p.a_bits) + int64_t(bits));
+            // (In 32-bit words: _wide.slang.)
+            uint2 range = p.b_bits;
+            bool small = range.y == 0u && range.x != 0u && range.x < 0x10000000u;
+            uint2 bits = small ? uint2(x.x % range.x, 0u) : uint2(x.y, x.x);
+            if (!small && (range.x | range.y) != 0u)
+                bits = umod_wide(bits, range);
+            uint2 v = add_wide(p.a_bits, bits);
+#if defined(T_i64)
+            p.out[i] = T(int64_t(uint64_t(v.x) | (uint64_t(v.y) << 32)));
+#elif defined(T_f64)
+            p.out[i] = T(asint(v.y)) * 4294967296.0l + T(v.x);  // (exact parts, one rounding)
+#elif defined(IS_FLOAT)
+            p.out[i] = T(int64_words_to_float(v.x, v.y));
+#else
+            p.out[i] = T(int(v.x));
+#endif
             continue;
         }
 #ifdef IS_FLOAT
