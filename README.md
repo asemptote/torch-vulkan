@@ -133,11 +133,16 @@ kernels:
   broadcasting as PyTorch's (a dense operand's batch dims become sparse
   dims), `sparse_mask` and its gradient projection;
 - `mm`/`addmm`/`addmv`/`bmm`/`hspmm`/`torch.sparse.mm` for any mix of dense
-  and compressed operands, with autograd and the dense ops' errors;
-  `sampled_addmm`, batched and broadcast;
+  and compressed operands, with autograd and the dense ops' errors; sparse
+  @ sparse from the entries (each entry of the first meets its row of the
+  second, found by a sorted search; the products coalesced), so memory
+  grows with the products, not the dense size; `sampled_addmm`, batched
+  and broadcast;
 - sparse `softmax`/`log_softmax` and their gradients (over the specified
   elements), the gradient of sparse `sum`, sum and prod of compressed
-  tensors over dims, `triangular_solve` with a compressed matrix.
+  tensors over dims (the entries accumulated by their kept indices; complex
+  products pairwise by sorted runs), `triangular_solve` with a compressed
+  matrix.
 
 PyTorch's test_sparse.py and test_sparse_csr.py pass on vk but for tests
 whose expectations name other devices (printing's per-device files,
@@ -145,9 +150,7 @@ error-message patterns for CPU/CUDA/MPS, products the CPU refuses), listed
 with their reasons in `tools/pytorch_tests.py`. They run locally, not in
 the cluster's full runs (their slowest gradchecks take minutes each).
 
-Not yet (M18): the sparse-sparse product and the compressed reductions as
-sparse kernels (they go through dense operands, so memory grows with the
-dense size), and per-op overhead on tiny sparse tensors (each op is a few
+Not yet (M18): per-op overhead on tiny sparse tensors (each op is a few
 kernel launches: about 10x the CPU's time at a handful of elements).
 
 ## Dedicated kernels (M16)
@@ -908,6 +911,6 @@ no fallbacks in the OpInfo sweep).
     the smooth-L1/Huber backward as single kernels.
 17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: int64
     Mali products in gemm4 (they use the tiles).
-18. ~~**M18 sparse tensors**~~: done (see above). Not yet: sparse kernels
-    for the sparse-sparse product and compressed reductions.
+18. ~~**M18 sparse tensors**~~: done (see above). Not yet: lower per-op
+    overhead on tiny sparse tensors.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

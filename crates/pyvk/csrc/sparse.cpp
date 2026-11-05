@@ -299,11 +299,43 @@ at::Tensor& addmm_(at::Tensor& self, const at::Tensor& mat1, const at::Tensor& m
   return addmm_out(self, mat1, mat2, beta, alpha, self);
 }
 
+// sparse [n, m] @ sparse [m, p], no dense dims, from the entries: each
+// entry (i, k) of `a` meets row k of `b` (found by a sorted search), the
+// products coalesced. Memory grows with the products' count, not n * p.
+// Products that cancel stay as entries (zeros), as the CPU's.
+at::Tensor spgemm(const at::Tensor& a0, const at::Tensor& b0) {
+  at::Tensor a = a0.coalesce(), b = b0.coalesce();
+  int64_t n = a.size(0), m = a.size(1), p = b.size(1);
+  at::Tensor ai = a._indices(), bi = b._indices();
+  at::TensorOptions lopts = ai.options();
+  int64_t total = 0;
+  at::Tensor start, counts;
+  if (a._nnz() > 0 && b._nnz() > 0) {
+    at::Tensor bptr = at::searchsorted(bi.select(0, 0).contiguous(), at::arange(m + 1, lopts));  // (b's rows sorted)
+    at::Tensor ak = ai.select(0, 1);
+    start = bptr.index_select(0, ak);
+    counts = bptr.index_select(0, ak + 1) - start;
+    total = counts.sum().item<int64_t>();
+  }
+  if (total == 0) {
+    return make_sparse(a, 2, 0, {n, p}, at::empty({2, 0}, lopts), at::empty({0}, a._values().options()), true);
+  }
+  at::Tensor rep = at::repeat_interleave(at::arange(a._nnz(), lopts), counts, 0, total);
+  at::Tensor first = at::cumsum(counts, 0) - counts;  // each A entry's first product
+  at::Tensor pos = at::arange(total, lopts) - first.index_select(0, rep) + start.index_select(0, rep);
+  at::Tensor rows = ai.select(0, 0).index_select(0, rep), cols = bi.select(0, 1).index_select(0, pos);
+  at::Tensor vals = a._values().index_select(0, rep) * b._values().index_select(0, pos);
+  return make_sparse(a, 2, 0, {n, p}, at::stack({rows, cols}), vals, false).coalesce();
+}
+
 at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
   TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: expected 2-D tensors");
   if (self.is_sparse() && mat2.is_sparse()) {  // sparse @ sparse: sparse
     TORCH_CHECK(self.scalar_type() == mat2.scalar_type(), "mat1 dtype ", self.scalar_type(),
                 " does not match mat2 dtype ", mat2.scalar_type());
+    TORCH_CHECK(self.size(1) == mat2.size(0), "mat1 and mat2 shapes cannot be multiplied (", self.size(0), "x",
+                self.size(1), " and ", mat2.size(0), "x", mat2.size(1), ")");
+    if (self.dense_dim() == 0 && mat2.dense_dim() == 0) return spgemm(self, mat2);
     return vk::mm(self, mat2.to_dense()).to_sparse();
   }
   if (!self.is_sparse()) {  // dense @ sparse = (sparse^T @ dense^T)^T
@@ -642,8 +674,13 @@ at::Tensor csr_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::T
 at::Tensor csr_mm(const at::Tensor& self, const at::Tensor& mat2) {
   bool shapes_ok = self.dim() == 2 && mat2.dim() == 2 && self.size(1) == mat2.size(0);
   if (!shapes_ok) return at::mm(dense_of(self), dense_of(mat2));  // (the dense op's error)
+  if (compressed_layout(self) && compressed_layout(mat2) && self.dense_dim() == 0 && mat2.dense_dim() == 0) {
+    // CSR, as PyTorch's: the sparse product of the entries
+    return to_layout(spgemm(compressed_as_coo(self), compressed_as_coo(mat2)), at::kSparseCsr, std::nullopt,
+                     std::nullopt);
+  }
   at::Tensor r = any_mm(self, mat2);
-  if (compressed_layout(self) && compressed_layout(mat2)) {  // CSR, as PyTorch's
+  if (compressed_layout(self) && compressed_layout(mat2)) {
     return to_layout(r.contiguous(), at::kSparseCsr, std::nullopt, std::nullopt);
   }
   return r;
@@ -888,7 +925,7 @@ at::Tensor index_select_coo(const at::Tensor& self, int64_t dim, const at::Tenso
 at::Tensor sparse_sparse_matmul(const at::Tensor& a, const at::Tensor& b) {
   TORCH_CHECK(a.scalar_type() == b.scalar_type(), "mat1 dtype ", a.scalar_type(), " does not match mat2 dtype ",
               b.scalar_type());
-  return vk::mm(a, b.to_dense()).to_sparse().coalesce();
+  return vk::mm(a, b).coalesce();
 }
 
 }  // namespace
@@ -1157,24 +1194,89 @@ namespace {
 // A CSR tensor reduced over dims (sum, or prod: over the specified elements
 // only, unspecified ones count as zeros for sum and as ones for prod, as
 // PyTorch's masked reductions): CSR where any reduced element was specified.
+// The products of v's rows [n, *] by key into out (ones) [groups, *]: the
+// rows sorted by key, then neighbours of a key multiplied pairwise, halving
+// the rows per round (log2 of the longest run rounds).
+at::Tensor segment_prod(const at::Tensor& key, const at::Tensor& v0, at::Tensor out) {
+  auto [ks, order] = at::sort(key, /*stable=*/true, 0, false);
+  at::Tensor v = v0.index_select(0, order);
+  while (ks.numel() > 1) {
+    int64_t n = ks.numel();
+    at::Tensor same_next = at::eq(ks.narrow(0, 1, n - 1), ks.narrow(0, 0, n - 1));  // [n - 1]
+    if (!same_next.any().item<bool>()) break;  // (one row per key)
+    at::Tensor head = at::cat({at::ones({1}, same_next.options()), at::logical_not(same_next)});
+    at::Tensor idx = at::arange(n, ks.options());
+    at::Tensor start = std::get<0>(at::cummax(at::where(head, idx, at::zeros({}, idx.options())), 0));
+    at::Tensor even = at::eq(at::remainder(idx - start, 2), 0);
+    at::Tensor has_next = at::cat({same_next, at::zeros({1}, same_next.options())});
+    std::vector<int64_t> one_shape(v.sizes().begin(), v.sizes().end());
+    one_shape[0] = 1;
+    at::Tensor next_v = at::cat({v.narrow(0, 1, n - 1), at::ones(one_shape, v.options())});
+    std::vector<int64_t> bshape(v.dim(), 1);
+    bshape[0] = n;
+    at::Tensor partner = at::where(has_next.view(bshape), next_v, at::ones({}, v.options()));
+    at::Tensor keep = at::nonzero(even).reshape({-1});
+    v = (v * partner).index_select(0, keep);
+    ks = ks.index_select(0, keep);
+  }
+  return out.index_copy_(0, ks, v);
+}
+
 at::Tensor csr_reduce(const at::Tensor& self, at::IntArrayRef dim, bool keepdim, std::optional<at::ScalarType> dtype,
                       bool prod) {
-  at::Tensor d = self.to_dense();
-  at::Tensor spec = specified_mask(self);
-  if (prod) d = at::where(spec, d, at::ones({}, d.options()));
-  std::vector<int64_t> dims(dim.begin(), dim.end());
-  for (auto& k : dims) k = at::maybe_wrap_dim(k, d.dim());
-  std::sort(dims.rbegin(), dims.rend());
-  at::Tensor r = d;
-  if (prod) {
-    for (int64_t k : dims) r = at::prod(r, k, keepdim, dtype);
-  } else {
-    r = at::sum(d, dims, keepdim, dtype);
+  // From the entries, not through dense: the reduced result (its keepdim
+  // shape) accumulates them by their kept indices, so memory grows with nnz
+  // and the result's size.
+  TORCH_CHECK(keepdim, "reduction operations on CSR tensors with keepdim=False is unsupported");
+  int64_t nd = self.dim();
+  std::vector<bool> reduced(nd, false);
+  for (int64_t k : dim) reduced[at::maybe_wrap_dim(k, nd)] = true;
+  if (dim.empty() && !prod) std::fill(reduced.begin(), reduced.end(), true);  // (at::sum over no dims: all)
+  at::ScalarType st = self.scalar_type();
+  at::ScalarType out_t = dtype.value_or(at::isIntegralType(st, true) ? at::kLong : st);
+  at::Tensor e = compressed_entries(self);
+  int64_t sd = e.sparse_dim();
+  at::Tensor vals = e._values().to(out_t);  // [nnz, *dense]
+  for (int64_t d = nd - 1; d >= sd; --d) {
+    if (!reduced[d]) continue;
+    vals = prod ? at::prod(vals, d - sd + 1, true) : at::sum(vals, {d - sd + 1}, true);
   }
-  if (r.dim() < 2) return r;
-  at::Tensor any = spec;
-  for (int64_t k : dims) any = any.any(k, keepdim);
-  return to_csr_from(dense_to_compressed(r.contiguous(), at::kSparseCsr, std::nullopt, 0, any), std::nullopt);
+  std::vector<int64_t> kd_shape(self.sizes().begin(), self.sizes().end());
+  for (int64_t d = 0; d < nd; ++d) {
+    if (reduced[d]) kd_shape[d] = 1;
+  }
+  std::vector<int64_t> kd_sparse(kd_shape.begin(), kd_shape.begin() + sd);
+  int64_t groups = 1;
+  for (int64_t s : kd_sparse) groups *= s;
+  at::Tensor idx = e._indices().clone();
+  for (int64_t d = 0; d < sd; ++d) {
+    if (reduced[d]) idx.select(0, d).zero_();
+  }
+  std::vector<int64_t> flat_shape = {groups};
+  flat_shape.insert(flat_shape.end(), vals.sizes().begin() + 1, vals.sizes().end());
+  at::Tensor r = prod ? at::ones(flat_shape, vals.options()) : at::zeros(flat_shape, vals.options());
+  at::Tensor any = at::zeros(flat_shape, vals.options().dtype(at::kBool));
+  if (e._nnz() > 0) {
+    at::Tensor key = linear_keys(idx, kd_sparse, sd);
+    if (prod && at::isComplexType(out_t)) {
+      r = segment_prod(key, vals, r);  // (index_reduce has no complex kernel)
+    } else {
+      r = prod ? r.index_reduce_(0, key, vals, "prod", true) : r.index_add_(0, key, vals);
+    }
+    any.index_fill_(0, key, true);
+  }
+  r = r.view(kd_shape);
+  any = any.view(kd_shape);
+  if (!keepdim) {
+    for (int64_t d = nd - 1; d >= 0; --d) {
+      if (reduced[d]) {
+        r = r.squeeze(d);
+        any = any.squeeze(d);
+      }
+    }
+  }
+  if (r.dim() < 2) return r.contiguous();
+  return to_csr_from(dense_to_compressed(r.contiguous(), at::kSparseCsr, std::nullopt, 0, any.contiguous()), std::nullopt);
 }
 
 at::Tensor csr_sum_dim(const at::Tensor& self, at::IntArrayRef dim, bool keepdim, std::optional<at::ScalarType> dtype) {

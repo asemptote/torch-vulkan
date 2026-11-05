@@ -196,3 +196,30 @@ def test_csr_products_and_sampled_addmm():
     same(torch.sparse.sampled_addmm(*vk(m, x, y), beta=0.5), torch.sparse.sampled_addmm(m, x, y, beta=0.5), 1e-4)
     with pytest.raises(RuntimeError, match="shapes cannot be multiplied"):
         torch.mm(*vk(a.to_sparse_csr(), a))
+
+
+def test_sparse_products_and_reductions_without_dense():
+    # sizes whose dense form would not fit: the product and the sums work from the entries
+    torch.manual_seed(0)
+    n, nnz = 100000, 20000
+    a = torch.sparse_coo_tensor(torch.randint(0, n, (2, nnz)), torch.randn(nnz), (n, n)).coalesce()
+    with on_gpu():
+        got = torch.sparse.mm(a.to("vk"), a.to("vk"))
+    want = torch.sparse.mm(a, a).coalesce()
+    assert torch.equal(got.cpu()._indices(), want._indices())
+    torch.testing.assert_close(got.cpu()._values(), want._values())
+    c = a.to_sparse_csr()
+    with on_gpu():
+        s = torch.sum(c.to("vk"), (0,), keepdim=True)
+    w = torch.sum(c, (0,), keepdim=True)
+    assert torch.equal(s.cpu().col_indices(), w.col_indices())
+    torch.testing.assert_close(s.cpu().values(), w.values(), rtol=1e-4, atol=1e-5)
+    # products that cancel stay as entries, as the CPU's; complex masked prod
+    x = torch.sparse_coo_tensor([[0, 0], [0, 1]], [1.0, 1.0], (2, 2))
+    y = torch.sparse_coo_tensor([[0, 1], [0, 0]], [1.0, -1.0], (2, 2))
+    assert torch.sparse.mm(x.to("vk"), y.to("vk"))._nnz() == torch.sparse.mm(x, y)._nnz() == 1
+    z = (torch.randn(6, 7, dtype=torch.complex64) * (torch.rand(6, 7) < 0.6)).to_sparse_csr()
+    for d in (0, 1):
+        with on_gpu():
+            g = torch._sparse_csr_prod(z.to("vk"), [d], True)
+        torch.testing.assert_close(g.cpu().to_dense(), torch._sparse_csr_prod(z, [d], True).to_dense())
