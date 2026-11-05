@@ -90,16 +90,20 @@ at::Tensor coalesce(const at::Tensor& self) {
   if (at::gt(key.narrow(0, 1, nnz - 1), key.narrow(0, 0, nnz - 1)).all().item<bool>()) {
     return make_sparse(self, sd, dd, self.sizes(), indices.clone(), values.clone(), true);
   }
-  auto [sorted, order] = at::sort(key, /*stable=*/true, 0, false);
-  at::Tensor head = at::ones({nnz}, key.options().dtype(at::kBool));
-  head.narrow(0, 1, nnz - 1).copy_(at::ne(sorted.narrow(0, 1, nnz - 1), sorted.narrow(0, 0, nnz - 1)));
-  at::Tensor group = at::cumsum(head, 0, at::kLong) - 1;
-  at::Tensor unique_keys = at::masked_select(sorted, head);
-  int64_t u = unique_keys.numel();
+  // one stable sort of the keys; each entry's group from the runs; the values
+  // summed by group in index order (one launch), as the CPU's coalesce
+  at::Tensor order = sort_rows(key.reshape({1, nnz}).contiguous(), false).reshape({nnz});
+  at::Tensor ol = order.to(at::kLong);
+  at::Tensor sorted = key.index_select(0, ol);
+  at::Tensor head = at::cat({at::ones({1}, key.options().dtype(at::kBool)),
+                             at::ne(sorted.narrow(0, 1, nnz - 1), sorted.narrow(0, 0, nnz - 1))});
+  at::Tensor group_sorted = at::cumsum(head, 0, at::kLong) - 1;
+  int64_t u = group_sorted[nnz - 1].item<int64_t>() + 1;
+  at::Tensor group = at::empty({nnz}, key.options()).index_copy_(0, ol, group_sorted);
+  at::Tensor unique_keys = at::zeros({u}, key.options()).index_copy_(0, group_sorted, sorted);  // (a run's keys agree)
   std::vector<int64_t> vshape(values.sizes().begin(), values.sizes().end());
   vshape[0] = u;
-  // (summed in index order within each run, as the CPU's coalesce)
-  at::Tensor summed = at::zeros(vshape, values.options()).index_add_(0, group, values.index_select(0, order));
+  at::Tensor summed = sum_rows_by_sorted_group(values.reshape({nnz, -1}), group, order, u).view(vshape);
   return make_sparse(self, sd, dd, self.sizes(), unlinear_keys(unique_keys, self.sizes(), sd), summed, true);
 }
 
@@ -142,6 +146,33 @@ at::Tensor& add_out(const at::Tensor& self, const at::Tensor& other, const at::S
   TORCH_CHECK(self.sparse_dim() == other.sparse_dim(), "add: expected 'self' and 'other' to have same sparse dimensions");
   at::Tensor ov = other._values().to(t);
   if (!(alpha.isIntegral(true) && alpha.toLong() == 1)) ov = ov * alpha;
+  if (self.is_coalesced() && other.is_coalesced() && self.dense_dim() == other.dense_dim()) {
+    // Two coalesced operands: merged in key order without a sort (each
+    // entry's place: its index plus the other side's keys before it), a
+    // key in both summed (self's value first, as the CPU's merge).
+    int64_t sd = self.sparse_dim(), na = self._nnz(), nb = other._nnz();
+    at::Tensor ka = linear_keys(self._indices(), self.sizes(), sd), kb = linear_keys(other._indices(), self.sizes(), sd);
+    at::TensorOptions lo = ka.options();
+    at::Tensor pa = at::arange(na, lo) + at::searchsorted(kb, ka);
+    at::Tensor pb = at::arange(nb, lo) + at::searchsorted(ka, kb, false, true);
+    int64_t n = na + nb;
+    at::Tensor keys = at::empty({n}, lo).index_copy_(0, pa, ka).index_copy_(0, pb, kb);
+    std::vector<int64_t> vshape(ov.sizes().begin(), ov.sizes().end());
+    vshape[0] = n;
+    at::Tensor vals = at::empty(vshape, ov.options()).index_copy_(0, pa, self._values().to(t)).index_copy_(0, pb, ov);
+    at::Tensor head = at::cat({at::ones({1}, lo.dtype(at::kBool)), at::ne(keys.narrow(0, 1, n - 1), keys.narrow(0, 0, n - 1))});
+    at::Tensor group = at::cumsum(head, 0, at::kLong) - 1;
+    int64_t u = group[n - 1].item<int64_t>() + 1;
+    if (u < n) {
+      vshape[0] = u;
+      vals = sum_rows_by_sorted_group(vals.reshape({n, -1}), group, at::arange(n, lo), u).view(vshape);
+      keys = at::zeros({u}, lo).index_copy_(0, group, keys);
+    }
+    at::Tensor r = make_sparse(self, sd, self.dense_dim(), self.sizes(), unlinear_keys(keys, self.sizes(), sd), vals, true);
+    out.copy_(r);
+    out._coalesced_(true);
+    return out;
+  }
   at::Tensor indices = at::cat({self._indices(), other._indices()}, 1);
   at::Tensor values = at::cat({self._values().to(t), ov}, 0);
   at::Tensor r = make_sparse(self, self.sparse_dim(), self.dense_dim(), self.sizes(), indices, values, false);

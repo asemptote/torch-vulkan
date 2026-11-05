@@ -173,6 +173,13 @@ at::Generator new_generator();
 // ascending (descending: largest first), ties in original order. sorting.cpp.
 at::Tensor sort_rows(const at::Tensor& x, bool descending);
 
+// Rows of vals [n, W] summed into [groups, W] by group [n] (int64, each
+// source row's group), `order` [n] the source rows sorted (stably) by
+// group: one launch (shaders/segreduce.slang), each group's rows added in
+// source order, as the CPU's loops. indexing.cpp.
+at::Tensor sum_rows_by_sorted_group(const at::Tensor& vals, const at::Tensor& group, const at::Tensor& order,
+                                    int64_t groups);
+
 // For x3 [K, O, L] contiguous, float32 or float64 (normgrad.cpp): each
 // slice's (over K and L) mean and biased variance, two-pass; and
 // x3 * a[o] + c[o].

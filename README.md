@@ -121,9 +121,12 @@ copies, the zero-preserving unary functions, norms, cat, permute), and the
 parts PyTorch writes per device are tensor ops here, running as Vulkan
 kernels:
 
-- coalescing (one int64 key per entry, a stable sort, runs summed in index
-  order), and PyTorch's `flatten_indices` stub (its coalesced-constructor
-  check) registered for vk;
+- coalescing (one int64 key per entry, a stable sort, each run's values
+  summed in index order in one launch of `segreduce.slang`; entries already
+  in order skip it), sums of two coalesced tensors as a merge without a
+  sort (2-3x faster than sorting their concatenation at 10^4-10^6 entries),
+  and PyTorch's `flatten_indices` stub (its coalesced-constructor check)
+  registered for vk;
 - every conversion between dense and the five layouts, batched and hybrid,
   with PyTorch's structure: from a sparse source the specified elements
   (explicit zeros included) decide the entries and blocks, from a dense one
@@ -156,7 +159,8 @@ check before coalescing): CSR to dense 9, dense to CSR 14, `sparse_mask`
 with a CSR mask 10, coalescing entries already in order 10.
 
 Not yet (M18): tiny sparse tensors still take several times the CPU's time
-(an op is 5-50 kernel launches; COO + COO, which sorts, is the most).
+(an op is 5-50 kernel launches; COO + COO's merge is the most, about 50:
+each step is its own small kernel).
 
 ## Dedicated kernels (M16)
 
@@ -920,6 +924,6 @@ no fallbacks in the OpInfo sweep).
     stay in the tiles: they are bound by the emulated 64-bit multiplies, and
     an int64 gemm4 ran at 0.3 GOP/s on the A13 against 2.5 in the tiles;
     making gemm4 generic over it also slowed its float32 path 4x.)
-18. ~~**M18 sparse tensors**~~: done (see above). Not yet: fused kernels
-    for the sort-based sparse ops (COO + COO, coalescing unordered entries).
+18. ~~**M18 sparse tensors**~~: done (see above). Not yet: a single merge
+    kernel for COO + COO (positions, keys and values in one pass).
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).

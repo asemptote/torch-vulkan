@@ -1452,6 +1452,32 @@ at::Tensor& isin_out(const at::Tensor& elements, const at::Tensor& test, bool as
 }
 
 }  // namespace
+
+at::Tensor sum_rows_by_sorted_group(const at::Tensor& vals, const at::Tensor& group, const at::Tensor& order,
+                                    int64_t groups) {
+  int64_t n = vals.size(0), width = vals.size(1);
+  if (accum_label(vals.scalar_type()) == nullptr || !is_vk(vals) || n * width >= (int64_t(1) << 31) || width == 0) {
+    return at::zeros({groups, width}, vals.options()).index_add_(0, group.index_select(0, order.to(at::kLong)),
+                                                                 vals.index_select(0, order.to(at::kLong)));
+  }
+  at::Tensor result = at::zeros({groups, width}, vals.options());
+  if (n == 0) return result;
+  at::Tensor v = vals.contiguous();
+  at::Tensor offs = at::mul(group, width).reshape({1, n}).contiguous();
+  at::Tensor ord = order.to(at::kInt).contiguous();
+  SegReduceParams p{};
+  p.dst = gpu_address_out(result);
+  p.offs = gpu_address(offs);
+  p.vals = gpu_address(v);
+  p.order = gpu_address(ord);
+  p.n = static_cast<uint32_t>(n);
+  p.width = static_cast<uint32_t>(width);
+  uint32_t grid = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(n * width), &grid, &p.stride));
+  dispatch(std::string("segreduce_") + accum_label(v.scalar_type()), {op::SEGREDUCE_SUM, 0u}, p, grid);
+  return result;
+}
+
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
