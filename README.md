@@ -150,8 +150,13 @@ error-message patterns for CPU/CUDA/MPS, products the CPU refuses), listed
 with their reasons in `tools/pytorch_tests.py`. They run locally, not in
 the cluster's full runs (their slowest gradchecks take minutes each).
 
-Not yet (M18): per-op overhead on tiny sparse tensors (each op is a few
-kernel launches: about 10x the CPU's time at a handful of elements).
+The common conversions and masks of one matrix take few kernel launches
+(an entry's row by a sorted search of the compressed indices, a sorted
+check before coalescing): CSR to dense 9, dense to CSR 14, `sparse_mask`
+with a CSR mask 10, coalescing entries already in order 10.
+
+Not yet (M18): tiny sparse tensors still take several times the CPU's time
+(an op is 5-50 kernel launches; COO + COO, which sorts, is the most).
 
 ## Dedicated kernels (M16)
 
@@ -911,6 +916,6 @@ no fallbacks in the OpInfo sweep).
     the smooth-L1/Huber backward as single kernels.
 17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: int64
     Mali products in gemm4 (they use the tiles).
-18. ~~**M18 sparse tensors**~~: done (see above). Not yet: lower per-op
-    overhead on tiny sparse tensors.
+18. ~~**M18 sparse tensors**~~: done (see above). Not yet: fused kernels
+    for the sort-based sparse ops (COO + COO, coalescing unordered entries).
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
