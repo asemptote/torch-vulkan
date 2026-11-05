@@ -1,11 +1,13 @@
-// axis T: f32=float
+// axis T: f32=float i32=int
 //
-// Batched float32 GEMM for Arm Mali GPUs, as shaders/gemm.slang (same
-// parameters, C[b] = alpha * A[b] @ B[b] (+ beta * Cin[b])) but without
-// shared memory and with 16-byte loads: Mali's shared memory is ordinary
-// cached memory, and its load/store unit favours vector loads. The host uses
-// it for row-major A and B (unit k and n strides) whose rows and batches
-// start 16-byte aligned, with K and N multiples of 4.
+// Batched float32 / int32 GEMM for Arm Mali GPUs, as shaders/gemm.slang
+// (same parameters, C[b] = alpha * A[b] @ B[b] (+ beta * Cin[b]); int32
+// wraps) but without shared memory and with 16-byte loads: Mali's shared
+// memory is ordinary cached memory, and its load/store unit favours vector
+// loads. The host uses it for row-major A and B (unit k and n strides) whose
+// rows and batches start 16-byte aligned, with K a multiple of 4 and B's
+// rows padded to a multiple of 4 columns (zeros past N, never written to C):
+// other operands are copied into that layout first.
 //
 // Each WX x WY workgroup computes a (WY*RM) x (WX*RN4*4) tile of C; thread
 // (tx, ty) the rows ty + WY*i and the float4 column groups tx + WX*j.
@@ -24,10 +26,10 @@
 
 struct Params
 {
-    float* a;        // 0
-    float* b;        // 8
-    float* c;        // 16
-    float* cin;      // 24
+    T* a;            // 0
+    T* b;            // 8
+    T* c;            // 16
+    T* cin;          // 24
     slot64 alpha;    // 32  (raw slots: see param)
     slot64 beta;     // 40
     uint m;          // 48
@@ -42,10 +44,17 @@ struct Params
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
-// A raw 64-bit parameter slot (float bits in the low word, as gemm.slang's).
-float param(slot64 bits)
+typedef vector<T, 4> T4;
+
+// A raw 64-bit parameter slot, as gemm.slang's: float bits in the low word
+// for float32, an int64 for int32.
+T param(slot64 bits)
 {
+#if defined(T_f32)
     return slot_float(bits);
+#else
+    return T(slot_integer(bits));
+#endif
 }
 
 [vk::constant_id(0)] const int USE_CIN = 0;
@@ -57,9 +66,9 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     uint tx = tid.x, ty = tid.y;
     uint row0 = gid.y * BM, g0 = gid.x * (WX * RN4);
     int batch = int(gid.z);
-    float4* a4 = (float4*)p.a;
-    float4* b4 = (float4*)p.b;
-    uint n4 = p.n / 4;
+    T4* a4 = (T4*)p.a;
+    T4* b4 = (T4*)p.b;
+    uint n4 = (p.n + 3) / 4;  // (B's padded column groups)
     int aoff[RM], boff[RN4];  // (in float4s)
     [ForceUnroll]
     for (uint i = 0; i < RM; i++)
@@ -69,16 +78,16 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         boff[j] = (batch * p.b_sb) / 4 + int(min(g0 + tx + WX * j, n4 - 1));
     int bstep = p.b_sk / 4;
 
-    float4 acc[RM][RN4];
+    T4 acc[RM][RN4];
     [ForceUnroll]
     for (uint i = 0; i < RM; i++)
         [ForceUnroll]
         for (uint j = 0; j < RN4; j++)
-            acc[i][j] = float4(0);
+            acc[i][j] = T4(T(0));
 
     for (uint k4 = 0; k4 < p.k / 4; k4++)
     {
-        float4 av[RM];
+        T4 av[RM];
         [ForceUnroll]
         for (uint i = 0; i < RM; i++)
             av[i] = loadAligned<16>(a4 + aoff[i] + int(k4));
@@ -86,7 +95,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         [ForceUnroll]
         for (uint kk = 0; kk < 4; kk++)
         {
-            float4 bv[RN4];
+            T4 bv[RN4];
             [ForceUnroll]
             for (uint j = 0; j < RN4; j++)
                 bv[j] = loadAligned<16>(b4 + boff[j] + brow + int(kk) * bstep);
@@ -98,7 +107,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         }
     }
 
-    float alpha = param(p.alpha), beta = param(p.beta);
+    T alpha = param(p.alpha), beta = param(p.beta);
     [ForceUnroll]
     for (uint i = 0; i < RM; i++)
     {
@@ -115,7 +124,9 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             for (uint e = 0; e < 4; e++)
             {
                 uint gn = g * 4 + e;
-                float v = alpha * acc[i][j][e];
+                if (gn >= p.n)
+                    continue;
+                T v = alpha * acc[i][j][e];
                 if (USE_CIN != 0)
                     v += beta * p.cin[batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn];
                 p.c[batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = v;

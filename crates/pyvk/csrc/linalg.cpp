@@ -33,8 +33,9 @@ constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
 
-// Whether float32 products use shaders/gemm4.slang where they can: on Arm
-// GPUs (Mali), unless TORCH_VK_GEMM is "tiled" ("float4" forces it).
+// Whether float32 and int32 products use shaders/gemm4.slang where they
+// can: on Arm GPUs (Mali), unless TORCH_VK_GEMM is "tiled" ("float4" forces
+// it).
 bool prefer_gemm4() {
   static const bool prefer = [] {
     const char* env = std::getenv("TORCH_VK_GEMM");
@@ -46,12 +47,22 @@ bool prefer_gemm4() {
 }
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
-// batches start 16-byte aligned, K and N multiples of 4.
+// batches start 16-byte aligned, K a multiple of 4, and B's rows N wide
+// rounded up to 4 (a padded copy's, when N is not a multiple of 4).
 bool float4_rows(const at::Tensor& t) {
   return t.stride(2) == 1 && t.stride(1) % 4 == 0 && t.stride(0) % 4 == 0 && gpu_address(t) % 16 == 0;
 }
+int64_t round4(int64_t x) { return (x + 3) / 4 * 4; }
 bool gemm4_layout(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t k) {
-  return n % 4 == 0 && k % 4 == 0 && float4_rows(a) && float4_rows(b);
+  return k % 4 == 0 && b.size(2) >= round4(n) && float4_rows(a) && float4_rows(b);
+}
+
+// t [B, R, C] in a zeroed [B, rows, cols] (rows >= R, cols >= C), row-major.
+at::Tensor padded(const at::Tensor& t, int64_t rows, int64_t cols) {
+  if (t.size(1) == rows && t.size(2) == cols) return t.contiguous();
+  at::Tensor out = at::zeros({t.size(0), rows, cols}, t.options());
+  out.narrow(1, 0, t.size(1)).narrow(2, 0, t.size(2)).copy_(t);
+  return out;
 }
 
 bool gemm_dtype(at::ScalarType t) {
@@ -96,15 +107,19 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   if (c.numel() == 0) {
     return true;
   }
-  if (c.scalar_type() == at::kFloat && prefer_gemm4() && n % 4 == 0 && k % 4 == 0 && !gemm4_layout(a, b, n, k)) {
-    // Another layout (as x @ W.t()'s column-major W.t()): a row-major copy of
-    // the operand, then gemm4, when the product's work is 16x the copy's or
-    // more. On the A13: x @ W.t() at 2048^3 0.57 s against 1.2 s in the tiles.
-    int64_t work = batch * m * n * k;
-    bool a_ok = float4_rows(a) || a.numel() * 16 <= work, b_ok = float4_rows(b) || b.numel() * 16 <= work;
-    if (a_ok && b_ok) {
-      at::Tensor a2 = float4_rows(a) ? a : a.contiguous(), b2 = float4_rows(b) ? b : b.contiguous();
-      if (gemm4_layout(a2, b2, n, k)) return gemm(a2, b2, c, cin, alpha, beta);
+  bool gemm4_type = c.scalar_type() == at::kFloat || c.scalar_type() == at::kInt;
+  if (gemm4_type && prefer_gemm4() && !gemm4_layout(a, b, n, k)) {
+    // Another layout (as x @ W.t()'s column-major W.t()), or K or N not
+    // multiples of 4: row-major copies (zero-padded to multiples of 4: the
+    // padding adds zero products), then gemm4, when the product's work is
+    // 16x the copies' or more. On the A13: x @ W.t() at 2048^3 0.57 s against
+    // 1.2 s in the tiles.
+    int64_t k4 = round4(k), n4 = round4(n), work = batch * m * n * k;
+    bool copy_a = !float4_rows(a) || k4 != k, copy_b = !float4_rows(b) || k4 != k || n4 != n;
+    int64_t copied = (copy_a ? a.size(0) * m * k4 : 0) + (copy_b ? b.size(0) * k4 * n4 : 0);
+    if (copied * 16 <= work) {
+      at::Tensor a2 = copy_a ? padded(a, m, k4) : a, b2 = copy_b ? padded(b, k4, n4) : b;
+      if (gemm4_layout(a2, b2, n, k4)) return gemm(a2, b2, c, cin, alpha, beta);
     }
   }
   bool use_cin = cin != nullptr && beta != 0.0;
@@ -132,9 +147,8 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     p.cin_sm = static_cast<int32_t>(cin->stride(1));
     p.cin_sn = static_cast<int32_t>(cin->stride(2));
   }
-  if (c.scalar_type() == at::kFloat && prefer_gemm4() && gemm4_layout(a, b, n, k) &&
-      (m + kTile4M - 1) / kTile4M <= kMaxGroups) {
-    dispatch("gemm4_f32", {use_cin ? 1u : 0u}, p, static_cast<uint32_t>((n + kTile4N - 1) / kTile4N),
+  if (gemm4_type && prefer_gemm4() && gemm4_layout(a, b, n, k) && (m + kTile4M - 1) / kTile4M <= kMaxGroups) {
+    dispatch(std::string("gemm4_") + dtype_label(c.scalar_type()), {use_cin ? 1u : 0u}, p, static_cast<uint32_t>((n + kTile4N - 1) / kTile4N),
              static_cast<uint32_t>((m + kTile4M - 1) / kTile4M), static_cast<uint32_t>(batch));
     return true;
   }

@@ -77,16 +77,19 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   repeats; int8/uint8/int16 ops without their own kernels in int32 on the GPU
   (wrapping arithmetic gives the narrow results). In the OpInfo sweep only
   `to_sparse` still fell back (sparse tensors: M18).
-- **Matrix products for Mali** (`gemm4.slang`): on Arm GPUs, float32
-  products of row-major operands (K and N multiples of 4, 16-byte aligned
-  rows) use a kernel without shared memory (on Mali it is ordinary cached
-  memory) and with 16-byte loads, 2x8 outputs per thread. On the A13 a
+- **Matrix products for Mali** (`gemm4.slang`): on Arm GPUs, float32 and
+  int32 products (float16/bfloat16 ones compute in float32) of row-major
+  operands (16-byte aligned rows, K a multiple of 4) use a kernel without
+  shared memory (on Mali it is ordinary cached memory) and with 16-byte
+  loads, 2x8 outputs per thread. On the A13 a
   2048x2048 product takes 0.55-0.66 s (26-31 GFLOP/s), against 0.97 s for
   the shared-memory tiles of `gemm.slang` and 0.64 s on the 8 CPU cores.
-  Operands in other layouts (`x @ W.t()`'s column-major `W.t()`) are first
-  copied row-major when the product's work is 16x the copy's: `x @ W.t()`
-  at 2048^3 takes 0.57 s against 1.2 s in the tiles (a dot-product kernel
-  reading both operands along k reached only 14 GFLOP/s). On the Intel UHD
+  Operands in other layouts (`x @ W.t()`'s column-major `W.t()`) or with
+  K or N not multiples of 4 are first copied row-major, zero-padded to
+  multiples of 4, when the product's work is 16x the copies': `x @ W.t()`
+  at 2048^3 takes 0.57 s against 1.2 s in the tiles, 2047^3 0.54 s against
+  1.0 s (a dot-product kernel reading both operands along k reached only 14
+  GFLOP/s). On the Intel UHD
   620 the float4 kernel is 2.5x slower than the tiles, so it is Arm-only
   (`TORCH_VK_GEMM=float4` or `tiled` overrides).
 - **Building on the phone** (`tools/build-termux.sh`): Termux's
@@ -901,9 +904,8 @@ no fallbacks in the OpInfo sweep).
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
 16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
     the smooth-L1/Huber backward as single kernels.
-17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: Mali
-    products of other dtypes than float32 and of K or N not multiples of 4
-    (they use the tiles).
+17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: int64
+    Mali products in gemm4 (they use the tiles).
 18. ~~**M18 sparse tensors**~~: done (see above). Not yet: sparse kernels
     for the sparse-sparse product and compressed reductions.
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
