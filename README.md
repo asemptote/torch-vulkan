@@ -338,8 +338,10 @@ checks forward results and gradients against the CPU).
   kernel over window sizes), adaptive pooling, upsampling backward and
   antialiased upsampling (separable per-dim matrices: interpolation weights
   from PyTorch's formulas, applied with matmul; the backward pass applies the
-  transposes), grid sampling backward and 3-D forward, fractional max
-  pooling, `cdist`/`pdist`, `rrelu` noise, `embedding_bag`.
+  transposes; uint8 bilinear/bicubic as the CPU's fixed-point kernel, bit
+  for bit: int16 weights, a width then a height pass of integer sums,
+  shifted and clamped), grid sampling backward and 3-D forward, fractional
+  max pooling, `cdist`/`pdist`, `rrelu` noise, `embedding_bag`.
 - 8- and 16-bit types (uint8, int8, int16, float16, bfloat16) now compute in
   element-wise ops, in int32/float32 and cast back as on the CPU.
 

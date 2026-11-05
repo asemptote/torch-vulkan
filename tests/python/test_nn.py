@@ -194,3 +194,15 @@ def test_antialiased_upsample():
     x = make((2, 3, 12, 9), torch.float32)
     for mode in ["bilinear", "bicubic"]:
         compare_with_cpu(lambda t: F.interpolate(t, size=(5, 4), mode=mode, antialias=True), x)
+
+
+def test_uint8_resize_matches_cpu_exactly():
+    # the CPU's fixed-point separable kernel: width pass, height pass, int16 weights
+    torch.manual_seed(0)
+    x = torch.randint(0, 256, (2, 3, 13, 17), dtype=torch.uint8)
+    for mode, aa, ac, size in itertools.product(("bilinear", "bicubic"), (False, True), (False, True),
+                                                [(7, 9), (26, 40), (13, 5), (3, 34)]):
+        want = F.interpolate(x, size=size, mode=mode, antialias=aa, align_corners=ac)
+        with on_gpu():
+            got = F.interpolate(x.to("vk"), size=size, mode=mode, antialias=aa, align_corners=ac)
+        assert torch.equal(got.cpu(), want), (mode, aa, ac, size)

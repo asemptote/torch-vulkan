@@ -13,6 +13,7 @@ a depthwise convolution with a ones kernel, divided by the window sizes.
 
 import functools
 import math
+import struct
 
 import torch
 import torch.nn.functional as F
@@ -119,11 +120,8 @@ def _make_upsample_linear(k):
         if x.numel() == 0 and math.prod(x.shape[1:]) == 0:
             raise RuntimeError(f"Non-empty {k + 2}D data tensor expected but got a tensor with sizes {list(x.shape)}")
         out_shape = (*x.shape[:-k], *output_size)
-        if x.dtype == torch.uint8 and k == 2:
-            # (the CPU's one integer dtype: in float32, rounded half up as its
-            # fixed-point kernel rounds; its weights are fixed-point, so a
-            # result can differ by one)
-            return (forward(x.float(), output_size, align_corners, *scales) + 0.5).floor().clamp(0, 255).to(x.dtype)
+        if x.dtype == torch.uint8 and k == 2:  # (the CPU's one integer dtype: its fixed-point kernel)
+            return _u8_resize(x, output_size, align_corners, scales, "bilinear", False)
         if not x.is_floating_point():
             return _on_cpu(op._schema.name.split("::")[1], x, output_size, align_corners, *scales)
         spatial, out = list(x.shape[-k:]), list(out_shape[-k:])
@@ -745,18 +743,139 @@ def _aa_matrix(kind, n_in, n_out, align_corners, scale_opt, like):
     return m.to(like.device, like.dtype)
 
 
+# ---------------------------------------------------------------- uint8 bilinear / bicubic, as the CPU's
+
+def _u8_filter(kind, antialias, x):
+    """HelperInterpLinear / HelperInterpCubic::aa_filter (a = -0.5 with
+    antialiasing, -0.75 without), in double."""
+    x = abs(x)
+    if kind == "bilinear":
+        return 1.0 - x if x < 1.0 else 0.0
+    a = -0.5 if antialias else -0.75
+    if x < 1.0:
+        return ((a + 2) * x - (a + 3)) * x * x + 1
+    if x < 2.0:
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+    return 0.0
+
+
+def _c_trunc(x):
+    return int(x)  # (C++'s static_cast<int64_t> of a double: toward zero, as Python's int)
+
+
+@functools.lru_cache(maxsize=256)
+def _u8_taps(kind, antialias, n_in, n_out, align_corners, scale_opt):
+    """The CPU's fixed-point taps for one dim of a uint8 resize
+    (_compute_index_ranges_int16_weights): per output its first input
+    index, tap count and int16 weights, and the weights' precision (bits)."""
+    interp = 2 if kind == "bilinear" else 4
+    if align_corners:
+        scale = (n_in - 1) / (n_out - 1) if n_out > 1 else 0.0
+    else:
+        scale = 1.0 / scale_opt if scale_opt is not None and scale_opt > 0 else n_in / n_out
+    taps = []
+    wt_max = 0.0
+    if antialias:
+        support = interp * 0.5 * scale if scale >= 1.0 else interp * 0.5
+        max_size = math.ceil(support) * 2 + 1
+        invscale = 1.0 / scale if scale >= 1.0 else 1.0
+        for i in range(n_out):
+            center = scale * (i + 0.5)
+            xmin = max(_c_trunc(center - support + 0.5), 0)
+            xsize = min(max(min(_c_trunc(center + support + 0.5), n_in) - xmin, 0), max_size)
+            w = [_u8_filter(kind, True, (j + xmin - center + 0.5) * invscale) for j in range(xsize)]
+            total = sum(w)  # (accumulated in order, as the CPU's loop)
+            if total != 0.0:
+                w = [v / total for v in w]
+                wt_max = max([wt_max] + w)
+            taps.append((xmin, xsize, w))
+    else:
+        max_size = interp
+        cubic = max_size > 2
+        support = int(max_size * 0.5)
+        for i in range(n_out):
+            if align_corners:
+                real = scale * i
+            else:
+                real = scale * (i + 0.5) - 0.5
+                if not cubic and real < 0.0:
+                    real = 0.0
+            # guard_index_and_lambda: floorf (a float32 floor) of the double index
+            index = min(int(math.floor(_f32(real))), n_in - 1)
+            lam = min(max(real - index, 0.0), 1.0)
+            umin = index - support + 1
+            xmin = max(umin, 0)
+            xsize = min(max(min(index + support + 1, n_in) - xmin, 0), max_size)
+            wt = [0.0] * max_size
+            w_index = 0
+            for j in range(max_size):
+                wt[j] = 0.0
+                w = _u8_filter(kind, False, (j + 1 - support) - lam)
+                if umin + j <= 0:
+                    w_index = 0
+                elif umin + j >= n_in - 1:
+                    w_index = xsize - 1
+                wt[w_index] += w
+                wt_max = max(wt_max, wt[w_index])
+                w_index += 1
+            taps.append((xmin, xsize, wt[:xsize]))
+    precision = 0
+    while precision < 22 and int(0.5 + wt_max * (1 << (precision + 1))) < (1 << 15):
+        precision += 1
+    width = max([t[1] for t in taps] + [1])
+    idx, wts = [], []
+    for xmin, xsize, w in taps:
+        ints = [int(-0.5 + v * (1 << precision)) if v * (1 << precision) < 0 else int(0.5 + v * (1 << precision))
+                for v in w]
+        idx.append([min(xmin + j, n_in - 1) if j < xsize else xmin for j in range(width)])
+        wts.append(ints + [0] * (width - xsize))
+    return idx, wts, precision
+
+
+def _f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _u8_resize(x, output_size, align_corners, scales, kind, antialias):
+    """uint8 bilinear/bicubic resize of N, C, H, W as the CPU's separable
+    fixed-point kernel: the width pass, then the height pass, each output
+    the int16-weighted sum of its taps plus half, shifted by the weights'
+    precision and clamped to [0, 255] (the intermediate kept as uint8)."""
+    out_hw = list(output_size)
+    if list(x.shape[-2:]) == out_hw:
+        return x.clone()
+    y = x.contiguous()
+    for d in (3, 2):  # (W first, as the CPU)
+        n_in, n_out = y.shape[d], out_hw[d - 2]
+        if n_in == n_out:
+            continue
+        s = scales[d - 2] if scales is not None and d - 2 < len(scales) else None
+        idx, wts, precision = _u8_taps(kind, antialias, n_in, n_out, bool(align_corners), s)
+        idx_t = torch.tensor(idx, dtype=torch.long, device=y.device)
+        w_t = torch.tensor(wts, dtype=torch.int32, device=y.device)
+        moved = y.movedim(d, -1).to(torch.int32)
+        g = moved.index_select(-1, idx_t.reshape(-1)).reshape(*moved.shape[:-1], n_out, idx_t.shape[1])
+        acc = (g * w_t).sum(-1, dtype=torch.int32) + (1 << (precision - 1))
+        y = torch.bitwise_right_shift(acc, precision).clamp(0, 255).to(torch.uint8).movedim(-1, d).contiguous()
+    return y
+
+
+def _upsample_bicubic2d(x, output_size, align_corners, scales_h=None, scales_w=None):
+    """uint8 as the CPU's fixed-point kernel; other dtypes PyTorch's
+    decomposition (as before this registration)."""
+    if x.dtype == torch.uint8 and x.dim() == 4 and len(output_size) == 2 and min(x.shape[-2:]) > 0             and min(output_size) > 0:
+        return _u8_resize(x, output_size, align_corners, (scales_h, scales_w), "bicubic", False)
+    return decomposition_table[aten.upsample_bicubic2d.default](x, output_size, align_corners, scales_h, scales_w)
+
+
 def _make_aa(kind):
     def matrices(input_size, output_size, align_corners, scales_h, scales_w, like):
         return [_aa_matrix(kind, input_size[2 + d], output_size[d], align_corners, (scales_h, scales_w)[d], like)
                 for d in range(2)]
 
     def forward(x, output_size, align_corners, scales_h=None, scales_w=None):
-        if not x.is_floating_point():
-            # uint8 (the only integer dtype the CPU takes): in float32, then
-            # rounded half up and clamped, as the CPU's fixed-point kernel
-            # (whose weights are fixed-point: a result can differ by one).
-            y = forward(x.float(), output_size, align_corners, scales_h, scales_w)
-            return (y + 0.5).floor().clamp(0, 255).to(x.dtype)
+        if x.dtype == torch.uint8:  # (the only integer dtype the CPU takes)
+            return _u8_resize(x, output_size, align_corners, (scales_h, scales_w), kind, True)
         mats = matrices(x.shape, output_size, align_corners, scales_h, scales_w, x)
         return _apply_dims(x, mats).contiguous()
 
@@ -1393,6 +1512,7 @@ def _kernels():
         "upsample_bilinear2d_backward": _make_upsample_backward("bilinear2d", True),
         "upsample_trilinear3d_backward": _make_upsample_backward("trilinear3d", True),
         "upsample_bicubic2d_backward": _make_upsample_backward("bicubic2d", True),
+        "upsample_bicubic2d": _upsample_bicubic2d,
     }
     return {
         "avg_pool2d": avg2,
