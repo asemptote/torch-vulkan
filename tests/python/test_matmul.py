@@ -110,6 +110,8 @@ for m, k, n in [(64, 30, 50), (40, 33, 66), (70, 64, 61)]:  # K or N not multipl
     cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
     ai, bi = torch.randint(-50, 50, (m, k), dtype=torch.int32), torch.randint(-50, 50, (k, n), dtype=torch.int32)
     assert torch.equal((ai.to("vk") @ bi.to("vk")).cpu(), ai @ bi)  # (int32: exact)
+    al, bl = ai.long() * 3_000_000_007, bi.long() * 1_000_003  # (int64, wrapping past 2^63)
+    assert torch.equal((al.to("vk") @ bl.to("vk")).cpu(), al @ bl)
 x, w = torch.randn(64, 32), torch.randn(48, 32)  # x @ W.t() and x.t() @ y: copied row-major first
 cases.append(((x.to("vk") @ w.to("vk").t()).cpu(), x @ w.t()))
 cases.append(((x.to("vk").t() @ x.to("vk")).cpu(), x.t() @ x))

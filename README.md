@@ -914,8 +914,10 @@ no fallbacks in the OpInfo sweep).
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
 16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
     the smooth-L1/Huber backward as single kernels.
-17. ~~**M17 phones and small GPUs**~~: done (see above). Not yet: int64
-    Mali products in gemm4 (they use the tiles).
+17. ~~**M17 phones and small GPUs**~~: done (see above). (int64 products
+    stay in the tiles: they are bound by the emulated 64-bit multiplies, and
+    an int64 gemm4 ran at 0.3 GOP/s on the A13 against 2.5 in the tiles;
+    making gemm4 generic over it also slowed its float32 path 4x.)
 18. ~~**M18 sparse tensors**~~: done (see above). Not yet: fused kernels
     for the sort-based sparse ops (COO + COO, coalescing unordered entries).
 Testing throughout: PyTorch OpInfo samples compared against the CPU (`tools/opinfo_coverage.py`).
