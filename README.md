@@ -868,8 +868,8 @@ evidence as its reason, rather than a workaround.
    `pow`/`atan2`, the arg-reduction thread-per-output mode) came later. Not
    yet: Payne-Hanek reduction for huge sin/cos arguments.
 5. ~~**M5 matrix products**~~: done (see above). Not yet: a faster
-   subgroup/cooperative-matrix kernel, integer and half-precision GEMM,
-   convolutions.
+   subgroup/cooperative-matrix kernel. (Integer GEMM, 16-bit products in
+   float32 and convolutions, 1-D to 3-D and transposed, run on the GPU.)
 6. ~~**M6 complex numbers + FFT**~~: done (see above), with an own FFT
    rather than VkFFT (VkFFT's Vulkan backend needs the raw device/queue
    handles and runtime glslang). Not yet: faster FFT kernels. (Complex
@@ -901,11 +901,11 @@ no fallbacks in the OpInfo sweep).
     native kernels for the hottest composed ops with M16).
 13. ~~**M13 linear algebra on the GPU**~~: done (see above). Not yet:
     general (nonsymmetric) `eig`/`eigvals`, `ldl_factor`/`ldl_solve`
-    (Bunch-Kaufman pivoting), complex matrices (M14).
-14. ~~**M14 complex completion**~~: done (see above). Not yet: the ops
-    the sweep still sends to the CPU (see `tools/opinfo_coverage.json`),
-    accuracy-faithful complex edge cases (infinities, branch cuts at signed
-    zeros), a faster eig (multishift QR, aggressive deflation).
+    (Bunch-Kaufman pivoting). (Complex matrices came with M14.)
+14. ~~**M14 complex completion**~~: done (see above); the OpInfo sweep runs
+    every op on the GPU. Not yet: accuracy-faithful complex edge cases
+    (infinities, branch cuts at signed zeros), a faster eig (multishift QR,
+    aggressive deflation).
 15. ~~**M15 PyTorch's own tests**~~: done (see above). Not yet: tensors of
     2^31 or more elements (32-bit element offsets; lavapipe's buffers stop at
     2 GiB), float32 subnormals on devices that flush them, and long float64
