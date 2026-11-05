@@ -201,7 +201,7 @@ def test_csr_products_and_sampled_addmm():
 def test_sparse_products_and_reductions_without_dense():
     # sizes whose dense form would not fit: the product and the sums work from the entries
     torch.manual_seed(0)
-    n, nnz = 100000, 20000
+    n, nnz = 40000, 20000  # (n * n under 2^31: 32-bit hosts count elements in size_t)
     a = torch.sparse_coo_tensor(torch.randint(0, n, (2, nnz)), torch.randn(nnz), (n, n)).coalesce()
     with on_gpu():
         got = torch.sparse.mm(a.to("vk"), a.to("vk"))

@@ -85,6 +85,11 @@ at::Tensor coalesce(const at::Tensor& self) {
     return make_sparse(self, sd, dd, self.sizes(), at::empty({0, 1}, indices.options()), values.sum(0, true), true);
   }
   at::Tensor key = linear_keys(indices, self.sizes(), sd);
+  // (already in order without repeats, as most tensors built by these ops:
+  // one comparison, no sort, no sums)
+  if (at::gt(key.narrow(0, 1, nnz - 1), key.narrow(0, 0, nnz - 1)).all().item<bool>()) {
+    return make_sparse(self, sd, dd, self.sizes(), indices.clone(), values.clone(), true);
+  }
   auto [sorted, order] = at::sort(key, /*stable=*/true, 0, false);
   at::Tensor head = at::ones({nnz}, key.options().dtype(at::kBool));
   head.narrow(0, 1, nnz - 1).copy_(at::ne(sorted.narrow(0, 1, nnz - 1), sorted.narrow(0, 0, nnz - 1)));
@@ -513,9 +518,8 @@ at::Tensor convert_csr_to_coo(const at::Tensor& crow, const at::Tensor& col, boo
     return stack[0].toTensor();
   }
   at::Tensor c = crow.to(at::kLong);
-  int64_t n = c.numel() - 1;
-  at::Tensor counts = c.narrow(0, 1, n) - c.narrow(0, 0, n);
-  at::Tensor rows = at::repeat_interleave(at::arange(n, c.options()), counts, 0, col.numel());
+  // each entry's row: the last row starting at or before it
+  at::Tensor rows = at::searchsorted(c, at::arange(col.numel(), c.options()), false, true) - 1;
   at::Tensor cols = col.to(at::kLong);
   return (transpose ? at::stack({cols, rows}) : at::stack({rows, cols})).to(t);
 }
@@ -572,18 +576,27 @@ at::Tensor compressed_entries(const at::Tensor& t) {
     indices = at::empty({nb + 2, 0}, lopts);
   } else {
     at::Tensor c2 = ci.reshape({B, outer + 1}).to(at::kLong);
-    at::Tensor counts = (c2.narrow(1, 1, outer) - c2.narrow(1, 0, outer)).flatten();  // [B * outer]
-    at::Tensor bo = at::repeat_interleave(at::arange(B * outer, lopts), counts, 0, E);  // batch * outer + o
-    at::Tensor o = at::remainder(bo, outer), bat = at::floor_divide(bo, outer);
+    // each entry's batch * outer + o: a sorted search in the batches' starts,
+    // offset to global positions
+    at::Tensor starts = c2.narrow(1, 0, outer);
+    if (B > 1) starts = starts + (at::arange(B, lopts) * nnz).view({B, 1});
+    at::Tensor bo = at::searchsorted(starts.reshape({B * outer}), at::arange(E, lopts), false, true) - 1;
+    at::Tensor o = B > 1 ? at::remainder(bo, outer) : bo;
     at::Tensor in = pi.reshape({E}).to(at::kLong);
     at::Tensor rb = by_col ? in : o, cb = by_col ? o : in;
-    at::Tensor rows = (rb.view({E, 1, 1}) * R + at::arange(R, lopts).view({1, R, 1})).expand({E, R, C}).reshape({N});
-    at::Tensor cols = (cb.view({E, 1, 1}) * C + at::arange(C, lopts).view({1, 1, C})).expand({E, R, C}).reshape({N});
-    at::Tensor bb = bat.view({E, 1, 1}).expand({E, R, C}).reshape({N});
+    at::Tensor rows = rb, cols = cb;
+    if (blocked) {
+      rows = (rb.view({E, 1, 1}) * R + at::arange(R, lopts).view({1, R, 1})).expand({E, R, C}).reshape({N});
+      cols = (cb.view({E, 1, 1}) * C + at::arange(C, lopts).view({1, 1, C})).expand({E, R, C}).reshape({N});
+    }
     std::vector<at::Tensor> parts(nb + 2);
-    for (int64_t d = nb - 1; d >= 0; --d) {
-      parts[d] = at::remainder(bb, t.size(d));
-      bb = at::floor_divide(bb, t.size(d));
+    if (nb > 0) {
+      at::Tensor bb = at::floor_divide(bo, outer);
+      if (blocked) bb = bb.view({E, 1, 1}).expand({E, R, C}).reshape({N});
+      for (int64_t d = nb - 1; d >= 0; --d) {
+        parts[d] = at::remainder(bb, t.size(d));
+        bb = at::floor_divide(bb, t.size(d));
+      }
     }
     parts[nb] = rows;
     parts[nb + 1] = cols;
@@ -591,6 +604,38 @@ at::Tensor compressed_entries(const at::Tensor& t) {
   }
   at::Tensor r = make_sparse(t, nb + 2, dd, t.sizes(), indices, flat_vals, false);
   return by_col ? r : r.coalesce();
+}
+
+// A compressed tensor as dense: its entries copied into a zeroed tensor
+// (positions are unique in compressed layouts).
+at::Tensor compressed_to_dense(const at::Tensor& self, std::optional<at::ScalarType> dtype,
+                               std::optional<bool> masked_grad) {
+  if (dtype.has_value() && *dtype != self.scalar_type()) {
+    return at::native::sparse_compressed_to_dense(self, dtype, masked_grad);
+  }
+  at::Layout l = self.layout();
+  if ((l == at::kSparseCsr || l == at::kSparseCsc) && self.dim() == 2 && self.dense_dim() == 0) {
+    // (one matrix: each entry's outer index by a sorted search, then its
+    // position in the dense matrix)
+    bool by_col = l == at::kSparseCsc;
+    at::Tensor c = (by_col ? self.ccol_indices() : self.crow_indices()).to(at::kLong);
+    at::Tensor in = (by_col ? self.row_indices() : self.col_indices()).to(at::kLong);
+    at::Tensor dense = at::zeros(self.sizes(), self.values().options());
+    if (in.numel() == 0) return dense;
+    at::Tensor o = at::searchsorted(c, at::arange(in.numel(), c.options()), false, true) - 1;
+    int64_t N = self.size(1);
+    dense.view({-1}).index_copy_(0, by_col ? in * N + o : o * N + in, self.values());
+    return dense;
+  }
+  at::Tensor e = compressed_entries(self);
+  int64_t sd = e.sparse_dim();
+  at::Tensor dense = at::zeros(self.sizes(), e._values().options());
+  if (e._nnz() == 0) return dense;
+  int64_t inner = 1;
+  for (int64_t d = sd; d < self.dim(); ++d) inner *= self.size(d);
+  at::Tensor key = linear_keys(e._indices(), self.sizes(), sd);
+  dense.view({-1, inner}).index_copy_(0, key, e._values().reshape({e._nnz(), inner}));
+  return dense;
 }
 
 // A compressed matrix (CSR, CSC, BSR, BSC) as COO, explicit zeros kept.
@@ -719,7 +764,7 @@ TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
   m.impl("clone", TORCH_FN(clone_sparse_compressed));
   m.impl("resize_as_sparse_", TORCH_FN(resize_as_sparse_compressed_));
   m.impl("zero_", TORCH_FN(zero_sparse_csr_));
-  m.impl("_to_dense", TORCH_FN(sparse_compressed_to_dense));
+  m.impl("_to_dense", TORCH_FN(vk::compressed_to_dense));
   m.impl("sum", TORCH_FN(sum_csr));
   // (sparse_mask: vk::sparse_mask_compressed, below)
   m.impl("select.int", TORCH_FN(select_sparse_csr));
@@ -1072,6 +1117,20 @@ at::Tensor dense_to_compressed(const at::Tensor& x, at::Layout layout, at::Optio
                                std::optional<int64_t> dense_dim, const at::Tensor& specified) {
   int64_t dd = dense_dim.value_or(0);
   int64_t nb = x.dim() - 2 - dd;  // batch dims
+  if (nb == 0 && dd == 0 && (layout == at::kSparseCsr || layout == at::kSparseCsc) && x.dim() == 2) {
+    // (one matrix: the entries in row- or column-major order from one
+    // nonzero, the compressed indices by a sorted search)
+    bool cols_first = layout == at::kSparseCsc;
+    at::Tensor m = specified.defined() ? specified : at::ne(x, 0);
+    at::Tensor nz = at::nonzero(cols_first ? m.t() : m);  // [nnz, 2]: outer, inner
+    at::Tensor o = nz.select(1, 0), in = nz.select(1, 1);
+    int64_t M = x.size(0), N = x.size(1);
+    at::Tensor lin = cols_first ? in * N + o : o * N + in;
+    at::Tensor vals = x.reshape({-1}).index_select(0, lin);
+    at::Tensor compressed = at::searchsorted(o.contiguous(), at::arange((cols_first ? N : M) + 1, o.options()));
+    return at::_sparse_compressed_tensor_unsafe(packed(compressed), packed(in), packed(vals), x.sizes(),
+                                                x.options().layout(layout));
+  }
   TORCH_CHECK(nb >= 0, "to_sparse: expected a tensor with at least ", 2 + dd, " dims, got ", x.dim());
   bool blocked = layout == at::kSparseBsr || layout == at::kSparseBsc;
   bool by_col = layout == at::kSparseCsc || layout == at::kSparseBsc;
@@ -1143,6 +1202,15 @@ at::Tensor sparse_mask_compressed(const at::Tensor& self, const at::Tensor& mask
   bool by_col = l == at::kSparseCsc || l == at::kSparseBsc;
   at::Tensor ci = by_col ? mask.ccol_indices() : mask.crow_indices();
   at::Tensor pi = by_col ? mask.row_indices() : mask.col_indices();
+  if ((l == at::kSparseCsr || l == at::kSparseCsc) && mask.dim() == 2 && mask.dense_dim() == 0) {
+    // (one matrix: the dense values at the mask's entries, its indices kept)
+    at::Tensor c = ci.to(at::kLong), in = pi.to(at::kLong);
+    at::Tensor o = at::searchsorted(c, at::arange(in.numel(), c.options()), false, true) - 1;
+    int64_t N = self.size(1);
+    at::Tensor lin = by_col ? in * N + o : o * N + in;
+    at::Tensor vals = self.reshape({-1}).index_select(0, lin);
+    return at::_sparse_compressed_tensor_unsafe(ci.clone(), pi.clone(), vals, self.sizes(), vals.options().layout(l));
+  }
   at::Tensor ones = at::ones(mask.values().sizes(), self.options().dtype(at::kBool));
   at::Tensor specified =
       at::_sparse_compressed_tensor_unsafe(ci, pi, ones, self.sizes(), ones.options().layout(l)).to_dense();
