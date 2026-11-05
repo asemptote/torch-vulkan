@@ -164,14 +164,16 @@ Ops that ran as chains of generic kernels (PyTorch's decompositions), chosen
 by profiling (`benchmarks/composed.py`, which counts each op's launches and
 CPU fallbacks) and by the slowest tests of the full runs on lavapipe:
 
-- softmax / log_softmax and layer norm, forward and backward: one workgroup
-  per row (`softmax.slang`, `layernorm.slang`);
+- softmax / log_softmax, layer norm and RMS norm (`_fused_rms_norm`),
+  forward and backward: one workgroup per row (`softmax.slang`,
+  `layernorm.slang`);
 - batch norm and group norm, forward and backward: per-channel (or per-group)
   moments and gradient sums, then one element-wise pass (`normgrad.slang`);
 - max / average pooling, linear upsampling (a gather per dim for the
   backward) and grid sampling, forward and backward (`pool.slang`,
   `resample.slang`, `gridsample.slang`);
 - nll_loss (so cross_entropy) forward and backward (`loss.slang`);
+  smooth-L1 and Huber loss backward as one binary kernel each;
 - embedding's backward and grid sampling's grad_input as rows summed by key:
   one sort of the keys, then whole rows folded in index order, as the CPU's
   loops (`segreduce.slang`'s row mode);
@@ -912,8 +914,8 @@ no fallbacks in the OpInfo sweep).
     kernels on Windows GPUs (the float64 zeta test outlasts the Intel UHD
     620's watchdog and loses the device). (lavapipe's slowest tests, the
     SVD-heavy ones and grid_sampler_3d's, got faster in M16.)
-16. ~~**M16 dedicated kernels**~~: done (see above). Not yet: rms_norm and
-    the smooth-L1/Huber backward as single kernels.
+16. ~~**M16 dedicated kernels**~~: done (see above), rms_norm and the
+    smooth-L1/Huber backward included.
 17. ~~**M17 phones and small GPUs**~~: done (see above). (int64 products
     stay in the tiles: they are bound by the emulated 64-bit multiplies, and
     an int64 gemm4 ran at 0.3 GOP/s on the A13 against 2.5 in the tiles;

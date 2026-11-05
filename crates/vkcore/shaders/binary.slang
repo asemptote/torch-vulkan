@@ -139,6 +139,14 @@ T apply(T a, T b)
     case BINARY_ELU_BACKWARD_RESULT:  // (b: the output)
         return b <= T(0) ? a * T(gamma()) * (b + T(alpha())) : a * T(beta());
     case BINARY_HARDTANH_BACKWARD: return (b <= T(alpha()) || b >= T(beta())) ? T(0) : a;
+    case BINARY_SMOOTH_L1_BACKWARD: {  // b: input - target; alpha: beta, beta: norm (the CPU's kernel)
+        T norm = T(beta());
+        return b <= -T(alpha()) ? -norm * a : (b >= T(alpha()) ? norm * a : norm * b * a / T(alpha()));
+    }
+    case BINARY_HUBER_BACKWARD: {  // b: input - target; alpha: delta, beta: norm
+        T norm = T(beta()), delta = T(alpha());
+        return b <= -delta ? -norm * a * delta : (b >= delta ? norm * a * delta : norm * b * a);
+    }
     case BINARY_LEAKY_RELU_BACKWARD: return b > T(0) ? a : a * T(alpha());
     case BINARY_LOGIT_BACKWARD: {  // alpha: eps (< 0: none), beta: 1 - eps
         if (T(alpha()) < T(0))

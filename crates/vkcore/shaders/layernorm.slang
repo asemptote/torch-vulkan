@@ -7,6 +7,9 @@
 //   LAYERNORM_BACKWARD: gx = rstd * g w + bc * x + cc, with ds = sum(g w x),
 //                       db = sum(g w), bc = (db mean - ds) rstd^3 / n and
 //                       cc = -bc mean - db rstd / n (the CPU's formula)
+//   LAYERNORM_RMS_FORWARD:  RMS norm: rstd = 1 / sqrt(mean(x^2) + eps),
+//                       y = x * rstd * w (mean not written)
+//   LAYERNORM_RMS_BACKWARD: gx = rstd * g w - x rstd^3 sum(g w x) / n
 // w and b are optional (HAS_W, HAS_B; absent: 1 and 0).
 
 #include "_fmath.slang"
@@ -73,7 +76,31 @@ void main(uint3 tid3: SV_GroupThreadID, uint3 gid: SV_GroupID)
     for (uint row = gid.x; row < p.m; row += p.ngroups)
     {
         uint base = row * p.n;
-        if (OP == LAYERNORM_FORWARD)
+        if (OP == LAYERNORM_RMS_FORWARD)
+        {
+            T q = T(0);
+            for (uint j = tid; j < p.n; j += G)
+            {
+                T v = p.x[base + j];
+                q += v * v;
+            }
+            T rstd = T(1) / sqrt(reduce_sum(q, tid) / n + param(p.eps));
+            if (tid == 0)
+                p.rstd[row] = rstd;
+            for (uint j = tid; j < p.n; j += G)
+                p.out[base + j] = p.x[base + j] * rstd * weight(j);
+        }
+        else if (OP == LAYERNORM_RMS_BACKWARD)
+        {
+            T rstd = p.rstd[row];
+            T ds = T(0);
+            for (uint j = tid; j < p.n; j += G)
+                ds += p.g[base + j] * weight(j) * p.x[base + j];
+            T bc = -reduce_sum(ds, tid) * rstd * rstd * rstd / n;
+            for (uint j = tid; j < p.n; j += G)
+                p.out[base + j] = rstd * p.g[base + j] * weight(j) + bc * p.x[base + j];
+        }
+        else if (OP == LAYERNORM_FORWARD)
         {
             T s = T(0);
             for (uint j = tid; j < p.n; j += G)

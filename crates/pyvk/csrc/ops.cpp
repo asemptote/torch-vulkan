@@ -691,6 +691,44 @@ at::Tensor elu_backward(const at::Tensor& grad, const at::Scalar& alpha, const a
   return elu_backward_out(grad, alpha, scale, input_scale, is_result, self_or_result, out);
 }
 
+// smooth_l1 / huber backward: one binary kernel of (grad_output, self -
+// target), with (beta or delta, norm: 1 / numel for the mean) as the CPU's
+// kernels, where PyTorch's decomposition took about a dozen launches.
+at::Tensor& loss_backward_out(uint32_t code, const char* name, const char* overload, const at::Tensor& grad,
+                              const at::Tensor& self, const at::Tensor& target, int64_t reduction, double param,
+                              at::Tensor& grad_input) {
+  at::Tensor d = at::sub(self, target);
+  double norm = reduction == at::Reduction::Mean ? 1.0 / static_cast<double>(self.numel()) : 1.0;
+  if (!act_param_gpu(code, grad.expand(d.sizes()), d, grad_input, {param, norm})) {
+    on_cpu(name, overload, grad, self, target, reduction, param, grad_input);
+  }
+  return grad_input;
+}
+
+at::Tensor& smooth_l1_loss_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& target,
+                                        int64_t reduction, double beta, at::Tensor& grad_input) {
+  return loss_backward_out(op::BINARY_SMOOTH_L1_BACKWARD, "aten::smooth_l1_loss_backward", "grad_input", grad, self,
+                           target, reduction, beta, grad_input);
+}
+
+at::Tensor smooth_l1_loss_backward(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& target,
+                                   int64_t reduction, double beta) {
+  at::Tensor out = at::empty({0}, self.options().dtype(at::result_type(grad, self)));
+  return smooth_l1_loss_backward_out(grad, self, target, reduction, beta, out);
+}
+
+at::Tensor& huber_loss_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& target,
+                                    int64_t reduction, double delta, at::Tensor& grad_input) {
+  return loss_backward_out(op::BINARY_HUBER_BACKWARD, "aten::huber_loss_backward", "out", grad, self, target,
+                           reduction, delta, grad_input);
+}
+
+at::Tensor huber_loss_backward(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& target,
+                               int64_t reduction, double delta) {
+  at::Tensor out = at::empty({0}, self.options().dtype(at::result_type(grad, self)));
+  return huber_loss_backward_out(grad, self, target, reduction, delta, out);
+}
+
 at::Tensor& hardtanh_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Scalar& min_val,
                                   const at::Scalar& max_val, at::Tensor& grad_input) {
   if (!act_param_gpu(op::BINARY_HARDTANH_BACKWARD, grad, self, grad_input, {min_val, max_val})) {
@@ -926,6 +964,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("log_sigmoid_backward", &vk::log_sigmoid_backward);
   m.impl("log_sigmoid_backward.grad_input", &log_sigmoid_backward_out);
   m.impl("softplus_backward", &vk::softplus_backward);
+  m.impl("smooth_l1_loss_backward", &vk::smooth_l1_loss_backward);
+  m.impl("smooth_l1_loss_backward.grad_input", &vk::smooth_l1_loss_backward_out);
+  m.impl("huber_loss_backward", &vk::huber_loss_backward);
+  m.impl("huber_loss_backward.out", &vk::huber_loss_backward_out);
   m.impl("softplus_backward.grad_input", &softplus_backward_out);
   m.impl("elu_backward", &vk::elu_backward);
   m.impl("elu_backward.grad_input", &elu_backward_out);

@@ -7,10 +7,12 @@
 #include "opcodes.h"
 #include "vk.h"
 
+#include <ATen/OpMathType.h>
 #include <torch/library.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <sstream>
 
 namespace vk {
@@ -182,10 +184,103 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm_backward(
   return {gx, gw, gb};
 }
 
+// PyTorch's rms_norm_composite (not exported), with tensor ops: in the
+// opmath dtype, rstd = rsqrt(mean(x^2) + eps) over the last dims.
+std::tuple<at::Tensor, at::Tensor> rms_norm_composite(const at::Tensor& input, at::IntArrayRef normalized_shape,
+                                                      const std::optional<at::Tensor>& weight_opt,
+                                                      std::optional<double> eps) {
+  std::vector<int64_t> dims;
+  for (size_t i = 0; i < normalized_shape.size(); ++i) dims.push_back(input.dim() - static_cast<int64_t>(i) - 1);
+  at::ScalarType ot = at::toOpMathType(input.scalar_type());
+  at::Tensor up = input.to(ot);
+  bool dbl = ot == at::kDouble || ot == at::kComplexDouble;
+  double e = eps.value_or(dbl ? std::numeric_limits<double>::epsilon()
+                              : static_cast<double>(std::numeric_limits<float>::epsilon()));
+  at::Tensor rstd = at::rsqrt(at::pow(up, 2).mean(dims, true).add_(e));
+  at::Tensor out = up.mul(rstd);
+  if (weight_opt.has_value() && weight_opt->defined()) out = out.mul(*weight_opt);
+  return {out.contiguous().to(input.scalar_type()), rstd.contiguous()};
+}
+
+// RMS norm (rms_norm calls _fused_rms_norm, whose autograd formula calls
+// _fused_rms_norm_backward): one workgroup per row as layer norm's, the
+// weight gradient a sum over the rows. 16-bit inputs in float32 (rstd
+// float32, as PyTorch's composite gives it); other cases PyTorch's composite.
+std::tuple<at::Tensor, at::Tensor> fused_rms_norm(const at::Tensor& input, at::IntArrayRef normalized_shape,
+                                                  const std::optional<at::Tensor>& weight_opt,
+                                                  std::optional<double> eps) {
+  at::Tensor weight = weight_opt.value_or(at::Tensor());
+  int64_t k = static_cast<int64_t>(normalized_shape.size());
+  int64_t n = c10::multiply_integers(normalized_shape);
+  int64_t m = n == 0 ? 0 : input.numel() / n;
+  bool half = at::isReducedFloatingType(input.scalar_type());
+  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? widened(weight) : weight;
+  if (!kernel_ok(x, w, at::Tensor()) || m == 0 || n == 0 || k < 1) {
+    return rms_norm_composite(input, normalized_shape, weight_opt, eps);
+  }
+  double e = eps.value_or(x.scalar_type() == at::kDouble ? std::numeric_limits<double>::epsilon()
+                                                         : static_cast<double>(std::numeric_limits<float>::epsilon()));
+  x = x.contiguous();
+  if (w.defined()) w = w.contiguous();
+  at::Tensor out = at::empty(input.sizes(), x.options());
+  at::Tensor rstd = at::empty(stat_shape(input, k), x.options());
+  LayerNormParams p{};
+  p.x = gpu_address(x);
+  p.w = w.defined() ? gpu_address(w) : 0;
+  p.out = gpu_address_out(out);
+  p.rstd = gpu_address_out(rstd);
+  p.m = static_cast<uint32_t>(m);
+  p.n = static_cast<uint32_t>(n);
+  p.eps = pack_param(e, x.scalar_type());
+  launch(op::LAYERNORM_RMS_FORWARD, p, x.scalar_type(), w.defined(), false);
+  return {half ? out.to(input.scalar_type()) : out, rstd};
+}
+
+std::tuple<at::Tensor, at::Tensor> fused_rms_norm_backward(const at::Tensor& grad_out, const at::Tensor& input,
+                                                           at::IntArrayRef normalized_shape, const at::Tensor& rstd,
+                                                           const std::optional<at::Tensor>& weight_opt,
+                                                           std::array<bool, 2> mask) {
+  at::Tensor weight = weight_opt.value_or(at::Tensor());
+  int64_t n = c10::multiply_integers(normalized_shape);
+  int64_t m = n == 0 ? 0 : input.numel() / n;
+  bool half = at::isReducedFloatingType(input.scalar_type());
+  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? widened(weight) : weight;
+  at::Tensor g = grad_out.to(x.scalar_type()).contiguous(), rs = rstd.to(x.scalar_type()).contiguous();
+  x = x.contiguous();
+  at::Tensor gx, gw;
+  if (mask[0]) {
+    if (kernel_ok(x, w, at::Tensor()) && m > 0 && n > 0 && is_vk(g) && is_vk(rs)) {
+      gx = at::empty(input.sizes(), x.options());
+      at::Tensor wc = w.defined() ? w.contiguous() : w;
+      LayerNormParams p{};
+      p.x = gpu_address(x);
+      p.g = gpu_address(g);
+      p.w = wc.defined() ? gpu_address(wc) : 0;
+      p.out = gpu_address_out(gx);
+      p.rstd = gpu_address(rs);
+      p.m = static_cast<uint32_t>(m);
+      p.n = static_cast<uint32_t>(n);
+      launch(op::LAYERNORM_RMS_BACKWARD, p, x.scalar_type(), wc.defined(), false);
+    } else {  // (the formula with tensor ops)
+      at::Tensor x2 = x.view({m, n}), g2 = g.view({m, n}), r2 = rs.view({m, 1});
+      at::Tensor gw2 = w.defined() ? g2 * w.reshape({1, n}) : g2;
+      gx = (r2 * gw2 - x2 * r2 * r2 * r2 * (gw2 * x2).sum(1, true) / n).view(input.sizes());
+    }
+    if (half) gx = gx.to(input.scalar_type());
+  }
+  if (mask[1] && weight.defined()) {
+    gw = (g.view({m, n}) * x.view({m, n}) * rs.view({m, 1})).sum(0).view(normalized_shape);
+    if (half) gw = gw.to(weight.scalar_type());
+  }
+  return {gx, gw};
+}
+
 }  // namespace
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("native_layer_norm", &vk::native_layer_norm);
   m.impl("native_layer_norm_backward", &vk::native_layer_norm_backward);
+  m.impl("_fused_rms_norm", &vk::fused_rms_norm);
+  m.impl("_fused_rms_norm_backward", &vk::fused_rms_norm_backward);
 }

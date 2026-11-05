@@ -1,5 +1,6 @@
 """Neural-network ops on "vk" vs the CPU (M12), forward and backward."""
 
+import contextlib
 import itertools
 
 import pytest
@@ -206,3 +207,34 @@ def test_uint8_resize_matches_cpu_exactly():
         with on_gpu():
             got = F.interpolate(x.to("vk"), size=size, mode=mode, antialias=aa, align_corners=ac)
         assert torch.equal(got.cpu(), want), (mode, aa, ac, size)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_rms_norm_and_robust_loss_backward_kernels(dtype):
+    # rms_norm forward/backward and smooth_l1/huber backward as single kernels
+    torch.manual_seed(0)
+    tol = dict(rtol=2e-2, atol=2e-2) if dtype == torch.float16 else dict(rtol=1e-4, atol=1e-5)
+    x, w, g = torch.randn(6, 33, dtype=dtype), torch.randn(33, dtype=dtype), torch.randn(6, 33, dtype=dtype)
+    outs = []
+    for dev in ("cpu", "vk"):
+        xx, ww = x.clone().to(dev).requires_grad_(True), w.clone().to(dev).requires_grad_(True)
+        ctx = on_gpu() if dev == "vk" else contextlib.nullcontext()
+        with ctx:
+            y = F.rms_norm(xx, (33,), ww, 1e-5)
+            y.backward(g.to(dev))
+        outs.append([t.detach().cpu().float() for t in (y, xx.grad, ww.grad)])
+    for a, b in zip(*outs):
+        torch.testing.assert_close(b, a, **tol)
+    t = torch.randn(6, 33)
+    for red, param in (("mean", 1.0), ("sum", 0.5), ("none", 0.0)):
+        for fn in (lambda a: F.smooth_l1_loss(a, t.to(a.device), reduction=red, beta=param),
+                   lambda a: F.huber_loss(a, t.to(a.device), reduction=red, delta=param or 1.0)):
+            grads = []
+            for dev in ("cpu", "vk"):
+                xx = x.float().clone().to(dev).requires_grad_(True)
+                ctx = on_gpu() if dev == "vk" else contextlib.nullcontext()
+                with ctx:
+                    out = fn(xx)
+                    out.backward(torch.ones_like(out))
+                grads.append(xx.grad.cpu())
+            torch.testing.assert_close(grads[1], grads[0])
