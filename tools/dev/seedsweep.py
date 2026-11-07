@@ -18,6 +18,7 @@ if dev == "vk":
 
 _seed = torch.manual_seed
 torch.manual_seed = lambda s: _seed(s + offset)
-os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.expanduser("~/pytorch-src/test")))
+os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                                       "pytorch-src", "test")))
 sys.path.insert(0, os.getcwd())
 sys.exit(pytest.main(["-q", "-p", "no:cacheprovider", "--no-header", "--tb=line", "-W", "ignore"] + sys.argv[3:]))

@@ -8,3 +8,5 @@ __pycache__/
 tools/opinfo_coverage.json
 tools/opinfo_coverage.log
 tools/*.part*.jsonl
+# PyTorch's test suite (sparse checkout; tools/pytorch_tests.py says how)
+pytorch-src/

@@ -3,6 +3,7 @@
 # tests at the installed torch's commit, a venv with torch, and the build:
 #   bash tools/cluster/setup.sh        (from the repo at ~/torch-vulkan)
 set -euo pipefail
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
 cd ~
 echo "[$(date +%T)] rust"
 if [ ! -x ~/.cargo/bin/cargo ]; then
@@ -25,10 +26,14 @@ export VULKAN_SDK=~/opt/$SDK_VERSION/x86_64
 "$VULKAN_SDK/bin/slangc" -version
 
 echo "[$(date +%T)] pytorch tests"
-if [ ! -f ~/pytorch-src/test/test_ops.py ]; then
-  rm -rf ~/pytorch-src
-  git init -q ~/pytorch-src
-  cd ~/pytorch-src
+SRC="$REPO/pytorch-src"  # (git-ignored)
+if [ ! -f "$SRC/test/test_ops.py" ] && [ -f ~/pytorch-src/test/test_ops.py ]; then
+  mv ~/pytorch-src "$SRC"  # (where earlier setups put it)
+fi
+if [ ! -f "$SRC/test/test_ops.py" ]; then
+  rm -rf "$SRC"
+  git init -q "$SRC"
+  cd "$SRC"
   git remote add origin https://github.com/pytorch/pytorch.git
   git config core.sparseCheckout true
   echo "test/" > .git/info/sparse-checkout

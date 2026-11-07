@@ -3,7 +3,7 @@
     python tools/dev/pt.py test_linalg.py -k "inverse and complex" [pytest options]
 
 Stops at the first failure (add --maxfail=N to go on). PyTorch's tests are
-taken from $PYTORCH_TEST_DIR (default ~/pytorch-src/test); see
+taken from $PYTORCH_TEST_DIR (default: pytorch-src/test in this repo); see
 tools/pytorch_tests.py for running whole files with the CPU re-check.
 """
 import os
@@ -14,7 +14,8 @@ import pytest  # noqa: E402
 import torch  # noqa: E402,F401
 import torch_vulkan  # noqa: E402,F401
 
-os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.expanduser("~/pytorch-src/test")))
+os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                                       "pytorch-src", "test")))
 sys.path.insert(0, os.getcwd())
 # (-c / --rootdir: no search for a configuration file above the tests; see
 # NO_CONFIG in tools/pytorch_tests.py)

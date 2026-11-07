@@ -11,8 +11,9 @@ instantiation to "vk", and runs pytest on the given files:
     python tools/pytorch_tests.py --merge [--out DIR]
     python tools/pytorch_tests.py --ids FAILURES.txt [--name NAME] [--out DIR] [--shard INDEX/COUNT]
 
-DIR defaults to $PYTORCH_TEST_DIR, the test/ directory of a PyTorch checkout
-at the installed torch's commit (torch.version.git_version):
+DIR defaults to $PYTORCH_TEST_DIR, else pytorch-src/test in this repo (git
+ignores pytorch-src/): the test/ directory of a PyTorch checkout at the
+installed torch's commit (torch.version.git_version), made from the repo root:
 
     git init pytorch-src && cd pytorch-src
     git remote add origin https://github.com/pytorch/pytorch.git
@@ -105,6 +106,10 @@ if args and args[0].startswith("@"):
     args = open(args[0][1:], encoding="utf-8").read().split() + args[1:]
 sys.exit(pytest.main(args, plugins=[Recorder(sys.argv[1])] if sys.argv[1] != "-" else []))
 """
+
+
+# PyTorch's test/ directory when $PYTORCH_TEST_DIR is unset: pytorch-src/ at the repo root.
+DEFAULT_TESTS = pathlib.Path(__file__).resolve().parents[1] / "pytorch-src" / "test"
 
 
 def message_key(message):
@@ -406,7 +411,7 @@ def main():
         argv, extra = argv[:i], argv[i + 1:]
     parser = argparse.ArgumentParser()
     parser.add_argument("files", nargs="*")
-    parser.add_argument("--tests", default=os.environ.get("PYTORCH_TEST_DIR", ""))
+    parser.add_argument("--tests", default=os.environ.get("PYTORCH_TEST_DIR", str(DEFAULT_TESTS)))
     parser.add_argument("--out", default=str(pathlib.Path(__file__).with_name("pytorch_tests")))
     parser.add_argument("--shard", default="", help="INDEX/COUNT: run every COUNT-th collected test, starting at INDEX")
     parser.add_argument("--timeout", type=int, default=6 * 3600, help="seconds per pytest process")

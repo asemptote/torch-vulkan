@@ -15,11 +15,13 @@ bash ~/torch-vulkan/tools/cluster/setup.sh
 
 `setup.sh` installs Rust and the Vulkan SDK (for `slangc`) in the home
 directory, checks out PyTorch's `test/` directory at the installed torch's
-commit into `~/pytorch-src`, creates `~/torch-vulkan/.venv` with torch, and
-builds (Cargo's files on local `/tmp`; network home directories are slow for
-them). Large, rarely read things (the SDK, the Rust toolchain) can live on a
-bigger, slower volume behind symlinks; the venv should stay on the fast one,
-since every test process imports torch from it.
+commit into `pytorch-src/` in the repo (git-ignored; an existing
+`~/pytorch-src` from an earlier setup is moved there), creates
+`~/torch-vulkan/.venv` with torch, and builds (Cargo's files on local `/tmp`;
+network home directories are slow for them). Large, rarely read things (the
+SDK, the Rust toolchain) can live on a bigger, slower volume behind symlinks;
+the venv should stay on the fast one, since every test process imports torch
+from it.
 
 After changing the code locally, `tools/cluster/sync.sh HOST --build -J
 GATEWAY` copies the working tree (uncommitted changes included) to the shared

@@ -83,7 +83,8 @@ class Trace(TorchDispatchMode):
         return r
 
 
-os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.expanduser("~/pytorch-src/test")))
+os.chdir(os.environ.get("PYTORCH_TEST_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                                       "pytorch-src", "test")))
 sys.path.insert(0, os.getcwd())
 with Trace():
     pytest.main(["-q", "-p", "no:cacheprovider", "--no-header", "--tb=line", "-W", "ignore"] + sys.argv[1:])

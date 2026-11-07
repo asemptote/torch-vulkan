@@ -44,7 +44,7 @@ esac
 
 # Environment for running in the dev copy (a shell prefix).
 ENV="cd $DIR && export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/${ICD}_icd.x86_64.json \
-LP_NUM_THREADS=$THREADS OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTORCH_TEST_DIR=\$HOME/pytorch-src/test"
+LP_NUM_THREADS=$THREADS OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTORCH_TEST_DIR=\$HOME/torch-vulkan/pytorch-src/test"
 
 # Runs shell command $1 in the dev copy on DRIVER: through ssh on HOST, or
 # as a job script on a GPU node (the same text: ssh's remote shell and the
