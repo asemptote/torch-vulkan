@@ -83,7 +83,7 @@ shards on the shared file system: `$RUNS/NAME` for lavapipe and
 - Cluster workers take shards from the start of each queue: the PBS lavapipe
   array, plus an H100 job and an L40S job (separate queues).
 - Workstation workers (`pool.sh`) take shards from the end, one per core on
-  ws0, ws2 and ws3 (lavapipe). Each is ranked: worker k runs only while
+  ws1, ws2 and ws3 (lavapipe). Each is ranked: worker k runs only while
   the cores other processes use (a per-machine `top` monitor) plus k fit in
   the machine (resuming a paused shard needs one core more). As other users' load rises, the highest ranks pause
   their shards and come back in order as it falls; a shard paused for 20

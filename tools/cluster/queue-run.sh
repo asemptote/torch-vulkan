@@ -9,7 +9,7 @@
 #   - the cluster: PBS_JOBS single-core lavapipe jobs, and an H100 and an
 #     L40S job (separate queues) of GPU_WORKERS workers each;
 #   - backfill on the workstations (pool.sh): one ranked worker per core on
-#     ws0, ws2 and ws3 for the lavapipe run (each running only while
+#     ws1, ws2 and ws3 for the lavapipe run (each running only while
 #     its rank fits beside the machine's other users' load, see worker.sh),
 #     and ws3's Tesla M4 on the NVIDIA run if WS3_GPU_WORKERS > 0.
 # The cluster's workers take shards from the start of each queue and the
@@ -25,7 +25,7 @@
 # Settings (environment): DEV_SSH (ssh options, default "-J
 # gateway.example.edu"), RUNS (/shared/scratch/me/torch-vulkan-runs),
 # LAVAPIPE_SHARDS (192), NVIDIA_SHARDS (64), PBS_JOBS (48), GPU_WORKERS (16),
-# WS0_WORKERS, WS2_WORKERS, WS3_WORKERS (one per core), WS3_GPU_WORKERS (0: the
+# WS1_WORKERS, WS2_WORKERS, WS3_WORKERS (one per core), WS3_GPU_WORKERS (0: the
 # Tesla M4 has 4 GB, and full runs need more; it stays for quick checks, dev.sh DRIVER=nvidia-host).
 set -euo pipefail
 CMD=${1:?usage: queue-run.sh start|status NAME [TEST_FILE...]}
@@ -68,7 +68,7 @@ test_sort_and_select.py test_view_ops.py}
         qsub -q \$q -l select=1:ncpus=16:ngpus=1:mem=32gb -o $NV/pbs-logs \
           -v RUN_DIR=$NV,WORKERS=${GPU_WORKERS:-16} tools/cluster/pbs-gpu.sh
       done"
-    on ws0 "bash $TV/pool.sh lavapipe $LAV ${WS0_WORKERS:-}"
+    on ws1 "bash $TV/pool.sh lavapipe $LAV ${WS1_WORKERS:-}"
     on ws2 "bash $TV/pool.sh lavapipe $LAV ${WS2_WORKERS:-}"
     # (ws3's GPU workers rank first: lavapipe workers there rank after them)
     G=${WS3_GPU_WORKERS:-0}
