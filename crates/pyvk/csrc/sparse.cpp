@@ -312,10 +312,27 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
   int64_t n = mat1.size(0), k = mat2.size(1);
   at::ScalarType t = at::result_type(mat1, mat2);
   at::Tensor product = at::zeros({n, k}, mat2.options().dtype(t));
-  if (mat1._nnz() > 0) {
-    at::Tensor idx = mat1._indices();
-    at::Tensor rows = mat2.to(t).index_select(0, idx.select(0, 1)) * mat1._values().to(t).unsqueeze(1);
-    product.index_add_(0, idx.select(0, 0), rows);
+  int64_t nnz = mat1._nnz();
+  if (nnz > 0) {
+    // each entry's scaled row of mat2 added into its output row, in entry
+    // order; in chunks of entries, so the gathered rows stay within 2^22
+    // elements (nnz * k of them at once: gigabytes for a 10^5-entry matrix
+    // times 1000 columns)
+    // (each chunk: one sort of its output rows, then whole rows folded in
+    // entry order by sum_rows_by_sorted_group; complex rows as real pairs)
+    at::Tensor idx = mat1._indices(), vals = mat1._values().to(t), m2 = mat2.to(t);
+    bool cplx = at::isComplexType(t);
+    int64_t width = cplx ? 2 * k : k;
+    int64_t chunk = std::max<int64_t>(1, (int64_t(1) << 22) / std::max<int64_t>(width, 1));
+    for (int64_t start = 0; start < nnz; start += chunk) {
+      int64_t len = std::min(chunk, nnz - start);
+      at::Tensor out_rows = idx.select(0, 0).narrow(0, start, len).contiguous();
+      at::Tensor rows = m2.index_select(0, idx.select(0, 1).narrow(0, start, len)) * vals.narrow(0, start, len).unsqueeze(1);
+      at::Tensor flat = cplx ? at::view_as_real(rows).reshape({len, width}) : rows;
+      at::Tensor order = sort_rows(out_rows.reshape({1, len}), false).reshape({len});
+      at::Tensor summed = sum_rows_by_sorted_group(flat, out_rows, order, n);  // [n, width]
+      product.add_(cplx ? at::view_as_complex(summed.view({n, k, 2})) : summed);
+    }
   }
   at::Tensor base = self.expand({n, k});
   at::Tensor r = beta.toComplexDouble() == 0.0 ? product * alpha : at::add(base * beta, product, alpha);
