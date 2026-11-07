@@ -156,6 +156,21 @@ R reduce_sum_real(uint t, R v)
     return r;
 }
 
+R reduce_max_real(uint t, R v)
+{
+    rval[t] = v;
+    barrier();
+    for (uint s = WG / 2; s > 0; s >>= 1)
+    {
+        if (t < s)
+            rval[t] = max(rval[t], rval[t + s]);
+        barrier();
+    }
+    R r = rval[0];
+    barrier();
+    return r;
+}
+
 // Two real sums and one T sum at once.
 void reduce_sum3(uint t, inout R x, inout R y, inout T z)
 {
@@ -177,6 +192,16 @@ void reduce_sum3(uint t, inout R x, inout R y, inout T z)
     y = rval2[0];
     z = sval[0];
     barrier();
+}
+
+// The smallest normal R: below it GPUs may flush values to zero.
+R min_normal()
+{
+#if defined(T_f64) || defined(T_c128)
+    return asdouble(0u, 0x00100000u);  // 2^-1022
+#else
+    return asfloat(0x00800000u);  // 2^-126
+#endif
 }
 
 R sign_of(R x)
@@ -356,17 +381,27 @@ void qr_panel(uint t, uint z)
     uint m = p.rows, ld = p.ld;
     for (uint j = p.k; j < p.k + p.b; j++)
     {
-        // dlarfg / zlarfg on x = a[j:m, j]
-        R part = R(0);
-        for (uint i = j + 1 + t; i < m; i += WG)
-            part += norm2(a[i * ld + j]);
-        R xnorm2 = reduce_sum_real(t, part);
+        // dlarfg / zlarfg on x = a[j:m, j]. The norms are scaled by the
+        // largest |part| (as dlapy3/dznrm2), or squares of tiny entries
+        // underflow (flushed on GPUs) and beta becomes 0: tau NaN; a column
+        // whose largest part is subnormal counts as zero (H = I).
         T alpha = a[j * ld + j];
+        R amax = R(0);
+        for (uint i = j + 1 + t; i < m; i += WG)
+            amax = max(amax, mag1(a[i * ld + j]));
+        amax = max(reduce_max_real(t, amax), mag1(alpha));
+        R part = R(0);
+        if (amax >= min_normal())
+        {
+            for (uint i = j + 1 + t; i < m; i += WG)
+                part += norm2(a[i * ld + j] / amax);
+        }
+        R xnorm2 = reduce_sum_real(t, part);  // (|x|^2 / amax^2)
         R alphr = re(alpha);
         T tj = ZERO;
-        if (xnorm2 != R(0) || !is_zero(alpha - fromr(alphr)))
+        if (amax >= min_normal() && (xnorm2 != R(0) || !is_zero(alpha - fromr(alphr))))
         {
-            R beta = -sign_of(alphr) * sqrt(norm2(alpha) + xnorm2);
+            R beta = -sign_of(alphr) * amax * sqrt(norm2(alpha / amax) + xnorm2);
 #ifdef IS_COMPLEX
             tj = T((beta - alphr) / beta, -alpha.y / beta);
 #else
