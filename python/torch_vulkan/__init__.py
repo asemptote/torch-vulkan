@@ -72,6 +72,30 @@ def device_name():
     return _native.device_name()
 
 
+def _warn_llvmpipe_on_android():
+    """On Android, Termux's Vulkan loader finds only Mesa's llvmpipe (the
+    CPU), whose 32-bit ARM shaders fault with SIGBUS in reductions and
+    softmax (an aligned NEON store to 8-byte aligned memory): say so at
+    import, before the first sum kills the process."""
+    if not (sys.platform == "android" or hasattr(sys, "getandroidapilevel")):
+        return
+    try:
+        name = _native.device_name()
+    except RuntimeError:
+        return
+    if name.startswith("llvmpipe"):
+        import warnings
+
+        warnings.warn(
+            "torch_vulkan: Vulkan found only llvmpipe (Mesa's CPU driver), not the phone's GPU; on 32-bit "
+            "Android its shaders crash (SIGBUS) in reductions such as sum and softmax. Load Android's own "
+            "Vulkan loader (/system/lib/libvulkan.so) first for this process, e.g. through LD_LIBRARY_PATH "
+            "(see the README's 'Building on the phone').", RuntimeWarning, stacklevel=2)
+
+
+_warn_llvmpipe_on_android()
+
+
 def synchronize(device=None):
     """Waits for all queued GPU work."""
     _native.synchronize()
