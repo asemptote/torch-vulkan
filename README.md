@@ -99,8 +99,8 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   reached through Android's own Vulkan loader (Termux's finds only
   llvmpipe, Mesa's CPU driver, whose 32-bit ARM shaders for reductions and
   softmax die with SIGBUS: an aligned NEON store, `vst1.64 {..}, [rN:128]`,
-  to heap memory llvmpipe allocated 8-byte aligned; importing torch_vulkan
-  on Android warns when it gets llvmpipe). On the A13's Mali-G57 the local suite passes but for the
+  to heap memory llvmpipe allocated 8-byte aligned, in Mesa 26.2.4 and
+  26.2.6; importing torch_vulkan on Android warns when it gets llvmpipe). On the A13's Mali-G57 the local suite passes but for the
   float64 tests (skipped) and two references the phone's ARM CPU computes
   differently (complex log2 at 0, float16 linspace).
 - **Typed errors on Android**: Android's libc++ matches exception types by
