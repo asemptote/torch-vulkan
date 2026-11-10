@@ -9,6 +9,12 @@ on:
 
 env:
   SLANG_VERSION: "2026.20"
+  # The validation layer of the Vulkan SDK used in development: Ubuntu's
+  # 1.3.275 reports false positives (storagePushConstant8/16 for push
+  # constants that only hold buffer pointers) and best-practices warnings the
+  # current layer no longer raises.
+  VVL_SDK: "1.4.363.0"
+  VVL_SDK_SHA256: 197962f5cbf80baf2775a03336a01cee7c8745686c65aaa70d3f751ade4d7e43
   TORCH_VK_VALIDATE: "1"
   # lavapipe's LLVM JIT emits AVX-512 code that faults on some runner CPUs.
   LP_NATIVE_VECTOR_WIDTH: "256"
@@ -19,16 +25,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Vulkan (lavapipe, loader, validation layers)
+      - uses: actions/cache@v4
+        id: vvl-cache
+        with:
+          path: ~/vvl
+          key: vvl-${{ env.VVL_SDK }}
+
+      - name: Validation layer (from the Vulkan SDK)
+        if: steps.vvl-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSLf -o sdk.tar.xz "https://sdk.lunarg.com/sdk/download/${VVL_SDK}/linux/vulkansdk-linux-x86_64-${VVL_SDK}.tar.xz"
+          echo "${VVL_SDK_SHA256}  sdk.tar.xz" | sha256sum -c -
+          mkdir -p ~/vvl
+          tar -xJf sdk.tar.xz -C ~/vvl --strip-components=2 --wildcards \
+            "*/x86_64/lib/libVkLayer_khronos_validation.so" \
+            "*/x86_64/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"
+          rm sdk.tar.xz
+
+      - name: Vulkan (lavapipe, loader, validation layer)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+          echo "VK_ADD_LAYER_PATH=$HOME/vvl/share/vulkan/explicit_layer.d" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/vvl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Use lavapipe even if the runner exposes another Vulkan driver. The
           # manifest's name varies between Mesa releases, so ask the package.
           icd=$(dpkg -L mesa-vulkan-drivers | grep -E '/icd\.d/lvp_icd[^/]*\.json$' | head -1)
           test -n "$icd" || { echo "lavapipe manifest not found"; dpkg -L mesa-vulkan-drivers | grep icd.d; exit 1; }
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
           VK_DRIVER_FILES=$icd vulkaninfo --summary
+          VK_ADD_LAYER_PATH=$HOME/vvl/share/vulkan/explicit_layer.d LD_LIBRARY_PATH=$HOME/vvl/lib \
+            vulkaninfo --summary | grep -A3 -i "VK_LAYER_KHRONOS_validation"
 
       - name: Slang
         run: |
