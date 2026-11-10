@@ -161,3 +161,76 @@ def test_group_norm_empty_batch():
     no_fallback(lambda: y.sum().backward())
     assert y.shape == (0, 4, 3)
     torch.testing.assert_close(w.grad.cpu(), torch.zeros(4))
+
+
+def test_index_with_cpu_indices():
+    x = make((5, 4), torch.float32)
+    mask = torch.tensor([True, False, True, False, True])
+    rows = torch.tensor([3, 0])
+    v = x.to("vk")
+    torch.testing.assert_close(no_fallback(lambda: v[mask]).cpu(), x[mask])
+    torch.testing.assert_close(no_fallback(lambda: v[rows]).cpu(), x[rows])
+    no_fallback(lambda: v.index_put_((mask,), torch.full((3, 4), 7.0, device="vk")))
+    torch.testing.assert_close(v.cpu(), x.index_put((mask,), torch.full((3, 4), 7.0)))
+
+
+def test_nonzero_many_dims():
+    x = (make((2, 1, 3, 1, 2, 2, 1, 3, 1, 2, 1, 2), torch.float32) > 0)
+    torch.testing.assert_close(no_fallback(lambda: torch.nonzero(x.to("vk"))).cpu(), torch.nonzero(x))
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_searchsorted_scalar(side):
+    s = torch.sort(make((20,), torch.float32)).values
+    for value in (0.3, -5, 2):
+        got = no_fallback(lambda: torch.searchsorted(s.to("vk"), value, side=side))
+        torch.testing.assert_close(got.cpu(), torch.searchsorted(s, value, side=side))
+    p = torch.randperm(20)
+    u = s[torch.argsort(p)]
+    got = no_fallback(lambda: torch.searchsorted(u.to("vk"), 0.1, sorter=torch.argsort(u).to("vk"), out_int32=True))
+    torch.testing.assert_close(got.cpu(), torch.searchsorted(u, 0.1, sorter=torch.argsort(u), out_int32=True))
+
+
+@pytest.mark.parametrize("op", [torch.logical_and, torch.logical_or, torch.logical_xor])
+def test_logical_mixed_dtypes(op):
+    a = make((6,), torch.float32) * (make((6,), torch.float32, seed=1) > 0)
+    b = (make((6,), torch.float32, seed=2) > 0).to(torch.bfloat16)
+    got = no_fallback(lambda: op(a.to("vk"), b.to("vk")))
+    torch.testing.assert_close(got.cpu(), op(a, b))
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_linspace_logspace_complex(dtype):
+    for steps in (0, 1, 2, 7):
+        got = no_fallback(lambda: torch.linspace(1 - 2j, -3 + 4j, steps, dtype=dtype, device="vk"))
+        torch.testing.assert_close(got.cpu(), torch.linspace(1 - 2j, -3 + 4j, steps, dtype=dtype))
+    got = torch.logspace(0.5 - 1j, 1 + 2j, 6, dtype=dtype, device="vk")
+    torch.testing.assert_close(got.cpu(), torch.logspace(0.5 - 1j, 1 + 2j, 6, dtype=dtype))
+
+
+def test_unique_internal():
+    x = torch.tensor([3, 1, 3, 7, 1])
+    for sorted_ in (True, False):
+        got = no_fallback(lambda: torch._unique(x.to("vk"), sorted=sorted_, return_inverse=True))
+        want = torch._unique(x, sorted=sorted_, return_inverse=True)
+        torch.testing.assert_close(got[0].cpu(), want[0])
+        torch.testing.assert_close(got[1].cpu(), want[1])
+
+
+def test_add_complex_and_bool_alpha():
+    a, b = torch.tensor([1 + 1j, 2 - 1j]), torch.tensor([3j, 1 + 0j])
+    got = no_fallback(lambda: torch.add(a.to("vk"), b.to("vk"), alpha=2 - 1j))
+    torch.testing.assert_close(got.cpu(), torch.add(a, b, alpha=2 - 1j))
+    got = no_fallback(lambda: torch.sub(a.to("vk"), b.to("vk"), alpha=1j))
+    torch.testing.assert_close(got.cpu(), torch.sub(a, b, alpha=1j))
+    p, q = torch.tensor([True, False, False]), torch.tensor([True, True, False])
+    for alpha in (True, False):
+        got = no_fallback(lambda: torch.add(p.to("vk"), q.to("vk"), alpha=alpha))
+        torch.testing.assert_close(got.cpu(), torch.add(p, q, alpha=alpha))
+    with pytest.raises(RuntimeError, match="complex"):
+        torch.add(torch.ones(2, device="vk"), torch.ones(2, device="vk"), alpha=1j)
+
+
+def test_pinv_of_a_vector_raises_as_cpu():
+    with pytest.raises(RuntimeError, match=r"linalg.pinv\(Float\{\[3\]\}\): expected a tensor with 2 or more dimensions"):
+        torch.linalg.pinv(torch.ones(3, device="vk"))

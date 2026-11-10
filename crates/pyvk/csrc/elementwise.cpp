@@ -359,8 +359,9 @@ at::Tensor& predicate_out(const at::Tensor& self, at::Tensor& out) {
 template <uint32_t Code>  // COMPARE_LOGICAL_AND, _OR, _XOR
 at::Tensor& logical_out(const at::Tensor& self, const at::Tensor& other, at::Tensor& out) {
   at::native::resize_output(out, at::infer_size(self.sizes(), other.sizes()));
+  // (any storable dtypes, mixed too: both sides are cast to bool first)
   bool ok = is_vk(self) && is_vk(out) && (is_vk(other) || cpu_scalar(other)) &&
-            dtype_label(self.scalar_type()) && dtype_label(other.scalar_type());
+            storage_label(self.scalar_type()) && storage_label(other.scalar_type());
   if (!ok) {
     const char* name = Code == op::COMPARE_LOGICAL_AND  ? "aten::logical_and"
                        : Code == op::COMPARE_LOGICAL_OR ? "aten::logical_or"

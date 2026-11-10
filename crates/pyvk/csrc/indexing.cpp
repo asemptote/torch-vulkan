@@ -353,9 +353,23 @@ bool indices_on_vk(const c10::List<std::optional<at::Tensor>>& indices) {
   return true;
 }
 
-at::Tensor& index_out(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices, at::Tensor& out) {
-  TORCH_CHECK_INDEX(!indices.empty(), "at least one index must be provided");
-  check_index_devices(self, indices);
+// CPU index tensors (allowed, as on CUDA) moved to the vk tensor's device.
+c10::List<std::optional<at::Tensor>> indices_to(const c10::List<std::optional<at::Tensor>>& indices,
+                                                const at::Tensor& self) {
+  if (!is_vk(self)) return indices;
+  c10::List<std::optional<at::Tensor>> moved;
+  for (const std::optional<at::Tensor>& t : indices) {
+    bool cpu = t.has_value() && t->defined() && t->device().is_cpu() && t->dim() > 0;
+    moved.push_back(cpu ? std::optional<at::Tensor>(t->to(self.device())) : t);
+  }
+  return moved;
+}
+
+at::Tensor& index_out(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices_in,
+                      at::Tensor& out) {
+  TORCH_CHECK_INDEX(!indices_in.empty(), "at least one index must be provided");
+  check_index_devices(self, indices_in);
+  c10::List<std::optional<at::Tensor>> indices = indices_to(indices_in, self);
   if (!movable(self) || !is_vk(out) || out.scalar_type() != self.scalar_type() || !indices_on_vk(indices)) {
     on_cpu("aten::index", "Tensor_out", self, indices, out);
     return out;
@@ -375,9 +389,10 @@ at::Tensor index(const at::Tensor& self, const c10::List<std::optional<at::Tenso
 bool accum_supported(at::ScalarType t, bool sum_only);
 void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, const at::Tensor& values);
 
-at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
+at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices_in,
                            const at::Tensor& values, bool accumulate, bool unsafe) {
-  check_index_devices(self, indices);
+  check_index_devices(self, indices_in);
+  c10::List<std::optional<at::Tensor>> indices = indices_to(indices_in, self);
   if (at::has_internal_overlap(self) == at::MemOverlap::Yes) {  // (as the CPU)
     TORCH_WARN("Use of index_put_ on expanded tensors is deprecated. Please clone() the tensor before performing "
                "this operation. This also applies to advanced indexing e.g. tensor[indices] = tensor");
@@ -939,8 +954,21 @@ static_assert(sizeof(NonzeroParams) == 72, "must match shaders/nonzero.slang");
 at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
   TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
               "devices, ", self.device(), " and ", out.device(), "!");
-  if (!is_vk(self) || !is_vk(out) || self.dim() > 8 || out.scalar_type() != at::kLong) {
+  if (!is_vk(self) || !is_vk(out) || out.scalar_type() != at::kLong) {
     on_cpu("aten::nonzero", "out", self, out);
+    return out;
+  }
+  if (self.dim() > 8) {
+    // (more dims than the kernel takes: the flat positions, unravelled)
+    at::Tensor lin = at::nonzero(self.reshape({-1})).select(1, 0);
+    std::vector<at::Tensor> coords(self.dim());
+    for (int64_t d = self.dim() - 1; d >= 0; --d) {
+      coords[d] = at::remainder(lin, self.size(d));
+      lin = at::div(lin, self.size(d), "floor");
+    }
+    at::Tensor r = at::stack(coords, 1);
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
     return out;
   }
   int64_t ndim = self.dim();
@@ -1327,6 +1355,18 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
   at::assert_no_internal_overlap(out);
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
   at::ScalarType dtype = out.scalar_type();
+  if (is_vk(out) && at::isComplexType(dtype) && storage_label(c10::toRealValueType(dtype)) != nullptr) {
+    // (the real and imaginary parts each a linspace: the CPU's complex
+    // step and halfway formula are componentwise)
+    if (out.numel() != steps) at::native::resize_output(out, {steps});
+    if (steps == 0) return out;
+    at::Tensor parts = at::view_as_real(out);
+    at::Tensor re = parts.select(-1, 0), im = parts.select(-1, 1);
+    c10::complex<double> s = start.toComplexDouble(), e = end.toComplexDouble();
+    linspace_out(s.real(), e.real(), steps, re);
+    linspace_out(s.imag(), e.imag(), steps, im);
+    return out;
+  }
   if (!is_vk(out) || at::isComplexType(dtype) || dtype == at::kBool) {
     on_cpu("aten::linspace", "out", start, end, steps, out);
     return out;

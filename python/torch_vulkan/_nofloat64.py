@@ -133,6 +133,15 @@ def _make_quantile(nan, original):
 
 # ---------------------------------------------------------------- pinv / matrix_rank
 
+_COMPLEX_NAMES = {torch.complex32: "ComplexHalf", torch.complex64: "ComplexFloat", torch.complex128: "ComplexDouble"}
+
+
+def _check_real(t, name, what):
+    """PyTorch's check (and message) that a tolerance tensor is not complex."""
+    if isinstance(t, torch.Tensor) and t.is_complex():
+        raise RuntimeError(f"{name}: {what} tensor of complex type is not supported. Got {_COMPLEX_NAMES[t.dtype]}")
+
+
 def _tolerance(input, atol, rtol, name):
     """(atol, rtol) as tensors with PyTorch's defaults: float64 as PyTorch's
     where the GPU has it, else input's real dtype."""
@@ -141,8 +150,7 @@ def _tolerance(input, atol, rtol, name):
     if _has_float64():
         real = torch.float64
     for t, what in ((atol, "atol"), (rtol, "rtol")):
-        if isinstance(t, torch.Tensor) and t.is_complex():
-            raise RuntimeError(f"{name}: {what} tensor of complex type is not supported.")
+        _check_real(t, name, what)
     as_t = lambda v: v.to(real) if isinstance(v, torch.Tensor) else torch.full((), v, dtype=real, device=input.device)
     a = as_t(0.0 if atol is None else atol)
     if rtol is not None:
@@ -154,11 +162,14 @@ def _tolerance(input, atol, rtol, name):
 
 
 def _pinv_impl(input, atol, rtol, hermitian):
+    if input.dim() < 2 or not (input.is_floating_point() or input.is_complex()):
+        # (PyTorch's checks, with its messages, on a meta tensor of the shape)
+        torch.linalg.pinv(torch.empty(input.shape, dtype=input.dtype, device="meta"), hermitian=hermitian)
     if input.numel() == 0:
         shape = list(input.shape)
         shape[-1], shape[-2] = shape[-2], shape[-1]
         return input.new_zeros(shape) + input.sum() * 0  # (zeros that keep the autograd graph, as PyTorch's)
-    a, r = _tolerance(input, atol, rtol, "linalg.pinv")
+    a, r = _tolerance(input, atol, rtol, "torch.linalg.pinv")
     if not hermitian:
         U, S, Vh = torch.linalg.svd(input, full_matrices=False)
         tol = torch.maximum(a.unsqueeze(-1), r.unsqueeze(-1) * S.narrow(-1, 0, 1))
@@ -203,7 +214,8 @@ def _overloads(fn_name, impl, original_packet):
             "linalg_pinv.atol_rtol_float": pick("atol_rtol_float", lambda x, *, atol=None, rtol=None, hermitian=False:
                                                 (x, atol, rtol, hermitian)),
             "linalg_pinv": pick("default", lambda x, rcond, hermitian=False: (x, 0.0, rcond, hermitian)),
-            "linalg_pinv.rcond_tensor": pick("rcond_tensor", lambda x, rcond, hermitian=False: (x, 0.0, rcond, hermitian)),
+            "linalg_pinv.rcond_tensor": pick("rcond_tensor", lambda x, rcond, hermitian=False: (
+                _check_real(rcond, "torch.linalg.pinv", "rcond"), (x, 0.0, rcond, hermitian))[1]),
         }
     return {
         "linalg_matrix_rank.atol_rtol_tensor": pick("atol_rtol_tensor", lambda x, *, atol=None, rtol=None,

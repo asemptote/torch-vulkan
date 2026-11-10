@@ -11,6 +11,8 @@
 #include "opcodes.h"
 #include "vk.h"
 
+#include <ATen/native/BinaryOps.h>
+
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/Resize.h>
@@ -496,6 +498,13 @@ namespace {
 
 template <size_t I>
 at::Tensor& binary_alpha_out(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha, at::Tensor& out) {
+  if ((alpha.isComplex() || alpha.isBoolean()) && is_vk(self) && is_vk(out) && (is_vk(other) || other.dim() == 0)) {
+    // (a complex alpha: other scaled first; a bool alpha, for bool tensors:
+    // other or nothing; after the CPU's check of alpha against the dtype)
+    at::native::alpha_check(at::result_type(self, other), alpha);
+    at::Tensor scaled = alpha.isComplex() ? at::mul(other, alpha) : alpha.toBool() ? other : at::zeros_like(other);
+    if (binary_gpu(kBinary[I], self, &scaled, nullptr, 1, out)) return out;
+  }
   if (!binary_gpu(kBinary[I], self, &other, nullptr, alpha, out)) {
     on_cpu(kBinary[I].name, kBinary[I].overload, self, other, alpha, out);
   }

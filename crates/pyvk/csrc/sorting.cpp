@@ -815,6 +815,31 @@ at::Tensor trace(const at::Tensor& self) {
   return self.diagonal().sum();
 }
 
+// searchsorted with a scalar value: as a wrapped-number tensor, as the CPU
+// does (its promotion rules are a binary op's).
+at::Tensor scalar_value(const at::Scalar& value, const at::Device& device) {
+  at::Tensor t = c10::scalar_to_tensor(value, device);
+  t.unsafeGetTensorImpl()->set_wrapped_number(true);
+  return t;
+}
+
+at::Tensor searchsorted_scalar(const at::Tensor& sorted, const at::Scalar& self, bool out_int32, bool right,
+                               std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter) {
+  return vk::searchsorted(sorted, scalar_value(self, sorted.device()), out_int32, right, side, sorter);
+}
+
+at::Tensor& searchsorted_scalar_out(const at::Tensor& sorted, const at::Scalar& self, bool out_int32, bool right,
+                                    std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter,
+                                    at::Tensor& out) {
+  return vk::searchsorted_out(sorted, scalar_value(self, sorted.device()), out_int32, right, side, sorter, out);
+}
+
+// _unique (no counts): _unique2's values and inverse.
+std::tuple<at::Tensor, at::Tensor> unique_values(const at::Tensor& self, bool sorted, bool return_inverse) {
+  auto [values, inverse, counts] = unique2(self, sorted, return_inverse, false);
+  return {values, inverse};
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -837,6 +862,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_logcumsumexp.out", &logcumsumexp_out);
   m.impl("searchsorted.Tensor", &vk::searchsorted);
   m.impl("searchsorted.Tensor_out", &searchsorted_out);
+  m.impl("searchsorted.Scalar", &searchsorted_scalar);
+  m.impl("searchsorted.Scalar_out", &searchsorted_scalar_out);
+  m.impl("_unique", &unique_values);
   m.impl("bucketize.Tensor", &vk::bucketize);
   m.impl("bucketize.Tensor_out", &bucketize_out);
   m.impl("_unique2", &unique2);
