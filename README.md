@@ -130,7 +130,9 @@ Requirements: Rust (stable), a C++20 compiler, Python 3.10 or newer, PyTorch
 compiler `slangc` (in the Vulkan SDK, or from Slang's releases), and a Vulkan
 driver. `build.rs` finds `slangc` through `SLANGC`, then `VULKAN_SDK`, then
 `PATH`. The extension is compiled against the PyTorch of the environment it is
-installed into, so rebuild it after upgrading PyTorch.
+installed into, so rebuild it after upgrading PyTorch. The tests and CI use
+PyTorch 2.14.1; with 2.15, float16 `linspace` differs from the CPU's by a few
+units in the last place.
 
 Linux (as the CI does; lavapipe gives a Vulkan driver on any machine):
 
@@ -139,7 +141,7 @@ sudo apt-get install mesa-vulkan-drivers libvulkan1 vulkan-tools
 mkdir -p ~/slang && curl -sSL https://github.com/shader-slang/slang/releases/download/v2026.20/slang-2026.20-linux-x86_64.tar.gz | tar -xz -C ~/slang
 export SLANGC=~/slang/bin/slangc
 python -m venv .venv && . .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
 pip install numpy pytest maturin expecttest hypothesis
 maturin develop --release
 python -m pytest -q
@@ -151,7 +153,7 @@ Windows (Visual Studio Build Tools with C++, the Vulkan SDK, and
 ```powershell
 uv venv .venv --python 3.12
 $env:VIRTUAL_ENV = "$PWD\.venv"
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
 uv pip install numpy pytest maturin expecttest hypothesis
 .\.venv\Scripts\maturin develop --release --uv
 .\.venv\Scripts\python -m pytest -q
