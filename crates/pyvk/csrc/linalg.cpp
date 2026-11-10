@@ -3,7 +3,9 @@
 // All of them run shaders/gemm.slang on 3-D views [batch, rows, cols]:
 // operands are passed by strides, so transposed (e.g. from autograd) and
 // broadcast operands need no copies. float32 and float64; other dtypes and
-// shapes the kernel cannot address run on the CPU.
+// shapes the kernel cannot address run on the CPU. Products with one output
+// column or one output row are matrix-vector products and run
+// shaders/gemv.slang instead.
 
 #include "vk.h"
 
@@ -29,7 +31,20 @@ struct GemmParams {
 };
 static_assert(sizeof(GemmParams) == 112 && offsetof(GemmParams, a_sm) == 64, "must match shaders/gemm.slang");
 
+struct GemvParams {
+  uint64_t mat, vec, out, cin;
+  uint64_t alpha, beta;  // pack_param slots
+  uint32_t rows, k;
+  int32_t m_sr, m_sk, m_sb;
+  int32_t v_sk, v_sb;
+  int32_t o_sr, o_sb;
+  int32_t c_sr, c_sb;
+};
+static_assert(sizeof(GemvParams) == 96 && offsetof(GemvParams, m_sr) == 56 && offsetof(GemvParams, c_sb) == 88,
+              "must match shaders/gemv.slang");
+
 constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
+constexpr int64_t kGemvRows0 = 8, kGemvRows1 = 64;  // rows per workgroup in shaders/gemv.slang's modes
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
 
@@ -85,6 +100,53 @@ int64_t max_offset(const at::Tensor& t) {
   return span;
 }
 
+// gemm()'s product when C has one column (N == 1: c[r] = sum_k a[r, k] b[k])
+// or one row (M == 1: c[r] = sum_k b[k, r] a[k]), as shaders/gemv.slang's
+// matrix-vector product. The operands are already checked by gemm(). Returns
+// false if the grid is too large (gemm.slang then takes it).
+bool gemv(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
+          double beta) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
+  bool column = n == 1;  // the product's rows are C's rows (else C's columns)
+  const at::Tensor& mat = column ? a : b;
+  const at::Tensor& vec = column ? b : a;
+  int64_t rows = column ? m : n;
+  auto m_sr = static_cast<int32_t>(column ? mat.stride(1) : mat.stride(2));
+  auto m_sk = static_cast<int32_t>(column ? mat.stride(2) : mat.stride(1));
+  // Threads along k when k is contiguous (or neither stride is), else along rows.
+  int64_t mode = (m_sk == 1 || m_sr != 1) ? 0 : 1;
+  int64_t per_group = mode == 0 ? kGemvRows0 : kGemvRows1;
+  int64_t groups = (rows + per_group - 1) / per_group;
+  if (groups > kMaxGroups) {
+    return false;
+  }
+  int64_t rdim = column ? 1 : 2;  // C's (and cin's) dim along the product's rows
+  bool use_cin = cin != nullptr && beta != 0.0;
+  GemvParams p{};
+  p.mat = gpu_address(mat);
+  p.vec = gpu_address(vec);
+  p.out = gpu_address_out(c);
+  p.cin = use_cin ? gpu_address(*cin) : 0;
+  p.alpha = pack_param(alpha, c.scalar_type());
+  p.beta = pack_param(beta, c.scalar_type());
+  p.rows = static_cast<uint32_t>(rows);
+  p.k = static_cast<uint32_t>(k);
+  p.m_sr = m_sr;
+  p.m_sk = m_sk;
+  p.m_sb = static_cast<int32_t>(mat.stride(0));
+  p.v_sk = static_cast<int32_t>(column ? vec.stride(1) : vec.stride(2));
+  p.v_sb = static_cast<int32_t>(vec.stride(0));
+  p.o_sr = static_cast<int32_t>(c.stride(rdim));
+  p.o_sb = static_cast<int32_t>(c.stride(0));
+  if (use_cin) {
+    p.c_sr = static_cast<int32_t>(cin->stride(rdim));
+    p.c_sb = static_cast<int32_t>(cin->stride(0));
+  }
+  dispatch(std::string("gemv_") + dtype_label(c.scalar_type()), {use_cin ? 1u : 0u, static_cast<uint32_t>(mode)}, p,
+           static_cast<uint32_t>(groups), static_cast<uint32_t>(batch));
+  return true;
+}
+
 // c = alpha * a @ b (+ beta * cin), all 3-D views: a [B, M, K], b [B, K, N],
 // c and cin [B, M, N] (cin may broadcast through zero strides). Returns false
 // if the kernel cannot handle the case.
@@ -105,6 +167,9 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     return false;
   }
   if (c.numel() == 0) {
+    return true;
+  }
+  if ((n == 1 || m == 1) && gemv(a, b, c, cin, alpha, beta)) {
     return true;
   }
   bool gemm4_type = c.scalar_type() == at::kFloat || c.scalar_type() == at::kInt;

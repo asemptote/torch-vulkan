@@ -77,6 +77,71 @@ def test_addmm_baddbmm_addmv(dtype):
         check(got, want, **mm_tol(dtype, 25))
 
 
+def exact_or_mm_tol(dtype, k):
+    return dict(rtol=0, atol=0) if not dtype.is_floating_point else mm_tol(dtype, k)
+
+
+@pytest.mark.parametrize("dtype", NUMERIC)
+@pytest.mark.parametrize("rows,k", [(1, 1), (7, 3), (64, 64), (130, 257), (1000, 37), (9, 0), (3, 2000)])
+def test_matrix_vector_products(dtype, rows, k):
+    # shaders/gemv.slang: one output column (mat @ vec, threads along k for a
+    # row-major mat, along rows for a transposed one) or one output row
+    # (vec @ mat), each with addmv's beta / alpha
+    mat, vec, bias = make((rows, k), dtype, 1), make((k,), dtype, 2), make((rows,), dtype, 3)
+    mat_t = make((k, rows), dtype, 4)
+    vm, vv, vb, vt = mat.to("vk"), vec.to("vk"), bias.to("vk"), mat_t.to("vk")
+    alpha, beta = (2, -1) if not dtype.is_floating_point else (0.5, 2.0)
+    with on_gpu():
+        results = [vm @ vv, vt.t() @ vv, vv @ vt, vv @ vm.t(), torch.addmv(vb, vm, vv, beta=beta, alpha=alpha),
+                   torch.addmv(vb, vt.t(), vv, beta=beta, alpha=alpha)]
+    expected = [mat @ vec, mat_t.t() @ vec, vec @ mat_t, vec @ mat.t(), torch.addmv(bias, mat, vec, beta=beta, alpha=alpha),
+                torch.addmv(bias, mat_t.t(), vec, beta=beta, alpha=alpha)]
+    for got, want in zip(results, expected):
+        check(got, want, **exact_or_mm_tol(dtype, k))
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_matrix_vector_products_strided_batched_and_nan_bias(dtype):
+    a = make((5, 40, 70), dtype, 1)
+    x = make((5, 70, 3), dtype, 2)
+    va, vx = a.to("vk"), x.to("vk")
+    nan_bias = torch.full((40,), float("nan"), dtype=dtype)
+    with on_gpu():
+        results = [
+            torch.bmm(va, vx[:, :, 1:2]),  # strided column of x
+            torch.bmm(vx[:, :, 2:3].transpose(1, 2), va.transpose(1, 2)),  # one row: [5, 1, 70] @ [5, 70, 40]
+            va[:, ::3, ::2] @ vx[:, ::2, 0:1],  # strided rows and k
+            torch.addmv(nan_bias.to("vk"), va[0], vx[0, :, 0], beta=0),  # beta = 0 ignores NaN
+            torch.addmv(torch.tensor(1.5, dtype=dtype).to("vk"), va[1], vx[1, :, 0]),  # broadcast bias
+            va[2, 7] @ vx[2],  # [70] @ [70, 3]: one row, 3 columns
+        ]
+    expected = [torch.bmm(a, x[:, :, 1:2]), torch.bmm(x[:, :, 2:3].transpose(1, 2), a.transpose(1, 2)),
+                a[:, ::3, ::2] @ x[:, ::2, 0:1], torch.addmv(nan_bias, a[0], x[0, :, 0], beta=0),
+                torch.addmv(torch.tensor(1.5, dtype=dtype), a[1], x[1, :, 0]), a[2, 7] @ x[2]]
+    for got, want in zip(results, expected):
+        check(got, want, **mm_tol(dtype, 70))
+
+
+@pytest.mark.parametrize("dtype", COMPLEX)
+def test_complex_matrix_vector_products(dtype):
+    mat, vec, bias = make_complex((50, 33), dtype, 1), make_complex((33,), dtype, 2), make_complex((50,), dtype, 3)
+    vm, vv, vb = mat.to("vk"), vec.to("vk"), bias.to("vk")
+    with on_gpu():
+        results = [vm @ vv, vv.conj() @ vm.t(), torch.addmv(vb, vm, vv, beta=0.5, alpha=2.0), vm.mH @ vb]
+    expected = [mat @ vec, vec.conj() @ mat.t(), torch.addmv(bias, mat, vec, beta=0.5, alpha=2.0), mat.mH @ bias]
+    tol = mm_tol(torch.float32 if dtype == torch.complex64 else torch.float64, 50)
+    for got, want in zip(results, expected):
+        check(got, want, **tol)
+
+
+def test_int64_matrix_vector_product_wraps():
+    mat = make((20, 30), torch.int64, 1) * 3_000_000_007
+    vec = make((30,), torch.int64, 2) * 1_000_003
+    with on_gpu():
+        got = mat.to("vk") @ vec.to("vk")
+    check(got, mat @ vec, rtol=0, atol=0)
+
+
 def test_linear_layer_autograd():
     torch.manual_seed(0)
     layer = torch.nn.Linear(50, 20, dtype=WIDE)
