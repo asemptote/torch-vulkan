@@ -58,8 +58,8 @@ or two; there is no guaranteed response time. Design decisions are made by the
 maintainer, discussed in issues first for anything large (a new dependency, a
 change to the device's behaviour or to the public API).
 
-## License
+## Licence
 
 By contributing, you agree that your contributions are licensed under the
 project's terms: MIT OR Apache-2.0, at the user's option (see the README's
-[License](README.md#license) section).
+[Licence](README.md#licence) section).

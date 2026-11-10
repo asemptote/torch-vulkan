@@ -14,7 +14,7 @@ cat, flip, roll, padding, arange/linspace/eye, sorting and order statistics
 accumulation into repeated indices (index_add, scatter_add/scatter_reduce,
 index_put_ with accumulate, bincount, histc), random numbers (rand, randn,
 randint, bernoulli, multinomial, randperm, dropout, ...), neural-network ops
-(convolution, pooling, normalization, softmax, losses, upsampling, grid
+(convolution, pooling, normalisation, softmax, losses, upsampling, grid
 sampling, embeddings, attention, with their backward passes), reductions (sum,
 mean, prod, max/min, argmax, var/std, norms, any/all), scans (cumsum,
 cumprod), matrix products (mm, bmm, matmul, addmm, baddbmm, addmv, dot,
@@ -70,7 +70,7 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   and gigabytes of compiler memory per kernel.)
 - **The last CPU fallbacks moved to the GPU**: `_standard_gamma`, `poisson`,
   `binomial`, `_sample_dirichlet` (the softmax of log-gamma samples, so small
-  shapes do not underflow in float32) and the gamma/Dirichlet reparameterized
+  shapes do not underflow in float32) and the gamma/Dirichlet reparameterised
   gradients (`sample.slang`, PyTorch's algorithms); `unique` and
   `unique_consecutive` along a dim (rows ranked by batched column sorts);
   bicubic `grid_sample`'s backward; `repeat_interleave` with a tensor of
@@ -210,7 +210,7 @@ convolution and attention are matrix products already.
 installed torch's commit. Each test that fails on `"vk"` is run again on the
 CPU: failures shared with the CPU are not ours. Known, explained differences
 are listed in its `EXPECTED` table with the reason for each (sparse and
-quantized tensors are out of scope; some tests hard-code CUDA's or the CPU's
+quantised tensors are out of scope; some tests hard-code CUDA's or the CPU's
 behaviour). `tools/cluster/` runs the shards as a PBS job array on lavapipe
 (Mesa's CPU Vulkan driver), and optionally with GPU-assisted validation
 (bounds-checked buffer accesses).
@@ -222,7 +222,7 @@ What the tests asked of `"vk"`, beyond correct values:
   _checks.py`; the dtypes the CPU accepts (`_dtypes.py`); out= semantics
   (resizing and its warning, exact or castable dtypes, out= on another
   device); memory-overlap errors; deterministic-algorithm alerts;
-  copy-on-write inputs left unmaterialized; output strides as PyTorch's
+  copy-on-write inputs left unmaterialised; output strides as PyTorch's
   meta kernels predict them.
 - Results that do not depend on the driver. float32 math no longer uses the
   GPU's transcendental built-ins, whose accuracy varies (lavapipe's asin is
@@ -256,7 +256,7 @@ What the tests asked of `"vk"`, beyond correct values:
 
 Every failure left in these files, on lavapipe and on the H100, also fails
 on the CPU or has an `EXPECTED` entry giving the reason: out-of-scope layouts
-(sparse, quantized, int4), CUDA-specific expectations, tolerances tuned to
+(sparse, quantised, int4), CUDA-specific expectations, tolerances tuned to
 one seed or device, random numbers that are not the CPU's, ill-conditioned
 float32 comparisons, float32 subnormals on devices that flush them (the H100
 cannot keep them in shaders), and tensors of 2^31 or more elements.
@@ -283,7 +283,7 @@ record the numbers at each milestone).
   complex matrices with LAPACK's outputs.
 - General `eig`/`eigvals` (`shaders/eig.slang`): Householder reduction to
   Hessenberg form, single-shift QR with Givens rotations to the complex Schur
-  form, eigenvectors by back substitution, normalized as LAPACK's geev
+  form, eigenvectors by back substitution, normalised as LAPACK's geev
   (unit norm, largest component real). Eigenvalues come in no particular
   order (as documented for `torch.linalg.eig`).
 - `ldl_factor`/`ldl_solve`: Bunch-Kaufman as LAPACK's sytf2/hetf2 and
@@ -308,7 +308,7 @@ No LAPACK anywhere: every size and batch of float32/float64 matrices runs on
 the GPU (`csrc/dense.cpp`, `shaders/factor.slang`).
 
 - Blocked LU (rectangular too), Cholesky and Householder QR: the column-by-
-  column steps LAPACK would do (panel factorization with partial pivoting
+  column steps LAPACK would do (panel factorisation with partial pivoting
   and whole-row interchanges, Cholesky diagonal blocks, Householder panels
   and the compact-WY `T` factor, inverses of small triangular blocks, row
   interchanges) run in `factor.slang` with one workgroup per matrix; the
@@ -442,7 +442,7 @@ OpInfo sweep: 346 of 659 ops fully on the GPU (317 after M9), no mismatches.
   the result's shape. Advanced indexing (integer and boolean, adjacent or not)
   follows PyTorch's `make_info`; boolean masks go through the GPU `nonzero`.
 - **Out-of-range indices** are reported like CUDA's device asserts: the kernel
-  sets an error word, and the next synchronize (`.cpu()`, `.item()`,
+  sets an error word, and the next synchronise (`.cpu()`, `.item()`,
   `torch_vulkan.synchronize()`) raises `IndexError`. Queued work is not
   stopped, and the result of the bad op is undefined.
 - **nonzero** counts with a GPU running sum (one sync for the result size, as
@@ -536,7 +536,7 @@ Measured (`python benchmarks/linalg.py`, UHD 620 vs 4-thread CPU with MKL):
 | `inv` | 587 ms | 305 ms | 1640 ms | 572 ms |
 
 Correct, but slower than MKL on this machine: the trailing updates use the
-M5 GEMM (itself slower than MKL here), and each panel synchronizes, leaving
+M5 GEMM (itself slower than MKL here), and each panel synchronises, leaving
 the GPU idle while the CPU factors it. Look-ahead (factoring panel k+1 while
 the GPU updates the rest) and a faster GEMM are the next steps; on an
 integrated GPU like this one, `TORCH_VK_LINALG=cpu` is the faster choice.
@@ -550,7 +550,7 @@ integrated GPU like this one, `TORCH_VK_LINALG=cpu` is the faster choice.
   `view_as_complex` (they alias: `x.real += 1` updates `x`).
 - Lazy conjugate/negative bits: `_copy_from` passes through PyTorch's
   Conjugate/Negative layers and applies the bits itself (otherwise
-  materializing them recursed forever). The CPU fallback now refuses view
+  materialising them recursed forever). The CPU fallback now refuses view
   ops (`error_on_views`) instead of silently returning copies.
 - `shaders/fft.slang` + `csrc/fft.cpp`: `_fft_c2c`, `_fft_r2c`, `_fft_c2r`,
   which every `torch.fft` function reduces to. Power-of-two lengths use
@@ -657,7 +657,7 @@ Measured (`python benchmarks/elementwise.py`, 16M elements, UHD 620 vs 4-thread 
 - Strided launches merge contiguous dims; tensors with more than 4
   non-mergeable dims loop over the outer dims on the host (one dispatch each).
 - `crates/pyvk/src/ffi.rs`: the C ABI from C++ to the Rust runtime (alloc, free,
-  dispatch, synchronize); the C++ is compiled by `crates/pyvk/build.rs` against
+  dispatch, synchronise); the C++ is compiled by `crates/pyvk/build.rs` against
   the libtorch of the target Python and linked into the same extension module.
 - `python/torch_vulkan`: names the backend `vk`, registers `torch.vk`, adds
   `Tensor.vk()`, and exposes `synchronize`, `memory_stats`, `empty_cache`,
@@ -667,7 +667,7 @@ The M2 prototype (a `__torch_dispatch__` tensor subclass) is replaced; its
 kernels and tests carry over.
 
 Kernels are Slang templates compiled per dtype (`// axis T: ...` lines in the
-shader; see `build.rs`), with the op chosen by a specialization constant:
+shader; see `build.rs`), with the op chosen by a specialisation constant:
 `unary`, `binary`, `compare`, `cast` (all 25 pairs of f32/f64/i32/i64/bool;
 also strided copies) and `fill`. Operands are addressed as pointer + up to 4
 coalesced (size, stride) dims, so broadcasting, transposes and slices need no copies.
@@ -699,7 +699,7 @@ overhead is now close to the CPU's.
 | Memory | Prefer device-local + host-visible + coherent memory | On integrated GPUs (UHD 620, Strix Halo) CPU and GPU share tensors with no copies |
 | Kernels | [Slang](https://shader-slang.org) → SPIR-V (`crates/vkcore/shaders`, compiled by `build.rs`) | Generics, pointers, autodiff; can later also target CUDA/Metal |
 | FFT | VkFFT (planned) | Complex + float64 FFT on Vulkan |
-| Matmul | Own kernels, modeled on llama.cpp's `ggml-vulkan` | No mature Vulkan BLAS exists |
+| Matmul | Own kernels, modelled on llama.cpp's `ggml-vulkan` | No mature Vulkan BLAS exists |
 
 ## Verified on this machine (M0)
 
@@ -725,18 +725,18 @@ overhead is now close to the CPU's.
   empty blocks to Vulkan, and allocation retries after trimming when out of memory.
 - **Kernel cache** (`kernels.rs`): one shared pipeline layout (no descriptor
   sets, 128-byte push-constant block). Pipelines are keyed by
-  (kernel, specialization constants); compiled code persists across runs in
+  (kernel, specialisation constants); compiled code persists across runs in
   `%LOCALAPPDATA%\torch-vulkan\pipelines.bin` (override with `TORCH_VK_CACHE_DIR`).
 - **Stream** (`stream.rs`): in-order like a CUDA stream. Commands are recorded
   with a full memory barrier between them and submitted in batches of up to
   256, tracked by a timeline semaphore; command buffers are recycled.
   The host must `synchronize()` before touching memory that queued work uses.
 - **Validation** (`context.rs`): `TORCH_VK_VALIDATE=1` enables the Khronos
-  validation layer with synchronization and best-practices checks; every
+  validation layer with synchronisation and best-practices checks; every
   message is printed and counted, and the tests fail on any.
 
 Measured on the UHD 620 (`cargo run --release --example dispatch_bench`):
-synchronizing after every small kernel costs **486 µs/op**; batching brings it
+synchronising after every small kernel costs **486 µs/op**; batching brings it
 to **5.6 µs/op** (~87× less).
 
 ## Layout
@@ -806,7 +806,7 @@ $env:PATH = "$HOME\.cargo\bin;$env:PATH"
 cargo run --release --example smoke
 ```
 
-Tests and examples under validation (synchronization and best-practices checks included):
+Tests and examples under validation (synchronisation and best-practices checks included):
 
 ```powershell
 $env:TORCH_VK_VALIDATE = "1"

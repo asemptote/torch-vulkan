@@ -1,7 +1,7 @@
 # torch-vulkan
 
 [![ci](https://github.com/asemptote/torch-vulkan/actions/workflows/ci.yml/badge.svg)](https://github.com/asemptote/torch-vulkan/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
 
 A Vulkan compute backend for PyTorch aimed at **scientific** workloads:
@@ -58,7 +58,7 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
 - **Random numbers**: rand, randn, randint, bernoulli, multinomial, randperm,
   dropout, poisson, gamma, binomial, Dirichlet.
 - **Neural-network ops** with their backward passes: convolution (1-D to 3-D,
-  transposed), pooling, normalization, softmax, losses, upsampling, grid
+  transposed), pooling, normalisation, softmax, losses, upsampling, grid
   sampling, embeddings, attention.
 
 Anything else runs on the CPU through PyTorch's fallback and is counted in
@@ -183,7 +183,7 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
 | Variable | Effect |
 |---|---|
 | `TORCH_VK_STRICT=1` | Raise instead of running an op on the CPU. |
-| `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronization and best-practices checks; every message is printed and counted, and the tests fail on any. |
+| `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted, and the tests fail on any. |
 | `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU (often faster on integrated GPUs). |
 | `TORCH_VK_GEMM=tiled` or `float4` | Choose the matrix-multiply kernel (`float4` is the default on Arm GPUs, `tiled` elsewhere). |
 | `TORCH_VK_API=1.1` | Use the Vulkan 1.1 code path on a newer driver. |
@@ -203,7 +203,7 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
 - **One device**; no pinned memory.
 - **Tensors of 2^31 or more elements** are not supported (32-bit element
   offsets).
-- **Quantized and int4 tensors** are out of scope.
+- **Quantised and int4 tensors** are out of scope.
 - **float32 subnormals** are flushed to zero on GPUs that flush them in
   shaders (e.g. the H100).
 - **Long float64 kernels** can trip the Windows GPU watchdog on small
@@ -248,10 +248,10 @@ measurements, is in [docs/development-log.md](docs/development-log.md).
 Bug reports from more GPUs and drivers are especially welcome. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## License
+## Licence
 
 Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or
-the [MIT license](LICENSE-MIT), at your option. Code derived from PyTorch,
-Cephes and the Faddeeva package keeps its own licenses; see [NOTICE](NOTICE).
+the [MIT licence](LICENSE-MIT), at your option. Code derived from PyTorch,
+Cephes and the Faddeeva package keeps its own licences; see [NOTICE](NOTICE).
 Unless you state otherwise, any contribution you submit for inclusion is
 dual-licensed as above, without additional terms.
