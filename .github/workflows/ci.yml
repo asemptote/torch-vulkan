@@ -93,7 +93,9 @@ jobs:
         run: python -m pytest -q
 
       - name: Op coverage sweep
-        run: python tools/opinfo_coverage.py --jobs 4 | tail -50
+        run: |
+          set -o pipefail
+          python tools/opinfo_coverage.py --jobs 4 --strict | tail -50
         env:
           TORCH_VK_VALIDATE: "0"
 

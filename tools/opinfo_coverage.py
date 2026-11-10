@@ -213,18 +213,27 @@ def max_error(x, ref):
 
 
 def as_accurate_as_cpu(op, sample, dtype, expected, actual):
-    """For 16-bit dtypes: True if the vk result is no further from the op
-    computed in float64 (on the CPU) than the CPU's own 16-bit result. The
-    CPU often rounds to 16 bits at every step where vk computes in float32 and
-    rounds once, so the two differ by more than a few ulps without vk being
-    less accurate."""
+    """True if the vk result is no further from the op computed in float64 (on
+    the CPU) than the CPU's own result in `dtype`. For 16-bit dtypes the CPU
+    often rounds to 16 bits at every step where vk computes in float32 and
+    rounds once; for float32 and complex64, some vk ops (matrix_exp) compute
+    in double precision where the CPU's single-precision result can be off
+    in its smaller elements. The two then differ by more than the tolerance
+    without vk being less accurate."""
+    wide = torch.complex128 if dtype.is_complex else torch.float64
+
     def up(x):
-        return x.to(torch.float64) if isinstance(x, torch.Tensor) and x.dtype == dtype else x
+        return x.to(wide) if isinstance(x, torch.Tensor) and x.dtype == dtype else x
     try:
         precise = op(*tree_map(up, (sample.input, *sample.args)), **tree_map(up, sample.kwargs))
     except Exception:
         return False
     return max_error(actual, precise) <= max_error(expected, precise)
+
+
+# dtypes whose results may be judged by accuracy against float64 when they
+# differ from the CPU's (as_accurate_as_cpu)
+LOW_PRECISION = (torch.float16, torch.bfloat16, torch.float32, torch.complex64)
 
 
 def check_op(info, dtypes, nsamples):
@@ -267,7 +276,7 @@ def check_op(info, dtypes, nsamples):
                 problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:
                 problem = compare(expected, actual)
-            if problem and dtype in (torch.float16, torch.bfloat16) and not problem.startswith("The values for attr")                     and as_accurate_as_cpu(info.op, sample, dtype, expected, actual):
+            if problem and dtype in LOW_PRECISION and not problem.startswith("The values for attr")                     and as_accurate_as_cpu(info.op, sample, dtype, expected, actual):
                 problem = None  # (differs from the CPU, but no less accurate)
             if problem:
                 return {"status": "mismatch", "detail": f"{dtype}: {problem}", "fallbacks": sorted(fallbacks)}
@@ -337,6 +346,8 @@ def main():
     parser.add_argument("--filter", default="")
     parser.add_argument("--out", default=str(pathlib.Path(__file__).with_name("opinfo_coverage.json")))
     parser.add_argument("--jobs", type=int, default=1, help="worker processes")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 if any op crashes, errors, mismatches or runs an aten op on the CPU")
     parser.add_argument("--shard", default="", help="internal: K/N, run every N-th op starting at K")
     parser.add_argument("--after", type=int, default=-1, help="internal: skip ops up to this index")
     args = parser.parse_args()
@@ -354,6 +365,8 @@ def main():
     for t in threads:
         t.join()
     report(results, args.out, time.perf_counter() - start)
+    if args.strict and any(r["status"] != "gpu" for r in results.values()):
+        return 1
     return 0
 
 
