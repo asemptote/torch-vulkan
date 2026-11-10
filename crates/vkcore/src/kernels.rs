@@ -205,7 +205,7 @@ pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool)
     if remaining_modes == 0 {
         // (later position first, so the earlier one stays valid)
         let mut spans: Vec<(usize, usize)> = capability_at.map(|at| (at, 2)).into_iter().chain(extension_at).collect();
-        spans.sort_by(|a, b| b.0.cmp(&a.0));
+        spans.sort_by_key(|&(at, _)| std::cmp::Reverse(at));
         for (at, n) in spans {
             out.drain(at..at + n);
         }

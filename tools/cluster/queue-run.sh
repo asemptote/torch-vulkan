@@ -6,12 +6,12 @@
 #
 # Two runs, one per driver family, each a queue of small shards on the
 # shared file system ($RUNS/NAME for lavapipe, $RUNS/NAME-nvidia):
-#   - the cluster: PBS_JOBS single-core lavapipe jobs, and an H100 and an
-#     L40S job (separate queues) of GPU_WORKERS workers each;
+#   - the cluster (through PBS_HEAD): PBS_JOBS single-core lavapipe jobs,
+#     and one job per GPU queue (GPU_QUEUES) of GPU_WORKERS workers each;
 #   - backfill on the workstations (pool.sh): one ranked worker per core on
-#     ws1, ws2 and ws3 for the lavapipe run (each running only while
+#     each of BACKFILL_HOSTS for the lavapipe run (each running only while
 #     its rank fits beside the machine's other users' load, see worker.sh),
-#     and ws3's Tesla M4 on the NVIDIA run if WS3_GPU_WORKERS > 0.
+#     and GPU_HOST's own GPU on the NVIDIA run if BACKFILL_GPU_WORKERS > 0.
 # The cluster's workers take shards from the start of each queue and the
 # workstations' from its end, so they meet in the middle. With --from PREV
 # (an earlier run's name), plan_shards.py plans each queue longest first from
@@ -22,21 +22,30 @@
 # each file). Merge as for fixed shards:
 #   .venv/bin/python tools/pytorch_tests.py --merge --out $RUNS/NAME
 #
-# Settings (environment): DEV_SSH (ssh options, default "-J
-# gateway.example.edu"), RUNS (/shared/scratch/me/torch-vulkan-runs),
-# LAVAPIPE_SHARDS (192), NVIDIA_SHARDS (64), PBS_JOBS (48), GPU_WORKERS (16),
-# WS1_WORKERS, WS2_WORKERS, WS3_WORKERS (one per core), WS3_GPU_WORKERS (0: the
-# Tesla M4 has 4 GB, and full runs need more; it stays for quick checks, dev.sh DRIVER=nvidia-host).
+# Settings (environment, or tools/cluster/cluster.env: see
+# cluster.env.example): CLUSTER_SSH (ssh options), CLUSTER_USER, RUNS (the
+# shared run directory), PBS_HEAD, LAVAPIPE_QUEUE, GPU_QUEUES,
+# BACKFILL_HOSTS, GPU_HOST, QUEUE_HOST (where the queues are made and read:
+# the first backfill host), LAVAPIPE_SHARDS (192), NVIDIA_SHARDS (64),
+# PBS_JOBS (48), GPU_WORKERS (16), <HOST>_WORKERS (one per core; HOST in
+# capitals), BACKFILL_GPU_WORKERS (0: a small GPU runs out of memory in full
+# runs; it stays for quick checks, dev.sh DRIVER=nvidia-host).
 set -euo pipefail
 CMD=${1:?usage: queue-run.sh start|status NAME [TEST_FILE...]}
 NAME=${2:?usage: queue-run.sh start|status NAME [TEST_FILE...]}
 shift 2
-SSH_OPTS=${DEV_SSH:--J gateway.example.edu}
-RUNS=${RUNS:-/shared/scratch/me/torch-vulkan-runs}
+CFG="$(dirname "$0")/cluster.env"
+if [ -f "$CFG" ]; then . "$CFG"; fi
+SSH_OPTS=${CLUSTER_SSH:-}
+RUNS=${RUNS:?set RUNS (a directory every machine shares): see tools/cluster/cluster.env.example}
+BACKFILL_HOSTS=${BACKFILL_HOSTS:-}
+PBS_HEAD=${PBS_HEAD:-}
+QUEUE_HOST=${QUEUE_HOST:-${BACKFILL_HOSTS%% *}}
+QUEUE_HOST=${QUEUE_HOST:-${PBS_HEAD:?set QUEUE_HOST, BACKFILL_HOSTS or PBS_HEAD: see tools/cluster/cluster.env.example}}
 LAV="$RUNS/$NAME"
 NV="$RUNS/$NAME-nvidia"
 TV='~/torch-vulkan/tools/cluster'
-on() { ssh -o ServerAliveInterval=30 $SSH_OPTS "me@$1" "${@:2}"; }
+on() { ssh -o ServerAliveInterval=30 $SSH_OPTS "${CLUSTER_USER:+$CLUSTER_USER@}$1" "${@:2}"; }
 
 case "$CMD" in
   start)
@@ -54,28 +63,37 @@ test_sort_and_select.py test_view_ops.py}
     }
     if [ -n "$PREV" ]; then
       P="python3 ~/torch-vulkan/tools/cluster/plan_shards.py --minutes ${PLAN_MINUTES:-5}"
-      on ws3 "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
+      on "$QUEUE_HOST" "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
         mkdir -p $LAV/pbs-logs $NV/pbs-logs
         $P $RUNS/$PREV --out $LAV
         $P \$(ls -d $RUNS/$PREV-nvidia $RUNS/$PREV-h100 2>/dev/null | head -1) --out $NV"
     else
-      on ws3 "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
+      on "$QUEUE_HOST" "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
         $(queue "$LAV" "${LAVAPIPE_SHARDS:-192}"); $(queue "$NV" "${NVIDIA_SHARDS:-64}")"
     fi
-    on headnode "cd ~/torch-vulkan
-      qsub -J 0-$((${PBS_JOBS:-48} - 1)) -o $LAV/pbs-logs -v RUN_DIR=$LAV tools/cluster/pbs-lavapipe.sh
-      for q in h100 l40s; do
-        qsub -q \$q -l select=1:ncpus=16:ngpus=1:mem=32gb -o $NV/pbs-logs \
-          -v RUN_DIR=$NV,WORKERS=${GPU_WORKERS:-16} tools/cluster/pbs-gpu.sh
-      done"
-    on ws1 "bash $TV/pool.sh lavapipe $LAV ${WS1_WORKERS:-}"
-    on ws2 "bash $TV/pool.sh lavapipe $LAV ${WS2_WORKERS:-}"
-    # (ws3's GPU workers rank first: lavapipe workers there rank after them)
-    G=${WS3_GPU_WORKERS:-0}
-    on ws3 "bash $TV/pool.sh nvidia $NV $G 0; bash $TV/pool.sh lavapipe $LAV ${WS3_WORKERS:-\$((\$(nproc) - $G))} $G"
+    if [ -n "$PBS_HEAD" ]; then
+      on "$PBS_HEAD" "cd ~/torch-vulkan
+        qsub ${LAVAPIPE_QUEUE:+-q $LAVAPIPE_QUEUE} -J 0-$((${PBS_JOBS:-48} - 1)) -o $LAV/pbs-logs -v RUN_DIR=$LAV \
+          tools/cluster/pbs-lavapipe.sh
+        for q in ${GPU_QUEUES:-}; do
+          qsub -q \$q -l select=1:ncpus=16:ngpus=1:mem=32gb -o $NV/pbs-logs \
+            -v RUN_DIR=$NV,WORKERS=${GPU_WORKERS:-16} tools/cluster/pbs-gpu.sh
+        done"
+    fi
+    G=${BACKFILL_GPU_WORKERS:-0}
+    for h in $BACKFILL_HOSTS; do
+      v=$(echo "$h" | tr a-z.- A-Z__)_WORKERS  # (WS1_WORKERS for host ws1)
+      w=${!v:-}
+      if [ "$h" = "${GPU_HOST:-}" ] && [ "$G" -gt 0 ]; then
+        # (the GPU workers rank first: lavapipe workers there rank after them)
+        on "$h" "bash $TV/pool.sh nvidia $NV $G 0; bash $TV/pool.sh lavapipe $LAV ${w:-\$((\$(nproc) - $G))} $G"
+      else
+        on "$h" "bash $TV/pool.sh lavapipe $LAV $w"
+      fi
+    done
     ;;
   status)
-    on ws3 "for r in $LAV $NV; do
+    on "$QUEUE_HOST" "for r in $LAV $NV; do
       echo \"\$(basename \$r): \$(ls \$r/queue | wc -l) queued, \$(ls \$r/claimed | wc -l) running, \$(ls \$r/done | wc -l) done\"
       ls \$r/claimed | sed 's/^shard-[0-9]*\.\([^.]*\)\..*/  \1/' | sort | uniq -c
     done"

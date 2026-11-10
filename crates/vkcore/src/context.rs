@@ -263,6 +263,10 @@ impl Context {
     }
 
     /// vkGetBufferDeviceAddress (core 1.2, or its KHR extension on 1.1).
+    ///
+    /// # Safety
+    ///
+    /// The same as for the Vulkan call: the handles must belong to this device and be valid.
     pub unsafe fn buffer_device_address(&self, buffer: vk::Buffer) -> u64 {
         let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         match &self.khr {
@@ -272,6 +276,10 @@ impl Context {
     }
 
     /// vkGetSemaphoreCounterValue (core 1.2, or KHR on 1.1).
+    ///
+    /// # Safety
+    ///
+    /// The same as for the Vulkan call: the handles must belong to this device and be valid.
     pub unsafe fn semaphore_counter_value(&self, semaphore: vk::Semaphore) -> std::result::Result<u64, vk::Result> {
         match &self.khr {
             Some((_, tls)) => tls.get_semaphore_counter_value(semaphore),
@@ -280,6 +288,10 @@ impl Context {
     }
 
     /// vkWaitSemaphores (core 1.2, or KHR on 1.1).
+    ///
+    /// # Safety
+    ///
+    /// The same as for the Vulkan call: the handles must belong to this device and be valid.
     pub unsafe fn wait_semaphores(&self, info: &vk::SemaphoreWaitInfo, timeout: u64) -> std::result::Result<(), vk::Result> {
         match &self.khr {
             Some((_, tls)) => tls.wait_semaphores(info, timeout),

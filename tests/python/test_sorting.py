@@ -85,6 +85,18 @@ def test_median_nanmedian_with_nan():
     check(got[2], want[2], equal_nan=True)
 
 
+@pytest.mark.parametrize("n", [1, 8, 9, 17, 33])
+def test_nanmedian_all_nan_row_index(n):
+    # (which NaN the CPU picks depends on its C++ standard library and n)
+    x = make((3, n), torch.float32)
+    x[1] = float("nan")
+    with on_gpu():
+        got = torch.nanmedian(x.to("vk"), 1)
+    want = torch.nanmedian(x, 1)
+    check(got.values, want.values, equal_nan=True)
+    check(got.indices, want.indices)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
 def test_unique(dtype):
     x = sample((7, 9), dtype, ties=True)

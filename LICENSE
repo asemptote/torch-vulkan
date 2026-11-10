@@ -1,0 +1,11 @@
+torch-vulkan is licensed under either of
+
+  * the Apache License, Version 2.0 (LICENSE-APACHE or
+    https://www.apache.org/licenses/LICENSE-2.0), or
+  * the MIT licence (LICENSE-MIT or https://opensource.org/licenses/MIT),
+
+at your option.
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+Code derived from third-party software keeps its own licence; see NOTICE.

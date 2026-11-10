@@ -14,27 +14,32 @@
 # run, rss, pt and py use lavapipe on DEV_HOST; with DRIVER=nvidia they run
 # on the NVIDIA driver instead, as a PBS job on a GPU node (DEV_GPU_QSUB),
 # submitted through DEV_HEAD and waited for, with its output printed; with
-# DRIVER=nvidia-host, on DEV_HOST's own NVIDIA GPU (ws3: a Tesla M4, 4 GB),
-# directly: no queue, for quick checks of the NVIDIA driver.
+# DRIVER=nvidia-host, on DEV_HOST's own NVIDIA GPU, directly: no queue, for
+# quick checks of the NVIDIA driver.
 #
 # ID is a pytest node id (test_linalg.py::TestLinalgPRIVATEUSE1::test_foo_vk);
 # run and pt pass the runner's / pytest's remaining options through.
-# Settings (environment): DEV_HOST (ws3), DEV_HEAD (headnode), DEV_SSH (ssh
-# options, default "-J gateway.example.edu"), DEV_DIR
-# (/shared/scratch/me/tv-dev, on a file system the GPU nodes share),
+# Settings (environment, or tools/cluster/cluster.env: see
+# cluster.env.example): DEV_HOST, DEV_DIR (on a file system the GPU nodes
+# share), PBS_HEAD, CLUSTER_SSH (ssh options), CLUSTER_USER, DEV_GPU_QSUB
+# (qsub options; default a 2-hour 1-GPU job on the first of GPU_QUEUES),
 # LP_NUM_THREADS (lavapipe threads, 4), TIMEOUT (seconds per test, 3600).
 set -euo pipefail
-HOST=${DEV_HOST:-ws3}
-HEAD=${DEV_HEAD:-headnode}
-SSH_OPTS=${DEV_SSH:--J gateway.example.edu}
-DIR=${DEV_DIR:-/shared/scratch/me/tv-dev}
+CFG="$(dirname "$0")/cluster.env"
+if [ -f "$CFG" ]; then . "$CFG"; fi
+HOST=${DEV_HOST:?set DEV_HOST: see tools/cluster/cluster.env.example}
+DIR=${DEV_DIR:?set DEV_DIR: see tools/cluster/cluster.env.example}
+HEAD=${PBS_HEAD:-}
+SSH_OPTS=${CLUSTER_SSH:-}
+AT=${CLUSTER_USER:+$CLUSTER_USER@}
 THREADS=${LP_NUM_THREADS:-4}
 TIMEOUT=${TIMEOUT:-3600}
 DRIVER=${DRIVER:-lavapipe}
-GPU_QSUB=${DEV_GPU_QSUB:--q h100 -l select=1:ncpus=4:ngpus=1:mem=16gb -l walltime=02:00:00}
+Q=${GPU_QUEUES:-}
+GPU_QSUB=${DEV_GPU_QSUB:-${Q:+-q ${Q%% *} }-l select=1:ncpus=4:ngpus=1:mem=16gb -l walltime=02:00:00}
 CMD=${1:?usage: dev.sh init|sync|build|run|rss|pt|py ...}; shift
 
-remote() { ssh -o ServerAliveInterval=30 $SSH_OPTS "$HOST" "$@"; }
+remote() { ssh -o ServerAliveInterval=30 $SSH_OPTS "$AT$HOST" "$@"; }
 
 case "$DRIVER" in
   lavapipe) ICD=lvp ;;  # Mesa's file name for lavapipe
@@ -53,7 +58,7 @@ on_driver() {
   if [ "$DRIVER" = nvidia ]; then
     printf '#!/bin/bash\n%s\n' "$ENV; $1" | remote "cat > $DIR/.dev-gpu-job.sh"
     # (PBS copies the output file back after qsub -W block returns.)
-    ssh -o ServerAliveInterval=30 $SSH_OPTS "$HEAD" "rm -f $DIR/.dev-gpu-out.txt; qsub $GPU_QSUB -N tv-dev -W block=true -j oe \
+    ssh -o ServerAliveInterval=30 $SSH_OPTS "$AT${HEAD:?set PBS_HEAD for DRIVER=nvidia}" "rm -f $DIR/.dev-gpu-out.txt; qsub $GPU_QSUB -N tv-dev -W block=true -j oe \
       -o $DIR/.dev-gpu-out.txt $DIR/.dev-gpu-job.sh > /dev/null
       for i in \$(seq 60); do [ -f $DIR/.dev-gpu-out.txt ] && break; sleep 1; done; cat $DIR/.dev-gpu-out.txt"
   else
@@ -61,8 +66,10 @@ on_driver() {
   fi
 }
 
+# (the files git tracks or would track, and the site's cluster.env)
 sync_tree() {
-  git ls-files -co --exclude-standard | tar czf - --force-local -T - | remote "mkdir -p $DIR && tar xzf - -C $DIR"
+  { git ls-files -co --exclude-standard; ls tools/cluster/cluster.env 2>/dev/null || true; } |
+    tar czf - --force-local -T - | remote "mkdir -p $DIR && tar xzf - -C $DIR"
 }
 
 # Writes the arguments, one per line, to a file in the dev copy; prints its name.

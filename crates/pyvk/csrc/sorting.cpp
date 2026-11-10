@@ -17,6 +17,8 @@
 #include <torch/library.h>
 
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 namespace vk {
 
@@ -251,14 +253,35 @@ std::tuple<at::Tensor&, at::Tensor&> kthvalue_out(const at::Tensor& self, int64_
 
 // ---------------------------------------------------------------- median, nanmedian, mode
 
+// The index the CPU's nanmedian gives a row of n NaNs. It runs
+// std::nth_element with a comparator that is false for every pair of NaNs,
+// so the element left first is the standard library's: index 0 with MSVC's,
+// with libstdc++'s introselect another one that depends on n alone (7 for
+// n = 9). Asked of the CPU once per n.
+int64_t all_nan_nanmedian_index(int64_t n) {
+  static std::mutex mutex;
+  static std::unordered_map<int64_t, int64_t> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = cache.find(n);
+  if (it != cache.end()) return it->second;
+  at::Tensor row = at::full({1, n}, std::numeric_limits<float>::quiet_NaN(), at::TensorOptions().dtype(at::kFloat));
+  int64_t index = std::get<1>(at::nanmedian(row, 1)).item<int64_t>();
+  cache.emplace(n, index);
+  return index;
+}
+
 // Position of the (nan)median in each sorted row: the lower median; for
-// median, the first NaN if the row has one (NaNs sort last).
+// median, the first NaN if the row has one (NaNs sort last, in index order).
+// For nanmedian, a row of NaNs takes the CPU's choice of NaN.
 at::Tensor median_positions(const at::Tensor& sorted_v, bool ignore_nan) {
   int64_t n = sorted_v.size(1);
   at::Tensor nans = at::isnan(sorted_v).sum(1);  // int64
   if (ignore_nan) {
     at::Tensor valid = n - nans;
-    return at::clamp_min(at::div(valid - 1, 2, "floor"), 0);
+    at::Tensor pos = at::clamp_min(at::div(valid - 1, 2, "floor"), 0);
+    if (!at::isFloatingType(sorted_v.scalar_type()) && !at::isComplexType(sorted_v.scalar_type())) return pos;
+    int64_t c = all_nan_nanmedian_index(n);
+    return c == 0 ? pos : at::where(valid == 0, c, pos);
   }
   at::Tensor lower = at::full_like(nans, (n - 1) / 2);
   return at::where(nans > 0, n - nans, lower);
