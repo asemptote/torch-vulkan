@@ -267,7 +267,7 @@ fn main() {
             // (spirv_fix.rs: no forward pointers, which Intel's driver rejects)
             let spv = out.join(format!("{name}.spv"));
             let bytes = std::fs::read(&spv).unwrap();
-            let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
             if let Some(fixed) = spirv_fix::drop_forward_pointers(&words) {
                 std::fs::write(&spv, fixed.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
             }
