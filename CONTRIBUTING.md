@@ -23,6 +23,25 @@ because a GPU lacks a feature, are worth reporting too.
 
 Open an issue or a GitHub discussion. There is no chat channel.
 
+## Design principles
+
+- **All numerical work on "vk" tensors runs on the GPU**, in this project's
+  Slang kernels. There are no BLAS, LAPACK, FFT or other vendor libraries,
+  and no routing of work to them on the CPU. Algorithms may follow LAPACK's
+  (blocked factorisations, Householder reductions, tridiagonal solvers); the
+  code that runs them is ours, on the GPU.
+- **The host only** builds small tables that do not grow with the problem's
+  work (FFT twiddles, rotation schedules), makes control decisions from a few
+  scalars read back (convergence, pivot errors), and reproduces PyTorch's
+  errors where PyTorch rejects an input.
+- **PyTorch's CPU fallback is a safety net, not a design choice.** It is
+  counted by `torch_vulkan.fallback_counts()` and is an error under
+  `TORCH_VK_STRICT=1`; an op that falls back is a bug or a listed gap.
+  `TORCH_VK_LINALG=cpu` is a reference for testing and comparison, not a
+  performance option: a slow GPU kernel is fixed on the GPU.
+- **Match PyTorch's CPU results** within the tolerances PyTorch's own tests
+  use, on every supported GPU, including those without float64 or int64.
+
 ## Making a change
 
 1. Build as described in the README's [Building](README.md#building) section.
