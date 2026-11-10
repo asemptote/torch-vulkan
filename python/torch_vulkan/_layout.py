@@ -44,7 +44,13 @@ def _fake_layouts(op, args, kwargs):
     try:
         with FakeTensorMode(allow_non_fake_inputs=True) as mode:
             def fake(t):
-                return mode.from_tensor(t) if isinstance(t, torch.Tensor) else t
+                # (from a meta tensor of the same layout, not from t: the mode
+                # memoizes its inputs by weak reference, and a weakref to a
+                # parameter makes torch.utils.swap_tensors refuse it)
+                if not isinstance(t, torch.Tensor):
+                    return t
+                meta = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device="meta")
+                return mode.fake_tensor_converter.from_meta_and_device(mode, meta, t.device)
 
             out = op(*tree_map(fake, args), **tree_map(fake, kwargs))
         leaves, _ = tree_flatten(out)

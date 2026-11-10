@@ -9,6 +9,7 @@
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/ResizeCommon.h>
 #include <ATen/native/TensorFactories.h>
+#include <ATen/ops/_has_compatible_shallow_copy_type_native.h>
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/is_set_to_native.h>
@@ -1088,6 +1089,18 @@ at::Tensor& set_empty(at::Tensor& self) {
   return at::native::set_storage_cpu_(self, std::move(empty), 0, {0}, {});
 }
 
+// Whether `from`'s data can be shallow-copied into `self` (param.data = x,
+// as module.to("vk") does): for two dense tensors, a vk and a CPU (or vk)
+// one, as for CUDA (TensorImpl's own rule lists only the built-in dense
+// backends; PyTorch asks PrivateUse1 backends to override this op).
+bool compatible_shallow_copy_type(const at::Tensor& self, const at::Tensor& from) {
+  auto dense = [](const at::Tensor& t) {
+    return t.layout() == at::kStrided && (t.device().is_cpu() || t.device().type() == kDevice);
+  };
+  if (dense(self) && dense(from)) return true;
+  return at::native::_has_compatible_shallow_copy_type(self, from);
+}
+
 // A zero tensor (autograd's efficient zeros): no storage, the ZeroTensor
 // key, as the CPU's and CUDA's.
 at::Tensor efficient_zero_tensor(at::IntArrayRef size, std::optional<at::ScalarType> dtype,
@@ -1110,6 +1123,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", vk::empty_memory_format);
   m.impl("empty_strided", vk::empty_strided);
   m.impl("_efficientzerotensor", vk::efficient_zero_tensor);
+  m.impl("_has_compatible_shallow_copy_type", vk::compatible_shallow_copy_type);
   m.impl("view", at::native::view);
   m.impl("as_strided", at::native::as_strided_tensorimpl);
   m.impl("_reshape_alias", at::native::_reshape_alias);

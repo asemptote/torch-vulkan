@@ -128,3 +128,32 @@ def test_fallback_with_several_outputs_writes_them_back():
     mo, eo = torch.empty(7, device="vk"), torch.empty(7, dtype=torch.int32, device="vk")
     torch.frexp(x.to("vk"), out=(mo, eo))
     assert torch.equal(mo.cpu(), wm) and torch.equal(eo.cpu(), we)
+
+
+def test_module_to_keeps_parameters():
+    # (param.data = moved tensor, as for CUDA: the Parameter objects stay, so
+    # an optimizer made before .to("vk") still holds them; lazy modules stay lazy)
+    m = torch.nn.Linear(3, 4)
+    w = m.weight
+    m.to("vk")
+    assert m.weight is w and w.device.type == "vk"
+    m.to("cpu")
+    assert m.weight is w and w.device.type == "cpu"
+    lazy = torch.nn.LazyLinear(4).to("vk")
+    assert lazy(torch.randn(2, 3, device="vk")).shape == (2, 4)
+    assert lazy.weight.shape == (4, 3) and lazy.weight.device.type == "vk"
+
+
+def test_swap_after_backward():
+    # (no weak references left on parameters by the layout prediction)
+    import weakref
+
+    m = torch.nn.PReLU().to("vk")
+    m(torch.randn(3, 2, device="vk")).sum().backward()
+    assert weakref.getweakrefcount(m.weight) == 0
+    torch.__future__.set_swap_module_params_on_conversion(True)
+    try:
+        m.to(dtype=torch.half)
+    finally:
+        torch.__future__.set_swap_module_params_on_conversion(False)
+    assert m.weight.dtype == torch.half
