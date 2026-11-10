@@ -10,6 +10,7 @@ instantiation to "vk", and runs pytest on the given files:
     python tools/pytorch_tests.py [--tests DIR] [--out DIR] [--shard INDEX/COUNT] test_ops.py [...] [-- pytest args]
     python tools/pytorch_tests.py --merge [--out DIR]
     python tools/pytorch_tests.py --ids FAILURES.txt [--name NAME] [--out DIR] [--shard INDEX/COUNT]
+    python tools/pytorch_tests.py --collect [--out DIR] test_ops.py [...]
 
 DIR defaults to $PYTORCH_TEST_DIR, else pytorch-src/test in this repo (git
 ignores pytorch-src/): the test/ directory of a PyTorch checkout at the
@@ -30,6 +31,9 @@ too are counted as "fails on CPU too", not as vk problems, and failures
 listed in EXPECTED (with the reason) are counted as "expected". A summary
 (outcome counts and the most common messages of the vk-only failures) is
 printed and the vk-only failures are listed in --out/<run>.failures.txt.
+The aten ops that ran on the CPU instead of the GPU (each test's fallbacks,
+whatever its outcome) are listed in --out/cpu_ops.txt: per op, the number of
+tests and calls, and an example test id.
 --merge summarizes every run in --out (e.g. shards from several machines).
 """
 
@@ -48,6 +52,8 @@ import sys
 # (elapsed; flushed, so they survive a crash). tools/cluster/plan_shards.py
 # schedules the next run's longest tests first from the elapsed times. With TORCH_VK_VALIDATE set, a test during which the validation
 # layer reported anything gets the outcome "validation" (with the message).
+# The aten ops a test ran on the CPU instead of the GPU (torch_vulkan's
+# fallback counts, before and after) go in its entry as cpu_ops {op: calls}.
 RUNNER = r"""
 import json, os, sys, time
 import torch_vulkan  # noqa: F401
@@ -61,6 +67,14 @@ class Recorder:
         self.out = open(path, "a", encoding="utf-8")
         self.issues = 0
         self.started = time.time()
+        self.fallbacks = torch_vulkan.fallback_counts()
+
+    def cpu_ops(self):
+        # {op: calls} of the fallbacks since the last call (each charged once)
+        now = torch_vulkan.fallback_counts()
+        new = {op: n - self.fallbacks.get(op, 0) for op, n in now.items() if n > self.fallbacks.get(op, 0)}
+        self.fallbacks = now
+        return new
 
     def write(self, **entry):
         self.out.write(json.dumps(entry) + "\n")
@@ -68,6 +82,7 @@ class Recorder:
 
     def pytest_runtest_logstart(self, nodeid, location):
         self.started = time.time()
+        self.cpu_ops()  # (not charged to this test: anything since the last one's report)
         self.write(start=nodeid)
 
     def pytest_runtest_teardown(self, item):
@@ -98,8 +113,12 @@ class Recorder:
             crash = getattr(report.longrepr, "reprcrash", None)
             message = crash.message if crash is not None else str(report.longrepr)
             message = message.strip().splitlines()[0][:200] if message.strip() else ""
-        self.write(nodeid=report.nodeid, outcome=outcome, message=message,
-                   elapsed=round(time.time() - self.started, 3))
+        entry = dict(nodeid=report.nodeid, outcome=outcome, message=message,
+                     elapsed=round(time.time() - self.started, 3))
+        ops = self.cpu_ops()
+        if ops:
+            entry["cpu_ops"] = ops
+        self.write(**entry)
 
 args = sys.argv[2:]
 if args and args[0].startswith("@"):
@@ -135,6 +154,17 @@ def read_results(path):
     if started in results:
         started = None
     return results, started
+
+
+def read_cpu_ops(path):
+    """{nodeid: {op: calls}}: the aten ops each test ran on the CPU."""
+    ops = collections.defaultdict(collections.Counter)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            entry = json.loads(line)
+            if "cpu_ops" in entry:
+                ops[entry["nodeid"]].update(entry["cpu_ops"])
+    return ops
 
 
 def cpu_twin(nodeid):
@@ -368,8 +398,14 @@ def summarize(out, stems):
     """Prints and returns outcome totals over the runs `stems` in out."""
     total = collections.Counter()
     messages = collections.Counter()
+    calls, tests, example = collections.Counter(), collections.Counter(), {}
     for stem in stems:
         results, _ = read_results(out / f"{stem}.jsonl")
+        for nodeid, ops in sorted(read_cpu_ops(out / f"{stem}.jsonl").items()):
+            for op, n in ops.items():
+                calls[op] += n
+                tests[op] += 1
+                example.setdefault(op, nodeid)
         both_file = out / f"{stem}.cpu-too.txt"
         both = set(both_file.read_text(encoding="utf-8").split()) if both_file.exists() else set()
         if (out / f"{stem}.cpu.jsonl").exists():  # (recomputed: the rule may have changed since the run)
@@ -395,7 +431,16 @@ def summarize(out, stems):
             for nodeid, reason in expected:
                 fh.write(f"{nodeid}\t{reason}\n")
         total.update(counts)
+    # Every aten op that ran on the CPU, by the number of tests it ran in.
+    with open(out / "cpu_ops.txt", "w", encoding="utf-8") as fh:
+        fh.write("op\ttests\tcalls\texample\n")
+        for op, n in tests.most_common():
+            fh.write(f"{op}\t{n}\t{calls[op]}\t{example[op]}\n")
     print("\ntotal:", describe(total))
+    if tests:
+        print(f"\n{len(tests)} aten ops ran on the CPU (tests, calls, an example; all in cpu_ops.txt):")
+        for op, n in tests.most_common(40):
+            print(f"{n:6d} {calls[op]:8d}  {op}  {example[op]}")
     if messages:
         print("\nmost common failure messages (vk only):")
         for message, count in messages.most_common(40):
@@ -418,6 +463,8 @@ def main():
     parser.add_argument("--merge", action="store_true", help="summarize every run in --out")
     parser.add_argument("--ids", default="", help="run these test ids (one per line) instead of collecting a file's")
     parser.add_argument("--name", default="", help="run name for --ids (default: the ids file's name)")
+    parser.add_argument("--collect", action="store_true",
+                        help="only collect the files' test ids, into --out/collected.jsonl (for plan_shards.py)")
     args = parser.parse_args(argv)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -432,6 +479,15 @@ def main():
     # The -k / -m filters are applied when collecting the ids.
     run_extra = [arg for i, arg in enumerate(extra)
                  if arg not in ("-k", "-m") and (i == 0 or extra[i - 1] not in ("-k", "-m"))]
+    if args.collect:
+        # (entries without times: plan_shards.py plans them at its default)
+        with open(out / "collected.jsonl", "w", encoding="utf-8") as fh:
+            for test_file in args.files:
+                ids = collect(tests, test_file, env, extra)
+                print(f"{test_file}: {len(ids)} tests", flush=True)
+                for nodeid in ids:
+                    fh.write(json.dumps({"nodeid": nodeid}) + "\n")
+        return
     stems = []
     runs = [(test_file, None) for test_file in args.files]
     if args.ids:

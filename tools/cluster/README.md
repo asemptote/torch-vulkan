@@ -43,8 +43,8 @@ home directory and rebuilds there with `build.sh` (log in
 - `pbs-lavapipe.sh`: a PBS job array, one single-core lavapipe shard per job.
 - `pbs-gpu.sh`: one GPU job running several shards side by side on its GPU.
 - `full-run.sh NAME [--gpu]` (on the head node): the standard full run, all
-  thirteen test files in 48 lavapipe shards, and with `--gpu` one H100 job
-  of 16 shards alongside (a separate queue). Each takes about an hour.
+  test files in `test_files.txt` in 48 lavapipe shards, and with `--gpu` one H100 job
+  of 16 shards alongside (a separate queue). (Thirteen files took about an hour.)
 
 Each script's header has a `qsub` example. Pass several test files in
 `TEST_FILES` to run each one's slice in the same shard. To re-run only the
@@ -77,7 +77,10 @@ python tools/pytorch_tests.py --merge --out OUT_DIR
 prints outcome totals and the most common vk-only failure messages over all
 shards in `OUT_DIR`, and writes `<run>.failures.txt` (vk-only failures) and
 `<run>.expected.txt` (failures matching the runner's `EXPECTED` list, with
-the reason). Concatenating the `failures.txt` files gives the input for an
+the reason), and `cpu_ops.txt`: every aten op that ran on the CPU instead
+of the GPU, with the number of tests and calls and an example test id (each
+test's fallbacks are recorded in its results). Concatenating the
+`failures.txt` files gives the input for an
 `--ids` re-run.
 
 ## Queued runs: the cluster plus workstation backfill
@@ -105,8 +108,10 @@ The two sides meet in the middle, so whatever starts soonest does the most,
 and a busy cluster queue no longer holds the run up. Every worker claims a
 shard by renaming its file into `claimed/` (`worker.sh`).
 
-With `--from PREV`, `plan_shards.py` plans each queue from an earlier run:
-its tests and their recorded times (the runner records each test's wall
+With `--from PREV`, the test files' tests are collected first
+(`pytorch_tests.py --collect`) and `plan_shards.py` plans each queue from
+them and an earlier run:
+the times its tests took (the runner records each test's wall
 time), packed longest first into one-file shards of about 5 minutes, and
 numbered from the longest. The cluster then starts the slowest tests first
 instead of finishing on them, and each shard needs one pytest start-up.

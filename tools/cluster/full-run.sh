@@ -13,10 +13,8 @@ NAME=${1:?usage: full-run.sh NAME [--gpu]}
 CFG="$(dirname "$0")/cluster.env"
 if [ -f "$CFG" ]; then . "$CFG"; fi
 RUNS=${RUNS:-$HOME/torch-vulkan-runs}
-FILES="test_ops.py test_torch.py test_binary_ufuncs.py test_unary_ufuncs.py test_nn.py test_linalg.py \
-test_reductions.py test_indexing.py test_tensor_creation_ops.py test_shape_ops.py test_type_promotion.py \
-test_sort_and_select.py test_view_ops.py"
 cd "${TORCH_VULKAN:-$HOME/torch-vulkan}"
+FILES=$(grep -v '^#' tools/cluster/test_files.txt | tr '\n' ' ')
 mkdir -p "$RUNS/$NAME" "$RUNS/pbs-logs"
 qsub ${LAVAPIPE_QUEUE:+-q $LAVAPIPE_QUEUE} -J 0-47 -o "$RUNS/pbs-logs" \
   -v "FIRST_SHARD=0,SHARD_COUNT=48,OUT_DIR=$RUNS/$NAME,TEST_FILES=$FILES" tools/cluster/pbs-lavapipe.sh

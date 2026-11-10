@@ -1,11 +1,13 @@
 """Plans a queued run's shards longest first, from an earlier run's results.
 
-    python3 plan_shards.py FROM_DIR... --out RUN_DIR [--minutes 5]
+    python3 plan_shards.py FROM_DIR... --out RUN_DIR [--minutes 5] [--ids-from DIR]
 
 The test ids are those an earlier run recorded (FROM_DIR: its *.jsonl results;
 several directories merge, later ones winning), and each test's expected time
 is the wall time it took there (elapsed, recorded by tools/pytorch_tests.py),
 else a prior for tests known to be slow (KNOWN_SLOW), else DEFAULT seconds.
+With --ids-from (e.g. the ids tools/pytorch_tests.py --collect wrote), the
+tests are that directory's instead, timed from the FROM_DIRs where they ran.
 Each shard holds tests of one file (one pytest process imports and collects
 one file), packed longest first up to --minutes of expected time, so a test
 longer than that gets a shard of its own. The shards are numbered from the
@@ -100,8 +102,11 @@ def main():
     ap.add_argument("from_dirs", nargs="+")
     ap.add_argument("--out", required=True)
     ap.add_argument("--minutes", type=float, default=5.0)
+    ap.add_argument("--ids-from", default="", help="plan these tests (a directory of *.jsonl), not FROM_DIRs'")
     args = ap.parse_args()
     times = recorded(args.from_dirs)
+    if args.ids_from:
+        times = {nodeid: times.get(nodeid) for nodeid in recorded([args.ids_from])}
     if not times:
         sys.exit(f"no results in {args.from_dirs}")
     shards = plan(times, args.minutes * 60)

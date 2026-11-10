@@ -14,8 +14,9 @@
 #     and GPU_HOST's own GPU on the NVIDIA run if BACKFILL_GPU_WORKERS > 0.
 # The cluster's workers take shards from the start of each queue and the
 # workstations' from its end, so they meet in the middle. With --from PREV
-# (an earlier run's name), plan_shards.py plans each queue longest first from
-# that run's tests and their recorded times ($RUNS/PREV for lavapipe,
+# (an earlier run's name), the files' tests are collected (into $RUNS/NAME/collected)
+# and plan_shards.py plans each queue longest first from
+# that run's recorded times ($RUNS/PREV for lavapipe,
 # $RUNS/PREV-nvidia or PREV-h100 for the GPUs): one-file shards of about
 # PLAN_MINUTES (5) each, numbered from the longest, so the cluster starts the
 # longest work first. Without it, shards are fixed (every COUNT-th test of
@@ -54,17 +55,18 @@ case "$CMD" in
       PREV=${2:?--from needs a run name}
       shift 2
     fi
-    FILES=${*:-test_ops.py test_torch.py test_binary_ufuncs.py test_unary_ufuncs.py test_nn.py test_linalg.py \
-test_reductions.py test_indexing.py test_tensor_creation_ops.py test_shape_ops.py test_type_promotion.py \
-test_sort_and_select.py test_view_ops.py}
+    FILES=${*:-$(grep -v '^#' "$(dirname "$0")/test_files.txt" | tr '\n' ' ')}
     queue() {  # queue RUN_DIR COUNT
       echo "mkdir -p $1/queue $1/pbs-logs && echo $2 > $1/shard_count && echo '$FILES' > $1/test_files &&
         for i in \$(seq 0 $(($2 - 1))); do touch $1/queue/shard-\$(printf %04d \$i); done"
     }
     if [ -n "$PREV" ]; then
-      P="python3 ~/torch-vulkan/tools/cluster/plan_shards.py --minutes ${PLAN_MINUTES:-5}"
+      # (the files' tests collected now, on lavapipe; their times from PREV)
+      P="python3 ~/torch-vulkan/tools/cluster/plan_shards.py --minutes ${PLAN_MINUTES:-5} --ids-from $LAV/collected"
       on "$QUEUE_HOST" "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
         mkdir -p $LAV/pbs-logs $NV/pbs-logs
+        cd ~/torch-vulkan && VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json LP_NUM_THREADS=1 \
+          .venv/bin/python tools/pytorch_tests.py --collect --out $LAV/collected $FILES
         $P $RUNS/$PREV --out $LAV
         $P \$(ls -d $RUNS/$PREV-nvidia $RUNS/$PREV-h100 2>/dev/null | head -1) --out $NV"
     else
