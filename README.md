@@ -119,6 +119,10 @@ Tested on:
 | Arm Mali-G57 (Galaxy A13 5G) | Arm, Android (Termux) | Vulkan 1.1, no float64, no int64 |
 | Mesa lavapipe | Mesa, Linux | CI, with the validation layer; PyTorch's test files |
 
+Apple GPUs (through MoltenVK) are untested: MoltenVK provides buffer device
+addresses only on Metal 3 devices, and Apple GPUs have no float64, so at
+best they would run float32 work.
+
 ## Building
 
 Requirements: Rust (stable), a C++20 compiler, Python 3.10 or newer, PyTorch
