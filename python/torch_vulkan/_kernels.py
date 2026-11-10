@@ -1486,6 +1486,21 @@ def _masked_softmax(x, mask, dim=None, mask_type=None):
     return torch.softmax(x.masked_fill(m, -math.inf), d if x.dim() else 0)
 
 
+def _assert_async_msg(x, assert_msg):
+    """The CPU's: x's one value must be nonzero (one host transfer)."""
+    if x.numel() != 1:
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+    if not bool(x.item()):
+        raise RuntimeError(assert_msg)
+
+
+def _assert_async(x):
+    if x.numel() != 1:
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+    if not bool(x.item()):
+        raise RuntimeError("Expected Tensor with single nonzero value, but got zero")
+
+
 # ---------------------------------------------------------------- CTC loss
 
 def _ctc_setup(log_probs, targets, input_lengths, target_lengths, blank):
@@ -1795,6 +1810,8 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "_assert_async": _assert_async,
+        "_assert_async.msg": _assert_async_msg,
         "_ctc_loss": _ctc_loss,
         "_ctc_loss.Tensor": _ctc_loss_tensor,
         "_ctc_loss_backward": _ctc_loss_backward,
