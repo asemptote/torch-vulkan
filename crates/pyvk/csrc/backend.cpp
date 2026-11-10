@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
 
 namespace vk {
@@ -707,16 +708,40 @@ bool is_small_int(at::ScalarType s) {
   return s == at::kChar || s == at::kByte || s == at::kShort;
 }
 
-// A float16/bfloat16 (widened to float32) or int8/uint8/int16 (to int32) vk tensor.
+// Whether the op half_via_float is handling takes complex32 through
+// complex64 too (complex32_ops).
+thread_local bool g_complex_half = false;
+
+// The ops the CPU computes for complex32: through complex64 on the GPU, the
+// result rounded back. (Others raise on the CPU, and still do: their
+// complex32 tensors stay the CPU's.)
+bool complex32_op(const std::string& name) {
+  static const std::set<std::string> ops = {
+      "aten::add", "aten::sub", "aten::mul", "aten::eq", "aten::ne", "aten::abs", "aten::isnan", "aten::isinf",
+      "aten::isfinite", "aten::neg", "aten::conj_physical", "aten::where", "aten::tril", "aten::triu",
+      "aten::masked_fill", "aten::masked_fill_", "aten::index_add", "aten::fill_", "aten::zero_", "aten::sgn",
+      "aten::index_select", "aten::roll", "aten::nonzero", "aten::addcmul", "aten::isclose", "aten::normal_",
+      "aten::uniform_", "aten::masked_select", "aten::index_put_", "aten::_index_put_impl_", "aten::repeat"};
+  return ops.count(name) > 0;
+}
+
+// A float16/bfloat16 (widened to float32), int8/uint8/int16 (to int32) or,
+// for complex32_op ops, complex32 (to complex64) vk tensor.
 bool is_half_vk(const at::Tensor& t) {
-  if (!t.defined() || !is_vk(t) || storage_label(t.scalar_type()) == nullptr) return false;
+  if (!t.defined() || !is_vk(t)) return false;
   at::ScalarType s = t.scalar_type();
+  if (s == at::kComplexHalf) return g_complex_half && storage_label(at::kHalf) != nullptr;
+  if (storage_label(s) == nullptr) return false;
   return s == at::kHalf || s == at::kBFloat16 || is_small_int(s);
+}
+
+at::ScalarType widened(at::ScalarType s) {
+  return is_small_int(s) ? at::kInt : (s == at::kComplexHalf ? at::kComplexFloat : at::kFloat);
 }
 
 at::Tensor widen_half_arg(const at::Tensor& t) {
   if (!is_half_vk(t)) return t;
-  return at::_to_copy(t, t.options().dtype(is_small_int(t.scalar_type()) ? at::kInt : at::kFloat));
+  return at::_to_copy(t, t.options().dtype(widened(t.scalar_type())));
 }
 
 // Ops whose integer results depend on the dtype's width beyond wrapping
@@ -798,6 +823,7 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   if (half_on_cpu(schema.name())) {
     return false;
   }
+  g_complex_half = complex32_op(schema.name());
   for (const auto& r : schema.returns()) {
     if (r.alias_info() != nullptr && !r.alias_info()->isWrite()) {
       return false;
@@ -817,7 +843,11 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
     }
     if (t.defined() && is_vk(t) && t.dim() > 0 &&
         (at::isFloatingType(t.scalar_type()) || at::isComplexType(t.scalar_type()))) {
-      mixed = mixed || (floating.has_value() && *floating != t.scalar_type());
+      // (complex32 with float16, its parts' type, counts as one: abs of complex32 is float16)
+      auto same = [&](at::ScalarType a, at::ScalarType b) {
+        return a == b || (g_complex_half && c10::toRealValueType(a) == c10::toRealValueType(b));
+      };
+      mixed = mixed || (floating.has_value() && !same(*floating, t.scalar_type()));
       floating = t.scalar_type();
     }
   };
@@ -882,6 +912,7 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
       auto d = static_cast<at::ScalarType>(v.toInt());
       if (is_small_int(d)) v = static_cast<int64_t>(at::kInt);
       if (d == at::kHalf || d == at::kBFloat16) v = static_cast<int64_t>(at::kFloat);
+      if (d == at::kComplexHalf && g_complex_half) v = static_cast<int64_t>(at::kComplexFloat);
       continue;
     }
     if (v.isTensor() && is_half_vk(v.toTensor())) {
@@ -1057,6 +1088,17 @@ at::Tensor& set_empty(at::Tensor& self) {
   return at::native::set_storage_cpu_(self, std::move(empty), 0, {0}, {});
 }
 
+// A zero tensor (autograd's efficient zeros): no storage, the ZeroTensor
+// key, as the CPU's and CUDA's.
+at::Tensor efficient_zero_tensor(at::IntArrayRef size, std::optional<at::ScalarType> dtype,
+                                 std::optional<at::Layout> /*layout*/, std::optional<at::Device> device,
+                                 std::optional<bool> /*pin_memory*/) {
+  auto allocator = at::native::ZeroTensorAllocator(device.value_or(at::Device(kDevice, 0)));
+  auto keys = at::DispatchKeySet(c10::DispatchKey::PrivateUse1) | at::DispatchKeySet(c10::DispatchKey::ZeroTensor);
+  return at::detail::empty_generic(size, &allocator, keys, dtype.value_or(c10::get_default_dtype_as_scalartype()),
+                                   std::nullopt);
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -1067,6 +1109,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("is_set_to", at::native::is_set_to);
   m.impl("empty.memory_format", vk::empty_memory_format);
   m.impl("empty_strided", vk::empty_strided);
+  m.impl("_efficientzerotensor", vk::efficient_zero_tensor);
   m.impl("view", at::native::view);
   m.impl("as_strided", at::native::as_strided_tensorimpl);
   m.impl("_reshape_alias", at::native::_reshape_alias);

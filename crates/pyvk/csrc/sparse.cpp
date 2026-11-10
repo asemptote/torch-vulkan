@@ -792,6 +792,47 @@ at::Tensor& csr_addmv_out(const at::Tensor& self, const at::Tensor& mat, const a
   return out;
 }
 
+// The compressed-index invariants (the CPU's ValidateCompressedIndicesCommon.h:
+// first compressed index 0, last nnz, steps in [0, dim], plain indices in
+// [0, dim) and increasing within each compressed slice), checked on the GPU
+// with one transfer of the verdict. Inputs the CPU rejects before its
+// checks (shapes, dtypes, overflow), and any that fail one, go to the CPU,
+// which raises with its message.
+void validate_compressed_indices(bool is_crow, const at::Tensor& cidx, const at::Tensor& idx, int64_t cdim,
+                                 int64_t dim, int64_t nnz) {
+  auto cpu = [&] { on_cpu("aten::_validate_compressed_sparse_indices", "", is_crow, cidx, idx, cdim, dim, nnz); };
+  at::ScalarType t = idx.scalar_type();
+  bool shapes = cidx.dim() >= 1 && idx.dim() >= 1 && cidx.size(-1) == cdim + 1 && idx.size(-1) == nnz &&
+                cidx.numel() / (cdim + 1) == (nnz > 0 ? idx.numel() / nnz : cidx.numel() / (cdim + 1));
+  int64_t limit = t == at::kInt ? std::numeric_limits<int32_t>::max() : std::numeric_limits<int64_t>::max();
+  if (!is_vk(cidx) || !is_vk(idx) || !(t == at::kInt || t == at::kLong) || cidx.scalar_type() != t || !shapes ||
+      dim > limit || cdim > limit || nnz > limit) {
+    cpu();
+    return;
+  }
+  at::Tensor c = cidx.reshape({-1, cdim + 1}).to(at::kLong);
+  int64_t batches = c.size(0);
+  std::vector<at::Tensor> checks;
+  checks.push_back(at::eq(c.select(1, 0), 0).all());
+  checks.push_back(at::eq(c.select(1, cdim), nnz).all());
+  if (cdim > 0) {
+    at::Tensor step = c.narrow(1, 1, cdim) - c.narrow(1, 0, cdim);
+    checks.push_back(at::logical_and(at::ge(step, 0), at::le(step, dim)).all());
+  }
+  if (nnz > 0 && batches > 0) {
+    at::Tensor p = idx.reshape({batches, nnz}).to(at::kLong);
+    checks.push_back(at::logical_and(at::ge(p, 0), at::lt(p, dim)).all());
+    if (nnz > 1) {
+      // position j + 1 starts a slice, or the plain index grows from j to j + 1
+      at::Tensor starts = at::zeros({batches, nnz + 1}, c.options().dtype(at::kBool));
+      starts.scatter_(1, at::clamp(c, 0, nnz), true);
+      at::Tensor grows = at::lt(p.narrow(1, 0, nnz - 1), p.narrow(1, 1, nnz - 1));
+      checks.push_back(at::logical_or(starts.narrow(1, 1, nnz - 1), grows).all());
+    }
+  }
+  if (!at::stack(checks).all().item<bool>()) cpu();
+}
+
 }  // namespace
 }  // namespace vk
 
@@ -867,6 +908,7 @@ TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_convert_indices_from_coo_to_csr", TORCH_FN(vk::convert_coo_to_csr));
   m.impl("_convert_indices_from_csr_to_coo", TORCH_FN(vk::convert_csr_to_coo));
+  m.impl("_validate_compressed_sparse_indices", TORCH_FN(vk::validate_compressed_indices));
 }
 
 // ---------------------------------------------------------------- more layouts and ops

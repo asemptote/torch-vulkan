@@ -103,6 +103,7 @@ fn main() {
             "csrc/loss.cpp",
             "csrc/sparse.cpp",
             "csrc/optim.cpp",
+            "csrc/nested.cpp",
     ];
     let mut build = cc::Build::new();
     build

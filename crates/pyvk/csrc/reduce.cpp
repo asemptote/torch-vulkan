@@ -640,6 +640,14 @@ at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::O
     return out;
   }
   double p = ord.toDouble();
+  if (input.numel() == 0 && p >= 0 && std::isfinite(p) && at::isFloatingType(input.scalar_type()) && is_vk(input) &&
+      is_vk(out)) {
+    // (an empty sum: 0 for every finite order >= 0; the CPU raises for the
+    // infinite ones, which have no identity)
+    at::Tensor r = at::zeros_like(input).sum(reduce_dims_of(input, dim), keepdim);
+    store(out, r, r.sizes().vec());
+    return out;
+  }
   ROp op = kSum;
   Final final = kNone;
   if (p == 2.0) {

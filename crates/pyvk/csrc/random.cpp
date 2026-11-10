@@ -297,7 +297,28 @@ void update_float_bounds(at::ScalarType t, int64_t& from, int64_t* to) {
   });
 }
 
+// uint16, uint32 and uint64 (no storage kernels of their own): [from, to)
+// drawn in int64, then stored (as bits for uint64), after the CPU's checks.
+bool wide_unsigned(const at::Tensor& self) {
+  at::ScalarType t = self.scalar_type();
+  return is_vk(self) && (t == at::kUInt16 || t == at::kUInt32 || t == at::kUInt64);
+}
+
+at::Tensor& random_unsigned(at::Tensor& self, int64_t from, int64_t to, std::optional<at::Generator> gen) {
+  TORCH_CHECK(from < to, "random_ expects 'from' to be less than 'to', but got from=", from, " >= to=", to);
+  at::native::templates::check_from_to_in_range(from, to - 1, self.dtype());
+  at::Tensor drawn = at::empty(self.sizes(), self.options().dtype(at::kLong));
+  random_range(drawn, from, static_cast<uint64_t>(to) - static_cast<uint64_t>(from), gen);
+  if (self.scalar_type() == at::kUInt64) {
+    self.view(at::kLong).copy_(drawn);
+  } else {
+    self.copy_(drawn);
+  }
+  return self;
+}
+
 at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<at::Generator> gen) {
+  if (to.has_value() && wide_unsigned(self)) return random_unsigned(self, from, *to, gen);
   if (!random_ok(self)) {
     on_cpu("aten::random_", "from", self, from, to, gen);
     return self;
@@ -317,6 +338,7 @@ at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> t
 }
 
 at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator> gen) {
+  if (wide_unsigned(self)) return random_unsigned(self, 0, to, gen);
   if (!random_ok(self)) {
     on_cpu("aten::random_", "to", self, to, gen);
     return self;
