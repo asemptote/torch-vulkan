@@ -718,7 +718,7 @@ def _make_fractional_max(k):
         idx, flat = [], None
         for d in range(k):
             n_in, n_out, pool = spatial[d], output_size[d], kernel_size[d]
-            u = random_samples[..., sample_of[d]].to(dtype)  # [n, c]
+            u = random_samples[:n, :c, sample_of[d]].to(dtype)  # [n, c] (the CPU reads those; samples may have more)
             if n_out > 1:
                 alpha = torch.tensor(float(n_in - pool), dtype=dtype) / (n_out - 1)
                 steps = torch.arange(n_out, device=x.device, dtype=dtype)

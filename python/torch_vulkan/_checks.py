@@ -158,6 +158,8 @@ def _max_pool(k):
             raise RuntimeError(f"max_pool{k}d: dilation must be either a single int, or a tuple of {count} ints")
         ks, pd, dl = (ks * k)[:k], (pd * k)[:k], (dl * k)[:k]
         st = (st * k)[:k] if st else ks
+        if k == 2 and x.dim() not in (3, 4):
+            raise RuntimeError("non-empty 3D or 4D (batch mode) tensor expected for input")
         if k == 3 and x.dim() not in (4, 5):
             raise RuntimeError("non-empty 4D or 5D (batch mode) tensor expected for input")
         spatial = list(x.shape[-k:])
