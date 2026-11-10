@@ -23,6 +23,13 @@ SDK, the Rust toolchain) can live on a bigger, slower volume behind symlinks;
 the venv should stay on the fast one, since every test process imports torch
 from it.
 
+The scripts that reach the machines from the local repo (`queue-run.sh`,
+`dev.sh`, `sync.sh`) and `full-run.sh` read the site's details (ssh options,
+user name, host names, PBS queues, the shared run directory) from the
+environment or from `tools/cluster/cluster.env`, git-ignored: copy
+`cluster.env.example` there and fill it in. `sync.sh` and `dev.sh` copy it
+to the cluster along with the tree.
+
 After changing the code locally, `tools/cluster/sync.sh HOST --build -J
 GATEWAY` copies the working tree (uncommitted changes included) to the shared
 home directory and rebuilds there with `build.sh` (log in
@@ -81,17 +88,18 @@ shards on the shared file system: `$RUNS/NAME` for lavapipe and
 `$RUNS/NAME-nvidia`.
 
 - Cluster workers take shards from the start of each queue: the PBS lavapipe
-  array, plus an H100 job and an L40S job (separate queues).
+  array, plus one job per GPU queue (`GPU_QUEUES`).
 - Workstation workers (`pool.sh`) take shards from the end, one per core on
-  ws1, ws2 and ws3 (lavapipe). Each is ranked: worker k runs only while
+  each of `BACKFILL_HOSTS` (lavapipe). Each is ranked: worker k runs only while
   the cores other processes use (a per-machine `top` monitor) plus k fit in
   the machine (resuming a paused shard needs one core more). As other users' load rises, the highest ranks pause
   their shards and come back in order as it falls; a shard paused for 20
   minutes goes back to the queue, so backfill workers stay (idle) until no
   shard is queued or claimed. (A shard left in `claimed/` by a worker that
-  died keeps them waiting: move it back to `queue/`.) ws3's Tesla M4 can join the NVIDIA run
-  (`WS3_GPU_WORKERS`), but its 4 GB is too small for some tests, so by
-  default it is left for quick checks (`dev.sh` with `DRIVER=nvidia-host`).
+  died keeps them waiting: move it back to `queue/`.) A workstation's own
+  GPU (`GPU_HOST`) can join the NVIDIA run (`BACKFILL_GPU_WORKERS`), but a
+  small one (4 GB) runs out of memory in some tests, so by default it is
+  left for quick checks (`dev.sh` with `DRIVER=nvidia-host`).
 
 The two sides meet in the middle, so whatever starts soonest does the most,
 and a busy cluster queue no longer holds the run up. Every worker claims a
