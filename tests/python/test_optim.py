@@ -83,3 +83,55 @@ def test_fused_grad_scale_found_inf(opt, found_inf):
         results.append((p.detach().cpu(), p.grad.cpu()))
     torch.testing.assert_close(results[0][0], results[1][0])
     torch.testing.assert_close(results[0][1], results[1][1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("bad", [None, float("inf"), float("nan")])
+def test_amp_unscale(dtype, bad):
+    results = []
+    for device in ("vk", "cpu"):
+        grads = [make((4, 3), torch.float32, seed=i).to(dtype).to(device) for i in range(3)]
+        if bad is not None:
+            grads[1][2, 1] = bad
+        found_inf = torch.zeros(1, device=device)
+        before = torch_vulkan.fallback_counts()
+        torch._amp_foreach_non_finite_check_and_unscale_(grads, found_inf, torch.full((1,), 0.25, device=device))
+        if device == "vk":
+            assert torch_vulkan.fallback_counts() == before
+        results.append(([g.cpu() for g in grads], found_inf.cpu()))
+    for g, w in zip(results[0][0], results[1][0]):
+        torch.testing.assert_close(g, w, equal_nan=True)
+    torch.testing.assert_close(results[0][1], results[1][1])
+
+
+@pytest.mark.parametrize("found", [0.0, 1.0])
+@pytest.mark.parametrize("tracker", [0, 2, 3])
+@pytest.mark.parametrize("scale", [65536.0, 3e38])
+def test_amp_update_scale(found, tracker, scale):
+    results = []
+    for device in ("vk", "cpu"):
+        s = torch.full((1,), scale, device=device)
+        t = torch.full((1,), tracker, dtype=torch.int32, device=device)
+        before = torch_vulkan.fallback_counts()
+        torch._amp_update_scale_(s, t, torch.full((1,), found, device=device), 2.0, 0.5, 3)
+        if device == "vk":
+            assert torch_vulkan.fallback_counts() == before
+        results.append((s.cpu(), t.cpu()))
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+    torch.testing.assert_close(results[0][1], results[1][1])
+
+
+def test_grad_scaler_steps():
+    # (torch.amp.GradScaler on "vk": unscale, skip on inf, and the scale update)
+    p = torch.nn.Parameter(torch.ones(3, device="vk"))
+    opt = torch.optim.SGD([p], lr=0.1)
+    scaler = torch.amp.GradScaler("vk", init_scale=4.0, growth_interval=1)
+    before = torch_vulkan.fallback_counts()
+    for g in (torch.ones(3), torch.tensor([1.0, float("inf"), 1.0]), torch.ones(3)):
+        opt.zero_grad()
+        scaler.scale((p * g.to("vk")).sum()).backward()
+        scaler.step(opt)
+        scaler.update()
+    assert torch_vulkan.fallback_counts() == before
+    torch.testing.assert_close(p.detach().cpu(), torch.full((3,), 0.8))
+    assert scaler.get_scale() == 8.0

@@ -133,3 +133,31 @@ def test_padded_to_jagged_too_long_raises_as_cpu():
     offsets = torch.tensor([0, 5])
     with pytest.raises(RuntimeError, match="found batch item of length 5"):
         torch.ops.aten._padded_dense_to_jagged_forward(torch.ones(1, 3, device="vk"), [offsets.to("vk")])
+
+
+@pytest.mark.parametrize("shape,ns", [((0, 1), (1,)), ((2, 0), (0,)), ((0, 3, 2), (3, 2))])
+def test_layer_norm_empty(shape, ns):
+    for dev in ("cpu", "vk"):
+        x = torch.randn(shape, device=dev, requires_grad=True)
+        w = torch.ones(ns, device=dev, requires_grad=True)
+        b = torch.zeros(ns, device=dev, requires_grad=True)
+        f = (lambda: torch.nn.functional.layer_norm(x, ns, w, b).sum().backward()) if dev == "vk" else None
+        if dev == "vk":
+            no_fallback(f)
+            torch.testing.assert_close(w.grad.cpu(), want_w)
+            o, m, r = no_fallback(lambda: torch.native_layer_norm(x, ns, w, b, 1e-5))
+            torch.testing.assert_close(m.cpu(), want_m, equal_nan=True)
+            torch.testing.assert_close(r.cpu(), want_r, equal_nan=True)
+        else:
+            torch.nn.functional.layer_norm(x, ns, w, b).sum().backward()
+            want_w = w.grad
+            _, want_m, want_r = torch.native_layer_norm(x, ns, w, b, 1e-5)
+
+
+def test_group_norm_empty_batch():
+    x = torch.randn(0, 4, 3, device="vk", requires_grad=True)
+    w = torch.ones(4, device="vk", requires_grad=True)
+    y = no_fallback(lambda: torch.nn.functional.group_norm(x, 2, w))
+    no_fallback(lambda: y.sum().backward())
+    assert y.shape == (0, 4, 3)
+    torch.testing.assert_close(w.grad.cpu(), torch.zeros(4))

@@ -156,6 +156,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
                 input.numel() == N * C * HxW && input.numel() < (int64_t(1) << 31) &&
                 grad_out.sizes().equals(input.sizes()) && mean.numel() == N * group && rstd.numel() == N * group &&
                 (!defined(gamma) || gamma->numel() == C) && all_vk({&g_opt, &x_opt, &m_opt, &r_opt, &gamma});
+  if (!kernel && N == 0 && t != at::ScalarType::Undefined && group > 0 && C > 0 && HxW > 0 && C % group == 0 &&
+      input.numel() == 0 && all_vk({&g_opt, &x_opt, &m_opt, &r_opt, &gamma})) {
+    // (no samples: the parameter gradients are zeros, as the CPU's)
+    auto popts = input.options().dtype(defined(gamma) ? gamma->scalar_type() : input.scalar_type());
+    return {mask[0] ? at::empty(input.sizes(), input.options()) : at::Tensor(),
+            mask[1] ? at::zeros({C}, popts) : at::Tensor(), mask[2] ? at::zeros({C}, popts) : at::Tensor()};
+  }
   if (!kernel) {
     auto s = on_cpu("aten::native_group_norm_backward", "", grad_out, input, mean, rstd, gamma, N, C, HxW, group,
                     mask);
@@ -213,6 +220,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm(const at::Tenso
   bool kernel = t != at::ScalarType::Undefined && is_vk(input) && group > 0 && N > 0 && C > 0 && HxW > 0 &&
                 C % group == 0 && input.numel() == N * C * HxW && input.numel() < (int64_t(1) << 31) &&
                 param_ok(weight) && param_ok(bias);
+  if (!kernel && N == 0 && is_vk(input) && t != at::ScalarType::Undefined && group > 0 && C > 0 && HxW > 0 &&
+      C % group == 0 && input.numel() == 0 && param_ok(weight) && param_ok(bias)) {
+    // (no samples: empty results, as the CPU's)
+    at::Tensor stats = at::empty({0, group}, input.options().dtype(t));
+    return {at::empty(input.sizes(), input.options()), stats, stats.clone()};
+  }
   if (!kernel) {
     auto s = on_cpu("aten::native_group_norm", "", input, weight, bias, N, C, HxW, group, eps);
     return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};

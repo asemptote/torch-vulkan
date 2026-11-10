@@ -1,4 +1,5 @@
-// Fused optimiser steps for device "vk" (torch.optim's fused=True):
+// Fused optimiser steps for device "vk" (torch.optim's fused=True), and
+// torch.amp GradScaler's unscale and scale update (at the end):
 // _fused_adam_, _fused_adamw_, _fused_sgd_ and _fused_adagrad_, one launch
 // of shaders/optim.slang per parameter tensor. As the CPU's kernels, the
 // step counts, grad_scale, found_inf and a tensor lr are read on the host
@@ -254,10 +255,67 @@ void fused_adagrad_tensor_lr(at::TensorList params, at::TensorList grads, at::Te
                 grad_scale, found_inf);
 }
 
+// ---------------------------------------------------------------- torch.amp's GradScaler
+
+// The gradients multiplied by inv_scale in place; found_inf set to 1 if any
+// element was infinite or NaN before (the CPU's and CUDA's kernels), with no
+// host transfer.
+void amp_unscale(at::TensorList grads, at::Tensor& found_inf, const at::Tensor& inv_scale) {
+  if (grads.empty()) return;
+  bool on_device = is_vk(found_inf) && is_vk(inv_scale);
+  for (const at::Tensor& g : grads) on_device = on_device && is_vk(g) && g.layout() == at::kStrided;
+  if (!on_device) {
+    on_cpu("aten::_amp_foreach_non_finite_check_and_unscale_", "", grads, found_inf, inv_scale);
+    return;
+  }
+  TORCH_CHECK(inv_scale.numel() == 1, "inv_scale must be a 1-element tensor.");
+  TORCH_CHECK(found_inf.numel() == 1, "found_inf must be a 1-element tensor.");
+  TORCH_CHECK(inv_scale.scalar_type() == at::kFloat, "inv_scale must be a float tensor.");
+  TORCH_CHECK(found_inf.scalar_type() == at::kFloat, "found_inf must be a float tensor.");
+  std::vector<at::Tensor> nonfinite;
+  for (const at::Tensor& g : grads) {
+    TORCH_CHECK(at::isFloatingType(g.scalar_type()), "scaled_grads must be floating point.");
+    if (g.numel() == 0) continue;
+    nonfinite.push_back(at::logical_not(at::isfinite(g)).any());
+    at::Tensor gm = g;  // (TensorList holds const references)
+    gm.mul_(inv_scale);
+  }
+  if (!nonfinite.empty()) found_inf.masked_fill_(at::stack(nonfinite).any(), 1.0);
+}
+
+// The scale backed off if found_inf, else grown every growth_interval
+// successful steps (unless that overflows float32), as the CPU's kernel:
+// the products in double where the device has it, rounded to float32.
+at::Tensor& amp_update_scale(at::Tensor& scale, at::Tensor& tracker, const at::Tensor& found_inf, double growth,
+                             double backoff, int64_t interval) {
+  if (!is_vk(scale) || !is_vk(tracker) || !is_vk(found_inf)) {
+    on_cpu("aten::_amp_update_scale_", "", scale, tracker, found_inf, growth, backoff, interval);
+    return scale;
+  }
+  TORCH_CHECK(tracker.numel() == 1, "growth_tracker must be a 1-element tensor.");
+  TORCH_CHECK(scale.numel() == 1, "current_scale must be a 1-element tensor.");
+  TORCH_CHECK(found_inf.numel() == 1, "found_inf must be a 1-element tensor.");
+  TORCH_CHECK(tracker.scalar_type() == at::kInt, "growth_tracker must be an int tensor.");
+  TORCH_CHECK(scale.scalar_type() == at::kFloat, "current_scale must be a float tensor.");
+  TORCH_CHECK(found_inf.scalar_type() == at::kFloat, "found_inf must be a float tensor.");
+  at::Tensor wide = scale.to(vkt_has_float64() ? at::kDouble : at::kFloat);
+  at::Tensor grown = (wide * growth).to(at::kFloat), backed = (wide * backoff).to(at::kFloat);
+  at::Tensor inf = at::ne(found_inf, 0);
+  at::Tensor successful = tracker + 1;
+  at::Tensor grow = at::eq(successful, interval);
+  at::Tensor new_scale = at::where(inf, backed, at::where(at::logical_and(grow, at::isfinite(grown)), grown, scale));
+  at::Tensor new_tracker = at::where(at::logical_or(inf, grow), at::zeros_like(tracker), successful);
+  scale.copy_(new_scale);
+  tracker.copy_(new_tracker);
+  return scale;
+}
+
 }  // namespace
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  m.impl("_amp_foreach_non_finite_check_and_unscale_", &vk::amp_unscale);
+  m.impl("_amp_update_scale_", &vk::amp_update_scale);
   m.impl("_fused_adam_", &vk::fused_adam<false>);
   m.impl("_fused_adam_.tensor_lr", &vk::fused_adam_tensor_lr<false>);
   m.impl("_fused_adamw_", &vk::fused_adam<true>);

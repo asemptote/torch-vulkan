@@ -68,6 +68,24 @@ std::vector<int64_t> stat_shape(const at::Tensor& input, int64_t k) {
   return shape;
 }
 
+// An empty input (no rows, or rows of no elements), as the CPU: the output
+// empty, the statistics of rows of nothing mean 0 and rstd NaN (the
+// statistics in float32 for 16-bit inputs, as the non-empty path's).
+bool empty_ok(const at::Tensor& input, const at::Tensor& w, const at::Tensor& b) {
+  if (!is_vk(input) || !at::isFloatingType(input.scalar_type())) return false;
+  for (const at::Tensor* p : {&w, &b}) {
+    if (p->defined() && !is_vk(*p)) return false;
+  }
+  return true;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> empty_layer_norm(const at::Tensor& input, int64_t k) {
+  at::ScalarType st = at::isReducedFloatingType(input.scalar_type()) ? at::kFloat : input.scalar_type();
+  auto stats = input.options().dtype(st);
+  return {at::empty(input.sizes(), input.options()), at::zeros(stat_shape(input, k), stats),
+          at::full(stat_shape(input, k), std::numeric_limits<double>::quiet_NaN(), stats)};
+}
+
 void launch(uint32_t op, LayerNormParams& p, at::ScalarType t, bool has_w, bool has_b) {
   int64_t groups = std::min<int64_t>(p.m, kMaxGroups);
   p.ngroups = static_cast<uint32_t>(groups);
@@ -110,6 +128,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tenso
     auto [out, mean, rstd] = vk::native_layer_norm(widened(input), normalized_shape, widened(weight), widened(bias), eps);
     return {out.to(input.scalar_type()), mean, rstd};
   }
+  if ((m == 0 || n == 0) && empty_ok(input, weight, bias)) return empty_layer_norm(input, k);
   if (!kernel_ok(input, weight, bias) || m == 0 || n == 0) {
     auto s = on_cpu("aten::native_layer_norm", "", input, normalized_shape, weight_opt, bias_opt, eps);
     return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};
@@ -148,6 +167,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm_backward(
                                                    widened(rstd), widened(weight), widened(bias), mask);
     return {gx.defined() ? gx.to(input.scalar_type()) : gx, gw.defined() ? gw.to(weight.scalar_type()) : gw,
             gb.defined() ? gb.to(bias.scalar_type()) : gb};
+  }
+  if ((m == 0 || n == 0) && empty_ok(input, weight, bias) && is_vk(grad_out)) {
+    // (no rows: zero parameter gradients; rows of nothing: empty ones)
+    auto zeros = [](const at::Tensor& p) { return at::zeros(p.sizes(), p.options()); };
+    return {mask[0] ? at::empty(input.sizes(), input.options()) : at::Tensor(),
+            mask[1] && weight.defined() ? zeros(weight) : at::Tensor(),
+            mask[2] && bias.defined() ? zeros(bias) : at::Tensor()};
   }
   if (!kernel_ok(input, weight, bias) || m == 0 || n == 0 || !is_vk(grad_out) ||
       grad_out.scalar_type() != input.scalar_type() || mean.scalar_type() != input.scalar_type() ||
