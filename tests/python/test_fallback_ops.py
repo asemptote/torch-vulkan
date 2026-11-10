@@ -330,3 +330,42 @@ def test_channels_last_layouts_as_cpu(case):
         y.backward(torch.ones_like(y))
         layouts.append((y.is_contiguous(memory_format=CL), t.grad.is_contiguous(memory_format=CL)))
     assert layouts[1] == layouts[0]
+
+
+def test_strided_nested_tensor_autograd():
+    # (PyTorch's device-generic NestedTensor kernels for vk nested tensors: no
+    # CPU fallback, and autograd through them, which used to abort the process)
+    a = make((1, 2, 4), torch.float64)
+    b = make((2, 2, 4), torch.float64, seed=1)
+    grads = []
+    for dev in ("cpu", "vk"):
+        x, y = a.clone().to(dev).requires_grad_(), b.clone().to(dev).requires_grad_()
+        nt = torch.nested.as_nested_tensor([x, y])
+        ln = torch.nn.functional.layer_norm(nt, (4,), torch.ones(4, dtype=torch.float64, device=dev),
+                                            torch.zeros(4, dtype=torch.float64, device=dev))
+        out = torch.nested.to_padded_tensor(torch.nn.functional.relu(ln) * 2, 0)
+        if dev == "vk":
+            before = torch_vulkan.fallback_counts()
+        out.sum().backward()
+        if dev == "vk":
+            assert torch_vulkan.fallback_counts() == before
+        grads.append((out.detach().cpu(), x.grad.cpu(), y.grad.cpu()))
+    for g, w in zip(grads[1], grads[0]):
+        torch.testing.assert_close(g, w)
+
+
+@pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min", "prod"])
+def test_segment_reduce_backward(reduce):
+    d = torch.tensor([1.0, 0.0, 3.0, 3.0, float("nan"), 2.0, 0.0, 0.0, 5.0, -1.0], dtype=torch.float64)
+    lengths = torch.tensor([2, 3, 0, 4, 1])
+    grads = []
+    for dev in ("cpu", "vk"):
+        x = d.clone().to(dev).requires_grad_()
+        y = torch.segment_reduce(x, reduce, lengths=lengths.to(dev))
+        if dev == "vk":
+            before = torch_vulkan.fallback_counts()
+        y.backward(torch.tensor([1.0, -2.0, 3.0, 4.0, 0.5], dtype=torch.float64, device=dev))
+        if dev == "vk":
+            assert torch_vulkan.fallback_counts() == before
+        grads.append(x.grad.cpu())
+    torch.testing.assert_close(grads[1], grads[0], equal_nan=True)

@@ -1342,6 +1342,13 @@ def _segment_reduce(data, reduce, *, lengths=None, indices=None, offsets=None, a
                        unsafe=unsafe, initial=initial)
     axis = axis % data.dim()
     if offsets is None:
+        if not unsafe and lengths.numel() > 0:
+            # (the CPU's checks of lengths, with its messages; one transfer)
+            low, ok = torch.stack([lengths.min().to(torch.int64),
+                                   (lengths.sum(-1) == data.shape[axis]).all().to(torch.int64)]).tolist()
+            torch._check(low >= 0, lambda: "lengths contains negative value!")
+            torch._check(ok == 1, lambda: "segment_reduce(): Expected all rows of lengths along axis to sum to "
+                         "data.size(lengths.dim()-1) when !unsafe.")
         offsets = torch.cat([torch.zeros_like(lengths[..., :1]), torch.cumsum(lengths, -1)], -1)
     offsets = offsets.to(torch.int64)
     S = offsets.shape[-1] - 1
@@ -1365,6 +1372,70 @@ def _segment_reduce(data, reduce, *, lengths=None, indices=None, offsets=None, a
         out = start.scatter_reduce(axis, seg, data, {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin"}[reduce],
                                    include_self=True)
     return out.narrow(axis, 0, S)
+
+
+def _segment_reduce_backward(grad, output, data, reduce, *, lengths=None, offsets=None, axis=0, initial=None):
+    """The CPU's segment_reduce backward: sum and mean spread each segment's
+    gradient (mean divided by the length); max/min give it to the elements
+    equal to the result (or NaN), divided among them where it is positive (as
+    the CPU's loop does); prod gives grad * out / x, or grad times the product
+    of the others for zeros and NaNs."""
+    if lengths is None and offsets is None:
+        raise RuntimeError("segment_reduce(): Either lengths or offsets must be defined.")
+    if reduce not in ("sum", "mean", "max", "min", "prod"):
+        return _on_cpu("_segment_reduce_backward", grad, output, data, reduce, lengths=lengths, offsets=offsets,
+                       axis=axis, initial=initial)
+    axis = axis % data.dim()
+    if offsets is None:
+        offsets = torch.cat([torch.zeros_like(lengths[..., :1]), torch.cumsum(lengths, -1)], -1)
+    offsets = offsets.to(torch.int64)
+    S = offsets.shape[-1] - 1
+    L = data.shape[axis]
+    inner = [1] * (data.dim() - axis - 1)
+    pos = torch.arange(L, device=data.device).expand(*offsets.shape[:-1], L).contiguous()
+    seg = torch.searchsorted(offsets[..., 1:].contiguous(), pos, right=True)  # [*lead, L]: S past the last
+    seg = seg.reshape(*seg.shape, *inner).expand(data.shape)
+
+    def per_element(t):  # [*lead, S, *inner] -> data's shape, 0 past the last segment
+        pad = list(t.shape)
+        pad[axis] = 1
+        return torch.cat([t, torch.zeros(pad, dtype=t.dtype, device=t.device)], axis).gather(axis, seg)
+
+    zero = torch.zeros((), dtype=data.dtype, device=data.device)
+    ge = per_element(grad.to(data.dtype))
+    if reduce == "sum":
+        gi = ge
+    elif reduce == "mean":
+        lens = (offsets[..., 1:] - offsets[..., :-1]).to(data.dtype)
+        lens = lens.reshape(*lens.shape, *inner).expand(output.shape)
+        gi = ge / per_element(lens).clamp(min=1)
+    else:
+        oe = per_element(output)
+        shape = list(data.shape)
+        shape[axis] = S + 1
+
+        def count(mask):  # per element: how many in its segment
+            return torch.zeros(shape, dtype=data.dtype, device=data.device).scatter_add(
+                axis, seg, mask.to(data.dtype)).gather(axis, seg)
+
+        nan = torch.isnan(data)
+        if reduce in ("max", "min"):
+            hit = nan | (data == oe)
+            gi = torch.where(hit, ge, zero)
+            ties = count(hit)
+            gi = torch.where((ties >= 2) & (gi > 0), gi / ties, gi)
+        else:
+            special = nan | (data == 0)
+            init = 1.0 if initial is None else initial
+            others = torch.full(shape, init, dtype=data.dtype, device=data.device).scatter_reduce(
+                axis, seg, torch.where(special, torch.ones((), dtype=data.dtype, device=data.device), data), "prod",
+                include_self=True).gather(axis, seg)  # (the segment's product of its non-zero, non-NaN elements)
+            other_nan = count(nan) - nan.to(data.dtype) > 0
+            other_zero = count(data == 0) - (data == 0).to(data.dtype) > 0
+            excl = torch.where(other_nan, torch.full((), math.nan, dtype=data.dtype, device=data.device),
+                               torch.where(other_zero, others * 0, others))
+            gi = torch.where(special, ge * excl, ge * oe / data)
+    return torch.where(seg < S, gi, zero)
 
 
 # ---------------------------------------------------------------- CTC loss
@@ -1673,6 +1744,7 @@ def _kernels():
         "_histogramdd_from_bin_cts": _histogramdd_from_bin_cts,
         "_histogramdd_from_bin_tensors": _histogramdd_from_bin_tensors,
         "segment_reduce": _segment_reduce,
+        "_segment_reduce_backward": _segment_reduce_backward,
         "_ctc_loss": _ctc_loss,
         "_ctc_loss.Tensor": _ctc_loss_tensor,
         "_ctc_loss_backward": _ctc_loss_backward,

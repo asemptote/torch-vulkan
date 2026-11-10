@@ -1,12 +1,27 @@
-// Nested (jagged) tensors for device "vk": the conversions between a jagged
-// tensor's packed values and a padded dense tensor that torch.nested's
-// jagged layout uses for most ops (_jagged_to_padded_dense_forward,
-// _padded_dense_to_jagged_forward), as one gather or scatter of rows with
-// each row's batch found by a sorted search in the offsets, where the CPU
-// loops over the batch.
+// Nested tensors for device "vk".
+//
+// Jagged layout (torch.nested with layout=torch.jagged): the conversions
+// between packed values and a padded dense tensor that most of its ops use
+// (_jagged_to_padded_dense_forward, _padded_dense_to_jagged_forward), as one
+// gather or scatter of rows with each row's batch found by a sorted search
+// in the offsets, where the CPU loops over the batch.
+//
+// Strided layout (torch.nested.nested_tensor's default): PyTorch's
+// NestedTensor kernels are written once from ordinary ops on the buffer and
+// the size/stride/offset tensors, but registered for the built-in devices
+// only, so NestedTensorPrivateUse1 had none: every op on a vk nested tensor
+// failed, and in autograd (which asks for _nested_tensor_size) aborted the
+// process. The ops whose CPU and CUDA kernels are one function in PyTorch's
+// native_functions.yaml (tools/dev/nested_ops.py lists them) get that kernel
+// by redispatching to NestedTensorCPU; its ops then run on the vk buffer as
+// usual. Layer norm, whose kernels call the CPU's LayerNormKernel stub
+// directly, runs as the dense op on the buffer.
 
 #include "vk.h"
 
+#include <ATen/NestedTensorImpl.h>
+#include <ATen/native/nested/NestedTensorMath.h>
+#include <ATen/native/nested/NestedTensorUtils.h>
 #include <torch/library.h>
 
 #include <cmath>
@@ -96,10 +111,171 @@ at::Tensor padded_dense_to_jagged(const at::Tensor& padded, at::TensorList offse
   return padded.narrow(0, 0, batches).reshape({batches * width, inner}).index_select(0, src).view(shape);
 }
 
+// ---------------------------------------------------------------- strided nested tensors
+
+// NestedTensorCPU kernels shared with NestedTensorCUDA (device-generic), plus
+// to_padded_tensor and bmm, whose CPU kernels are generic ATen code too.
+const char* const kNestedOps[] = {
+    "native_dropout",
+    "native_dropout_backward",
+    "abs",
+    "abs_",
+    "sgn",
+    "sgn_",
+    "add.Tensor",
+    "add_.Tensor",
+    "all.dim",
+    "logical_not",
+    "logical_not_",
+    "cat",
+    "chunk",
+    "copy_",
+    "cos",
+    "div.Tensor",
+    "div.Scalar",
+    "embedding",
+    "empty_like",
+    "fill_.Scalar",
+    "fill_.Tensor",
+    "isnan",
+    "is_same_size",
+    "linear",
+    "linear_backward",
+    "matmul",
+    "matmul_backward",
+    "matmul.out",
+    "value_selecting_reduction_backward",
+    "mul.Tensor",
+    "mul_.Tensor",
+    "mul.Scalar",
+    "mul_.Scalar",
+    "narrow",
+    "ones_like",
+    "neg",
+    "neg_",
+    "relu",
+    "relu_",
+    "gelu_",
+    "gelu",
+    "gelu_backward",
+    "select.int",
+    "_nested_select_backward",
+    "silu",
+    "silu_",
+    "silu_backward",
+    "sin",
+    "detach",
+    "_softmax",
+    "_softmax_backward_data",
+    "split_with_sizes",
+    "squeeze",
+    "squeeze.dim",
+    "squeeze.dims",
+    "sqrt",
+    "tanh",
+    "tanh_",
+    "threshold_backward",
+    "transpose.int",
+    "_nested_tensor_size",
+    "_nested_tensor_strides",
+    "_nested_tensor_storage_offsets",
+    "_nested_from_padded_and_nested_example",
+    "unsqueeze",
+    "where.self",
+    "where.self_out",
+    "clone",
+    "zero_",
+    "sub.Tensor",
+    "values",
+    "unbind.int",
+    "_to_copy",
+    "masked_fill.Scalar",
+    "view",
+    "eq.Scalar",
+    "eq.Tensor",
+    "ge.Scalar",
+    "gt.Scalar",
+    "normal_",
+    "alias",
+    "isinf",
+    "isposinf",
+    "isneginf",
+    "_test_autograd_multiple_dispatch.fullcoverage",
+    "_test_autograd_multiple_dispatch.ntonly",
+    "_safe_softmax",
+    "_transformer_encoder_layer_fwd",
+    "to_padded_tensor",
+    "bmm",
+};
+
+// Ops on dense tensors that build nested ones, whose CPU kernel is PyTorch's
+// generic one (shared with CUDA, or named so): for vk inputs, the same kernel
+// through the CPU key (a vk buffer makes a vk nested tensor).
+const char* const kDenseOps[] = {
+    "_nested_view_from_buffer",
+    "_nested_from_padded",
+    "_nested_tensor_from_mask",
+    "_nested_tensor_from_mask_left_aligned",
+};
+
+void to_nested_cpu(const c10::OperatorHandle& op, c10::DispatchKeySet, torch::jit::Stack* stack) {
+  op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::NestedTensorCPU), stack);
+}
+
+void to_cpu_kernel(const c10::OperatorHandle& op, c10::DispatchKeySet, torch::jit::Stack* stack) {
+  op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
+}
+
+// Layer norm of a contiguous nested tensor over its trailing dims: the dense
+// op on the buffer seen as [M, N] (the CPU's nested kernel's checks first).
+std::tuple<at::Tensor, at::Tensor, at::Tensor> nested_layer_norm(const at::Tensor& input,
+                                                                 at::IntArrayRef normalized_shape,
+                                                                 const std::optional<at::Tensor>& weight_opt,
+                                                                 const std::optional<at::Tensor>& bias_opt,
+                                                                 double eps) {
+  TORCH_CHECK_VALUE(weight_opt && bias_opt, "NestedTensor layer_norm requires weight and bias");
+  TORCH_CHECK(!weight_opt->is_nested(), "NestedTensor weight not supported for layer_norm");
+  TORCH_CHECK(!bias_opt->is_nested(), "NestedTensor bias not supported for layer_norm");
+  auto* nt = at::native::get_nested_tensor_impl(input);
+  TORCH_CHECK(at::native::nested_tensor_impl_is_contiguous(nt));
+  auto [M, N] = at::native::_check_nested_layer_norm_inputs(*nt, normalized_shape, *weight_opt, *bias_opt);
+  at::Tensor buffer = nt->get_buffer().view({M, N});
+  auto [out, mean, rstd] = at::native_layer_norm(buffer, {N}, weight_opt->reshape({N}), bias_opt->reshape({N}), eps);
+  return {at::native::wrap_buffer(out.reshape({-1}), nt->get_nested_sizes()), mean.reshape({M}), rstd.reshape({M})};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> nested_layer_norm_backward(
+    const at::Tensor& grad, const at::Tensor& input, at::IntArrayRef normalized_shape, const at::Tensor& mean,
+    const at::Tensor& rstd, const std::optional<at::Tensor>& weight_opt, const std::optional<at::Tensor>& bias_opt,
+    std::array<bool, 3> mask) {
+  TORCH_CHECK_VALUE(weight_opt.has_value() && bias_opt.has_value(),
+                    "NestedTensor layer_norm requires weight and bias");
+  auto* nt = at::native::get_nested_tensor_impl(input);
+  auto* ng = at::native::get_nested_tensor_impl(grad);
+  TORCH_CHECK(at::native::nested_tensor_impl_is_contiguous(nt) && at::native::nested_tensor_impl_is_contiguous(ng));
+  auto [M, N] = at::native::_check_nested_layer_norm_inputs(*nt, normalized_shape, *weight_opt, *bias_opt);
+  auto [gx, gw, gb] = at::native_layer_norm_backward(
+      ng->get_buffer().view({M, N}), nt->get_buffer().view({M, N}), {N}, mean.reshape({M, 1}), rstd.reshape({M, 1}),
+      weight_opt->reshape({N}), bias_opt->reshape({N}), mask);
+  return {gx.defined() ? at::native::wrap_buffer(gx.reshape({-1}), nt->get_nested_sizes()) : gx,
+          gw.defined() ? gw.view(weight_opt->sizes()) : gw, gb.defined() ? gb.view(bias_opt->sizes()) : gb};
+}
+
 }  // namespace
 }  // namespace vk
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_jagged_to_padded_dense_forward", TORCH_FN(vk::jagged_to_padded_dense));
   m.impl("_padded_dense_to_jagged_forward", TORCH_FN(vk::padded_dense_to_jagged));
+  for (const char* name : vk::kDenseOps) {
+    m.impl(name, torch::CppFunction::makeFromBoxedFunction<&vk::to_cpu_kernel>());
+  }
+}
+
+TORCH_LIBRARY_IMPL(aten, NestedTensorPrivateUse1, m) {
+  for (const char* name : vk::kNestedOps) {
+    m.impl(name, torch::CppFunction::makeFromBoxedFunction<&vk::to_nested_cpu>());
+  }
+  m.impl("native_layer_norm", TORCH_FN(vk::nested_layer_norm));
+  m.impl("native_layer_norm_backward", TORCH_FN(vk::nested_layer_norm_backward));
 }
