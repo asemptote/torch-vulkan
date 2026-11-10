@@ -62,8 +62,8 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
 
 All numerical work is meant to run on the GPU (see the design principles in
 [CONTRIBUTING.md](CONTRIBUTING.md#design-principles)). Anything that does not
-yet runs on the CPU through PyTorch's fallback and is counted in
-`torch_vulkan.fallback_counts()`; `TORCH_VK_STRICT=1` turns those fallbacks
+run there yet falls back to the CPU through PyTorch's fallback and is counted
+in `torch_vulkan.fallback_counts()`; `TORCH_VK_STRICT=1` turns those fallbacks
 into errors. In the OpInfo sweep (`tools/opinfo_coverage.py`, PyTorch's
 sample inputs for every op compared against the CPU) every op runs fully on
 the GPU and matches the CPU. PyTorch's own device-generic test files
