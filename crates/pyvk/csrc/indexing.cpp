@@ -1237,7 +1237,11 @@ at::Tensor& pad_out(const at::Tensor& self, at::IntArrayRef pad, bool reflect, c
     indices.push_back(i);
   }
   at::Tensor result = gather_dims(self, shape, dims, indices);
+  // (as the CPU's: the output takes the input's memory format)
   at::native::resize_output(out, shape);
+  if (self.suggest_memory_format() != at::MemoryFormat::Contiguous) {
+    out.resize_(shape, self.suggest_memory_format());
+  }
   out.copy_(result);
   return out;
 }

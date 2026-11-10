@@ -245,6 +245,9 @@ FAILING = ("failed", "crashed", "xpassed", "validation")
 # pattern, reason); counted as "expected", not as failures. Every entry needs
 # a reason a reader can check.
 EXPECTED = [
+    (r"^test_spectral_ops\.py::.*_vk_float16$", r"Unsupported dtype Half",
+     "PyTorch's torch.fft functions take float16 only on CUDA, XPU and meta devices (promote_type_fft) and raise "
+     "the CPU's error elsewhere, before any kernel; complex32 transforms run on vk"),
     (r"test_sparse_compressed_constructor_shape_and_device_inference_(_|factory)_from_list_", r"device\(type='cpu'\) != device\(type='vk'",
      "list inputs without a device make a CPU tensor; the test skips this case on CUDA for that reason, not on other devices"),
     (r"test_print_", r"module '__main__' has no attribute '__file__'",

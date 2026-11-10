@@ -186,7 +186,24 @@ bool fft_dtype(const at::Tensor& t) {
   return is_vk(t) && dtype_label(t.scalar_type()) != nullptr;
 }
 
+// float16 and complex32 (which the CPU does not transform; CUDA does): in
+// float32 / complex64, the result rounded back, any size.
+bool half_fft(const at::Tensor& t) {
+  return is_vk(t) && (t.scalar_type() == at::kHalf || t.scalar_type() == at::kComplexHalf);
+}
+
+at::Tensor widen_fft(const at::Tensor& t) {
+  return t.to(t.scalar_type() == at::kHalf ? at::kFloat : at::kComplexFloat);
+}
+
+at::Tensor narrow_fft(const at::Tensor& t) {
+  return t.to(t.is_complex() ? at::kComplexHalf : at::kHalf);
+}
+
 at::Tensor fft_c2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward) {
+  if (half_fft(self) && self.is_complex()) {
+    return narrow_fft(fft_c2c_compute(widen_fft(self), dim, normalization, forward));
+  }
   if (!fft_dtype(self) || !at::isComplexType(self.scalar_type())) {
     return on_cpu("aten::_fft_c2c", "", self, dim, normalization, forward)[0].toTensor();
   }
@@ -201,6 +218,9 @@ at::Tensor fft_c2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
 }
 
 at::Tensor fft_r2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided) {
+  if (half_fft(self) && !self.is_complex() && !dim.empty()) {
+    return narrow_fft(fft_r2c_compute(widen_fft(self), dim, normalization, onesided));
+  }
   if (!fft_dtype(self) || !at::isFloatingType(self.scalar_type()) || dim.empty()) {
     return on_cpu("aten::_fft_r2c", "", self, dim, normalization, onesided)[0].toTensor();
   }
@@ -219,6 +239,9 @@ at::Tensor fft_r2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
 }
 
 at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
+  if (half_fft(self) && self.is_complex() && !dim.empty()) {
+    return narrow_fft(fft_c2r_compute(widen_fft(self), dim, normalization, last_dim_size));
+  }
   int64_t last = dim.empty() ? 0 : at::maybe_wrap_dim(dim.back(), self.dim());
   if (!fft_dtype(self) || !at::isComplexType(self.scalar_type()) || dim.empty() ||
       self.size(last) < last_dim_size / 2 + 1 || last_dim_size < 1) {

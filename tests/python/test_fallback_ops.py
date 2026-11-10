@@ -296,3 +296,37 @@ def test_multilabel_margin_loss_backward(reduction, shape):
     t = t.reshape(shape)
     cpu, vk = _grads(lambda a, b: torch.nn.functional.multilabel_margin_loss(a, b, reduction=reduction), x, t)
     torch.testing.assert_close(vk[0], cpu[0])
+
+
+def test_complex32_fft():
+    x = torch.complex(make((16,), torch.float32), make((16,), torch.float32, seed=1)).to(torch.complex32)
+    got = no_fallback(lambda: torch.fft.fft(x.to("vk")))
+    assert got.dtype == torch.complex32
+    want = torch.fft.fft(x.to(torch.complex64))
+    torch.testing.assert_close(got.cpu().to(torch.complex64), want, atol=2e-2, rtol=2e-2)
+
+
+CL = torch.channels_last
+
+
+@pytest.mark.parametrize("case", ["conv_x", "conv_w", "pad_reflect", "pad_replicate", "batch_norm", "group_norm"])
+def test_channels_last_layouts_as_cpu(case):
+    # (outputs and input gradients in the CPU's memory formats)
+    x = make((2, 3, 6, 6), torch.float32)
+    w = make((4, 3, 3, 3), torch.float32, seed=1)
+    x_cl = case != "conv_w"
+    fns = {
+        "conv_x": lambda t, ww: torch.nn.functional.conv2d(t, ww),
+        "conv_w": lambda t, ww: torch.nn.functional.conv2d(t, ww.to(memory_format=CL)),
+        "pad_reflect": lambda t, ww: torch.nn.functional.pad(t, (1, 1, 2, 1), mode="reflect"),
+        "pad_replicate": lambda t, ww: torch.nn.functional.pad(t, (1, 1, 2, 1), mode="replicate"),
+        "batch_norm": lambda t, ww: torch.nn.functional.batch_norm(t, None, None, training=True),
+        "group_norm": lambda t, ww: torch.nn.functional.group_norm(t, 3),
+    }
+    layouts = []
+    for dev in ("cpu", "vk"):
+        t = (x.to(memory_format=CL) if x_cl else x.clone()).to(dev).requires_grad_()
+        y = fns[case](t, w.to(dev))
+        y.backward(torch.ones_like(y))
+        layouts.append((y.is_contiguous(memory_format=CL), t.grad.is_contiguous(memory_format=CL)))
+    assert layouts[1] == layouts[0]

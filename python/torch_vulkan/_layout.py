@@ -76,6 +76,12 @@ def _relayout(t, layout):
     return out
 
 
+# Ops whose CPU kernels lay their result out in the memory format of an
+# input (by argument index) where the meta kernels say contiguous: the
+# padding backwards (grad_input as the input).
+FOLLOW_INPUT = {f"{kind}_pad{d}d_backward": 1 for kind in ("reflection", "replication") for d in (1, 2, 3)}
+
+
 def with_layout(op, kernel):
     """`kernel` (implementing OpOverload `op`) with outputs laid out as FakeTensor predicts."""
 
@@ -87,10 +93,16 @@ def with_layout(op, kernel):
         with torch._C.DisableTorchFunction():
             return _laid_out(*args, **kwargs)
 
+    follow = FOLLOW_INPUT.get(op._schema.name.split("::", 1)[1])
+
     def _laid_out(*args, **kwargs):
         result = kernel(*args, **kwargs)
         if getattr(_local, "busy", False) or op._schema.is_mutable:
             return result  # (in-place and out= kernels write into given tensors)
+        if follow is not None and isinstance(result, torch.Tensor) and isinstance(args[follow], torch.Tensor):
+            from torch._prims_common import suggest_memory_format
+
+            return result.contiguous(memory_format=suggest_memory_format(args[follow]))
         key = (op, _signature(args), _signature(kwargs))
         layouts = _cache.get(key, _MISSING)
         if layouts is _MISSING:

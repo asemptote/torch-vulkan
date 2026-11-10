@@ -180,6 +180,16 @@ at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const 
                        at::IntArrayRef output_padding, int64_t groups) {
   at::Tensor result =
       convolution_compute(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups);
+  // (the CPU's rule, mkldnn's and the slow path's: channels-last output if
+  // the input or the weight is channels-last; the meta kernel says
+  // contiguous for meta tensors)
+  for (auto fmt : {at::MemoryFormat::ChannelsLast, at::MemoryFormat::ChannelsLast3d}) {
+    int64_t dims = fmt == at::MemoryFormat::ChannelsLast ? 4 : 5;
+    if (input.dim() == dims && result.dim() == dims &&
+        (input.suggest_memory_format() == fmt || weight.suggest_memory_format() == fmt)) {
+      return result.contiguous(fmt);
+    }
+  }
   at::Tensor layout = at::convolution(meta_of(input), meta_of(weight), meta_of(bias), stride, padding, dilation,
                                       transposed, output_padding, groups);
   return laid_out_like(result, layout);

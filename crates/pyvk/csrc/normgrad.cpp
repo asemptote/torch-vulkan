@@ -134,7 +134,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_backward(
       gmean = sum_g * norm;
     }
     gx = apply(op::NORMGRAD_APPLY_BN, x, g, mean, scale.contiguous(), proj, gmean, train, K, C, L)
-             .to(input.scalar_type());
+             .to(input.scalar_type())
+             .contiguous(input.suggest_memory_format());  // (the input's memory format, as the CPU's)
   }
   // (the parameters' dtype: float32 for a 16-bit input with float32 parameters)
   at::ScalarType wt = input.scalar_type();
@@ -184,7 +185,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
     gx = apply(op::NORMGRAD_APPLY_GN, x, g, at::Tensor(), c1.contiguous().view({N * C}),
                c2.unsqueeze(-1).expand({N, group, cpg}).contiguous().view({N * C}),
                c3.unsqueeze(-1).expand({N, group, cpg}).contiguous().view({N * C}), true, 1, N * C, HxW)
-             .to(input.scalar_type());
+             .to(input.scalar_type())
+             .view(input.sizes())
+             .contiguous(input.suggest_memory_format());  // (the input's memory format, as the CPU's)
   }
   at::ScalarType wt = defined(gamma) ? gamma->scalar_type() : input.scalar_type();
   if (mask[1]) {
