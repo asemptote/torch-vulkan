@@ -1438,6 +1438,54 @@ def _segment_reduce_backward(grad, output, data, reduce, *, lengths=None, offset
     return torch.where(seg < S, gi, zero)
 
 
+# ---------------------------------------------------------------- attention
+
+def _transform_bias_rescale_qkv(qkv, qkv_bias, num_head):
+    """The CPU's kernel: q, k, v = qkv + bias split into [B, heads, T, D / heads]
+    each, q times 1 / sqrt(D / heads) (in qkv's dtype). A nested qkv is padded
+    with zeros first, its sequence length rounded up to a multiple of 8, and
+    q, k, v are 0 past each sequence's end (as CUDA's kernel, which the tests
+    expect of accelerators)."""
+    valid = None
+    if qkv.is_nested:
+        lengths = qkv._nested_tensor_size()[:, 0]
+        longest = int(lengths.max()) if lengths.numel() else 0
+        t = longest + (8 - longest % 8) % 8
+        qkv = qkv.to_padded_tensor(0, output_size=(lengths.numel(), t, qkv.size(2)))
+        valid = (torch.arange(t) < lengths.unsqueeze(1)).to(qkv.device)  # [B, T]
+    if qkv.dim() != 3 or qkv.shape[2] % 3 or (qkv.shape[2] // 3) % num_head or qkv_bias.numel() != qkv.shape[2]:
+        return _on_cpu("_transform_bias_rescale_qkv", qkv, qkv_bias, num_head)
+    b, t, d3 = qkv.shape
+    dh = d3 // 3 // num_head
+    x = qkv + qkv_bias
+    if valid is not None:
+        x = torch.where(valid.unsqueeze(-1), x, torch.zeros((), dtype=x.dtype, device=x.device))
+    x = x.view(b, t, 3, num_head, dh).permute(2, 0, 3, 1, 4)
+    inv = torch.tensor(dh, dtype=qkv.dtype).sqrt().reciprocal().to(qkv.device)
+    return (x[0] * inv).contiguous(), x[1].contiguous(), x[2].contiguous()
+
+
+def _masked_softmax(x, mask, dim=None, mask_type=None):
+    """The CPU's masked softmax: masked positions excluded (0), a row with
+    every position masked all NaN; mask_type 0 is an (L, L) attention mask and
+    1 a (B, L) key padding mask for a [B, H, L, L] input, 2 a full mask."""
+    torch._check(mask.dtype == torch.bool, lambda: "Mask should be a boolean tensor")
+    mt = 2 if mask.dim() != 2 or x.dim() != 4 else mask_type
+    if mt == 2:
+        torch._check(x.shape == mask.shape, lambda: "For mask_type == 2 mask shape should match input shape")
+        m = mask
+    elif mt == 1:
+        torch._check(x.shape[0] == mask.shape[0] and x.shape[2] == mask.shape[1],
+                     lambda: "For mask_type == 1 mask shape should be (B, L)")
+        m = mask.view(x.shape[0], 1, 1, x.shape[2]).expand(x.shape)
+    else:
+        torch._check(x.shape[2] == mask.shape[0] and x.shape[2] == mask.shape[1],
+                     lambda: "For mask_type == 0 mask shape should be (L, L)")
+        m = mask.view(1, 1, x.shape[2], x.shape[2]).expand(x.shape)
+    d = x.dim() - 1 if dim is None else dim
+    return torch.softmax(x.masked_fill(m, -math.inf), d if x.dim() else 0)
+
+
 # ---------------------------------------------------------------- CTC loss
 
 def _ctc_setup(log_probs, targets, input_lengths, target_lengths, blank):
@@ -1745,6 +1793,8 @@ def _kernels():
         "_histogramdd_from_bin_tensors": _histogramdd_from_bin_tensors,
         "segment_reduce": _segment_reduce,
         "_segment_reduce_backward": _segment_reduce_backward,
+        "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
+        "_masked_softmax": _masked_softmax,
         "_ctc_loss": _ctc_loss,
         "_ctc_loss.Tensor": _ctc_loss_tensor,
         "_ctc_loss_backward": _ctc_loss_backward,
@@ -1825,4 +1875,7 @@ def register():
                 _lib.impl(out_op._schema.name.split("::", 1)[1] + "." + out_op._overloadname,
                           _layout.with_layout(out_op, out_fn), "PrivateUse1")
                 names.append(out_op.name())
+    # (nested qkv for the fast attention path: padded first, as on the CPU)
+    if not torch._C._dispatch_has_kernel_for_dispatch_key("aten::_transform_bias_rescale_qkv", "NestedTensorPrivateUse1"):
+        _lib.impl("_transform_bias_rescale_qkv", _transform_bias_rescale_qkv, "NestedTensorPrivateUse1")
     return names

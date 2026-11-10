@@ -114,7 +114,7 @@ at::Tensor padded_dense_to_jagged(const at::Tensor& padded, at::TensorList offse
 // ---------------------------------------------------------------- strided nested tensors
 
 // NestedTensorCPU kernels shared with NestedTensorCUDA (device-generic), plus
-// to_padded_tensor and bmm, whose CPU kernels are generic ATen code too.
+// a few whose CPU-only kernels are generic ATen code too.
 const char* const kNestedOps[] = {
     "native_dropout",
     "native_dropout_backward",
@@ -206,6 +206,8 @@ const char* const kNestedOps[] = {
     "_transformer_encoder_layer_fwd",
     "to_padded_tensor",
     "bmm",
+    "_native_multi_head_attention",
+    "_nested_tensor_softmax_with_shape",  // (NestedTensor_softmax_dropout: ATen ops on a dense score tensor)
 };
 
 // Ops on dense tensors that build nested ones, whose CPU kernel is PyTorch's
@@ -216,6 +218,7 @@ const char* const kDenseOps[] = {
     "_nested_from_padded",
     "_nested_tensor_from_mask",
     "_nested_tensor_from_mask_left_aligned",
+    "_native_multi_head_attention",  // (native_multi_head_attention_cpu: ATen ops throughout)
 };
 
 void to_nested_cpu(const c10::OperatorHandle& op, c10::DispatchKeySet, torch::jit::Stack* stack) {

@@ -369,3 +369,26 @@ def test_segment_reduce_backward(reduce):
             assert torch_vulkan.fallback_counts() == before
         grads.append(x.grad.cpu())
     torch.testing.assert_close(grads[1], grads[0], equal_nan=True)
+
+
+@pytest.mark.parametrize("mask_type", [0, 1, 2])
+def test_masked_softmax(mask_type):
+    x = make((2, 3, 4, 4), torch.float32)
+    m = {0: make((4, 4), torch.float32, seed=1) > 0.5, 1: make((2, 4), torch.float32, seed=2) > 0.3,
+         2: make((2, 3, 4, 4), torch.float32, seed=3) > 0.2}[mask_type]
+    if mask_type == 1:
+        m[0] = True  # (a batch with every key masked: rows of NaN, as the CPU's)
+    got = no_fallback(lambda: torch._masked_softmax(x.to("vk"), m.to("vk"), 3, mask_type))
+    torch.testing.assert_close(got.cpu(), torch._masked_softmax(x, m, 3, mask_type), equal_nan=True)
+
+
+def test_native_multi_head_attention_fast_path():
+    # (nn.MultiheadAttention's inference fast path on vk, nested input too)
+    torch.manual_seed(0)
+    mha = torch.nn.MultiheadAttention(16, 4, batch_first=True).eval()
+    x = torch.randn(3, 5, 16)
+    with torch.no_grad():
+        want = mha(x, x, x, need_weights=False)[0]
+        mha_vk = mha.to("vk")
+        got = no_fallback(lambda: mha_vk(x.to("vk"), x.to("vk"), x.to("vk"), need_weights=False)[0])
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
