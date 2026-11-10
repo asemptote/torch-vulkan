@@ -146,9 +146,9 @@ def cpu_twin(nodeid):
 
 # pytest's options that keep it from searching for a configuration file: it
 # would look in every directory above the tests, and on the cluster that
-# means a stat of /home/tox.ini, an automount lookup that once hung two
-# shards for an hour. (There is none to find: the tests run with pytest's
-# defaults.)
+# means a stat of a tox.ini at the root of an automounted file system, a
+# lookup that once hung two shards for an hour. (There is none to find: the
+# tests run with pytest's defaults.)
 NO_CONFIG = ["-c", os.devnull, "--rootdir", "."]
 
 
