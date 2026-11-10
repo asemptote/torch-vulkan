@@ -486,6 +486,109 @@ def _on_cpu(name, *args):
     return _decomp._cpu_fallback(op, op.name(), args, {})
 
 
+# ---------------------------------------------------------------- backward kernels with no decomposition
+
+def _shrink_backward(name):
+    """softshrink_backward / hardshrink_backward: the gradient where |x| > lambd
+    (the CPU's test, lambd in x's dtype), else 0."""
+    def kernel(grad_output, x, lambd):
+        if not (x.is_floating_point() and grad_output.dtype == x.dtype):
+            return _on_cpu(name, grad_output, x, lambd)
+        lam = torch.tensor(lambd, dtype=x.dtype)
+        inside = (x >= (-lam).to(x.device)) & (x <= lam.to(x.device))
+        return torch.where(inside, torch.zeros((), dtype=x.dtype, device=x.device), grad_output)
+
+    return kernel
+
+
+def _replication_pad_backward(dims):
+    """replication_pad{1,2,3}d_backward: each padded dim's gradient summed into
+    the input position it replicates (the clamped index), a dim at a time."""
+    name = f"replication_pad{dims}d_backward"
+
+    def kernel(grad_output, x, padding):
+        ok = len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1
+        for i in range(dims if ok else 0):
+            d = x.dim() - 1 - i
+            ok = ok and x.shape[d] > 0 and grad_output.shape[d] == x.shape[d] + padding[2 * i] + padding[2 * i + 1]
+        if not ok:
+            return _on_cpu(name, grad_output, x, padding)
+        g = grad_output
+        for i in range(dims):
+            d = x.dim() - 1 - i
+            idx = (torch.arange(g.shape[d], device=g.device) - padding[2 * i]).clamp(0, x.shape[d] - 1)
+            shape = list(g.shape)
+            shape[d] = x.shape[d]
+            g = torch.zeros(shape, dtype=g.dtype, device=g.device).index_add_(d, idx, g)
+        return g
+
+    return kernel
+
+
+def _targets_in_range(target, low, high):
+    """True if every target is in [low, high) (one host transfer)."""
+    if target.numel() == 0:
+        return True
+    lo, hi = torch.stack([target.min(), target.max()]).cpu().tolist()
+    return lo >= low and hi < high
+
+
+def _margin_scale(grad_input, grad_output, reduction):
+    # (the CPU's: a scalar grad_output for reduced losses, else one per sample)
+    if reduction != 0 or grad_output.dim() == 0:
+        return grad_input * grad_output.reshape(())
+    return grad_input * grad_output.reshape(-1, 1)
+
+
+def _multi_margin_loss_backward(grad_output, x, target, p, margin, weight=None, reduction=1):
+    """The CPU's multi_margin_loss_backward: for each class d other than the
+    target y with z = margin - x[y] + x[d] > 0, h = g (p = 1) or 2 g z (times
+    weight[y]) at d and -sum h at y; g = 1 / C (1 / (N C) for mean)."""
+    args = (grad_output, x, target, p, margin, weight, reduction)
+    if not (x.is_floating_point() and target.dtype == torch.int64 and p in (1, 2) and 1 <= x.dim() <= 2) or             (weight is not None and (weight.dim() != 1 or weight.numel() != x.shape[-1])):
+        return _on_cpu("multi_margin_loss_backward", *args)
+    xs = x.reshape(-1, x.shape[-1])
+    n, c = xs.shape
+    t = target.reshape(-1)
+    if t.numel() != n or c == 0 or not _targets_in_range(t, 0, c):
+        return _on_cpu("multi_margin_loss_backward", *args)
+    g = 1.0 / (n * c) if reduction == 1 else 1.0 / c
+    g = torch.tensor(g, dtype=x.dtype).item()  # (in x's dtype, as the CPU's scalar_t)
+    ty = t.unsqueeze(1)
+    z = margin - xs.gather(1, ty) + xs
+    h = z.new_full((), g) if p == 1 else 2 * g * z
+    hit = (z > 0) & (torch.arange(c, device=x.device) != ty)
+    h = torch.where(hit, h, torch.zeros((), dtype=x.dtype, device=x.device))
+    if weight is not None:
+        h = h * weight.to(x.dtype)[t].unsqueeze(1)
+    gi = h.scatter(1, ty, -h.sum(1, keepdim=True))
+    return _margin_scale(gi, grad_output, reduction).reshape(x.shape)
+
+
+def _multilabel_margin_loss_backward(grad_output, x, target, reduction, is_target):
+    """The CPU's multilabel_margin_loss_backward: for each target j (up to the
+    first -1) and each non-target d with z = 1 - x[j] + x[d] > 0, -g at j and
+    +g at d; g = 1 / C (1 / (N C) for mean)."""
+    args = (grad_output, x, target, reduction, is_target)
+    if not (x.is_floating_point() and target.dtype == torch.int64 and 1 <= x.dim() <= 2 and
+            target.shape == x.shape and is_target.shape == x.shape):
+        return _on_cpu("multilabel_margin_loss_backward", *args)
+    xs = x.reshape(-1, x.shape[-1])
+    n, c = xs.shape
+    tg = target.reshape(n, c)
+    if c == 0 or not _targets_in_range(tg, -1, c):
+        return _on_cpu("multilabel_margin_loss_backward", *args)
+    g = 1.0 / (n * c) if reduction == 1 else 1.0 / c
+    g = torch.tensor(g, dtype=x.dtype).item()
+    valid = torch.cumprod((tg >= 0).to(torch.int64), 1).bool()  # (targets before the first -1)
+    tc = tg.clamp(min=0)
+    z = 1 - xs.gather(1, tc).unsqueeze(2) + xs.unsqueeze(1)  # [N, target j, class d]
+    hit = (z > 0) & valid.unsqueeze(2) & (is_target.reshape(n, c) == 0).unsqueeze(1)
+    gi = g * hit.sum(1).to(x.dtype)
+    gi = gi.scatter_add(1, tc, -g * hit.sum(2).to(x.dtype) * valid.to(x.dtype))
+    return _margin_scale(gi, grad_output, reduction).reshape(x.shape)
+
+
 # ---------------------------------------------------------------- distances
 
 def _pairwise_diff(x1, x2):
@@ -1580,6 +1683,13 @@ def _kernels():
         "_thnn_fused_lstm_cell_backward_impl": _thnn_fused_lstm_cell_backward_impl,
         "_thnn_fused_gru_cell": _thnn_fused_gru_cell,
         "_thnn_fused_gru_cell_backward": _thnn_fused_gru_cell_backward,
+        "softshrink_backward": _shrink_backward("softshrink_backward"),
+        "hardshrink_backward": _shrink_backward("hardshrink_backward"),
+        "replication_pad1d_backward": _replication_pad_backward(1),
+        "replication_pad2d_backward": _replication_pad_backward(2),
+        "replication_pad3d_backward": _replication_pad_backward(3),
+        "multi_margin_loss_backward": _multi_margin_loss_backward,
+        "multilabel_margin_loss_backward": _multilabel_margin_loss_backward,
         **upsample,
     }
 

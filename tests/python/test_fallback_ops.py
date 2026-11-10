@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch_vulkan
 
-from _util import make
+from _util import make, make_complex
 
 
 def no_fallback(f):
@@ -234,3 +234,65 @@ def test_add_complex_and_bool_alpha():
 def test_pinv_of_a_vector_raises_as_cpu():
     with pytest.raises(RuntimeError, match=r"linalg.pinv\(Float\{\[3\]\}\): expected a tensor with 2 or more dimensions"):
         torch.linalg.pinv(torch.ones(3, device="vk"))
+
+
+def _grads(f, *inputs):
+    """d(sum f(inputs) * w)/d(inputs) on the CPU and on vk, w fixed."""
+    out = []
+    for dev in ("cpu", "vk"):
+        xs = [x.detach().to(dev).requires_grad_(i == 0) for i, x in enumerate(inputs)]
+        y = f(*xs)
+        w = (make_complex(y.shape, y.dtype) if y.dtype.is_complex else make(y.shape, y.dtype)).to(dev)
+        loss = (y * w).sum()
+        gs = torch.autograd.grad(loss.real if loss.is_complex() else loss, [x for x in xs if x.requires_grad])
+        out.append([g.cpu() for g in gs])
+    return out
+
+
+@pytest.mark.parametrize("which", ["softshrink", "hardshrink"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+def test_shrink_backward(which, dtype):
+    x = make((40,), torch.float32).to(dtype)
+    f = getattr(torch.nn.functional, which)
+    if dtype == torch.float16:  # (the forward stays the CPU's for float16)
+        gx = torch.ops.aten.softshrink_backward if which == "softshrink" else torch.ops.aten.hardshrink_backward
+        g = make((40,), torch.float32, seed=5).to(dtype)
+        got = no_fallback(lambda: gx(g.to("vk"), x.to("vk"), 0.5))
+        torch.testing.assert_close(got.cpu(), gx(g, x, 0.5))
+        return
+    cpu, vk = _grads(lambda t: f(t, 0.5), x)
+    torch.testing.assert_close(vk[0], cpu[0])
+
+
+@pytest.mark.parametrize("dims,shape,pad", [(1, (2, 3, 5), (2, 1)), (2, (1, 2, 4, 3), (1, 2, 0, 3)),
+                                            (3, (1, 1, 2, 3, 2), (1, 1, 2, 0, 1, 2)), (2, (2, 5, 4), (-1, 2, 1, -1))])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.complex64])
+def test_replication_pad_backward(dims, shape, pad, dtype):
+    x = make_complex(shape, dtype) if dtype.is_complex else make(shape, dtype)
+    before = torch_vulkan.fallback_counts()
+    cpu, vk = _grads(lambda t: torch.nn.functional.pad(t, pad, mode="replicate"), x)
+    assert {k: v for k, v in torch_vulkan.fallback_counts().items() if "replication" in k} == \
+        {k: v for k, v in before.items() if "replication" in k}
+    torch.testing.assert_close(vk[0], cpu[0])
+
+
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_multi_margin_loss_backward(p, reduction, weighted):
+    x = make((5, 4), torch.float64)
+    t = torch.tensor([0, 3, 1, 1, 2])
+    w = make((4,), torch.float64, positive=True) if weighted else None
+    cpu, vk = _grads(lambda a, b, *ww: torch.nn.functional.multi_margin_loss(
+        a, b, p=p, margin=0.7, weight=ww[0].detach() if ww else None, reduction=reduction), x, t, *([w] if weighted else []))
+    torch.testing.assert_close(vk[0], cpu[0])
+
+
+@pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
+@pytest.mark.parametrize("shape", [(3, 5), (5,)])
+def test_multilabel_margin_loss_backward(reduction, shape):
+    x = make(shape, torch.float64)
+    t = torch.tensor([[3, 0, -1, 1, 2], [1, 1, 4, -1, 0], [-1, 2, 0, 0, 0]])[: shape[0] if len(shape) == 2 else 1]
+    t = t.reshape(shape)
+    cpu, vk = _grads(lambda a, b: torch.nn.functional.multilabel_margin_loss(a, b, reduction=reduction), x, t)
+    torch.testing.assert_close(vk[0], cpu[0])
