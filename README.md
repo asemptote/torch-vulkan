@@ -20,7 +20,6 @@ Intel, NVIDIA, Arm Mali and Mesa's lavapipe.
 
 > [!WARNING]
 > **Experimental.** APIs, coverage and performance will change before 1.0.
-> There are no prebuilt wheels yet; see [Building](#building).
 
 ```python
 import torch
@@ -123,10 +122,29 @@ Apple GPUs (through MoltenVK) are untested: MoltenVK provides buffer device
 addresses only on Metal 3 devices, and Apple GPUs have no float64, so at
 best they would run float32 work.
 
+## Installing
+
+Wheels for Windows and Linux (x86_64, Python 3.10 or newer) are attached to
+each [release](https://github.com/asemptote/torch-vulkan/releases). They need
+PyTorch 2.14, which they are compiled against, and a Vulkan driver:
+
+```sh
+pip install "torch==2.14.*"
+# Windows
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.1.0/torch_vulkan-0.1.0-cp310-abi3-win_amd64.whl
+# Linux
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.1.0/torch_vulkan-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
+```
+
+On Android (Termux), build from source with the release's prebuilt kernels:
+extract `torch-vulkan-spirv-v0.1.0.tar.gz` and run `tools/build-termux.sh`
+with that directory (the script describes the setup). Other platforms build
+from source as below.
+
 ## Building
 
 Requirements: Rust (stable), a C++20 compiler, Python 3.10 or newer, PyTorch
-2.6 or newer (developed against 2.14), the [Slang](https://shader-slang.org)
+2.14, the [Slang](https://shader-slang.org)
 compiler `slangc` (in the Vulkan SDK, or from Slang's releases), and a Vulkan
 driver. `build.rs` finds `slangc` through `SLANGC`, then `VULKAN_SDK`, then
 `PATH`. The extension is compiled against the PyTorch of the environment it is
@@ -159,7 +177,9 @@ uv pip install numpy pytest maturin expecttest hypothesis
 .\.venv\Scripts\python -m pytest -q
 ```
 
-Android (Termux, 32-bit ARM): see `tools/build-termux.sh`.
+Android (Termux, 32-bit ARM): see `tools/build-termux.sh`; Termux has no
+`slangc`, so it uses kernels compiled elsewhere, such as a release's
+`torch-vulkan-spirv-*.tar.gz`.
 
 ## Python API
 
