@@ -951,9 +951,21 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
     return;
   }
   const auto& name = op.schema().operator_name();
-  record_fallback(name.overload_name.empty() ? name.name : name.name + "." + name.overload_name);
+  std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+  record_fallback(key);
   check_out_devices(op.schema(), *stack);
-  at::native::cpu_fallback(op, stack, error_on_views);
+  try {
+    at::native::cpu_fallback(op, stack, error_on_views);
+  } catch (...) {
+    // The CPU raised (a dtype or argument check, say): counted apart as
+    // "op (raised)", as it computed nothing on the CPU.
+    {
+      std::lock_guard<std::mutex> lock(g_fallback_mutex);
+      if (--g_fallbacks[key] == 0) g_fallbacks.erase(key);
+      ++g_fallbacks[key + " (raised)"];
+    }
+    throw;
+  }
 }
 
 void record_fallback(const std::string& op) {

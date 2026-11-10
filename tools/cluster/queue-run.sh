@@ -1,7 +1,7 @@
 #!/bin/bash
 # A full run spread over every machine that can take part, from the local
 # repo root:
-#   tools/cluster/queue-run.sh start NAME [--from PREV] [TEST_FILE...]
+#   tools/cluster/queue-run.sh start NAME [--from PREV [--ids DIR]] [TEST_FILE...]
 #   tools/cluster/queue-run.sh status NAME
 #
 # Two runs, one per driver family, each a queue of small shards on the
@@ -55,18 +55,25 @@ case "$CMD" in
       PREV=${2:?--from needs a run name}
       shift 2
     fi
+    IDS=""  # (--ids DIR: plan the tests in DIR's *.jsonl instead of collecting the files')
+    if [ -n "$PREV" ] && [ "${1:-}" = --ids ]; then
+      IDS=${2:?--ids needs a directory}
+      shift 2
+    fi
     FILES=${*:-$(grep -v '^#' "$(dirname "$0")/test_files.txt" | tr '\n' ' ')}
     queue() {  # queue RUN_DIR COUNT
       echo "mkdir -p $1/queue $1/pbs-logs && echo $2 > $1/shard_count && echo '$FILES' > $1/test_files &&
         for i in \$(seq 0 $(($2 - 1))); do touch $1/queue/shard-\$(printf %04d \$i); done"
     }
     if [ -n "$PREV" ]; then
-      # (the files' tests collected now, on lavapipe; their times from PREV)
-      P="python3 ~/torch-vulkan/tools/cluster/plan_shards.py --minutes ${PLAN_MINUTES:-5} --ids-from $LAV/collected"
+      # (the files' tests collected now, on lavapipe, or those in --ids; their times from PREV)
+      COLLECT="cd ~/torch-vulkan && VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json LP_NUM_THREADS=1 \
+        .venv/bin/python tools/pytorch_tests.py --collect --out $LAV/collected $FILES"
+      [ -z "$IDS" ] || COLLECT=true
+      P="python3 ~/torch-vulkan/tools/cluster/plan_shards.py --minutes ${PLAN_MINUTES:-5} --ids-from ${IDS:-$LAV/collected}"
       on "$QUEUE_HOST" "set -e; [ ! -e $LAV ] && [ ! -e $NV ] || { echo '$NAME exists'; exit 1; }
         mkdir -p $LAV/pbs-logs $NV/pbs-logs
-        cd ~/torch-vulkan && VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json LP_NUM_THREADS=1 \
-          .venv/bin/python tools/pytorch_tests.py --collect --out $LAV/collected $FILES
+        $COLLECT
         $P $RUNS/$PREV --out $LAV
         $P \$(ls -d $RUNS/$PREV-nvidia $RUNS/$PREV-h100 2>/dev/null | head -1) --out $NV"
     else

@@ -112,7 +112,8 @@ def empty_cache():
 
 
 def fallback_counts():
-    """{op: count} of aten ops that ran on the CPU instead of the GPU."""
+    """{op: count} of aten ops that ran on the CPU instead of the GPU (as
+    "op (raised)" where the CPU raised, a dtype or argument check, say)."""
     return dict(_native.fallback_counts())
 
 
