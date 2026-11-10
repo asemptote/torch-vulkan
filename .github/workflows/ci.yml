@@ -10,8 +10,8 @@ on:
 env:
   SLANG_VERSION: "2026.20"
   TORCH_VK_VALIDATE: "1"
-  # Use lavapipe even if the runner exposes another Vulkan driver.
-  VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+  # lavapipe's LLVM JIT emits AVX-512 code that faults on some runner CPUs.
+  LP_NATIVE_VECTOR_WIDTH: "256"
 
 jobs:
   test:
@@ -23,7 +23,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
-          vulkaninfo --summary
+          # Use lavapipe even if the runner exposes another Vulkan driver. The
+          # manifest's name varies between Mesa releases, so ask the package.
+          icd=$(dpkg -L mesa-vulkan-drivers | grep -E '/icd\.d/lvp_icd[^/]*\.json$' | head -1)
+          test -n "$icd" || { echo "lavapipe manifest not found"; dpkg -L mesa-vulkan-drivers | grep icd.d; exit 1; }
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES=$icd vulkaninfo --summary
 
       - name: Slang
         run: |
