@@ -102,6 +102,7 @@ fn main() {
             "csrc/normgrad.cpp",
             "csrc/loss.cpp",
             "csrc/sparse.cpp",
+            "csrc/optim.cpp",
     ];
     let mut build = cc::Build::new();
     build

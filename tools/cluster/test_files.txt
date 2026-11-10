@@ -1,7 +1,9 @@
 # PyTorch's test files a full run takes (queue-run.sh, full-run.sh), one per
 # line; device-generic (instantiate_device_type_tests) unless noted.
 # Not taken: quantisation, jit, fx, mps, dataloader, CUDA-only files, and the
-# compiler/tracing ones (dynamo, inductor, export, fake/proxy tensors).
+# compiler/tracing ones (dynamo, inductor, export, fake/proxy tensors), and
+# test_transformers.py (its device-generic classes are only for cpu, cuda,
+# mps and xpu: nothing to collect for vk).
 test_ops.py
 test_torch.py
 test_binary_ufuncs.py
@@ -33,7 +35,6 @@ test_modules.py
 test_scatter_gather_ops.py
 test_complex.py
 test_bmm_outer_product.py
-test_transformers.py
 test_native_mha.py
 test_expanded_weights.py
 test_sparse.py
