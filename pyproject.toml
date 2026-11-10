@@ -4,11 +4,19 @@ build-backend = "maturin"
 
 [project]
 name = "torch-vulkan"
-version = "0.0.1"
+version = "0.1.0"
 description = "Vulkan compute backend for PyTorch aimed at scientific workloads"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.6"]
+# The extension is compiled against one PyTorch release's C++ ABI, and the
+# tests compare with that release's CPU results.
+dependencies = ["torch>=2.14,<2.15"]
 license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Asem Wardak" }]
+
+[project.urls]
+Repository = "https://github.com/asemptote/torch-vulkan"
+Issues = "https://github.com/asemptote/torch-vulkan/issues"
 
 [project.optional-dependencies]
 test = ["pytest", "numpy"]

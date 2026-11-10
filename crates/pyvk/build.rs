@@ -182,7 +182,9 @@ fn main() {
     let lib = torch.join("lib");
     println!("cargo:rustc-link-search=native={}", lib.display());
     if !cfg!(windows) {
-        // Found at run time even when torch is not imported first.
+        // Found at run time even when torch is not imported first: beside an
+        // installed wheel (site-packages/torch/lib), else where it was built.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../torch/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     }
     for lib in ["c10", "torch_cpu", "torch"] {

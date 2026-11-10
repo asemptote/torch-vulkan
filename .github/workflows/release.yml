@@ -1,0 +1,184 @@
+# Builds wheels for Windows and Linux (x86_64) and the kernels' SPIR-V (for
+# Termux builds, which have no slangc), tests the Linux wheel on lavapipe
+# outside the source tree, and for a v* tag attaches everything to a draft
+# GitHub release. Run it by hand (workflow_dispatch) to build without
+# releasing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SLANG_VERSION: "2026.20"
+  # The wheels are compiled against this release's C++ ABI (pyproject.toml
+  # pins torch to the same minor version).
+  TORCH_VERSION: "2.14.1"
+
+jobs:
+  spirv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Slang
+        run: |
+          curl -sSLf -o slang.tar.gz "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz"
+          mkdir -p "$HOME/slang" && tar -xzf slang.tar.gz -C "$HOME/slang"
+          echo "SLANGC=$HOME/slang/bin/slangc" >> "$GITHUB_ENV"
+      - name: Compile the kernels
+        run: |
+          cargo build --release -p vkcore
+          out=$(dirname "$(ls target/release/build/vkcore-*/out/kernels.rs | head -1)")
+          mkdir -p spirv && cp "$out"/*.spv spirv/
+          echo "$(ls spirv | wc -l) kernels"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spirv
+          path: spirv/
+
+  wheel-windows:
+    needs: spirv
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: spirv
+          path: spirv
+      - name: Build the wheel
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --quiet "torch==$env:TORCH_VERSION" --index-url https://download.pytorch.org/whl/cpu
+          .venv\Scripts\python -m pip install --quiet maturin
+          $env:VIRTUAL_ENV = "$PWD\.venv"
+          $env:VKCORE_PREBUILT_SPIRV = "$PWD\spirv"
+          .venv\Scripts\maturin build --release --out dist --interpreter .venv\Scripts\python.exe
+      - name: Import check
+        shell: pwsh
+        run: |
+          python -m venv C:\t
+          C:\t\Scripts\python -m pip install --quiet "torch==$env:TORCH_VERSION" --index-url https://download.pytorch.org/whl/cpu
+          C:\t\Scripts\python -m pip install --quiet (Get-ChildItem dist\*.whl).FullName
+          cd C:\
+          C:\t\Scripts\python -c "import torch_vulkan; print('imported; GPU available:', torch_vulkan.is_available())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          path: dist/*.whl
+
+  wheel-linux:
+    needs: spirv
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spirv
+          path: spirv
+      - name: Build the wheel
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          /opt/python/cp312-cp312/bin/python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
+          /tmp/venv/bin/pip install --quiet maturin
+          export VIRTUAL_ENV=/tmp/venv VKCORE_PREBUILT_SPIRV="$PWD/spirv"
+          # libtorch comes from the installed torch package (found through the
+          # $ORIGIN/../torch/lib rpath), so auditwheel must not bundle it.
+          /tmp/venv/bin/maturin build --release --out dist --interpreter /tmp/venv/bin/python \
+            --compatibility manylinux_2_28 --auditwheel skip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+
+  test-wheel-linux:
+    needs: wheel-linux
+    runs-on: ubuntu-24.04
+    env:
+      LP_NATIVE_VECTOR_WIDTH: "256"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist
+      - name: lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          icd=$(dpkg -L mesa-vulkan-drivers | grep -E '/icd\.d/lvp_icd[^/]*\.json$' | head -1)
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+      - name: Install the wheel and run on the GPU
+        run: |
+          python -m venv /tmp/t
+          /tmp/t/bin/pip install --quiet "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
+          /tmp/t/bin/pip install --quiet dist/*.whl numpy
+          cd /tmp
+          TORCH_VK_STRICT=1 /tmp/t/bin/python - <<'EOF'
+          import torch, torch_vulkan
+          assert torch_vulkan.is_available(), "no Vulkan device"
+          print(torch_vulkan.device_name())
+          n = 64
+          a = torch.randn(n, n, dtype=torch.float64, device="vk")
+          a = a @ a.mT + n * torch.eye(n, dtype=torch.float64, device="vk")
+          b = torch.randn(n, dtype=torch.float64, device="vk")
+          r = torch.linalg.norm(a @ torch.linalg.solve(a, b) - b).item()
+          s = torch.randn(100, dtype=torch.complex128, device="vk")
+          f = (torch.fft.ifft(torch.fft.fft(s)) - s).abs().max().item()
+          print("residual", r, "fft round trip", f)
+          assert r < 1e-10 and f < 1e-12
+          assert not torch_vulkan.fallback_counts()
+          EOF
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [spirv, wheel-windows, wheel-linux, test-wheel-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the package version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: spirv
+          path: spirv
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf "dist/torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz" -C spirv .
+          cat > notes.md <<EOF
+          Wheels for Windows and Linux (x86_64), for Python 3.10 or newer and PyTorch 2.14:
+
+              pip install "torch==2.14.*"
+              pip install <wheel URL from the assets below>
+
+          On Android (Termux), build from source with the prebuilt kernels:
+          extract torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz and run
+          \`tools/build-termux.sh <that directory>\` (see the README).
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "torch-vulkan ${GITHUB_REF_NAME}" --notes-file notes.md dist/*
