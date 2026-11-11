@@ -57,13 +57,14 @@ DTYPE_ERROR = re.compile("|".join([
 def make_list(arg):
     """A plausible value for a list argument described only as "GenericList"."""
     t = str(arg.type) if arg is not None else ""
-    m = re.match(r"^(?:Sym)?[Ii]nt\[(\d*)\]", t)
+    t = re.sub(r"^Optional\[(.*)\]$", r"\1", t)
+    m = re.match(r"^(?:(?:Sym)?[Ii]nt\[(\d*)\]|List\[(?:Sym)?[Ii]nt\])", t)
     if m:
         n = int(m.group(1) or 2)
         if "dim" in arg.name:
             return [0]
         return [0] * n if "padding" in arg.name else [1] * n
-    if t.startswith("float["):
+    if t.startswith("float[") or t == "List[float]":
         return [1.0]
     raise ValueError(t)
 

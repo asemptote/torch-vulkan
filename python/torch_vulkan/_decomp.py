@@ -251,6 +251,10 @@ def candidates():
         schema = op._schema
         if name in DENYLIST or name in _python_kernels() or not _functional_or_out(schema):
             continue
+        # An out= variant whose functional op has a Python kernel: backend.cpp's
+        # rescue_out runs that kernel (a decomposition may decline, to the CPU).
+        if schema.is_mutable and schema.name in _python_kernels():
+            continue
         if not schema.returns:
             continue
         if not _has_kernel(name, "CPU") or _has_kernel(name, "PrivateUse1"):

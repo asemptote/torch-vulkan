@@ -641,6 +641,7 @@ ERROR_CASES = {
                                        out=torch.empty(2, 2, dtype=torch.int, device=d)),
     "eigvals_1d": lambda d: torch.linalg.eigvals(torch.ones(3, device=d)),
     "cholesky_inverse_nonsquare": lambda d: torch.cholesky_inverse(torch.ones(2, 3, device=d)),
+    "sum_complex32": lambda d: torch.ones(3, dtype=torch.complex32, device=d).sum(),
     "linear_combination_empty": lambda d: torch.ops.aten._compute_linear_combination(torch.ones((), device=d),
                                                                                      torch.ones(2, 2, device=d)),
 }
@@ -677,3 +678,26 @@ def test_prod_dtype(dtype):
     b = torch.tensor([True, True, False])
     got = no_fallback(lambda: torch.prod(b.to("vk")))
     assert got.dtype == torch.int64 and got.item() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.complex32, torch.float16, torch.bfloat16])
+def test_lazy_bits_resolved_on_gpu_16bit(dtype):
+    x = torch.randn(5, dtype=torch.complex64 if dtype == torch.complex32 else torch.float32).to(dtype)
+    views = [lambda t: t._neg_view()] + ([lambda t: t.conj()] if dtype == torch.complex32 else [])
+    for view in views:
+        got = no_fallback(lambda: view(x.to("vk")).clone())
+        want = view(x).clone()
+        assert not got.is_conj() and not got.is_neg()
+        assert torch.equal(got.cpu().view(torch.int16 if dtype != torch.complex32 else torch.int32),
+                           want.view(torch.int16 if dtype != torch.complex32 else torch.int32))
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_adaptive_max_pool_out(k):
+    x = torch.randn(1, 2, *([5] * k))
+    op = getattr(torch.ops.aten, f"adaptive_max_pool{k}d").out
+    out, idx = torch.empty(0, device="vk"), torch.empty(0, dtype=torch.long, device="vk")
+    no_fallback(lambda: op(x.to("vk"), [3] * k, out=out, indices=idx))
+    want, want_idx = op(x, [3] * k, out=torch.empty(0), indices=torch.empty(0, dtype=torch.long))
+    torch.testing.assert_close(out.cpu(), want)
+    assert torch.equal(idx.cpu(), want_idx)

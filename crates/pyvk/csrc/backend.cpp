@@ -658,6 +658,17 @@ void fix_up_in_place(const at::Tensor& t, bool conj, bool neg) {
   if (!conj && !neg) {
     return;
   }
+  at::ScalarType st = t.scalar_type();
+  if (label == nullptr && (st == at::kComplexHalf || st == at::kHalf || st == at::kBFloat16)) {
+    // (no 16-bit kernel: in complex64/float32 on the GPU, through an alias of t
+    // without its lazy bits)
+    at::Tensor raw = at::empty({0}, t.options()).set_(t.storage(), t.storage_offset(), t.sizes(), t.strides());
+    at::Tensor w = raw.to(st == at::kComplexHalf ? at::kComplexFloat : at::kFloat);
+    if (conj) w = w.conj_physical();
+    if (neg) w = w.neg();
+    raw.copy_(w);
+    return;
+  }
   if (label == nullptr) {
     record_fallback("aten::copy_ (conj/neg bit, dtype " + std::string(c10::toString(t.scalar_type())) + ")");
     at::Tensor host = t.cpu();
