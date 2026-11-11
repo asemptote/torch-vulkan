@@ -57,7 +57,7 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | `TORCH_VK_STRICT=1` | Raise `NotImplementedError` instead of running an op on the CPU. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
 | `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default limits batches on Intel GPUs only, where some drivers drop the results of very long submissions. |
-| `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500`; `0`: block at once). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
+| `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500` on discrete GPUs, `0`, blocking at once, on integrated ones and lavapipe, which share the CPU's power or cores). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
 
 ### Choosing kernels
 

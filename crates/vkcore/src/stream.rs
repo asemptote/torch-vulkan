@@ -29,10 +29,14 @@ pub const DEFAULT_MAX_BATCH: u32 = 256;
 pub const INTEL_MAX_BATCH_GROUPS: u64 = 1 << 13;
 
 /// Microseconds [`Stream::wait`] polls before blocking: TORCH_VK_SPIN_US, by
-/// default 500 (0: block at once).
-pub fn spin_us() -> u64 {
-    static SPIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SPIN.get_or_init(|| std::env::var("TORCH_VK_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
+/// default 500 on discrete GPUs and 0 (block at once) elsewhere. Integrated
+/// GPUs share the CPU's power budget (and a phone's battery), lavapipe its
+/// cores; on the HD 530 polling saved nothing measurable and cost ~5% more CPU
+/// time, while on NVIDIA it took ~19 us off every synchronize.
+pub fn spin_us(discrete: bool) -> u64 {
+    static SPIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    SPIN.get_or_init(|| std::env::var("TORCH_VK_SPIN_US").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(if discrete { 500 } else { 0 })
 }
 
 pub struct Stream {
@@ -237,7 +241,7 @@ impl Stream {
     /// H100 NVL, a tiny kernel followed by a synchronize took 43 us, most of
     /// it the wake-up; CUDA's synchronize spins likewise by default.)
     pub fn wait(&self, value: u64) -> Result<()> {
-        let spin = spin_us();
+        let spin = spin_us(self.ctx.discrete);
         if spin > 0 {
             let start = std::time::Instant::now();
             while start.elapsed().as_micros() < spin as u128 {
