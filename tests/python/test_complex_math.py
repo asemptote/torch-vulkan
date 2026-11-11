@@ -1,9 +1,11 @@
 """Complex math, matrix products and reductions on "vk" vs the CPU (M14)."""
 
+import math
+
 import pytest
 import torch
 
-from _util import COMPLEX, check, make, make_complex, on_gpu
+from _util import ARM32, COMPLEX, check, make, make_complex, on_gpu
 
 UNARY = ["exp", "log", "log2", "log10", "log1p", "expm1", "sqrt", "rsqrt", "reciprocal", "square", "sin", "cos",
          "tan", "sinh", "cosh", "tanh", "asin", "acos", "atan", "asinh", "acosh", "atanh", "sigmoid"]
@@ -22,7 +24,10 @@ def test_complex_unary(dtype, name):
     fn = getattr(torch, name)
     with on_gpu():
         got = fn(a.to("vk"))
-    check(got, fn(a), **tol(dtype, 10), equal_nan=True)
+    want = fn(a)
+    if ARM32 and name == "log2":
+        want[0, 0] = complex(-math.inf, 0)  # (that CPU's log2(0) is -inf+nanj; x86's, and clog(0) / ln 2, -inf+0j)
+    check(got, want, **tol(dtype, 10), equal_nan=True)
 
 
 @pytest.mark.parametrize("dtype", COMPLEX)

@@ -16,6 +16,7 @@
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -884,15 +885,30 @@ at::Tensor scalar_value(const at::Scalar& value, const at::Device& device) {
   return t;
 }
 
+// A Scalar as the CPU's 0-dim value for searchsorted: a wrapped number, so
+// that the search runs in the boundaries' dtype (a floating one), or the
+// default dtype (integer boundaries, a floating value). Without float64 a
+// Python float is a float32 wrapped number instead of a double: wrapped
+// numbers do not promote within their category, so the search's dtype, and
+// every result, is the same.
+at::Tensor scalar_search_value(const at::Tensor& sorted, const at::Scalar& self) {
+  if (!self.isFloatingPoint() || vkt_has_float64() || !is_vk(sorted)) {
+    return scalar_value(self, sorted.device());
+  }
+  at::Tensor value = at::scalar_tensor(self.toDouble(), sorted.options().dtype(at::kFloat));
+  value.unsafeGetTensorImpl()->set_wrapped_number(true);
+  return value;
+}
+
 at::Tensor searchsorted_scalar(const at::Tensor& sorted, const at::Scalar& self, bool out_int32, bool right,
                                std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter) {
-  return vk::searchsorted(sorted, scalar_value(self, sorted.device()), out_int32, right, side, sorter);
+  return vk::searchsorted(sorted, scalar_search_value(sorted, self), out_int32, right, side, sorter);
 }
 
 at::Tensor& searchsorted_scalar_out(const at::Tensor& sorted, const at::Scalar& self, bool out_int32, bool right,
                                     std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter,
                                     at::Tensor& out) {
-  return vk::searchsorted_out(sorted, scalar_value(self, sorted.device()), out_int32, right, side, sorter, out);
+  return vk::searchsorted_out(sorted, scalar_search_value(sorted, self), out_int32, right, side, sorter, out);
 }
 
 // _unique (no counts): _unique2's values and inverse.

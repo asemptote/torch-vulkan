@@ -30,11 +30,17 @@ def assert_bitwise(got, want):
 
 
 def test_sqrt_rsqrt_float32_bitwise():
+    # Against the correctly rounded root (float64's, rounded: 53 >= 2 * 24 + 2
+    # bits), as the CPU's scalar sqrt: its vectorised float32 sqrt is not
+    # always correctly rounded (MKL's on AVX2 builds, Sleef's on AVX-512 CPUs:
+    # CI's runners differed from it in 481 of these 65547 values, by 1 ulp).
+    # rsqrt as the CPU's 1 / sqrt(x), that root divided into 1 in float32.
     x = wide_range(1 << 16, torch.float32)
     vx = x.to("vk")
     with on_gpu():
         got = [torch.sqrt(vx), torch.rsqrt(vx), torch.pow(vx, 0.5)]
-    for g, w in zip(got, [torch.sqrt(x), torch.rsqrt(x), torch.pow(x, 0.5)]):
+    root = torch.sqrt(x.double()).float()
+    for g, w in zip(got, [root, torch.div(torch.ones_like(root), root), root]):
         assert_bitwise(g, w)
 
 
