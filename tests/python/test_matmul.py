@@ -241,3 +241,49 @@ def test_float4_gemm_kernel():
     out = subprocess.run([sys.executable, "-c", GEMM4_SCRIPT], env=env, capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     assert float(out.stdout.strip().splitlines()[-1]) < 1e-5
+
+
+HAS_COOPMAT_F16 = bool(tv._native.capabilities() & 16)
+
+
+@pytest.mark.skipif(not HAS_COOPMAT_F16, reason="no float16 cooperative matrices (VK_KHR_cooperative_matrix)")
+def test_coopmat_float16_gemm():
+    # shaders/gemmcm.slang: float16 products accumulated in float32 and rounded
+    # once, as the CPU's float32 product of the same values rounded to float16:
+    # one float16 ulp apart, plus float32 rounding errors of the sums (in
+    # another order) relative to the sums of the products' magnitudes; edges
+    # of every size, operands staged by pieces along each dim or by values,
+    # batches, alpha, beta and a broadcast bias
+    def want(x, y):
+        return (x.float() @ y.float()).half()
+
+    def close(got, ref, mag):
+        got, ref = got.cpu().float(), ref.float()
+        tol = torch.finfo(torch.half).eps * ref.abs().clamp_min(2**-14) + 2**-20 * mag
+        assert ((got - ref).abs() <= tol).all(), (got - ref).abs().max().item()
+
+    for m, k, n in [(64, 32, 64), (65, 33, 63), (17, 200, 129), (128, 1, 96), (3, 1000, 5)]:
+        a, b = make((m, k), torch.float32, 1).half(), make((k, n), torch.float32, 2).half()
+        at, bt = a.t().contiguous().t(), b.t().contiguous().t()  # (column-major)
+        for x, y in [(a, b), (at, bt), (a, bt), (at, b)]:
+            with on_gpu():
+                got = x.to("vk") @ y.to("vk")
+            close(got, want(a, b), a.float().abs() @ b.float().abs())
+        with on_gpu():  # (a strided view: staged value by value)
+            got = a.to("vk")[::2] @ b.to("vk")
+        close(got, want(a[::2], b), a[::2].float().abs() @ b.float().abs())
+    a, b = make((3, 40, 70), torch.float32, 3).half(), make((3, 50, 70), torch.float32, 4).half()
+    bias = make((50,), torch.float32, 5).half()
+    with on_gpu():
+        got_t = torch.bmm(a.to("vk"), b.to("vk").transpose(1, 2))
+        got_add = torch.addmm(bias.to("vk"), a[0].to("vk"), b[0].to("vk").t(), beta=0.5, alpha=2.0)
+    close(got_t, want(a, b.transpose(1, 2)), a.float().abs() @ b.float().abs().transpose(1, 2))
+    close(got_add, (0.5 * bias.float() + 2.0 * (a[0].float() @ b[0].float().t())).half(),
+          0.5 * bias.float().abs() + 2.0 * (a[0].float().abs() @ b[0].float().abs().t()))
+
+
+def test_coopmat_coverage():
+    # where the device has float16 cooperative matrices, gemmcm runs in
+    # subgroups of 32 (TORCH_VK_DISABLE=coopmat hides them)
+    if HAS_COOPMAT_F16:
+        assert tv._native.kernel_subgroup_size("gemmcm_f16") == 32
