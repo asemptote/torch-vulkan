@@ -116,6 +116,42 @@ def test_compressed_indices_invalid_raise_as_cpu(bad):
     assert str(vk.value) == str(cpu.value)
 
 
+STRICT_SCRIPT = r"""
+import warnings
+import torch, torch_vulkan
+crow, col, vals = torch.tensor([0, 2, 3, 4]), torch.tensor([0, 2, 1, 0, 3]), torch.ones(5)
+try:
+    torch.sparse_csr_tensor(crow, col, vals, (3, 4), check_invariants=True)
+except RuntimeError as e:
+    cpu = str(e)
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter("always")
+    try:
+        torch.sparse_csr_tensor(crow.to("vk"), col.to("vk"), vals.to("vk"), (3, 4), check_invariants=True)
+        print("no error")
+    except NotImplementedError as e:
+        print("NotImplementedError", e)
+    except RuntimeError as e:
+        print("same error" if str(e) == cpu else "other error: " + str(e))
+print("warned" if any("running it on the CPU" in str(x.message) for x in w) else "no warning")
+"""
+
+
+@pytest.mark.parametrize("strict", ["0", "1"])
+def test_cpu_check_that_only_raises_is_no_fallback(strict):
+    # (a CPU call that only raises, as for invalid compressed indices, gives
+    # the CPU's error with no "running it on the CPU" warning, also under
+    # TORCH_VK_STRICT, which then must not turn it into NotImplementedError)
+    import os
+    import subprocess
+    import sys
+
+    out = subprocess.run([sys.executable, "-c", STRICT_SCRIPT], env=dict(os.environ, TORCH_VK_STRICT=strict),
+                         capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split() == ["same", "error", "no", "warning"], out.stdout
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
 @pytest.mark.parametrize("max_length", [4, 2])
 def test_jagged_padded_round_trip(dtype, max_length):

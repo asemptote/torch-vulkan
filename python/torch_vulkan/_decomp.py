@@ -264,9 +264,19 @@ def _cpu_fallback(op, name, args, kwargs):
     result = _half_via_float(op, args, kwargs)
     if result is not NotImplemented:
         return result
-    if _STRICT:
-        raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
     key = name + (_describe(op, args, kwargs) if _DETAIL else "")
+    if _STRICT:
+        # (as backend.cpp's strict_probe: the CPU on copies, so that its own
+        # error reaches the caller; NotImplementedError only where it computes)
+        def to_cpu(x):
+            return x.cpu() if isinstance(x, torch.Tensor) and x.device.type == "vk" else x
+
+        try:
+            op(*tree_map(to_cpu, args), **tree_map(to_cpu, kwargs))
+        except Exception:
+            _native.record_fallback(key + " (raised)")
+            raise
+        raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
     if _TRACE:  # (as backend.cpp's TORCH_VK_FALLBACK_TRACE: the call and where it came from)
         import sys
         import traceback

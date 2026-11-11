@@ -1721,28 +1721,70 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   trace_fallback(key, op.schema(), *stack);
   TORCH_CHECK_NOT_IMPLEMENTED(op.hasComputedKernelForDispatchKey(c10::DispatchKey::CPU), "Could not run '",
                               op.schema().name(), "' with arguments from the 'vk' backend: it has no vk or CPU kernel.");
-  record_fallback(key);
+  // Counted and warned about only once the CPU has computed something: where
+  // it only raises (a dtype or argument check, say), the call is counted
+  // apart as "op (raised)", silently, and its error is the user's. Under
+  // TORCH_VK_STRICT the CPU runs on copies first, so that its own error
+  // still reaches the user; only a call it would compute raises
+  // NotImplementedError.
+  if (strict_mode()) {
+    strict_probe(op, *stack, key);
+  }
   try {
     at::native::cpu_fallback(op, stack, error_on_views);
   } catch (...) {
-    // The CPU raised (a dtype or argument check, say): counted apart as
-    // "op (raised)", as it computed nothing on the CPU.
-    {
-      std::lock_guard<std::mutex> lock(g_fallback_mutex);
-      if (--g_fallbacks[key] == 0) g_fallbacks.erase(key);
-      ++g_fallbacks[key + " (raised)"];
-    }
+    count_fallback(key + " (raised)", false);
     throw;
+  }
+  count_fallback(key, true);
+}
+
+void count_fallback(const std::string& op, bool warn) {
+  std::lock_guard<std::mutex> lock(g_fallback_mutex);
+  if (g_fallbacks[op]++ == 0 && warn) {
+    TORCH_WARN("torch_vulkan: ", op, " has no Vulkan kernel yet; running it on the CPU");
   }
 }
 
 void record_fallback(const std::string& op) {
   TORCH_CHECK_NOT_IMPLEMENTED(!strict_mode(), "torch_vulkan: ", op,
                               " has no Vulkan kernel (TORCH_VK_STRICT forbids running it on the CPU)");
-  std::lock_guard<std::mutex> lock(g_fallback_mutex);
-  if (g_fallbacks[op]++ == 0) {
-    TORCH_WARN("torch_vulkan: ", op, " has no Vulkan kernel yet; running it on the CPU");
+  count_fallback(op, true);
+}
+
+// TORCH_VK_STRICT: the op on CPU copies of the vk tensors (so nothing the
+// caller holds changes): its error if it raises, else NotImplementedError.
+void strict_probe(const c10::OperatorHandle& op, const torch::jit::Stack& stack, const std::string& key) {
+  size_t n = std::min(stack.size(), op.schema().arguments().size());
+  auto host = [](const c10::IValue& v) -> c10::IValue {
+    if (v.isTensor()) {
+      const at::Tensor& t = v.toTensor();
+      return t.defined() && is_vk(t) ? c10::IValue(t.cpu()) : v;
+    }
+    if (v.isTensorList()) {
+      std::vector<at::Tensor> ts;
+      for (const at::Tensor& t : v.toTensorVector()) ts.push_back(t.defined() && is_vk(t) ? t.cpu() : t);
+      return c10::IValue(ts);
+    }
+    if (v.isList()) {
+      c10::impl::GenericList out(v.toList().elementType());
+      for (const c10::IValue& e : v.toList()) {
+        out.push_back(e.isTensor() && e.toTensor().defined() && is_vk(e.toTensor()) ? c10::IValue(e.toTensor().cpu()) : e);
+      }
+      return c10::IValue(out);
+    }
+    return v;
+  };
+  torch::jit::Stack cpu;
+  for (size_t i = stack.size() - n; i < stack.size(); ++i) cpu.push_back(host(stack[i]));
+  try {
+    op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), &cpu);
+  } catch (...) {
+    count_fallback(key + " (raised)", false);
+    throw;
   }
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "torch_vulkan: ", key,
+                              " has no Vulkan kernel (TORCH_VK_STRICT forbids running it on the CPU)");
 }
 
 }  // namespace vk
@@ -1752,7 +1794,13 @@ void record_fallback(const std::string& op) {
 // strict mode (TORCH_VK_STRICT), where the caller raises instead.
 extern "C" int vkt_record_fallback(const char* op) {
   try {
-    vk::record_fallback(op);
+    std::string name(op);
+    const std::string raised = " (raised)";
+    if (name.size() > raised.size() && name.compare(name.size() - raised.size(), raised.size(), raised) == 0) {
+      vk::count_fallback(name, false);  // (the CPU only raised: counted, silently, strict or not)
+      return 0;
+    }
+    vk::record_fallback(name);
     return 0;
   } catch (const std::exception&) {
     return 1;

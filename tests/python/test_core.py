@@ -3,6 +3,7 @@
 import contextlib
 import itertools
 import math
+import os
 
 import pytest
 import torch
@@ -43,6 +44,7 @@ def test_factories():
     assert r.shape == (100,) and r.device.type == "vk" and r.std().item() > 0.5
 
 
+@pytest.mark.skipif(os.environ.get("TORCH_VK_STRICT", "0") not in ("", "0"), reason="TORCH_VK_STRICT forbids the fallback")
 def test_cpu_fallback_matches_and_is_counted():
     # (uint32, one of PyTorch's barely supported unsigned dtypes, has no sort kernel)
     x = torch.tensor([3, 1, 4, 1, 5, 9, 2, 6], dtype=torch.uint32)
