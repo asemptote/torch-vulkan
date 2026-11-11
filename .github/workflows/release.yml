@@ -125,8 +125,11 @@ jobs:
           path: dist
       - name: lavapipe
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          # GitHub's runner image points apt at an Azure mirror that has been
+          # unreachable at times; use Ubuntu's own archive, and retry downloads.
+          sudo sed -i 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources || true
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y mesa-vulkan-drivers libvulkan1
           icd=$(dpkg -L mesa-vulkan-drivers | grep -E '/icd\.d/lvp_icd[^/]*\.json$' | head -1)
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - name: Install the wheel and run on the GPU

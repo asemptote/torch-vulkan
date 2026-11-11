@@ -51,8 +51,11 @@ jobs:
 
       - name: Vulkan (lavapipe, loader, validation layer)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+          # GitHub's runner image points apt at an Azure mirror that has been
+          # unreachable at times; use Ubuntu's own archive, and retry downloads.
+          sudo sed -i 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources || true
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
           echo "VK_ADD_LAYER_PATH=$HOME/vvl/share/vulkan/explicit_layer.d" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$HOME/vvl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Use lavapipe even if the runner exposes another Vulkan driver. The
