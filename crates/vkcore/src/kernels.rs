@@ -88,7 +88,9 @@ impl KernelCache {
             (CAP_STORAGE_8BIT, caps.storage_buffer_8bit, "storageBuffer8BitAccess"),
             (CAP_SUBGROUP_BALLOT, caps.subgroup_ops.contains(vk::SubgroupFeatureFlags::BALLOT), "subgroup ballots"),
             (CAP_SUBGROUP_SHUFFLE, caps.subgroup_ops.contains(vk::SubgroupFeatureFlags::SHUFFLE), "subgroup shuffles"),
-            (CAP_COOPERATIVE_MATRIX, caps.cooperative_matrix_f16, "cooperative matrices (VK_KHR_cooperative_matrix)"),
+            (CAP_COOPERATIVE_MATRIX, caps.cooperative_matrix_f16 || caps.cooperative_matrix_bf16, "cooperative matrices (VK_KHR_cooperative_matrix)"),
+            (CAP_BFLOAT16_TYPE, caps.cooperative_matrix_bf16, "bfloat16 (VK_KHR_shader_bfloat16)"),
+            (CAP_BFLOAT16_COOPERATIVE_MATRIX, caps.cooperative_matrix_bf16, "bfloat16 cooperative matrices"),
         ];
         for (cap, have, what) in required {
             if declared.contains(&cap) && !have {
@@ -163,6 +165,8 @@ const CAP_STORAGE_8BIT: u32 = 4448;
 const CAP_SUBGROUP_BALLOT: u32 = 64;  // GroupNonUniformBallot (broadcasts)
 const CAP_SUBGROUP_SHUFFLE: u32 = 65; // GroupNonUniformShuffle
 const CAP_COOPERATIVE_MATRIX: u32 = 6022; // CooperativeMatrixKHR
+const CAP_BFLOAT16_TYPE: u32 = 5116; // BFloat16TypeKHR
+const CAP_BFLOAT16_COOPERATIVE_MATRIX: u32 = 5118; // BFloat16CooperativeMatrixKHR
 
 /// Kernels (by name prefix, first match) written for a fixed subgroup size,
 /// with the size each prefers.

@@ -103,9 +103,10 @@ def test_dyn_quant_errors():
 @pytest.mark.parametrize("rowwise", [False, True])
 def test_scaled_mm(fa, fb, out_dtype, rowwise):
     # the CPU's emulated path on the GPU: exact upcasts, scales, a float32
-    # product, bias, the cast; equal to the CPU's where the scaled values'
-    # products are exact (tensor-wise scales of few bits), else within the
-    # float32 sums' order (the CPU's BLAS adds in another), then one rounding
+    # product, bias, the cast; within the float32 sums' order (the CPU's BLAS
+    # and the GPU's GEMM add in different orders; even products of few bits
+    # carry more than float32 holds once summed, as the H100 showed), then
+    # one rounding to the output type
     a = torch.randn(16, 32, generator=gen(1)).to(fa)
     b = torch.randn(48, 32, generator=gen(2)).to(fb).t()
     sa = torch.rand(16, 1, generator=gen(3)) + 0.5 if rowwise else torch.tensor(1.25)
@@ -122,7 +123,7 @@ def test_scaled_mm(fa, fb, out_dtype, rowwise):
     assert got.dtype == want.dtype and got.shape == want.shape
     mag = (a.float() * sa).abs() @ (b.float() * sb).abs() / (2.0 if scale_result is not None else 1.0)
     eps = torch.finfo(want.dtype).eps
-    tol = 0 if not rowwise else eps * want.float().abs() + 2**-20 * mag
+    tol = eps * want.float().abs() + 2**-20 * mag
     for res in (got, out):
         assert ((res.cpu().float() - want.float()).abs() <= tol).all()
 
