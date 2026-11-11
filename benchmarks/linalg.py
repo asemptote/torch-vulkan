@@ -3,11 +3,14 @@
     python benchmarks/linalg.py
 """
 
+import os
 import time
 
 import torch
 
 import torch_vulkan as tv
+
+SMALL = os.environ.get("TORCH_VK_BENCH_SMALL") == "1"  # (benchmarks/integrated.py --small: a quick check)
 
 
 def timed(fn, sync, reps=3):
@@ -23,7 +26,7 @@ def timed(fn, sync, reps=3):
 def main():
     print(f"{tv.device_name()} vs CPU ({torch.get_num_threads()} threads), torch {torch.__version__}")
     for dtype in (torch.float32, torch.float64):
-        for n in (512, 2048):
+        for n in (64,) if SMALL else (512, 2048):
             a = torch.randn(n, n, dtype=dtype) + n**0.5 * torch.eye(n, dtype=dtype)
             spd = a @ a.T
             b = torch.randn(n, 8, dtype=dtype)

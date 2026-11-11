@@ -84,6 +84,15 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | `TORCH_VK_FALLBACK_DETAIL=1` | Count fallbacks per argument signature, e.g. `"aten::eq.Tensor_out [UInt16 1d, UInt16 1d, Bool 1d]"`. |
 | `TORCH_VK_FALLBACK_TRACE=1` | Print each fallback's arguments (sizes, strides, small values) and where it came from, to stderr. |
 
+### Benchmark scripts
+
+Read by `benchmarks/*.py`, not by the library.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_VK_BENCH_SMALL=1` | Small sizes only: a quick check that the scripts run (`benchmarks/integrated.py --small` sets it). |
+| `TORCH_VK_BENCH_COMMIT=sha` | The commit `benchmarks/integrated.py` names on its results page, where the tree is not a git checkout. |
+
 ## `torch.compile`
 
 The default Inductor backend has no code generator for `"vk"`;

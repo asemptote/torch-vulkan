@@ -21,6 +21,8 @@ import torch
 
 import torch_vulkan as tv
 
+SMALL = os.environ.get("TORCH_VK_BENCH_SMALL") == "1"  # (benchmarks/integrated.py --small: a quick check)
+
 
 def timed(fn, sync, reps=1):
     fn()
@@ -41,23 +43,23 @@ def main():
     torch.manual_seed(0)
     route = os.environ.get("TORCH_VK_LINALG", "gpu")
     print(f"{tv.device_name()}, torch {torch.__version__}, TORCH_VK_LINALG={route}")
-    for n in (128, 256, 512):
+    for n in (32, 64) if SMALL else (128, 256, 512):
         d = torch.diag(torch.arange(1.0, n + 1, dtype=torch.float64)).to("vk")
         ms = timed(lambda: torch.linalg.eigvalsh(d), tv.synchronize) * 1000
         print(f"  diagonal float64 n={n:4d}           {ms:10.1f} ms  (dispatches only)")
     for dtype in (torch.float32, torch.float64):
-        for n in (128, 256, 512, 1024):
+        for n in (64,) if SMALL else (128, 256, 512, 1024):
             a = symmetric(n, dtype)
             ms = timed(lambda: torch.linalg.eigvalsh(a), tv.synchronize) * 1000
             print(f"  random   {str(dtype)[6:]:7s} n={n:4d}           {ms:10.1f} ms")
     for dtype in (torch.float32, torch.float64, torch.complex128):
-        for n in (512, 1024, 2048):
+        for n in (64,) if SMALL else (512, 1024, 2048):
             if dtype == torch.complex128 and n > 1024:
                 continue
             a = symmetric(n, dtype)
             ms = timed(lambda: torch.linalg.eigh(a), tv.synchronize) * 1000
             print(f"  eigh     {str(dtype)[6:]:10s} n={n:4d}        {ms:10.1f} ms  (with eigenvectors)")
-    a4 = symmetric(256, torch.float64, (4,))
+    a4 = symmetric(64 if SMALL else 256, torch.float64, (4,))
     ms = timed(lambda: torch.linalg.eigvalsh(a4), tv.synchronize) * 1000
     print(f"  random   float64 n= 256, batch of 4 {ms:10.1f} ms")
 
