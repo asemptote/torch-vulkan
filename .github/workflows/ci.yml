@@ -90,7 +90,8 @@ jobs:
           python -m venv .venv
           # The PyTorch the backend is developed against: tests compare with the
           # CPU's results, which change between releases (2.15's float16 linspace).
-          .venv/bin/pip install --quiet "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/pip install --quiet "torch==$(cat tools/torch-version)" --index-url https://download.pytorch.org/whl/cpu
+          python tools/check_torch_version.py
           .venv/bin/pip install --quiet numpy pytest maturin expecttest hypothesis
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
