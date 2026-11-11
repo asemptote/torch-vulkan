@@ -892,3 +892,42 @@ def test_bfloat16_fft_unsupported_without_cpu():
     with pytest.raises(NotImplementedError, match="Unsupported dtype BFloat16"):
         torch.fft.rfft(torch.ones(8, dtype=torch.bfloat16, device="vk"))
     assert torch_vulkan.fallback_counts() == before
+
+
+@pytest.mark.parametrize("per_row", [False, True])
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("qrange", [(0, 255), (-128, 127)])
+def test_fused_moving_avg_obs_fake_quant(per_row, symmetric, qrange):
+    """The QAT observer and fake quantisation, bit for bit as the CPU's, over
+    several steps (the running min/max start infinite, then move)."""
+    g = torch.Generator().manual_seed(0)
+    size = 4 if per_row else 1
+    state = {d: [torch.full((size,), float("inf")), torch.full((size,), float("-inf")), torch.ones(size),
+                 torch.zeros(size, dtype=torch.int32)] for d in ("cpu", "vk")}
+    state["vk"] = [t.to("vk") for t in state["vk"]]
+    for step in range(4):
+        x = torch.randn(4, 3, 5, generator=g) * (0.1 + step) - 0.5 * step
+        got = {}
+        for d in ("cpu", "vk"):
+            rmin, rmax, s, z = state[d]
+            out, mask = torch.ops.aten._fused_moving_avg_obs_fq_helper(
+                x.to(d), torch.tensor([1]).to(d), torch.tensor([1]).to(d), rmin, rmax, s, z, 0.25,
+                qrange[0], qrange[1], 0, per_row, symmetric)
+            got[d] = [t.cpu() for t in (out, mask, rmin, rmax, s, z)]
+        for a, b in zip(got["cpu"], got["vk"]):
+            assert torch.equal(a, b)
+    assert not any("fake_quant" in k or "fused_moving" in k for k in torch_vulkan.fallback_counts())
+
+
+def test_fake_quantize_cachemask_ops():
+    x = torch.tensor([[-1.3, 0.0, 0.26, 4.0], [float("nan"), float("inf"), -0.5, 1e-3]])
+    v = lambda t: t.to("vk")
+    sc, zp = torch.tensor([0.05]), torch.tensor([3], dtype=torch.int32)
+    on = torch.ones(1, dtype=torch.long)
+    f = torch.ops.aten._fake_quantize_per_tensor_affine_cachemask_tensor_qparams
+    for a, b in zip(no_fallback(lambda: f(v(x), v(sc), v(zp), v(on), 0, 255)), f(x, sc, zp, on, 0, 255)):
+        assert torch.equal(a.cpu().nan_to_num(), b.nan_to_num())
+    scs, zps = torch.tensor([0.05, 0.2]), torch.tensor([3, 250], dtype=torch.int32)
+    g = torch.ops.aten.fake_quantize_per_channel_affine_cachemask
+    for a, b in zip(no_fallback(lambda: g(v(x), v(scs), v(zps), 0, 0, 255)), g(x, scs, zps, 0, 0, 255)):
+        assert torch.equal(a.cpu().nan_to_num(), b.nan_to_num())

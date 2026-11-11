@@ -1562,6 +1562,171 @@ def _slow_conv3d_forward(x, weight, kernel_size, bias, stride, padding):
     return torch.nn.functional.conv3d(x, weight, bias, stride, padding)
 
 
+# ---------------------------------------------------------------- fake quantisation (QAT)
+
+def _f32(v):
+    """v rounded to float32, as a Python float."""
+    import numpy as np
+
+    return float(np.float32(v))
+
+
+def _fake_quant(x, inv_scale, scale, zero_point, quant_min, quant_max, float_zero_point=False, int_cast=False):
+    """The CPU's fake-quantisation kernels: q = zp + nearbyint(x * inv_scale) (with
+    a float zero point: lrint(zp + x * inv_scale)), output (clamp(q) - zp) * scale
+    in float32, rounded to x's dtype; mask: q within [quant_min, quant_max].
+    inv_scale, scale, zero_point: float32 tensors broadcasting against x."""
+    xf = x.float()
+    if float_zero_point:
+        q = torch.round(zero_point + xf * inv_scale)
+    else:
+        q = torch.round(xf * inv_scale) + zero_point
+    mask = (q >= quant_min) & (q <= quant_max)
+    # (NaN: the CPU's fmax(NaN, quant_min) gives quant_min; with int_cast, the
+    # per-channel kernels' cast of q to an integer before clamping, any
+    # non-finite q does, as x86 converts it to the integer minimum)
+    lost = ~torch.isfinite(q) if int_cast else torch.isnan(q)
+    qc = torch.where(lost, torch.full_like(q, quant_min), q.clamp(quant_min, quant_max))
+    out = (qc - zero_point) * scale
+    return out.to(x.dtype), mask
+
+
+def _host_floats(t):
+    return [float(v) for v in t.detach().cpu().reshape(-1).tolist()] if t.device.type != "cpu" else \
+        [float(v) for v in t.reshape(-1).tolist()]
+
+
+def _fake_quantize_per_tensor_affine_cachemask_tensor_qparams(self, scale, zero_point, fake_quant_enabled,
+                                                               quant_min, quant_max):
+    torch._check(quant_min <= quant_max, lambda: "`quant_min` should be less than or         equal to `quant_max`.")
+    if not int(fake_quant_enabled.reshape(-1)[0].item()):
+        return self.clone(memory_format=torch.preserve_format), torch.ones_like(self, dtype=torch.bool)
+    sc = _f32(scale.reshape(-1)[0].item())
+    zp = int(zero_point.reshape(-1)[0].item())
+    inv = _f32(1.0 / sc) if sc != 0 else float("inf")  # (1.0f / sc: float32 division, rounded once)
+    dev = self.device
+    f = lambda v: torch.tensor(v, dtype=torch.float32, device=dev)
+    return _fake_quant(self, f(inv), f(sc), f(float(zp)), quant_min, quant_max)
+
+
+def _fake_quantize_per_channel_affine_cachemask(self, scale, zero_point, axis, quant_min, quant_max):
+    torch._check(scale.dtype in (torch.float32, torch.bfloat16),
+                 lambda: f"Scale must be Float or BFloat16, found {_C10.get(scale.dtype)}")
+    torch._check(zero_point.dtype in (torch.int32, torch.float32, torch.float16),
+                 lambda: f"Zero-point must be Int32, Float or Half, found {_C10.get(zero_point.dtype)}")
+    torch._check(scale.dim() == 1, lambda: "scale should be a 1-D tensor")
+    torch._check(zero_point.dim() == 1, lambda: "zero point should be a 1-D tensor")
+    torch._check(scale.numel() == zero_point.numel(), lambda: "scale and zero-point need to have the same dimensions")
+    torch._check(scale.numel() == self.size(axis),
+                 lambda: "dimensions of scale and zero-point are not consistent with input tensor")
+    torch._check(quant_min <= quant_max, lambda: "`quant_min` should be less than or         equal to `quant_max`.")
+    float_zp = zero_point.is_floating_point()
+    if not float_zp:
+        zps = _host_floats(zero_point)
+        torch._check(min(zps) >= quant_min and max(zps) <= quant_max,
+                     lambda: "`zero_point` must be between `quant_min` and `quant_max`.")
+    torch._check(0 <= axis <= self.dim(), lambda: "`axis` must be between 0 and number of dimensions of input")
+    scales = [_f32(v) for v in _host_floats(scale)]
+    inv = [_f32(1.0 / v) if v != 0 else float("inf") for v in scales]
+    shape = [1] * self.dim()
+    shape[axis] = -1
+    dev = self.device
+    t = lambda vs: torch.tensor(vs, dtype=torch.float32, device=dev).view(shape)
+    return _fake_quant(self, t(inv), t(scales), zero_point.float().view(shape), quant_min, quant_max, float_zp,
+                       int_cast=True)
+
+
+def _choose_qparams(mn, mx, qmin, qmax, preserve_sparsity):
+    """(scale, zero_point) as the CPU chooses them (ATen's
+    quant_utils::ChooseQuantizationParams, its float32 and float64 steps as
+    written there)."""
+    import numpy as np
+
+    f32 = np.float32
+    mn, mx = f32(mn), f32(mx)
+    torch._check(bool(mn <= mx), lambda: "In ChooseQuantizationParams, min should be less than or equal to max")
+    if mn < 0 and mx > 0 and preserve_sparsity:
+        sqmin = -((qmax - qmin) // 2 + 1)
+        sqmax = (qmax - qmin) // 2
+        max_scale = max(abs(float(mn / f32(sqmin))), abs(float(mx / f32(sqmax))))
+        mn, mx = f32(max_scale * sqmin), f32(max_scale * sqmax)
+    mn, mx = min(mn, f32(0)), max(mx, f32(0))
+    torch._check(qmin < qmax, lambda: "In ChooseQuantizationParams, qmin should be less than qmax")
+    scale = (float(mx) - float(mn)) / (qmax - qmin)  # (double)
+    with np.errstate(divide="ignore", over="ignore"):
+        if f32(scale) == 0 or np.isinf(f32(1) / f32(scale)):
+            scale = 0.1
+    torch._check(scale > 0, lambda: "quantization scale should be > 0")
+    small = f32(6.1e-5)
+    if scale < float(small):
+        org = f32(scale)
+        scale = float(small)
+        if mn == 0:
+            mx = small * f32(qmax - qmin)
+        elif mx == 0:
+            mn = -small * f32(qmax - qmin)
+        else:
+            amp = small / org
+            mn, mx = mn * amp, mx * amp
+    z_min, z_max = qmin - float(mn) / scale, qmax - float(mx) / scale
+    e_min, e_max = abs(qmin) - abs(float(mn) / scale), abs(qmax) - abs(float(mx) / scale)
+    z = z_min if e_min < e_max else z_max
+    if mn < 0 and mx > 0 and preserve_sparsity:
+        z = (qmin + qmax) / 2
+    zp = qmin if z < qmin else qmax if z > qmax else int(np.rint(z))
+    return _f32(scale), zp
+
+
+def _fused_moving_avg_obs_fq_helper(self, observer_on, fake_quant_on, running_min, running_max, scale, zero_point,
+                                    averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant=False,
+                                    symmetric_quant=False):
+    """The CPU's fused moving-average observer and fake quantisation (QAT): the
+    running min/max moved towards this batch's (taken as they are when still
+    infinite), then qparams chosen from them and the input fake-quantised."""
+    torch._check(ch_axis < self.dim(),
+                 lambda: "Error in fused_moving_avg_obs_fake_quant_cpu: ch_axis must be < self.dim()")
+    observe = int(observer_on.reshape(-1)[0].item())
+    x = self
+    if per_row_fake_quant:
+        if self.dim() != 2:
+            perm = list(range(self.dim()))
+            perm[ch_axis], perm[0] = 0, ch_axis
+            x = self.permute(perm).flatten(1)
+        size = self.size(ch_axis)
+        if running_min.numel() == 0:
+            running_min.resize_(size).fill_(float("inf"))
+            running_max.resize_(size).fill_(float("-inf"))
+            scale.resize_(size)
+            zero_point.resize_(size)
+    if observe:
+        if per_row_fake_quant:
+            torch._check(ch_axis == 0, lambda: "Per-channel FakeQuant in fused_moving_avg_obs_fake_quant is only "
+                                               "supported on axis == 0")
+            cur_min, cur_max = torch.aminmax(x, dim=1)
+        else:
+            cur_min, cur_max = torch.aminmax(x)
+        c = torch.tensor(_f32(averaging_const), dtype=torch.float32, device=self.device)
+        for run, cur in ((running_min, cur_min), (running_max, cur_max)):
+            cur = cur.float().reshape(run.shape)
+            run.copy_(torch.where(torch.isinf(run), cur, run + c * (cur - run)))
+    if not int(fake_quant_on.reshape(-1)[0].item()):
+        return self.clone(memory_format=torch.preserve_format), torch.ones_like(self, dtype=torch.bool)
+    mins, maxs = _host_floats(running_min), _host_floats(running_max)
+    qp = [_choose_qparams(a, b, quant_min, quant_max, symmetric_quant) for a, b in zip(mins, maxs)]
+    if not per_row_fake_quant:
+        qp = qp[:1]
+    scale.reshape(-1)[:len(qp)].copy_(torch.tensor([q[0] for q in qp], dtype=torch.float32))
+    zero_point.reshape(-1)[:len(qp)].copy_(torch.tensor([q[1] for q in qp], dtype=zero_point.dtype))
+    if per_row_fake_quant:
+        return _fake_quantize_per_channel_affine_cachemask(self, scale, zero_point, ch_axis, quant_min, quant_max)
+    return _fake_quantize_per_tensor_affine_cachemask_tensor_qparams(
+        self, scale, zero_point, torch.ones(1, dtype=torch.long, device=self.device), quant_min, quant_max)
+
+
+_C10 = {torch.float32: "Float", torch.float64: "Double", torch.float16: "Half", torch.bfloat16: "BFloat16",
+        torch.int32: "Int", torch.int64: "Long", torch.int8: "Char", torch.uint8: "Byte", torch.int16: "Short"}
+
+
 def _masked_softmax(x, mask, dim=None, mask_type=None):
     """The CPU's masked softmax: masked positions excluded (0), a row with
     every position masked all NaN; mask_type 0 is an (L, L) attention mask and
@@ -1927,6 +2092,10 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "_fake_quantize_per_tensor_affine_cachemask_tensor_qparams":
+            _fake_quantize_per_tensor_affine_cachemask_tensor_qparams,
+        "fake_quantize_per_channel_affine_cachemask": _fake_quantize_per_channel_affine_cachemask,
+        "_fused_moving_avg_obs_fq_helper": _fused_moving_avg_obs_fq_helper,
         "slow_conv3d_forward": _slow_conv3d_forward,
         "_transformer_encoder_layer_fwd": _transformer_encoder_layer_fwd,
         "_compute_linear_combination": _compute_linear_combination,
