@@ -8,10 +8,12 @@
 // the steps LAPACK would do column by column (LU and QR panels, Cholesky
 // diagonal blocks, inverses of small triangular blocks, row interchanges)
 // run in shaders/factor.slang with one workgroup per matrix; the O(n^3)
-// trailing updates are batched GEMMs (csrc/linalg.cpp). Eigenvalues and the
-// SVD use Jacobi methods (rotations of disjoint index pairs in parallel,
-// round-robin ordering), which are accurate to working precision and suit
-// the GPU. TORCH_VK_LINALG=cpu sends these ops to LAPACK on the CPU instead.
+// trailing updates are batched GEMMs (csrc/linalg.cpp). eigh reduces to a
+// tridiagonal matrix and runs implicit QL on it (shaders/tridiag.slang), as
+// LAPACK does; the SVD (and eigh of 2 x 2 and 3 x 3 matrices) use Jacobi
+// methods (rotations of disjoint index pairs in parallel, round-robin
+// ordering). Both are accurate to working precision. TORCH_VK_LINALG=cpu
+// sends these ops to LAPACK on the CPU instead, as a reference for testing.
 //
 // Complex matrices (M14) run through the same code: factor.slang has complex
 // variants following LAPACK's z* routines, and transposes that stand for
@@ -35,6 +37,11 @@ namespace vk {
 namespace {
 
 constexpr int64_t kBlock = 64;
+// eigh: tridiagonal reduction from this n up, Jacobi below. On the UHD 620 the
+// reduction is faster from n = 4 at any batch (64 matrices of 8 x 8: 14 ms
+// against Jacobi's 43, float64); Jacobi only for 10^4 matrices of 2 x 2 or
+// 3 x 3 (18 ms against 94 for 2 x 2).
+constexpr int64_t kTridiagMin = 4;
 constexpr int64_t kMaxBatch = 65535;  // workgroups per dispatch dimension
 
 struct FactorParams {
@@ -470,6 +477,103 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
   auto [values, order] = at::sort(diag, /*stable=*/true, 1, false);
   at::Tensor vectors = want_vectors ? at::gather(v, 2, order.unsqueeze(1).expand({B, n, n})) : at::Tensor();
   return {values, vectors};
+}
+
+// ---------------------------------------------------------------- tridiagonal eigh
+
+struct TridiagParams {
+  uint64_t a, tau, w, d, e, zt, logi, logcs, state;
+  uint32_t n, ld, sa, k, cap, groups;
+};
+static_assert(sizeof(TridiagParams) == 96, "must match shaders/tridiag.slang");
+
+void tridiag(uint32_t op, const TridiagParams& p, at::ScalarType dtype, uint32_t gx, uint32_t gy = 1,
+             bool log = false) {
+  dispatch(std::string("tridiag_") + dtype_label(dtype), {op, log ? 1u : 0u}, p, gx, gy);
+}
+
+// Symmetric (Hermitian) eigendecomposition of a3 [B, n, n] (contiguous, both
+// triangles; overwritten) as LAPACK does it, on the GPU (shaders/tridiag.slang):
+// Householder reduction to a real tridiagonal T = Q^H A Q, one column at a
+// time (dsytd2 / zhetd2; each step's A v is a matrix-vector product in
+// shaders/gemv.slang), implicit QL on T (tqli) with its plane rotations
+// accumulated into Z, then the eigenvectors Q Z (apply_q's blocked
+// reflectors). Eigenvalues ascending. False if QL did not converge (LAPACK's
+// info > 0; the caller then uses Jacobi).
+bool tridiag_eigh(const at::Tensor& a3, bool want_vectors, at::Tensor& values, at::Tensor& vectors) {
+  int64_t B = a3.size(0), n = a3.size(2);
+  at::ScalarType t = a3.scalar_type();
+  at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
+  at::Tensor tau = at::zeros({B, n}, a3.options());
+  at::Tensor w = at::zeros({B, n, 1}, a3.options());
+  at::Tensor e = at::zeros({B, n}, real);  // (e[n - 1] stays 0)
+  TridiagParams p{};
+  p.a = gpu_address(a3);
+  p.tau = gpu_address(tau);
+  p.w = gpu_address(w);
+  p.e = gpu_address(e);
+  p.n = static_cast<uint32_t>(n);
+  p.ld = static_cast<uint32_t>(a3.stride(1));
+  p.sa = static_cast<uint32_t>(a3.stride(0));
+  for (int64_t k = 0; k + 1 < n; ++k) {
+    int64_t m = n - 1 - k;
+    p.k = static_cast<uint32_t>(k);
+    tridiag(op::TRIDIAG_REFLECT, p, t, static_cast<uint32_t>(B));
+    // w = A22 v (v: column k below the diagonal, its first entry now 1)
+    at::Tensor a22 = a3.narrow(1, k + 1, m).narrow(2, k + 1, m);
+    at::Tensor wk = w.narrow(1, 0, m);
+    at::bmm_out(wk, a22, a3.narrow(1, k + 1, m).narrow(2, k, 1));
+    tridiag(op::TRIDIAG_UPDATE_W, p, t, static_cast<uint32_t>(B));
+    p.groups = groups_for(m * m);
+    tridiag(op::TRIDIAG_RANK2, p, t, p.groups, static_cast<uint32_t>(B));
+  }
+
+  at::Tensor d = at::real(a3.diagonal(0, 1, 2)).contiguous();
+  at::Tensor state = at::zeros({B, 8}, a3.options().dtype(at::kInt));
+  p.d = gpu_address(d);
+  p.state = gpu_address(state);
+  at::Tensor zt;
+  if (!want_vectors) {
+    tridiag(op::TRIDIAG_QL, p, t, static_cast<uint32_t>(B));
+  } else {
+    // The rotations of QL passes go to a log, applied to Z^T (rows i, i + 1
+    // of Z^T, coalesced) after each pass: about 0.75 n^2 of them in all, so
+    // usually one pass; at most 2^22 entries over the batch, and at least n
+    // per matrix (one iteration's worth, so every pass makes progress).
+    int64_t cap = std::max<int64_t>(n, std::min<int64_t>(n * n, (int64_t(1) << 22) / std::max<int64_t>(B, 1)));
+    at::Tensor logi = at::empty({B, cap}, a3.options().dtype(at::kInt));
+    at::Tensor logcs = at::empty({B, cap, 2}, real);
+    zt = at::zeros({B, n, n}, a3.options());
+    zt.diagonal(0, 1, 2).fill_(1);
+    p.zt = gpu_address(zt);
+    p.logi = gpu_address(logi);
+    p.logcs = gpu_address(logcs);
+    p.cap = static_cast<uint32_t>(cap);
+    p.groups = groups_for(n);
+    for (int64_t pass = 0;; ++pass) {
+      tridiag(op::TRIDIAG_QL, p, t, static_cast<uint32_t>(B), 1, /*log=*/true);
+      tridiag(op::TRIDIAG_ROT, p, t, p.groups, static_cast<uint32_t>(B));
+      if (state.select(1, 3).all().item<bool>() || pass > 30 * n) {
+        break;
+      }
+    }
+  }
+  if (state.select(1, 4).any().item<bool>() || !state.select(1, 3).all().item<bool>()) {
+    return false;
+  }
+  auto [sorted, order] = at::sort(d, /*stable=*/true, 1, false);
+  values = sorted;
+  if (want_vectors) {
+    at::Tensor z = zt.transpose(1, 2).contiguous();  // eigenvectors of T
+    if (n > 1) {
+      // Q = H_0 ... H_{n-2} acts on rows 1.. : the reflectors are a QR's in
+      // A[1:, :n-1] (v_0 = 1 on that view's diagonal).
+      apply_q(a3.narrow(1, 1, n - 1).narrow(2, 0, n - 1), tau.narrow(1, 0, n - 1), z.narrow(1, 1, n - 1),
+              /*left=*/true, /*transpose=*/false);
+    }
+    vectors = at::gather(z, 2, order.unsqueeze(1).expand({B, n, n}));
+  }
+  return true;
 }
 
 // One-sided Jacobi SVD of a3 [B, m, n], m >= n (overwritten):
@@ -1005,9 +1109,16 @@ std::tuple<at::Tensor&, at::Tensor&> eigh_out(const at::Tensor& a, c10::string_v
   at::Tensor diag = at::real(a.diagonal(0, -2, -1)).to(a.scalar_type());
   at::Tensor sym = strict + adj(strict) + at::diag_embed(diag);
   at::Tensor a3 = batched(sym);
-  auto [w, v] = jacobi_eigh(a3, compute_v);
-  auto bs = batch_shape(a);
+  // Tridiagonal reduction and QL (LAPACK's algorithm) from kTridiagMin up;
+  // Jacobi below it, for large batches of 2 x 2 and 3 x 3 matrices, and as
+  // the fallback should QL not converge.
+  at::Tensor w, v;
   int64_t n = a.size(-1);
+  bool small = n < kTridiagMin || a3.size(0) == 0;
+  if (small || !tridiag_eigh(a3, compute_v, w, v)) {
+    std::tie(w, v) = jacobi_eigh(small ? a3 : batched(sym), compute_v);
+  }
+  auto bs = batch_shape(a);
   assign(values, w.view(with_tail(bs, {n})));
   if (compute_v) {
     assign(vectors, v.view(a.sizes()));

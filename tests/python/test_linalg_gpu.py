@@ -5,7 +5,7 @@ so those are checked by reconstruction and orthonormality."""
 import pytest
 import torch
 
-from _util import check, make, on_gpu
+from _util import COMPLEX, check, make, make_complex, on_gpu
 
 FLOATS = [torch.float32, torch.float64]
 
@@ -132,6 +132,71 @@ def test_eigh(dtype, shape):
     eye = torch.eye(shape[-1], dtype=dtype).expand_as(a)
     check_close(v.transpose(-2, -1) @ v, eye, dtype)
     check_close(a @ v, v * w.unsqueeze(-2), dtype)
+
+
+def hermitian(a, upper):
+    t = a.triu(1) if upper else a.tril(-1)
+    return t + t.mH + torch.diag_embed(a.diagonal(0, -2, -1).real.to(a.dtype))
+
+
+@pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
+@pytest.mark.parametrize("shape", [(4, 4), (33, 33), (3, 40, 40), (130, 130)])
+def test_eigh_tridiagonal(dtype, shape):
+    # n >= 4: Householder reduction (shaders/tridiag.slang, gemv.slang) and
+    # implicit QL with its rotations logged and applied to Z^T, then Q Z
+    a = make_complex(shape, dtype, 1) if dtype.is_complex else make(shape, dtype, 1)
+    real = torch.float32 if dtype in (torch.float32, torch.complex64) else torch.float64
+    n = shape[-1]
+    va = a.to("vk")
+    for upper in (False, True):
+        uplo = "U" if upper else "L"
+        with on_gpu():
+            w, v = torch.linalg.eigh(va, UPLO=uplo)
+            vals = torch.linalg.eigvalsh(va, UPLO=uplo)
+        h = hermitian(a, upper)
+        want = torch.linalg.eigvalsh(h)
+        check(w, want, **tol(real, n))
+        check(vals, want, **tol(real, n))
+        w, v = w.cpu(), v.cpu()
+        eye = torch.eye(n, dtype=dtype).expand_as(h)
+        check_close(v.mH @ v, eye, real, n)
+        check_close(h @ v, v * w.unsqueeze(-2).to(dtype), real, n)
+
+
+@pytest.mark.parametrize("dtype,n", [(torch.float64, 520), (torch.float32, 1030)])
+def test_eigh_tridiagonal_large(dtype, n):
+    # past shaders/tridiag.slang's QL_SHARED: QL iterates on d and e in global memory
+    a = make((n, n), dtype, 2)
+    h = hermitian(a, False)
+    with on_gpu():
+        vals = torch.linalg.eigvalsh(a.to("vk"))
+    check(vals, torch.linalg.eigvalsh(h), **tol(dtype, n))
+    if dtype == torch.float64:
+        with on_gpu():
+            w, v = torch.linalg.eigh(a.to("vk"))
+        w, v = w.cpu(), v.cpu()
+        check_close(v.mT @ v, torch.eye(n, dtype=dtype), dtype, n)
+        check_close(h @ v, v * w.unsqueeze(-2), dtype, n)
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_eigh_tridiagonal_degenerate(dtype):
+    # repeated, zero and widely scaled eigenvalues, and already (tri)diagonal input
+    n = 40
+    q, _ = torch.linalg.qr(make((n, n), dtype, 3))
+    lam = torch.cat([torch.full((10,), 2.0), torch.zeros(10), torch.linspace(-1, 1, 10), torch.logspace(-6, 6, 10)])
+    cases = [torch.eye(n, dtype=dtype), torch.zeros(n, n, dtype=dtype), (q * lam.to(dtype)) @ q.mT,
+             torch.diag(torch.arange(n, dtype=dtype)) + torch.diag(torch.ones(n - 1, dtype=dtype), 1) +
+             torch.diag(torch.ones(n - 1, dtype=dtype), -1)]
+    for a in cases:
+        a = (a + a.mT) / 2
+        with on_gpu():
+            w, v = torch.linalg.eigh(a.to("vk"))
+        scale = max(1.0, float(a.abs().max()))
+        check(w, torch.linalg.eigvalsh(a), **tol(dtype, n * scale))
+        w, v = w.cpu(), v.cpu()
+        check_close(v.mT @ v, torch.eye(n, dtype=dtype), dtype, n)
+        check_close(a @ v, v * w.unsqueeze(-2), dtype, n * scale)
 
 
 def check_close(x, y, dtype, scale=10.0):

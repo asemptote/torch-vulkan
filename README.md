@@ -60,8 +60,10 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
   transposed), pooling, normalisation, softmax, losses, upsampling, grid
   sampling, embeddings, attention.
 
-Anything else runs on the CPU through PyTorch's fallback and is counted in
-`torch_vulkan.fallback_counts()`; `TORCH_VK_STRICT=1` turns those fallbacks
+All numerical work is meant to run on the GPU (see the design principles in
+[CONTRIBUTING.md](CONTRIBUTING.md#design-principles)). Anything that does not
+run there yet falls back to the CPU through PyTorch's fallback and is counted
+in `torch_vulkan.fallback_counts()`; `TORCH_VK_STRICT=1` turns those fallbacks
 into errors. In the OpInfo sweep (`tools/opinfo_coverage.py`, PyTorch's
 sample inputs for every op compared against the CPU) every op runs fully on
 the GPU and matches the CPU. PyTorch's own device-generic test files
@@ -204,7 +206,7 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
 |---|---|
 | `TORCH_VK_STRICT=1` | Raise instead of running an op on the CPU. |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted, and the tests fail on any. |
-| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU (often faster on integrated GPUs). |
+| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU, as a reference for testing and comparison. |
 | `TORCH_VK_GEMM=tiled` or `float4` | Choose the matrix-multiply kernel (`float4` is the default on Arm GPUs, `tiled` elsewhere). |
 | `TORCH_VK_API=1.1` | Use the Vulkan 1.1 code path on a newer driver. |
 | `TORCH_VK_DISABLE=int64,float64,int16,float16,int8,storage16,storage8,denorm` | Hide device features, to test a small GPU's code paths on a bigger one. |
