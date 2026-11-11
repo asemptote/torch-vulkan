@@ -15,9 +15,6 @@ permissions:
 
 env:
   SLANG_VERSION: "2026.20"
-  # The wheels are compiled against this release's C++ ABI (pyproject.toml
-  # pins torch to the same minor version).
-  TORCH_VERSION: "2.14.1"
 
 jobs:
   spirv:
@@ -46,6 +43,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: PyTorch version (tools/torch-version)
+        shell: bash
+        run: echo "TORCH_VERSION=$(cat tools/torch-version)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -82,6 +82,9 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
       - uses: actions/checkout@v4
+      - name: PyTorch version (tools/torch-version)
+        shell: bash
+        run: echo "TORCH_VERSION=$(cat tools/torch-version)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: spirv
@@ -109,6 +112,10 @@ jobs:
     env:
       LP_NATIVE_VECTOR_WIDTH: "256"
     steps:
+      - uses: actions/checkout@v4
+      - name: PyTorch version (tools/torch-version)
+        shell: bash
+        run: echo "TORCH_VERSION=$(cat tools/torch-version)" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -152,6 +159,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: PyTorch version (tools/torch-version)
+        shell: bash
+        run: echo "TORCH_VERSION=$(cat tools/torch-version)" >> "$GITHUB_ENV"
       - name: The tag matches the package version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
@@ -171,9 +181,9 @@ jobs:
         run: |
           tar -czf "dist/torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz" -C spirv .
           cat > notes.md <<EOF
-          Wheels for Windows and Linux (x86_64), for Python 3.10 or newer and PyTorch 2.14:
+          Wheels for Windows and Linux (x86_64), for Python 3.10 or newer and PyTorch ${TORCH_VERSION%.*}:
 
-              pip install "torch==2.14.*"
+              pip install "torch==${TORCH_VERSION%.*}.*"
               pip install <wheel URL from the assets below>
 
           On Android (Termux), build from source with the prebuilt kernels:

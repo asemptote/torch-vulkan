@@ -62,12 +62,46 @@ Open an issue or a GitHub discussion. There is no chat channel.
 New kernels are Slang files in `crates/vkcore/shaders`, templated per dtype,
 and their aten entry points live in `crates/pyvk/csrc`. Lavapipe is a good
 second device: it finds missing barriers and out-of-range loads that real GPUs
-hide. `docs/development-log.md` records the design decisions and their
-reasons, milestone by milestone.
+hide. The [development log](docs/development-log.md) records the design
+decisions and their reasons, one file per milestone in `docs/log/`; a change
+that deserves a design note adds a new `docs/log/MNN-topic.md` rather than
+editing an earlier one.
 
 `tools/cluster/` runs PyTorch's test files in shards on a PBS cluster; it
 needs a `tools/cluster/cluster.env` (see `cluster.env.example`) and is
 optional.
+
+## Pull requests
+
+- Keep a pull request to one topic. Leave the README's version numbers,
+  benchmark figures and release notes to the maintainer, who updates them at
+  release time; other README changes are welcome.
+- CI runs on the pull request merged with `main` as it was when the run
+  started. If `main` has since changed files the pull request also changes, it
+  is rebased and CI runs again before merging; otherwise it is merged as it is.
+- Pull requests are merged with a merge commit, so the history shows how the
+  work was done.
+
+## Upgrading PyTorch
+
+The extension's C++ layer is compiled against one PyTorch release, and the
+tests compare with that release's CPU results. That release is named in one
+place, `tools/torch-version`; `pyproject.toml` allows only its minor version,
+and CI's `tools/check_torch_version.py` fails if the two disagree. To move to
+a new release:
+
+1. Update `tools/torch-version` and the torch requirement in
+   `pyproject.toml`, and rebuild.
+2. Regenerate the files derived from PyTorch's own code:
+   `python tools/port_special.py` (`shaders/_special.slang`, from ATen's
+   `Math.h`) and `python tools/dev/cpu_dtype_errors.py` (the CPU's dtype
+   errors that vk raises itself, from a fallback-detail run). Review their
+   diffs.
+3. Run `tests/python`, the strict OpInfo sweep and PyTorch's test files
+   (`tools/pytorch_tests.py`); differences in the CPU's results between
+   releases (2.15's float16 `linspace`, for example) show up here.
+4. Update the PyTorch version in the README's installation and building
+   sections.
 
 ## Maintenance and support
 
