@@ -31,6 +31,7 @@ DENYLIST = {
 }
 
 _active = threading.local()
+_TRACE = os.environ.get("TORCH_VK_FALLBACK_TRACE", "0") not in ("", "0")
 _lib = None
 
 
@@ -177,13 +178,57 @@ _C10_NAMES = {"float32": "Float", "float64": "Double", "float16": "Half", "bfloa
               "uint64": "UInt64"}
 
 
+def _dtype_signature(name, op, args, kwargs):
+    """The key of _cpu_dtype_errors.TABLE (as tools/dev/cpu_dtype_errors.py's dtype_signature)."""
+    import re
+
+    parts = []
+    for text in _describe(op, args, kwargs)[2:-1].split(", ") if (args or kwargs) else []:
+        parts.append(text)
+    # (_describe's parts, rejoined where a list's values held commas)
+    joined, depth = [], 0
+    for p in parts:
+        if depth:
+            joined[-1] += ", " + p
+        else:
+            joined.append(p)
+        depth += p.count("[") + p.count("(") - p.count("]") - p.count(")")
+    keys = []
+    for text in joined:
+        m = re.match(r"^(\w+)( cpu)? \d+d( empty)?", text)
+        if m:
+            keys.append(m.group(1) + (" empty" if m.group(3) else ""))
+        elif text.startswith("list("):
+            keys.append("list")
+        elif re.match(r"^\[[-\d, ]*\]$", text):
+            keys.append("IntList")
+        else:
+            keys.append(text)
+    return f"{name} [{', '.join(keys)}]"
+
+
+def _raise_cpu_dtype_error(op, name, args, kwargs):
+    """Where the CPU would only raise a dtype error, raise it here (as backend.cpp's table)."""
+    from ._cpu_dtype_errors import TABLE
+
+    hit = TABLE.get(_dtype_signature(name, op, args, kwargs))
+    if hit is not None:
+        raise (NotImplementedError if hit[0] else RuntimeError)(hit[1])
+
+
 def _cpu_fallback(op, name, args, kwargs):
+    _raise_cpu_dtype_error(op, name, args, kwargs)
     result = _half_via_float(op, args, kwargs)
     if result is not NotImplemented:
         return result
     if _STRICT:
         raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
     key = name + (_describe(op, args, kwargs) if _DETAIL else "")
+    if _TRACE:  # (as backend.cpp's TORCH_VK_FALLBACK_TRACE: the call and where it came from)
+        import sys
+        import traceback
+        print(f"torch_vulkan fallback (Python): {name}{_describe(op, args, kwargs)}\n"
+              + "".join(traceback.format_stack(limit=8)[:-1]), file=sys.stderr, flush=True)
     try:
         return _run_on_cpu(op, args, kwargs, key)
     except Exception:
@@ -219,14 +264,17 @@ def _run_on_cpu(op, args, kwargs, key):
 
 def _make_kernel(op, decomp, name):
     def kernel(*args, **kwargs):
-        active = _active.__dict__.setdefault("ops", set())
-        if name in active:  # the decomposition calls its own op
+        # A decomposition may call its own op with other arguments (vdot of two
+        # conjugate views calls vdot of their conjugates): a few levels are
+        # allowed; deeper, it is taken to recur on the same ones.
+        active = _active.__dict__.setdefault("ops", {})
+        if active.get(name, 0) >= 3:
             return _cpu_fallback(op, name, args, kwargs)
-        active.add(name)
+        active[name] = active.get(name, 0) + 1
         try:
             result = decomp(*args, **kwargs)
         finally:
-            active.discard(name)
+            active[name] -= 1
         if result is NotImplemented:  # the decomposition declines these arguments
             return _cpu_fallback(op, name, args, kwargs)
         return result

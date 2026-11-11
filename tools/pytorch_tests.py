@@ -336,6 +336,9 @@ EXPECTED = [
      "an expected failure on every device (complex32 multiplication); vk's passes"),
     (r"test_fmod_remainder_by_zero_integral_", r"",
      "integer x % 0: vk returns its own value (the CPU raises ZeroDivisionError, the test expects CUDA's bit patterns)"),
+    (r"test_dtypes_stft_vk", r"worked in forward but are not listed by the OpInfo: \{torch.float16\}",
+     "float16 FFTs run on vk (in float32, rounded back); stft's OpInfo lists float16 for MPS and XPU only, and "
+     "vk gets the CPU's list"),
     (r"test_dtypes_nn_functional_max_pool1d_vk", r"worked in forward but are not listed",
      "max_pool1d off the CPU goes through max_pool2d_with_indices, whose CPU kernel (which vk follows) takes "
      "integers; the OpInfo lists CUDA's floating dtypes"),

@@ -433,6 +433,8 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
                       const at::Scalar& alpha, at::Tensor& out) {
   int64_t m = mat1.size(0), n = mat2.size(1);
   at::native::resize_output(out, {m, n});
+  TORCH_CHECK(out.dtype() == self.dtype(), "Expected out tensor to have dtype ", self.dtype(), ", but got ", out.dtype(),
+              " instead");  // (the CPU's check; its type names, too)
   if (is_vk(self) && is_vk(mat1) && is_vk(mat2) && is_vk(out) && mat1.dim() == 2 && mat2.dim() == 2 &&
       (out.numel() == 0 || mat1.size(1) == 0) && self.scalar_type() == mat1.scalar_type() &&
       mat1.scalar_type() == mat2.scalar_type() && out.scalar_type() == self.scalar_type()) {

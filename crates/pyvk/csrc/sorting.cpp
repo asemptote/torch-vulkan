@@ -496,6 +496,18 @@ at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, 
   TORCH_CHECK(out.scalar_type() == (out_int32 ? at::kInt : at::kLong), "torch.searchsorted(): output tensor's dtype "
               "is wrong, it can only be Int(int32) or Long(int64) depending on whether out_int32 flag is True, but we "
               "got output tensor's dtype ", out.scalar_type(), " and out_int32 flag is ", out_int32 ? "True" : "False");
+  // (the CPU's searchsorted_pre_check of the shapes)
+  if (self.dim() == 0) {
+    TORCH_CHECK(sorted.dim() == 1, "torch.searchsorted(): input value can be a scalar only when boundaries tensor "
+                "dimension is 1, but we got boundaries tensor dim(", sorted.dim(), ") and input value's dim(", self.dim(),
+                ") numel(", self.numel(), ")");
+  } else {
+    TORCH_CHECK(sorted.dim() == 1 || (sorted.dim() == self.dim() &&
+                                      sorted.sizes().slice(0, sorted.dim() - 1).equals(self.sizes().slice(0, self.dim() - 1))),
+                "torch.searchsorted(): boundaries tensor should be 1 dimension or the first N-1 dimensions of boundaries "
+                "tensor and input value tensor must match, but we got boundaries tensor ", sorted.sizes(),
+                " and input value tensor ", self.sizes());
+  }
   at::ScalarType dtype = at::result_type(sorted, self);
   const char* label = rowscan_label(dtype);
   bool ok = is_vk(sorted) && is_vk(self) && is_vk(out) && label != nullptr && dtype != at::kBool &&

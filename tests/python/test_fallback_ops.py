@@ -656,6 +656,16 @@ ERROR_CASES = {
     "index_reduce_0d_complex": lambda d: torch.index_reduce(torch.tensor(1 + 1j, device=d), 0,
                                                             torch.tensor([0], device=d), torch.tensor(2 + 0j, device=d),
                                                             "prod"),
+    "matrix_exp_int": lambda d: torch.linalg.matrix_exp(torch.ones(2, 2, dtype=torch.int, device=d)),
+    "upsample_bilinear_complex": lambda d: torch.nn.functional.interpolate(
+        torch.ones(1, 1, 2, 2, dtype=torch.cfloat, device=d), size=(3, 3), mode="bilinear"),
+    "repeat_interleave_float": lambda d: torch.repeat_interleave(torch.ones(3, device=d)),
+    "addmm_out_dtype": lambda d: torch.addmm(torch.ones(2, 3, device=d), torch.ones(2, 2, device=d),
+                                             torch.ones(2, 3, device=d), out=torch.empty(2, 3, dtype=torch.long, device=d)),
+    "searchsorted_scalar_2d": lambda d: torch.searchsorted(torch.ones(2, 3, dtype=torch.long, device=d),
+                                                           torch.tensor(1, device=d)),
+    "searchsorted_shapes": lambda d: torch.searchsorted(torch.ones(2, 3, dtype=torch.long, device=d),
+                                                        torch.ones(2, 3, 4, dtype=torch.long, device=d)),
     "linear_combination_empty": lambda d: torch.ops.aten._compute_linear_combination(torch.ones((), device=d),
                                                                                      torch.ones(2, 2, device=d)),
 }
@@ -875,3 +885,10 @@ def test_transformer_encoder_layer_fast_path():
         layer_vk = layer.to("vk")
         got = no_fallback(lambda: layer_vk(x.to("vk")))
     torch.testing.assert_close(got.cpu(), want, rtol=1e-4, atol=1e-5)
+
+
+def test_bfloat16_fft_unsupported_without_cpu():
+    before = torch_vulkan.fallback_counts()
+    with pytest.raises(NotImplementedError, match="Unsupported dtype BFloat16"):
+        torch.fft.rfft(torch.ones(8, dtype=torch.bfloat16, device="vk"))
+    assert torch_vulkan.fallback_counts() == before
