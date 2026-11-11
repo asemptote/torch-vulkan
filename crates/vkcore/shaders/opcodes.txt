@@ -231,7 +231,6 @@ RNG CAUCHY 5
 RNG LOG_NORMAL 6
 
 # shaders/factor.slang
-FACTOR LU_PANEL 0
 FACTOR TRI_INV 1
 FACTOR CHOL_BLOCK 2
 FACTOR QR_PANEL 3
@@ -242,6 +241,11 @@ FACTOR EIG_ROWS 7
 FACTOR LASWP 8
 FACTOR LDL 9
 FACTOR LDL_SOLVE 10
+
+# shaders/getrf.slang
+GETRF START 0
+GETRF STEP 1
+GETRF SWAP 2
 
 # shaders/special.slang (unary first; ZETA and later take a second operand)
 SPECIAL I0 0

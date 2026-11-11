@@ -234,6 +234,13 @@ at::Tensor tri_solve(const at::Tensor& a3, const at::Tensor& b3, bool upper, boo
 
 // ---------------------------------------------------------------- LU
 
+struct GetrfParams {
+  uint64_t a, piv, info, pval, pidx, pos;
+  uint32_t rows, cols, ld, sa, k, b, j, spiv, groups, pad;
+};
+static_assert(sizeof(GetrfParams) == 88, "must match shaders/getrf.slang");
+constexpr int64_t kGetrfRows = 32;  // RW in shaders/getrf.slang
+
 struct Lu {
   at::Tensor lu;     // [B, m, n]
   at::Tensor piv;    // [B, min(m, n)] int32, 1-based
@@ -249,15 +256,37 @@ Lu lu_factor(const at::Tensor& a, bool pivot = true) {
   if (B == 0 || kmax == 0) {
     return r;
   }
-  FactorParams p = params_for(r.lu);
-  p.piv = gpu_address(r.piv);
-  p.spiv = static_cast<uint32_t>(kmax);
-  p.info = gpu_address(r.info);
+  // the panels on many workgroups (shaders/getrf.slang), a column per dispatch
+  int64_t groups = (m + kGetrfRows - 1) / kGetrfRows;
+  at::Tensor pval = at::empty({B, 2, groups}, a.options().dtype(c10::toRealValueType(a.scalar_type())));
+  at::Tensor pidx = at::empty({B, 2, groups, 2}, a.options().dtype(at::kInt));
+  at::Tensor pos = at::empty({B, 2, m}, a.options().dtype(at::kInt));
+  GetrfParams g{};
+  g.a = gpu_address(r.lu);
+  g.piv = gpu_address(r.piv);
+  g.info = gpu_address(r.info);
+  g.pval = gpu_address(pval);
+  g.pidx = gpu_address(pidx);
+  g.pos = gpu_address(pos);
+  g.rows = static_cast<uint32_t>(m);
+  g.cols = static_cast<uint32_t>(n);
+  g.ld = static_cast<uint32_t>(r.lu.stride(1));
+  g.sa = static_cast<uint32_t>(r.lu.stride(0));
+  g.spiv = static_cast<uint32_t>(kmax);
+  g.groups = static_cast<uint32_t>(groups);
+  std::string kernel = std::string("getrf_") + dtype_label(a.scalar_type());
+  uint32_t unit = pivot ? 0u : 1u, bz = static_cast<uint32_t>(B);
   for (int64_t k = 0; k < kmax; k += kBlock) {
     int64_t b = std::min(kBlock, kmax - k);
-    p.k = static_cast<uint32_t>(k);
-    p.b = static_cast<uint32_t>(b);
-    factor(op::FACTOR_LU_PANEL, p, B, a.scalar_type(), false, /*no pivoting:*/ !pivot);
+    g.k = static_cast<uint32_t>(k);
+    g.b = static_cast<uint32_t>(b);
+    uint32_t gx = static_cast<uint32_t>((m - k + kGetrfRows - 1) / kGetrfRows);
+    dispatch(kernel, {op::GETRF_START, unit}, g, gx, bz);
+    for (int64_t j = k; j < k + b; ++j) {
+      g.j = static_cast<uint32_t>(j);
+      dispatch(kernel, {op::GETRF_STEP, unit}, g, gx, bz);
+    }
+    dispatch(kernel, {op::GETRF_SWAP, unit}, g, static_cast<uint32_t>((n + 255) / 256), bz);
     if (k + b < n) {
       // U12 = L11^{-1} A12;  A22 -= L21 U12.
       at::Tensor inv = block_inverse(r.lu, k, b, /*upper=*/false, /*unit=*/true);
@@ -1562,7 +1591,14 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
   auto bs = batch_shape(a);
   at::Tensor sigma, left, v;
   bool done = false;
-  if (tn >= kSvdBidiagMin && std::getenv("TORCH_VK_SVD_JACOBI") == nullptr) {
+  if (a3.size(0) == 0) {
+    // no matrices (PyTorch's test helpers make such batches): nothing to dispatch
+    sigma = at::empty({0, tn}, a3.options().dtype(c10::toRealValueType(a3.scalar_type())));
+    left = at::empty({0, tm, full_matrices ? tm : tn}, a3.options());
+    v = at::empty({0, tn, tn}, a3.options());
+    done = true;
+  }
+  if (!done && tn >= kSvdBidiagMin && std::getenv("TORCH_VK_SVD_JACOBI") == nullptr) {
     // (a3 is a fresh copy: batched() of a view, or of adj(a), copies)
     at::Tensor work = a3.contiguous().clone();
     done = bidiag_svd(work, compute_uv && full_matrices, sigma, left, v);
