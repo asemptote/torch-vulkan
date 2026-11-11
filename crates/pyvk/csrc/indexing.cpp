@@ -1416,12 +1416,15 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
 at::Tensor& logspace_out(const at::Scalar& start, const at::Scalar& end, int64_t steps, double base, at::Tensor& out) {
   at::assert_no_internal_overlap(out);
   at::ScalarType dtype = out.scalar_type();
-  if (!is_vk(out) || at::isComplexType(dtype) || dtype == at::kBool) {
+  bool complex = at::isComplexType(dtype) && dtype_label(dtype) != nullptr;  // (complex32 stays the CPU's)
+  if (!is_vk(out) || (at::isComplexType(dtype) && !complex) || dtype == at::kBool) {
     on_cpu("aten::logspace", "out", start, end, steps, base, out);
     return out;
   }
-  // Exponents in float32 for the 16-bit types (pow has no 16-bit kernel).
-  at::ScalarType compute = at::isFloatingType(dtype) && at::elementSize(dtype) > 2 ? iota_dtype(dtype)
+  // Exponents in float32 for the 16-bit types (pow has no 16-bit kernel);
+  // complex ones from the complex linspace, base^z as the CPU's std::pow.
+  at::ScalarType compute = complex ? dtype
+                           : at::isFloatingType(dtype) && at::elementSize(dtype) > 2 ? iota_dtype(dtype)
                            : at::isFloatingType(dtype)                         ? at::kFloat
                                                                                : iota_dtype(at::kDouble);
   at::Tensor exponents = at::empty({0}, out.options().dtype(compute));

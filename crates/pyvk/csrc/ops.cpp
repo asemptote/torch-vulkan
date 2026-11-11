@@ -18,6 +18,7 @@
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
+#include <limits>
 #include <utility>
 
 namespace vk {
@@ -353,8 +354,13 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       // s - alpha * b  ==  (b * -alpha) + s
       at::ScalarType dtype = at::result_type(self, *other);
       const char* label = dtype_label(dtype);
+      if (at::isComplexType(dtype) && label != nullptr) {
+        // (complex: the scalar as a 0-dim vk tensor of the result's dtype)
+        at::Tensor s = self.to(other->device(), dtype);
+        return binary_gpu(op, s, other, nullptr, alpha, out);
+      }
       if (!kind_allows(op.kind, dtype) || label == nullptr) {
-        return false;  // (complex dtypes fail kind_allows and fall back)
+        return false;
       }
       at::Tensor b = to_dtype(*other, dtype);
       std::string kernel = std::string("binary_") + label;
@@ -870,7 +876,33 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
   } else if (!is_vk(*other)) {
     return false;
   }
-  at::ScalarType dtype = widened(scalar ? at::result_type(self, *scalar) : at::result_type(self, *other));
+  at::ScalarType rt = scalar ? at::result_type(self, *scalar) : at::result_type(self, *other);
+  if (rt == at::kUInt16 || rt == at::kUInt32 || rt == at::kUInt64) {
+    // (the CPU has eq and ne for these, and raises for the ordered ones)
+    static const char* const names[] = {"eq_cpu", "ne_cpu", "lt_cpu", "le_cpu", "gt_cpu", "ge_cpu"};
+    TORCH_CHECK_NOT_IMPLEMENTED(code == op::COMPARE_EQ || code == op::COMPARE_NE, "\"", names[code],
+                                "\" not implemented for '", c10::toString(rt), "'");
+    // (unsigned: compared in a signed dtype that keeps their order: uint16
+    // and uint32 widened, uint64's bits with the top one flipped; a scalar
+    // wraps to the dtype first, as the CPU's cast)
+    auto lift = [&](const at::Tensor& t) {
+      at::Tensor u = t.to(rt);
+      return rt == at::kUInt64 ? at::bitwise_xor(u.view(at::kLong), std::numeric_limits<int64_t>::min())
+                               : u.to(rt == at::kUInt16 ? at::kInt : at::kLong);
+    };
+    at::Tensor a = lift(self);
+    if (scalar) {
+      uint64_t bits = scalar->type() == at::kUInt64 ? scalar->toUInt64() : static_cast<uint64_t>(scalar->toLong());
+      int64_t v = rt == at::kUInt64 ? static_cast<int64_t>(bits ^ (uint64_t(1) << 63))
+                  : rt == at::kUInt32 ? static_cast<int64_t>(bits & 0xffffffffu)
+                                      : static_cast<int64_t>(bits & 0xffffu);
+      at::Scalar sv(v);
+      return compare_gpu(code, a, nullptr, &sv, out);
+    }
+    at::Tensor b = lift(*other);
+    return compare_gpu(code, a, &b, nullptr, out);
+  }
+  at::ScalarType dtype = widened(rt);
   const char* label = dtype_label(dtype);
   bool complex = at::isComplexType(dtype);
   bool complex_ok = complex && (code == op::COMPARE_EQ || code == op::COMPARE_NE);

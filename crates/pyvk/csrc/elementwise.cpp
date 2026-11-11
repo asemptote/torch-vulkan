@@ -331,6 +331,11 @@ bool predicate_gpu(uint32_t code, const at::Tensor& self, const at::Tensor& out)
 }
 
 at::Tensor isnan(const at::Tensor& self) {
+  at::ScalarType t = self.scalar_type();
+  if (is_vk(self) && (t == at::kFloat8_e4m3fn || t == at::kFloat8_e5m2 || t == at::kFloat8_e4m3fnuz ||
+                      t == at::kFloat8_e5m2fnuz)) {
+    return vk::isnan(self.to(at::kFloat));  // (float8: through float32, exact)
+  }
   // (empty, so the output takes self's dim order when resized)
   at::Tensor out = at::empty({0}, self.options().dtype(at::kBool));
   if (!predicate_gpu(op::COMPARE_ISNAN, self, out)) {

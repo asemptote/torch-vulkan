@@ -204,7 +204,7 @@ def test_linspace_logspace_complex(dtype):
     for steps in (0, 1, 2, 7):
         got = no_fallback(lambda: torch.linspace(1 - 2j, -3 + 4j, steps, dtype=dtype, device="vk"))
         torch.testing.assert_close(got.cpu(), torch.linspace(1 - 2j, -3 + 4j, steps, dtype=dtype))
-    got = torch.logspace(0.5 - 1j, 1 + 2j, 6, dtype=dtype, device="vk")
+    got = no_fallback(lambda: torch.logspace(0.5 - 1j, 1 + 2j, 6, dtype=dtype, device="vk"))
     torch.testing.assert_close(got.cpu(), torch.logspace(0.5 - 1j, 1 + 2j, 6, dtype=dtype))
 
 
@@ -455,3 +455,31 @@ def test_where_keeps_operand_layout():
     y = make((4,), torch.float32, seed=1)
     for f in (lambda a, b: torch.where(a > 0, a, b), lambda a, b: torch.where(a > 0, a, 0.0)):
         assert f(x.to("vk"), y.to("vk")).stride() == f(x, y).stride()
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+@pytest.mark.parametrize("op", [torch.eq, torch.ne, torch.lt, torch.le, torch.gt, torch.ge], ids=lambda f: f.__name__)
+def test_compare_unsigned(dtype, op):
+    big = {torch.uint16: 65535, torch.uint32: 2**32 - 1, torch.uint64: 2**63 + 5}[dtype]
+    a = torch.tensor([0, 1, 7, big, big, 3], dtype=dtype)
+    b = torch.tensor([0, 2, 7, big, 1, big], dtype=dtype)
+    if op not in (torch.eq, torch.ne):  # (the CPU raises for these; vk raises the same, itself)
+        with pytest.raises(NotImplementedError) as cpu:
+            op(a, b)
+        before = torch_vulkan.fallback_counts()
+        with pytest.raises(NotImplementedError) as vk:
+            op(a.to("vk"), b.to("vk"))
+        assert str(vk.value) == str(cpu.value) and torch_vulkan.fallback_counts() == before
+        return
+    torch.testing.assert_close(no_fallback(lambda: op(a.to("vk"), b.to("vk"))).cpu(), op(a, b))
+    for s in (0, 7, big):
+        torch.testing.assert_close(no_fallback(lambda: op(a.to("vk"), s)).cpu(), op(a, s))
+
+
+def test_scalar_minus_complex_and_float8_isnan():
+    c = torch.complex(make((4,), torch.float32), make((4,), torch.float32, seed=1))
+    torch.testing.assert_close(no_fallback(lambda: 1 - c.to("vk")).cpu(), 1 - c)
+    torch.testing.assert_close(no_fallback(lambda: torch.rsub(c.to("vk"), 2, alpha=3)).cpu(), torch.rsub(c, 2, alpha=3))
+    x = torch.tensor([1.0, float("nan"), float("inf"), 0.0])
+    for f8 in FLOAT8:
+        torch.testing.assert_close(no_fallback(lambda: torch.isnan(x.to(f8).to("vk"))).cpu(), torch.isnan(x.to(f8)))
