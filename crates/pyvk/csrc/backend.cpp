@@ -1078,12 +1078,60 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 
 }  // namespace
 
+// With TORCH_VK_FALLBACK_DETAIL set, fallbacks are counted per argument
+// signature ("op [f32 vk 2d, i64 cpu 0d, 3]"), to find the cases a kernel
+// declines (tools/pytorch_tests.py records them as usual).
+bool fallback_detail() {
+  static const bool detail = [] {
+    const char* v = std::getenv("TORCH_VK_FALLBACK_DETAIL");
+    return v != nullptr && *v != '\0' && std::string(v) != "0";
+  }();
+  return detail;
+}
+
+std::string describe_args(const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
+  size_t n = schema.arguments().size();
+  if (stack.size() < n) return "";
+  auto tensor = [](const at::Tensor& t) {
+    if (!t.defined()) return std::string("undef");
+    std::string s = c10::toString(t.scalar_type());
+    s += t.is_cpu() ? " cpu " : (t.is_nested() ? " nested " : " ");
+    s += std::to_string(t.dim()) + "d";
+    if (t.numel() == 0) s += " empty";
+    if (t.layout() != at::kStrided) s += " sparse";
+    return s;
+  };
+  std::string out = " [";
+  for (size_t i = 0; i < n; ++i) {
+    const c10::IValue& v = stack[stack.size() - n + i];
+    if (i) out += ", ";
+    if (v.isTensor()) {
+      out += tensor(v.toTensor());
+    } else if (v.isTensorList()) {
+      out += "list(";
+      auto l = v.toTensorList();
+      out += l.size() ? tensor(l.get(0)) : std::string("");
+      out += ")";
+    } else if (v.isNone()) {
+      out += "None";
+    } else if (v.isScalar()) {
+      out += v.isDouble() ? "float" : v.isComplexDouble() ? "complex" : v.isBool() ? "bool" : "int";
+    } else if (v.isString()) {
+      out += std::string(v.toStringRef());
+    } else {
+      out += v.tagKind();
+    }
+  }
+  return out + "]";
+}
+
 void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
   if (half_via_float(op, stack)) {
     return;
   }
   const auto& name = op.schema().operator_name();
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+  if (fallback_detail()) key += describe_args(op.schema(), *stack);
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   record_fallback(key);
   try {
