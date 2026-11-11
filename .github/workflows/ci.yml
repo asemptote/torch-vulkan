@@ -49,10 +49,32 @@ jobs:
             "*/x86_64/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"
           rm sdk.tar.xz
 
+      # The Mesa and Vulkan packages, kept so a run doesn't depend on Ubuntu's
+      # archive being reachable (the runners lost DNS for it for hours once).
+      # Keyed by the runner image, whose other packages they must match
+      # (ImageOS and ImageVersion are the runner's shell variables).
+      - name: Runner image
+        run: echo "RUNNER_IMAGE=$ImageOS-$ImageVersion" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        id: apt-debs
+        with:
+          path: ~/apt-debs
+          key: apt-debs-${{ env.RUNNER_IMAGE }}-v1
+
       - name: Vulkan (lavapipe, loader, validation layer)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+          if [ "${{ steps.apt-debs.outputs.cache-hit }}" = "true" ] && sudo dpkg -i ~/apt-debs/*.deb; then
+            echo "Mesa and Vulkan tools installed from the cache"
+          else
+            mkdir -p ~/apt-debs/partial
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get -o Acquire::Retries=3 -o Dir::Cache::archives="$HOME/apt-debs" \
+              -o APT::Keep-Downloaded-Packages=true install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+            sudo chown -R "$(id -u):$(id -g)" ~/apt-debs
+            rm -rf ~/apt-debs/partial ~/apt-debs/lock
+            ls ~/apt-debs
+          fi
           echo "VK_ADD_LAYER_PATH=$HOME/vvl/share/vulkan/explicit_layer.d" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$HOME/vvl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Use lavapipe even if the runner exposes another Vulkan driver. The
