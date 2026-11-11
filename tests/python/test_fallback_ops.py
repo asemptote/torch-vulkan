@@ -931,3 +931,25 @@ def test_fake_quantize_cachemask_ops():
     g = torch.ops.aten.fake_quantize_per_channel_affine_cachemask
     for a, b in zip(no_fallback(lambda: g(v(x), v(scs), v(zps), 0, 0, 255)), g(x, scs, zps, 0, 0, 255)):
         assert torch.equal(a.cpu().nan_to_num(), b.nan_to_num())
+
+
+@pytest.mark.parametrize("qdtype", [torch.quint8, torch.qint8, torch.qint32])
+def test_quantized_per_tensor(qdtype):
+    """Legacy quantized tensors on vk: quantize_per_tensor, the getters,
+    int_repr, dequantize, flip, clone and copies, bit for bit as the CPU's."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.cat([torch.randn(40, generator=g) * 20,
+                   torch.tensor([float("nan"), float("inf"), -float("inf"), 0.05, 0.15, -0.05, 1e30, 3e9])]).view(6, 8)
+    c = torch.quantize_per_tensor(x, 0.1, 5, qdtype)
+    v = no_fallback(lambda: torch.quantize_per_tensor(x.to("vk"), 0.1, 5, qdtype))
+    assert v.is_quantized and v.device.type == "vk" and v.dtype == qdtype
+    assert (v.q_scale(), v.q_zero_point(), v.qscheme()) == (c.q_scale(), c.q_zero_point(), c.qscheme())
+    assert torch.equal(no_fallback(lambda: v.int_repr()).cpu(), c.int_repr())
+    assert torch.equal(no_fallback(lambda: v.dequantize()).cpu(), c.dequantize())
+    assert torch.equal(no_fallback(lambda: v.flip((0, 1))).int_repr().cpu(), c.flip((0, 1)).int_repr())
+    assert torch.equal(no_fallback(lambda: v.clone()).int_repr().cpu(), c.int_repr())
+    assert torch.equal(v.cpu().int_repr(), c.int_repr())
+    back = c.to("vk")
+    assert back.is_quantized and torch.equal(back.int_repr().cpu(), c.int_repr())
+    e = no_fallback(lambda: torch._empty_affine_quantized([5, 5, 5, 5], scale=2, zero_point=3, dtype=qdtype, device="vk"))
+    assert e.flatten(0, -1).shape == (625,) and e.ravel().shape == (625,)

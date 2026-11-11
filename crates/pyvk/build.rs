@@ -104,6 +104,7 @@ fn main() {
             "csrc/sparse.cpp",
             "csrc/optim.cpp",
             "csrc/nested.cpp",
+            "csrc/quantized.cpp",
     ];
     let mut build = cc::Build::new();
     build
