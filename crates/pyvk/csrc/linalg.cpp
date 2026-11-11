@@ -433,6 +433,24 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
                       const at::Scalar& alpha, at::Tensor& out) {
   int64_t m = mat1.size(0), n = mat2.size(1);
   at::native::resize_output(out, {m, n});
+  if (is_vk(self) && is_vk(mat1) && is_vk(mat2) && is_vk(out) && mat1.dim() == 2 && mat2.dim() == 2 &&
+      (out.numel() == 0 || mat1.size(1) == 0) && self.scalar_type() == mat1.scalar_type() &&
+      mat1.scalar_type() == mat2.scalar_type() && out.scalar_type() == self.scalar_type()) {
+    // (nothing to multiply: beta self, or zeros for beta 0, as the CPU)
+    if (out.numel() == 0) return out;
+    at::Tensor s = self.expand({m, n});
+    if (beta.toComplexDouble() == 0.0) {
+      out.zero_();
+    } else if (out.scalar_type() == at::kBool) {
+      // (the CPU's beta * self: an integer or float beta gives a result bools cannot hold)
+      at::ScalarType rt = at::result_type(s, beta);
+      TORCH_CHECK(rt == at::kBool, "result type ", rt, " can't be cast to the desired output type Bool");
+      out.copy_(s);
+    } else {
+      out.copy_(at::mul(s, beta));
+    }
+    return out;
+  }
   bool done = false;
   if (is_vk(self)) {
     at::Tensor cin = self.expand({m, n}).unsqueeze(0);  // (more than 2 dims: expand's error, as the CPU's)

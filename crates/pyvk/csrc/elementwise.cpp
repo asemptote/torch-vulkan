@@ -143,7 +143,8 @@ at::Tensor& hardshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::
 
 at::Tensor& threshold_out(const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value,
                           at::Tensor& out) {
-  if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
+  if (at::isIntegralType(self.scalar_type(), /*includeBool=*/false) && is_vk(self) && is_vk(out)) {
+    // (integers, value converted with the CPU's overflow check: uint8 takes -9 as 247)
     resize_elementwise_output(out, self.sizes(), &self);
     out.copy_(at::where(at::gt(self, threshold), self, at::scalar_tensor(value, self.options())));
     return out;
@@ -221,6 +222,20 @@ bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& l
   check_out_cast(result, out);
   resize_elementwise_output(out, self.sizes(), &self);
   at::ScalarType dtype = out.scalar_type();
+  if ((dtype == at::kByte || dtype == at::kChar || dtype == at::kShort) && is_vk(self) && is_vk(out)) {
+    // (8/16-bit integers: the bounds converted to the dtype as the CPU's
+    // kernel converts them (uint8 takes -1 as 255), the clamp in int32)
+    auto cv = [&](const at::Scalar& s) -> int64_t {
+      return dtype == at::kByte ? s.to<uint8_t>() : dtype == at::kChar ? s.to<int8_t>() : s.to<int16_t>();
+    };
+    int64_t a = lo ? cv(*lo) : std::numeric_limits<int64_t>::min();
+    int64_t b = hi ? cv(*hi) : std::numeric_limits<int64_t>::max();
+    at::Tensor w = to_dtype(self, dtype).to(at::kInt);
+    at::Tensor r = at::empty_like(w);
+    launch_strided((std::string("unary_") + dtype_label(at::kInt)).c_str(), {op::UNARY_CLAMP}, r, &w, nullptr, {a, b});
+    out.copy_(r);
+    return true;
+  }
   if (!is_vk(self) || !is_vk(out) || !(is_float(dtype) || is_int(dtype))) {
     return false;
   }

@@ -24,6 +24,8 @@
 #include <c10/util/safe_numerics.h>
 
 #include <cstring>
+#include <iostream>
+#include <sstream>
 #include <map>
 #include <set>
 #include <mutex>
@@ -1133,6 +1135,33 @@ bool fallback_detail() {
   return detail;
 }
 
+// TORCH_VK_FALLBACK_TRACE=1 (a debugging aid): each fallback's arguments,
+// sizes, strides and (small tensors) values, printed to stderr.
+void trace_fallback(const std::string& key, const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
+  static const bool on = [] {
+    const char* v = std::getenv("TORCH_VK_FALLBACK_TRACE");
+    return v != nullptr && *v != '\0' && std::string(v) != "0";
+  }();
+  size_t n = schema.arguments().size();
+  if (!on || stack.size() < n) return;
+  std::ostringstream o;
+  o << "torch_vulkan fallback: " << key << "\n";
+  for (size_t i = 0; i < n; ++i) {
+    const c10::IValue& v = stack[stack.size() - n + i];
+    o << "  " << schema.arguments()[i].name() << ": ";
+    if (v.isTensor() && v.toTensor().defined()) {
+      const at::Tensor& t = v.toTensor();
+      o << t.scalar_type() << " " << t.device() << " sizes " << t.sizes();
+      if (t.layout() == at::kStrided) o << " strides " << t.strides() << " offset " << t.storage_offset();
+      if (t.layout() == at::kStrided && t.numel() <= 16 && t.numel() > 0) o << " values " << t.cpu().reshape({-1});
+    } else {
+      o << v;
+    }
+    o << "\n";
+  }
+  std::cerr << o.str() << std::flush;
+}
+
 std::string describe_args(const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
   size_t n = schema.arguments().size();
   if (stack.size() < n) return "";
@@ -1588,6 +1617,7 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   }
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
   raise_meta_error(op, *stack);
+  trace_fallback(key, op.schema(), *stack);
   TORCH_CHECK_NOT_IMPLEMENTED(op.hasComputedKernelForDispatchKey(c10::DispatchKey::CPU), "Could not run '",
                               op.schema().name(), "' with arguments from the 'vk' backend: it has no vk or CPU kernel.");
   record_fallback(key);

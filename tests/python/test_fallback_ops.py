@@ -799,3 +799,65 @@ def test_broadcast_matrix_folded():
         f = l_.mT if upper else l_
         got = no_fallback(lambda: torch.cholesky_solve(b.to("vk"), f.to("vk"), upper))
         torch.testing.assert_close(got.cpu(), torch.cholesky_solve(b, f, upper), rtol=1e-4, atol=1e-5)
+
+
+def test_threshold_small_ints_and_permuted_reductions():
+    for dt, value in ((torch.uint8, -9), (torch.int8, 7), (torch.int16, -300)):
+        x = torch.tensor([0, 1, 100], dtype=dt)
+        got = no_fallback(lambda: torch.nn.functional.threshold(x.to("vk"), 0.15, value))
+        assert torch.equal(got.cpu(), torch.nn.functional.threshold(x, 0.15, value))
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.nn.functional.threshold(torch.ones(3, dtype=torch.int8, device="vk"), 0.15, 300)
+    # (column-major and other permuted layouts reduce as contiguous ones)
+    x = torch.randn(6, 2, 3, 5, 4).permute(4, 3, 2, 1, 0)
+    for f in (lambda t: (t > 0).all(), lambda t: (t > 0).any(), lambda t: t.sum(), lambda t: t.amax(), lambda t: t.max()):
+        got = no_fallback(lambda: f(x.to("vk")))
+        torch.testing.assert_close(got.cpu(), f(x))
+    # (no compressed slices: the CPU checks nothing more)
+    no_fallback(lambda: torch._validate_compressed_sparse_indices(
+        True, torch.tensor([5], device="vk"), torch.empty(0, dtype=torch.long, device="vk"), 0, 0, 0))
+
+
+def test_d46_cases():
+    v = lambda t: t.to("vk")
+    # unique along a dim with NaNs: NaN slices stay in place, each unique
+    x = torch.tensor([float("nan"), 0, 0, float("nan"), float("nan"), 1])
+    u, inv, cnt = no_fallback(lambda: torch.unique(v(x), return_inverse=True, return_counts=True, dim=0))
+    torch.testing.assert_close(u.cpu(), torch.tensor([float("nan"), 0, float("nan"), float("nan"), 1]), equal_nan=True)
+    assert inv.cpu().tolist() == [0, 1, 1, 2, 3, 4] and cnt.cpu().tolist() == [1, 2, 1, 1, 1]
+    # clamp of uint8 with bounds the CPU converts (-1 is 255)
+    b = torch.tensor([0, 7, 255], dtype=torch.uint8)
+    for lo, hi in ((-1, 0), (3, 200), (None, 5)):
+        got = no_fallback(lambda: torch.clamp(v(b), lo, hi))
+        assert torch.equal(got.cpu(), torch.clamp(b, lo, hi))
+    # addmm with nothing to multiply
+    s, m1, m2 = torch.ones(5, 4, dtype=torch.bool), torch.empty(5, 0, dtype=torch.bool), torch.empty(0, 4, dtype=torch.bool)
+    for beta in (0, True, False):
+        got = no_fallback(lambda: torch.addmm(v(s), v(m1), v(m2), beta=beta))
+        assert torch.equal(got.cpu(), torch.addmm(s, m1, m2, beta=beta))
+    with pytest.raises(RuntimeError, match="result type Long can't be cast to the desired output type Bool"):
+        torch.addmm(v(s), v(m1), v(m2), beta=2)
+    f = torch.randn(5, 4)
+    got = no_fallback(lambda: torch.addmm(v(f), v(m1.float()), v(m2.float()), beta=0.5))
+    torch.testing.assert_close(got.cpu(), torch.addmm(f, m1.float(), m2.float(), beta=0.5))
+    # searchsorted of complex tensors with nothing to search
+    c = torch.tensor([1 + 1j, 2 + 0j])
+    got = no_fallback(lambda: torch.searchsorted(v(c), torch.empty(0, dtype=torch.cfloat, device="vk")))
+    assert got.shape == (0,)
+    with pytest.raises(NotImplementedError, match="ComplexFloat"):
+        torch.searchsorted(v(c), v(c))
+    # 0-d complex scatter_reduce prod
+    a, src = torch.tensor(2 + 1j), torch.tensor(3 - 1j)
+    got = no_fallback(lambda: v(a).scatter_reduce(0, v(torch.tensor(0)), v(src), "prod"))
+    torch.testing.assert_close(got.cpu(), a.scatter_reduce(0, torch.tensor(0), src, "prod"))
+
+
+def test_transformer_encoder_layer_fast_path():
+    torch.manual_seed(0)
+    layer = torch.nn.TransformerEncoderLayer(8, 2, dim_feedforward=16, batch_first=True, dropout=0.0).eval()
+    x = torch.randn(2, 3, 8)
+    with torch.no_grad():
+        want = layer(x)
+        layer_vk = layer.to("vk")
+        got = no_fallback(lambda: layer_vk(x.to("vk")))
+    torch.testing.assert_close(got.cpu(), want, rtol=1e-4, atol=1e-5)

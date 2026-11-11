@@ -844,6 +844,16 @@ bool copy_self_if_no_index(const at::Tensor& self, const at::Tensor& index, at::
 // gather-multiply-scatter pass per rank, whose targets are all distinct.
 bool complex_scatter_prod(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                           bool include_self, at::Tensor& out) {
+  if (self.dim() == 0 && index.dim() == 0 && src.dim() == 0 && at::isComplexType(self.scalar_type()) &&
+      is_vk(self) && is_vk(out)) {
+    // (0-d: as 1-element tensors)
+    at::maybe_wrap_dim(dim, 1);
+    at::Tensor r = at::empty({1}, self.options());
+    if (!complex_scatter_prod(self.reshape({1}), 0, index.reshape({1}), src.reshape({1}), include_self, r)) return false;
+    at::native::resize_output(out, {});
+    out.copy_(r.reshape({}));
+    return true;
+  }
   if (!at::isComplexType(self.scalar_type()) || self.dim() == 0 || !is_vk(self) || !is_vk(index) || !is_vk(src) ||
       !is_vk(out) || out.scalar_type() != self.scalar_type() || index.scalar_type() != at::kLong ||
       index.dim() != self.dim() || (src.dim() != 0 && src.dim() != self.dim())) {

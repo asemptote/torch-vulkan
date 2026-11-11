@@ -837,6 +837,7 @@ void validate_compressed_indices(bool is_crow, const at::Tensor& cidx, const at:
     cpu();
     return;
   }
+  if (cdim == 0) return;  // (no compressed slices: the CPU checks nothing more)
   at::Tensor c = cidx.reshape({-1, cdim + 1}).to(at::kLong);
   int64_t batches = c.size(0);
   std::vector<at::Tensor> checks;

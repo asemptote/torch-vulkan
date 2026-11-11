@@ -562,10 +562,11 @@ bool right_side(bool right, std::optional<c10::string_view> side) {
 at::Tensor& searchsorted_out(const at::Tensor& sorted, const at::Tensor& self, bool out_int32, bool right,
                              std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter,
                              at::Tensor& out) {
-  if (sorted.scalar_type() == at::kBool && self.scalar_type() == at::kBool && is_vk(sorted) && is_vk(self) &&
+  at::ScalarType st = sorted.scalar_type();
+  if ((st == at::kBool || at::isComplexType(st)) && self.scalar_type() == st && is_vk(sorted) && is_vk(self) &&
       is_vk(out)) {
-    // (the CPU has no bool kernel, but searches no values without one)
-    TORCH_CHECK_NOT_IMPLEMENTED(self.numel() == 0, "\"searchsorted_out_cpu\" not implemented for 'Bool'");
+    // (the CPU has no bool or complex kernel, but searches no values without one)
+    TORCH_CHECK_NOT_IMPLEMENTED(self.numel() == 0, "\"searchsorted_out_cpu\" not implemented for '", st, "'");
     at::Tensor r = at::empty(self.sizes(), self.options().dtype(out_int32 ? at::kInt : at::kLong));
     TORCH_CHECK(out.scalar_type() == r.scalar_type(), "torch.searchsorted(): output tensor's dtype is wrong, it can only "
                 "be Int(int32) or Long(int64) depending on whether out_int32 flag is True, but we got output tensor's "
@@ -727,10 +728,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_dim(const at::Tensor& self
   std::tuple<at::Tensor, at::Tensor, at::Tensor> out;
   if (unique_dim_empty(self, dim, out)) return out;
   if (at::isFloatingType(self.scalar_type()) && at::isnan(self).any().item<bool>()) {
-    // (with NaNs the CPU's comparison sort is not an order: its result is
-    // whatever std::sort leaves, which only the CPU reproduces)
-    auto stack = on_cpu("aten::unique_dim", "", self, dim, sorted, return_inverse, return_counts);
-    return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
+    // With NaNs the comparison sort has no order: slices with a NaN stay where
+    // they are, each unique (NaN != NaN), and the slices between them sort
+    // among themselves, as PyTorch's tests expect ([nan, 0, 0, nan, nan, 1]
+    // gives [nan, 0, nan, nan, 1]). Each slice gets a leading key: 2k for the
+    // k-th NaN slice, 2k + 1 for the slices after it, so one sort keeps that.
+    int64_t n = self.size(dim);
+    at::ScalarType ft = self.scalar_type() == at::kDouble ? at::kDouble : at::kFloat;  // (holds the keys exactly)
+    if (ft == at::kFloat && 2 * n + 1 >= (int64_t(1) << 24)) {
+      auto stack = on_cpu("aten::unique_dim", "", self, dim, sorted, return_inverse, return_counts);
+      return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};
+    }
+    at::Tensor moved = self.movedim(dim, 0);
+    at::Tensor x = moved.reshape({n, -1}).to(ft);
+    at::Tensor nanrow = at::isnan(x).any(1);
+    at::Tensor c = at::cumsum(nanrow.to(at::kLong), 0) * 2;
+    at::Tensor key = at::where(nanrow, c, c + 1).to(ft);
+    // (a NaN slice is alone with its key: its NaNs, compared with nothing, are
+    // zeros for the sort; the values come from the slices themselves)
+    at::Tensor aug = at::cat({key.unsqueeze(1), at::nan_to_num(x, 0.0, 0.0, 0.0)}, 1);
+    auto [u, inverse, counts] = vk::unique_dim(aug, 0, sorted, true, return_counts);
+    int64_t groups = u.size(0);
+    at::Tensor first = at::full({groups}, n, inverse.options())
+                           .scatter_reduce_(0, inverse, at::arange(n, inverse.options()), "amin");
+    std::vector<int64_t> shape(moved.sizes().begin(), moved.sizes().end());
+    shape[0] = groups;
+    at::Tensor values = moved.reshape({n, -1}).index_select(0, first).reshape(shape).movedim(0, dim);
+    if (!return_inverse) inverse = at::empty({0}, inverse.options());
+    return {values, inverse, counts};
   }
   int64_t n = self.size(dim);
   at::TensorOptions lopts = self.options().dtype(at::kLong);

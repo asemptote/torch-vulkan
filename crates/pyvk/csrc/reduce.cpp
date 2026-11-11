@@ -8,6 +8,7 @@
 // bool inputs accumulate in int64, as PyTorch's sums do.
 
 #include "vk.h"
+#include <algorithm>
 
 #include "opcodes.h"
 #include "strided.h"
@@ -159,7 +160,19 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
   if (span >= (int64_t(1) << 31) || plan.n_out * std::max<int64_t>(plan.n_red, 1) >= (int64_t(1) << 32)) {
     return false;
   }
-  return coalesce(kept_size, kept_stride, plan.outer) && coalesce(red_size, red_stride, plan.red);
+  // The reduced dims in memory order (outermost first), as TensorIterator
+  // orders them: a permuted tensor's (movedim, .mT) then coalesce as a
+  // contiguous one's.
+  std::vector<size_t> order(red_size.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t x, size_t y) { return std::abs(red_stride[x]) > std::abs(red_stride[y]); });
+  std::vector<int64_t> rs, rt;
+  for (size_t i : order) {
+    rs.push_back(red_size[i]);
+    rt.push_back(red_stride[i]);
+  }
+  return coalesce(kept_size, kept_stride, plan.outer) && coalesce(rs, rt, plan.red);
 }
 
 // Workgroup chunks per output: enough work items to fill the GPU, each
@@ -545,6 +558,31 @@ bool arg_reducible(const at::Tensor& self) {
   return reducible(self, /*allow_bool=*/false);
 }
 
+// The max (Op 0) or min of a 1-D tensor too long for one reduction (2^31
+// elements or more): rows of 65,536 reduced first, then their results; the
+// first index of the extreme value, as the CPU's.
+std::optional<std::pair<at::Tensor, at::Tensor>> long_arg_extreme(const at::Tensor& self, uint32_t op) {
+  constexpr int64_t kRow = 65536;
+  if (self.dim() != 1 || self.numel() < (int64_t(1) << 31) || self.numel() % kRow != 0 || !is_vk(self)) {
+    return std::nullopt;
+  }
+  at::Tensor rows = self.reshape({self.numel() / kRow, kRow});
+  // (the rows 2^26 elements at a time: each a reduction of its own, its
+  // small-int input widened to int32 within one buffer)
+  std::vector<at::Tensor> vs, is;
+  constexpr int64_t kRows = (int64_t(1) << 26) / kRow;
+  for (int64_t s = 0; s < rows.size(0); s += kRows) {
+    at::Tensor part = rows.narrow(0, s, std::min(kRows, rows.size(0) - s));
+    auto [pv, pi] = op == 0 ? at::max(part, 1) : at::min(part, 1);
+    vs.push_back(pv);
+    is.push_back(pi);
+  }
+  at::Tensor v = at::cat(vs), i = at::cat(is);
+  auto [vv, j] = op == 0 ? at::max(v, 0) : at::min(v, 0);
+  at::Tensor index = j * kRow + i.index_select(0, j.reshape({1})).reshape({});
+  return std::make_pair(vv, index);
+}
+
 template <uint32_t Op>  // 0 max, 1 min
 std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int64_t dim, bool keepdim,
                                                      at::Tensor& values, at::Tensor& indices) {
@@ -570,6 +608,15 @@ std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int
     values.copy_(wide);
     return {values, indices};
   }
+  if (auto r = long_arg_extreme(self, Op); r.has_value() && is_vk(values) && is_vk(indices)) {
+    at::maybe_wrap_dim(dim, 1);
+    std::vector<int64_t> shape = keepdim ? std::vector<int64_t>{1} : std::vector<int64_t>{};
+    at::native::resize_output(values, shape);
+    at::native::resize_output(indices, shape);
+    values.copy_(r->first.view(shape));
+    indices.copy_(r->second.view(shape));
+    return {values, indices};
+  }
   at::Tensor src = widen_half(self);
   if (!arg_reducible(src) || !is_vk(values) || !is_vk(indices) || self.dim() == 0 ||
       !plan_reduce(src, dims, keepdim, plan)) {
@@ -590,6 +637,12 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
   std::vector<int64_t> dims;
   if (dim.has_value()) {
     dims.push_back(*dim);
+  }
+  if (auto r = long_arg_extreme(self, Op); r.has_value() && is_vk(out)) {
+    std::vector<int64_t> shape = keepdim ? std::vector<int64_t>{1} : std::vector<int64_t>{};
+    at::native::resize_output(out, shape);
+    out.copy_(r->second.view(shape));
+    return out;
   }
   at::Tensor src = widen_half(self);
   bool ok = arg_reducible(src) && is_vk(out) &&

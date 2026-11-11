@@ -1520,6 +1520,33 @@ def _compute_linear_combination_out(x, coefficients, *, out):
     return out.add_(r)
 
 
+def _transformer_encoder_layer_fwd(src, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight, proj_bias,
+                                   use_gelu, norm_first, eps, norm_weight_1, norm_bias_1, norm_weight_2,
+                                   norm_bias_2, ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2, mask=None,
+                                   mask_type=None):
+    """TransformerEncoderLayer's fused inference path, as the CPU's: self-attention
+    (_native_multi_head_attention) and the feed-forward block, each with its
+    residual and layer norm (before them with norm_first)."""
+    F = torch.nn.functional
+
+    def attention(h):
+        return torch._native_multi_head_attention(h, h, h, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight,
+                                                  proj_bias, mask, need_weights=False, mask_type=mask_type)[0]
+
+    def feed_forward(h):
+        h = F.linear(h, ffn_weight_1, ffn_bias_1)
+        return F.linear(F.gelu(h) if use_gelu else F.relu(h), ffn_weight_2, ffn_bias_2)
+
+    norm1 = lambda h: F.layer_norm(h, (embed_dim,), norm_weight_1, norm_bias_1, eps)
+    norm2 = lambda h: F.layer_norm(h, (embed_dim,), norm_weight_2, norm_bias_2, eps)
+    x = src
+    if norm_first:
+        x = x + attention(norm1(x))
+        return x + feed_forward(norm2(x))
+    x = norm1(x + attention(x))
+    return norm2(x + feed_forward(x))
+
+
 def _masked_softmax(x, mask, dim=None, mask_type=None):
     """The CPU's masked softmax: masked positions excluded (0), a row with
     every position masked all NaN; mask_type 0 is an (L, L) attention mask and
@@ -1885,6 +1912,7 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "_transformer_encoder_layer_fwd": _transformer_encoder_layer_fwd,
         "_compute_linear_combination": _compute_linear_combination,
         "_compute_linear_combination.out": _compute_linear_combination_out,
         "glu_jvp": _glu_jvp,
