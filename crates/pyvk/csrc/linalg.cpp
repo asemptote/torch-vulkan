@@ -225,8 +225,8 @@ bool coop_gemm_f16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
                    double alpha, double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2);
   if (!use_coopmat_f16() || a.scalar_type() != at::kHalf || b.scalar_type() != at::kHalf ||
-      (cin != nullptr && cin->scalar_type() != at::kHalf) || m == 1 || n == 1) {
-    return false;
+      (cin != nullptr && cin->scalar_type() != at::kHalf) || m == 1 || n == 1 || a.size(2) == 0) {
+    return false;  // (k = 0 too: gemmcm.slang's pipelined k loop needs one tile; it hung on NVIDIA)
   }
   for (const at::Tensor* t : {&a, &b, &c, cin}) {
     if (t != nullptr && (!is_vk(*t) || max_offset(*t) < 0 || max_offset(*t) >= (int64_t(1) << 31))) {
@@ -524,6 +524,22 @@ at::Tensor& baddbmm_out(const at::Tensor& self, const at::Tensor& batch1, const 
                         const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
   std::vector<int64_t> shape = {batch1.size(0), batch1.size(1), batch2.size(2)};
   at::native::resize_output(out, shape);
+  if (is_vk(self) && is_vk(batch1) && is_vk(batch2) && is_vk(out) && batch1.dim() == 3 && batch2.dim() == 3 &&
+      self.dim() <= 3 && (out.numel() == 0 || batch1.size(2) == 0) && self.scalar_type() == out.scalar_type()) {
+    // (nothing to multiply: beta self, or zeros for beta 0, as the CPU)
+    if (out.numel() == 0) return out;
+    at::Tensor s = self.expand(shape);
+    if (beta.toComplexDouble() == 0.0) {
+      out.zero_();
+    } else if (out.scalar_type() == at::kBool) {
+      at::ScalarType rt = at::result_type(s, beta);
+      TORCH_CHECK(rt == at::kBool, "result type ", rt, " can't be cast to the desired output type Bool");
+      out.copy_(s);
+    } else {
+      out.copy_(at::mul(s, beta));
+    }
+    return out;
+  }
   bool done = false;
   if (self.dim() <= 3 && is_vk(self)) {
     at::Tensor cin = self.expand(shape);
