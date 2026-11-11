@@ -242,3 +242,29 @@ def test_complex_nan_to_num():
             with on_gpu():
                 got = torch.nan_to_num(t.to("vk"), **kw)
             assert torch.equal(got.cpu().resolve_conj(), torch.nan_to_num(t, **kw).resolve_conj())
+
+
+def test_float32_division_correctly_rounded():
+    # _fmath.slang's m_div32: x / y and 1 / x equal to the CPU's bit for bit
+    # (Vulkan allows 2.5 ulp; the FMA correction it replaced needed a driver
+    # that fuses FMAs), over random bit patterns (subnormals included), huge
+    # and tiny quotients, and zeros, infinities and NaNs
+    g = torch.Generator().manual_seed(5)
+    n = 1 << 18
+
+    def bits(count):
+        u = torch.randint(0, 0x7F800000, (count,), generator=g, dtype=torch.int64)
+        u |= torch.randint(0, 2, (count,), generator=g, dtype=torch.int64) << 31
+        return torch.from_numpy(u.numpy().astype("uint32").view("float32"))
+
+    special = torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.0, -3.0, 2.0**-126, 2.0**-149,
+                            1.1754942e-38, 3.4028235e38, 7.0, 0.1])
+    xs = [bits(n), torch.randn(n, generator=g) * 1e30, torch.randn(n, generator=g) * 1e-30,
+          special.repeat_interleave(len(special))]
+    ys = [bits(n), torch.randn(n, generator=g) * 1e-8, torch.randn(n, generator=g) * 1e10, special.repeat(len(special))]
+    for x, y in zip(xs, ys):
+        with on_gpu():
+            got = [(x.to("vk") / y.to("vk")).cpu(), torch.reciprocal(x.to("vk")).cpu()]
+        for g_, w in zip(got, [x / y, torch.reciprocal(x)]):
+            same = (g_.view(torch.int32) == w.view(torch.int32)) | (g_.isnan() & w.isnan())
+            assert same.all(), (g_[~same][:4], w[~same][:4])
