@@ -1145,8 +1145,9 @@ std::string describe_args(const c10::FunctionSchema& schema, const torch::jit::S
   return out + "]";
 }
 
-// The key of cpu_dtype_errors.inc: the op and its arguments' dtypes (tensors),
-// "list" (tensor lists) and kinds (scalars), as tools/dev/cpu_dtype_errors.py.
+// The key of cpu_dtype_errors.inc: the op and its arguments' dtypes (tensors,
+// "empty" marked), "list" (tensor lists) and kinds (scalars), as
+// tools/dev/cpu_dtype_errors.py.
 std::string dtype_signature(const std::string& op, const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
   size_t n = schema.arguments().size();
   std::string out = op + " [";
@@ -1154,7 +1155,8 @@ std::string dtype_signature(const std::string& op, const c10::FunctionSchema& sc
     const c10::IValue& v = stack[stack.size() - n + i];
     if (i) out += ", ";
     if (v.isTensor()) {
-      out += v.toTensor().defined() ? c10::toString(v.toTensor().scalar_type()) : "undef";
+      const at::Tensor& t = v.toTensor();
+      out += t.defined() ? std::string(c10::toString(t.scalar_type())) + (t.numel() == 0 ? " empty" : "") : "undef";
     } else if (v.isTensorList()) {
       out += "list";
     } else if (v.isNone()) {
@@ -1383,6 +1385,55 @@ bool rescue_empty(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   return true;
 }
 
+// PyTorch's own argument checks (shapes, out= dtypes, dims...), by running the
+// op on meta tensors: an error there is raised as is, the CPU not asked. Errors
+// that only say the meta kernel is missing or cannot run are ignored (the CPU
+// then decides).
+void raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& stack) {
+  const auto& schema = op.schema();
+  size_t n = schema.arguments().size();
+  if (stack.size() < n) return;
+  torch::jit::Stack meta(stack.end() - static_cast<std::ptrdiff_t>(n), stack.end());
+  auto to_meta = [](const at::Tensor& t) {
+    if (!t.defined() || (t.is_cpu() && t.dim() == 0)) return t;  // (CPU scalars stay: meta takes them)
+    if (t.layout() != at::kStrided || t.is_nested() || t.is_quantized()) throw std::invalid_argument("layout");
+    at::Tensor m = at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta));
+    if (t.is_conj()) m = m.conj();
+    if (t.is_neg()) m._set_neg(true);
+    return m;
+  };
+  try {
+    for (c10::IValue& v : meta) {
+      if (v.isTensor()) {
+        v = to_meta(v.toTensor());
+      } else if (v.isTensorList()) {
+        c10::List<at::Tensor> l;
+        for (const at::Tensor& t : v.toTensorList()) l.push_back(to_meta(t));
+        v = l;
+      } else if (v.isList()) {
+        const auto& elems = v.toListRef();
+        for (const c10::IValue& e : elems) {
+          if (e.isTensor()) return;  // (lists of optional tensors: left to the CPU)
+        }
+      }
+    }
+  } catch (const std::invalid_argument&) {
+    return;
+  }
+  try {
+    op.callBoxed(&meta);
+  } catch (const c10::Error& e) {
+    std::string msg = e.what_without_backtrace();
+    for (const char* skip : {"Meta", "meta", "Could not run", "data-dependent", "data dependent", "fake", "symbolic",
+                             "SymInt", "not implemented for", "not supported"}) {
+      if (msg.find(skip) != std::string::npos) return;
+    }
+    throw;
+  } catch (const std::exception&) {
+    return;
+  }
+}
+
 void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
   if (half_via_float(op, stack)) {
     return;
@@ -1392,19 +1443,10 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   }
   const auto& name = op.schema().operator_name();
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
-  {
-    // (the table's errors are the CPU's for non-empty inputs: its kernels
-    // return before dispatching on the dtype when there is nothing to do)
-    size_t n = op.schema().arguments().size(), base = stack->size() - std::min(n, stack->size());
-    bool any_elements = false;
-    for (size_t i = base; i < stack->size(); ++i) {
-      const c10::IValue& v = (*stack)[i];
-      if (v.isTensor() && v.toTensor().defined() && v.toTensor().numel() > 0) any_elements = true;
-    }
-    if (any_elements) raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));
-  }
+  raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));  // (keyed with emptiness too)
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
+  raise_meta_error(op, *stack);
   record_fallback(key);
   try {
     at::native::cpu_fallback(op, stack, error_on_views);

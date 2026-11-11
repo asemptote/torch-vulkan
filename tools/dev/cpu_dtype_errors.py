@@ -33,7 +33,25 @@ C10_NAMES = {
     "Float8_e4m3fnuz": torch.float8_e4m3fnuz, "Float8_e5m2fnuz": torch.float8_e5m2fnuz,
 }
 SIGNATURE = re.compile(r"^(aten::[\w.]+) \[(.*)\] \(raised\)$")
-DTYPE_ERROR = re.compile(r"not implemented for '\w+'")
+# CPU errors that depend on the argument dtypes (and emptiness) alone
+DTYPE_ERROR = re.compile("|".join([
+    r"not implemented for '\w+'",
+    r"value cannot be converted to type \w+ without overflow",
+    r"only support floating point and complex dtypes",
+    r"dtype must be a floating point but you specified",
+    r"is not supported for complex",
+    r"inputs not supported for",
+    r"Negation, the `-` operator, on a bool tensor",
+    r"softmax with half to float conversion is not supported on CPU",
+    r"Integer division with addcdiv is no longer supported",
+    r"input dtype should be either floating point or complex",
+    r"result type \w+ can't be cast to the desired output type",
+    r"Expected out tensor to have dtype",
+    r"expected to have the same dtype",
+    r"must have the same scalar type",
+    r"expected scalar type \w+ but found",
+    r"Found dtype \w+ but expected",
+]))
 
 
 def make_arg(text):
@@ -59,8 +77,8 @@ def dtype_signature(name, described):
     parts = []
     for text in described:
         text = text.strip()
-        m = re.match(r"^(\w+)( cpu| nested)? \d+d", text)
-        parts.append(m.group(1) if m else "list" if text.startswith("list(") else text)
+        m = re.match(r"^(\w+)( cpu| nested)? \d+d( empty)?", text)
+        parts.append(m.group(1) + (" empty" if m.group(3) else "") if m else "list" if text.startswith("list(") else text)
     return f"{name} [{', '.join(parts)}]"
 
 
