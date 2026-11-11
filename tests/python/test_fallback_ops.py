@@ -740,9 +740,9 @@ def test_d45_regressions():
     out = torch.empty(0, dtype=torch.long, device="vk")
     no_fallback(lambda: torch.nonzero_static(v(x), size=4, fill_value=-7, out=out))
     assert torch.equal(out.cpu(), torch.nonzero_static(x, size=4, fill_value=-7))
-    # histc of integers, as CUDA's; its range errors
-    got = no_fallback(lambda: torch.histc(torch.tensor([1, 2, 1], dtype=torch.int8, device="vk"), bins=4, min=5, max=5))
-    assert got.dtype == torch.int8 and got.tolist() == [2, 0, 0, 1]
+    # histc of integers: the CPU's errors (range first, then its dtype error)
+    with pytest.raises(NotImplementedError, match="not implemented for 'Char'"):
+        torch.histc(torch.tensor([1, 2, 1], dtype=torch.int8, device="vk"), bins=4, min=5, max=5)
     with pytest.raises(RuntimeError, match="max must be larger than min"):
         torch.histc(torch.ones(3, dtype=torch.int32, device="vk"), bins=4, min=1, max=0)
     # _compute_linear_combination's out= adds to out, as the CPU's
@@ -783,3 +783,19 @@ def test_add_bool_integer_alpha(alpha):
     a, b = torch.tensor([[True, False], [False, False]]), torch.tensor([[True, True], [False, True]])
     got = no_fallback(lambda: torch.add(a.to("vk"), b.to("vk"), alpha=alpha))
     assert torch.equal(got.cpu(), torch.add(a, b, alpha=alpha))
+
+
+def test_broadcast_matrix_folded():
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(4, 4, generator=g)
+    a = a @ a.T + 4 * torch.eye(4)
+    b = torch.randn(3, 70, 4, 2, generator=g)
+    got = no_fallback(lambda: torch.matmul(a.to("vk"), b.to("vk")))
+    torch.testing.assert_close(got.cpu(), torch.matmul(a, b), rtol=1e-4, atol=1e-5)
+    got = no_fallback(lambda: torch.matmul(b.mT.to("vk"), a.to("vk")))
+    torch.testing.assert_close(got.cpu(), torch.matmul(b.mT, a), rtol=1e-4, atol=1e-5)
+    l_ = torch.linalg.cholesky(a)
+    for upper in (False, True):
+        f = l_.mT if upper else l_
+        got = no_fallback(lambda: torch.cholesky_solve(b.to("vk"), f.to("vk"), upper))
+        torch.testing.assert_close(got.cpu(), torch.cholesky_solve(b, f, upper), rtol=1e-4, atol=1e-5)

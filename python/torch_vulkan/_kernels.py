@@ -1211,8 +1211,10 @@ def _float_bits_as_double(x):
 
 
 def _hash_tensor_out(self, dim=(), *, keepdim=False, mode=0, out):
+    from torch._prims_common.wrappers import _maybe_resize_out
+
     r = _hash_tensor(self, dim, keepdim=keepdim, mode=mode)
-    out.resize_(r.shape)
+    _maybe_resize_out(out, r.shape)  # (warns on resizing a non-empty out, as PyTorch's)
     return out.copy_(r)
 
 

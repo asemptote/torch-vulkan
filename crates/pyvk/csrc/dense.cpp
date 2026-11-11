@@ -986,7 +986,30 @@ std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, boo
 }
 
 // cholesky_solve: A X = B with A = L L^H (or U^H U), self = B.
+// True if every batch dim of t has stride 0 (one matrix, broadcast).
+bool one_matrix_broadcast(const at::Tensor& t) {
+  if (t.dim() <= 2) return false;
+  for (int64_t d = 0; d + 2 < t.dim(); ++d) {
+    if (t.stride(d) != 0 && t.size(d) != 1) return false;
+  }
+  return true;
+}
+
 at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bool upper) {
+  if (one_matrix_broadcast(a) && is_vk(self) && self.dim() == a.dim() && float_dtype(a.scalar_type()) &&
+      is_vk(a) && !linalg_on_cpu()) {
+    // (one factor for every batch, as cholesky_solve's broadcasting gives: one
+    // solve of the batches side by side, [n, batch * k])
+    int64_t n = a.size(-1), k = self.size(-1);
+    at::Tensor a0 = a.reshape({-1, n, n}).select(0, 0);
+    at::Tensor b3 = self.reshape({-1, n, k});
+    int64_t B = b3.size(0);
+    at::Tensor side = b3.permute({1, 0, 2}).reshape({n, B * k});
+    at::Tensor l = upper ? adj(a0) : a0;
+    at::Tensor y = solve_triangular_vk(l, side, /*upper=*/false, true, false);
+    at::Tensor x = solve_triangular_vk(adj(l), y, /*upper=*/true, true, false);
+    return x.reshape({n, B, k}).permute({1, 0, 2}).reshape(self.sizes());
+  }
   if (gpu_matrices_chunked(a) && is_vk(self) && self.dim() == a.dim() &&
       self.sizes().slice(0, a.dim() - 2).equals(a.sizes().slice(0, a.dim() - 2))) {
     // (its inputs come broadcast to one batch shape: in chunks of kMaxBatch)

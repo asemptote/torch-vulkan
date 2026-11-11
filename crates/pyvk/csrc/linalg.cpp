@@ -397,6 +397,21 @@ at::Tensor& bmm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& 
     if (out.numel() != 0) out.zero_();  // (k = 0: sums of nothing)
     return out;
   }
+  if (is_vk(self) && is_vk(mat2) && is_vk(out) && self.dim() == 3 && mat2.dim() == 3 && self.size(0) > 1 &&
+      (self.stride(0) == 0 || mat2.stride(0) == 0) && self.scalar_type() == mat2.scalar_type() &&
+      out.scalar_type() == self.scalar_type() && out.numel() > 0) {
+    // (one matrix for every batch, as matmul's broadcasting gives: one product
+    // of the batches side by side, not many tiny ones)
+    int64_t B = self.size(0), m = self.size(1), k = self.size(2), n = mat2.size(2);
+    at::Tensor r;
+    if (self.stride(0) == 0) {
+      r = at::mm(self.select(0, 0), mat2.permute({1, 0, 2}).reshape({k, B * n})).view({m, B, n}).permute({1, 0, 2});
+    } else {
+      r = at::mm(self.reshape({B * m, k}), mat2.select(0, 0)).view({B, m, n});
+    }
+    out.copy_(r);
+    return out;
+  }
   constexpr int64_t kMaxBatch = 65535;  // (workgroups per dispatch dimension)
   if (is_vk(self) && is_vk(mat2) && is_vk(out) && self.dim() == 3 && mat2.dim() == 3 && self.size(0) > kMaxBatch &&
       out.is_contiguous()) {

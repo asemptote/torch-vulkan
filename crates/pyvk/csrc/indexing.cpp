@@ -1002,18 +1002,9 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
   TORCH_CHECK(self.dtype() == out.dtype(), "torch.histc: input tensor and hist tensor should have the same dtype, "
               "but got input ", self.dtype(), " and hist ", out.dtype());  // (as the CPU)
   at::ScalarType t = self.scalar_type();
-  if (is_vk(self) && is_vk(out) && at::isIntegralType(t, /*includeBool=*/false)) {
-    // (integers, as CUDA bins them (the CPU has no kernel): their values in a
-    // floating type that holds them, the counts back in the input's dtype)
-    at::ScalarType ft = has_feature(kFeatureFloat64) ? at::kDouble : at::kFloat;
-    at::Tensor hist = at::empty({0}, self.options().dtype(ft));
-    histc_out(self.to(ft), bins, min, max, hist);
-    at::native::resize_output(out, hist.sizes());
-    out.copy_(hist);
-    return out;
-  }
   if (is_vk(self) && !at::isFloatingType(t)) {
-    // (bools and complex numbers: the CPU's range checks, then its dtype error)
+    // (the CPU's range checks, then its dtype error: it bins floating types only;
+    // vk follows it, though CUDA bins integers too)
     double lo = min.toDouble(), hi = max.toDouble();
     TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc: range of [", lo, ", ", hi, "] is not finite");
     TORCH_CHECK(lo <= hi, "torch.histc: max must be larger than min");
