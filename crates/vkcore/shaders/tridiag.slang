@@ -17,9 +17,18 @@
 //             LAPACK's dsytd2 / zhetd2): zlarfg's reflector H = I - tau v v^H
 //             annihilating A[k+2:n, k], v (with v_0 = 1) stored in A[k+1:n, k];
 //             tau into tau[k], the real beta into e[k]. One workgroup per matrix.
-//   UPDATE_W  after w = A22 v (A22 = A[k+1:n, k+1:n]): x = tau w, then
-//             w = x - 1/2 tau (x^H v) v. One workgroup per matrix.
-//   RANK2     A22 <- A22 - v w^H - w v^H. Grid (groups, batch), grid-stride.
+//   SYMV      w = A22 v (A22 = A[k+1:n, k+1:n], m = n - k - 1 rows), and
+//             per workgroup the partial sum of conj(w_i) v_i over its rows
+//             (part). SYMV_ROWS rows per workgroup, 32 lanes along each row.
+//             Grid (m / SYMV_ROWS, batch).
+//   RANK2     A22 <- A22 - v w'^H - w' v^H with w' = tau w - 1/2 |tau|^2
+//             (w^H v) v (dsytd2's x - 1/2 tau (x^H v) v, x = tau w; w^H v
+//             from SYMV's partial sums, added in the same order by every
+//             workgroup). Grid (m / WG + 1 column tiles, m / RANK2_ROWS row
+//             tiles, batch): the last column tile is one workgroup that
+//             updates A22's first column (column k + 1 of A) alone and then
+//             runs REFLECT for step k + 1 on it, which saves that step a
+//             dispatch.
 //   QL        eigenvalues of the tridiagonal (d, e) by implicit QL with
 //             Wilkinson's shift (tqli), d and e in shared memory while it runs
 //             (n <= QL_SHARED), iterated by thread 0. With LOG, the
@@ -78,10 +87,11 @@ struct Params
     int* logi;
     R* logcs;
     int* state;
+    T* part;     // SYMV's partial sums of w^H v, SYMV_ROWS rows each, ceil(n / SYMV_ROWS) per matrix
     uint n;
     uint ld;
     uint sa;     // elements between matrices of a
-    uint k;      // REFLECT, UPDATE_W, RANK2: the reduction step
+    uint k;      // REFLECT, SYMV, RANK2: the reduction step
     uint cap;    // rotations per matrix in the log
     uint groups; // RANK2, ROT: workgroups along x
 };
@@ -183,10 +193,10 @@ R hypot2(R x, R y)
 
 // ---------------------------------------------------------------- reduction
 
-void reflect(uint t, uint z)
+void reflect(uint t, uint z, uint k)
 {
     T* a = p.a + z * p.sa;
-    uint n = p.n, ld = p.ld, k = p.k;
+    uint n = p.n, ld = p.ld;
     uint col = k, top = k + 1;  // alpha at (top, col); x below it
     // zlarfg on alpha = A[top, col], x = A[top+1:n, col], as qr_panel in
     // factor.slang: norms scaled by the largest |part|, a column whose
@@ -237,37 +247,103 @@ void reflect(uint t, uint z)
         a[top * ld + col] = ONE;  // v_0 (e[k] holds beta)
 }
 
-void update_w(uint t, uint z)
+// SYMV_ROWS rows of w = A22 v per workgroup, 32 lanes per row.
+#define SYMV_ROWS (WG / 32)
+void symv(uint t, uint gx, uint z)
 {
     T* a = p.a + z * p.sa;
     T* w = p.w + z * p.n;
     uint n = p.n, ld = p.ld, k = p.k, top = k + 1, m = n - top;
-    T tk = p.tau[z * n + k];
-    // x = tau w; dot = x^H v
-    T part = ZERO;
-    for (uint j = t; j < m; j += WG)
+    uint row = gx * SYMV_ROWS + t / 32, lane = t % 32;
+    T acc = ZERO;
+    if (row < m)
     {
-        T x = mul(tk, w[j]);
-        w[j] = x;
-        part += mul(cj(x), a[(top + j) * ld + k]);
+        uint ar = (top + row) * ld + top;
+        for (uint j = lane; j < m; j += 32)
+            acc += mul(a[ar + j], a[(top + j) * ld + k]);
     }
-    T alpha = scale(mul(tk, reduce_sum(t, part)), R(-0.5));
-    for (uint j = t; j < m; j += WG)
-        w[j] = w[j] + mul(alpha, a[(top + j) * ld + k]);
+    sval[t] = acc;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1)
+    {
+        if (lane < s)
+            sval[t] += sval[t + s];
+        barrier();
+    }
+    if (lane == 0)
+    {
+        T wi = sval[t];
+        if (row < m)
+            w[row] = wi;
+        // (conj(w_i) v_i for the partial sum, through shared memory)
+        sval[t] = row < m ? mul(cj(wi), a[(top + row) * ld + k]) : ZERO;
+    }
+    barrier();
+    if (t == 0)
+    {
+        T part = ZERO;
+        for (uint r = 0; r < SYMV_ROWS; r++)
+            part += sval[r * 32];
+        p.part[z * ((n + SYMV_ROWS - 1) / SYMV_ROWS) + gx] = part;
+    }
 }
 
-void rank2(uint t, uint gx, uint z)
+// -1/2 |tau|^2 (w^H v), from SYMV's partial sums (the same order in every workgroup)
+T rank2_alpha(uint t, uint z, uint m, T tk)
+{
+    uint groups = (m + SYMV_ROWS - 1) / SYMV_ROWS;
+    T* part = p.part + z * ((p.n + SYMV_ROWS - 1) / SYMV_ROWS);
+    T acc = ZERO;
+    for (uint g = t; g < groups; g += WG)
+        acc += part[g];
+    T dot = reduce_sum(t, acc);
+    return scale(dot, R(-0.5) * norm2(tk));
+}
+
+// A tile of RANK2_ROWS rows by WG columns per workgroup, a thread per
+// column (rows are contiguous: coalesced), v_c and w'_c in registers;
+// A22's first column is left to the extra workgroup (gx = column tiles).
+#define RANK2_ROWS 16
+void rank2(uint t, uint gx, uint gy, uint z)
 {
     T* a = p.a + z * p.sa;
     T* w = p.w + z * p.n;
     uint n = p.n, ld = p.ld, k = p.k, top = k + 1, m = n - top;
-    uint total = m * m;
-    for (uint idx = gx * WG + t; idx < total; idx += p.groups * WG)
+    uint tiles = (m + WG - 1) / WG;
+    if (gx == tiles && gy != 0)
+        return;
+    T tk = p.tau[z * n + k];
+    T alpha = rank2_alpha(t, z, m, tk);
+    if (gx == tiles)
     {
-        uint r = idx / m, c = idx % m;
-        T vr = a[(top + r) * ld + k], vc = a[(top + c) * ld + k];
+        // column k + 1 of A (A22's first): v_0 = 1 (REFLECT's), all m rows here
+        T w0 = mul(tk, w[0]) + alpha;
+        T v0 = cj(a[top * ld + k]), wc0 = cj(w0);
+        for (uint r = t; r < m; r += WG)
+        {
+            T vr = a[(top + r) * ld + k];
+            T wr = mul(tk, w[r]) + mul(alpha, vr);
+            uint at = (top + r) * ld + top;
+            a[at] = a[at] - mul(vr, wc0) - mul(wr, v0);
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (k + 2 < n)
+            reflect(t, z, k + 1);
+        return;
+    }
+    uint c = gx * WG + t;
+    if (c == 0 || c >= m)
+        return;
+    T vc = a[(top + c) * ld + k];
+    T wc = cj(mul(tk, w[c]) + mul(alpha, vc));
+    vc = cj(vc);
+    uint r0 = gy * RANK2_ROWS, r1 = min(r0 + RANK2_ROWS, m);
+    for (uint r = r0; r < r1; r++)
+    {
+        T vr = a[(top + r) * ld + k];
+        T wr = mul(tk, w[r]) + mul(alpha, vr);
         uint at = (top + r) * ld + top + c;
-        a[at] = a[at] - mul(vr, cj(w[c])) - mul(w[r], cj(vc));
+        a[at] = a[at] - mul(vr, wc) - mul(wr, vc);
     }
 }
 
@@ -481,9 +557,9 @@ void main(uint3 gid: SV_GroupID, uint3 lid: SV_GroupThreadID)
     uint t = lid.x;
     switch (OP)
     {
-    case TRIDIAG_REFLECT: reflect(t, gid.x); break;
-    case TRIDIAG_UPDATE_W: update_w(t, gid.x); break;
-    case TRIDIAG_RANK2: rank2(t, gid.x, gid.y); break;
+    case TRIDIAG_REFLECT: reflect(t, gid.x, p.k); break;
+    case TRIDIAG_SYMV: symv(t, gid.x, gid.y); break;
+    case TRIDIAG_RANK2: rank2(t, gid.x, gid.y, gid.z); break;
     case TRIDIAG_QL: ql(t, gid.x); break;
     case TRIDIAG_ROT: rot(t, gid.x, gid.y); break;
     }
