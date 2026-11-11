@@ -722,14 +722,19 @@ at::Tensor sum_rows_by_key(const at::Tensor& keys, const at::Tensor& vals, int64
               "sum_rows_by_key: expected int64 keys [T] and float vals [T, W] on vk, got ", keys.sizes(), " ",
               keys.scalar_type(), " and ", vals.sizes(), " ", vals.scalar_type());
   int64_t n = keys.numel(), width = vals.size(1);
-  TORCH_CHECK(n * width < (int64_t(1) << 31) && (num_rows + 1) * width < (int64_t(1) << 62),
+  TORCH_CHECK(n * width < (int64_t(1) << 31) && (num_rows + 1024) * width < (int64_t(1) << 62),
               "sum_rows_by_key: more elements than 32-bit offsets address");
   at::Tensor v = vals.contiguous();
-  // (one row more, where skipped keys go)
-  at::Tensor result = at::zeros({num_rows + 1, width}, v.options());
+  // (kSpare rows more, where skipped keys go, spread by position: in one row
+  // they would make one run, which one thread folds, serially; grid_sampler's
+  // backward with zero padding skips most corners, and a run of millions
+  // outlasted Intel's GPU hang check)
+  constexpr int64_t kSpare = 1024;
+  at::Tensor result = at::zeros({num_rows + kSpare, width}, v.options());
   if (n > 0 && width > 0) {
     at::Tensor keep = at::logical_and(at::ge(keys, 0), at::lt(keys, num_rows));
-    at::Tensor offs = at::mul(at::where(keep, keys, at::full({}, num_rows, keys.options())), width).reshape({1, n}).contiguous();
+    at::Tensor spare = at::remainder(at::arange(n, keys.options()), kSpare) + num_rows;
+    at::Tensor offs = at::mul(at::where(keep, keys, spare), width).reshape({1, n}).contiguous();
     at::Tensor order = sort_rows(offs, false);
     SegReduceParams p{};
     p.dst = gpu_address_out(result);
@@ -776,6 +781,39 @@ at::Tensor embedding_dense_backward(const at::Tensor& grad_output, const at::Ten
   return sum_rows_by_key(keys, grad, num_weights, scale_grad_by_freq);
 }
 
+// dst's rows (contiguous [m, width]) op= vals' rows ([n, width]) at row
+// offsets[i] (in elements, from index_offsets): one sort of the n row offsets
+// and segreduce over rows, without an offset per element. Complex: false.
+bool accumulate_rows(const at::Tensor& dst, const at::Tensor& offsets, const at::Tensor& vals, int64_t width,
+                     uint32_t op, bool include_self) {
+  at::ScalarType t = dst.scalar_type();
+  int64_t n = offsets.numel();
+  if (at::isComplexType(t) || n * width >= (int64_t(1) << 31)) return false;
+  if (accum_label(t) == nullptr) {
+    // (bool as int32, the small types widened, as accumulate)
+    at::ScalarType wide = t == at::kBool ? at::kInt : widened(t);
+    if (accum_label(wide) == nullptr) return false;
+    at::Tensor w = dst.to(wide);
+    if (!accumulate_rows(w, offsets, vals.to(wide), width, op, include_self)) return false;
+    dst.copy_(w);
+    return true;
+  }
+  at::Tensor offs = offsets.reshape({1, n}).contiguous();
+  at::Tensor v = vals.to(t).contiguous();
+  at::Tensor order = sort_rows(offs, false);
+  SegReduceParams p{};
+  p.dst = gpu_address_out(dst);
+  p.offs = gpu_address(offs);
+  p.vals = gpu_address(v);
+  p.order = gpu_address(order);
+  p.n = static_cast<uint32_t>(n);
+  p.width = static_cast<uint32_t>(width);
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(n * width), &groups, &p.stride));
+  dispatch(std::string("segreduce_") + accum_label(t), {op, include_self ? 1u : 0u}, p, groups);
+  return true;
+}
+
 // out = self, then out[index along dim] op= src (scatter_add, scatter_reduce, scatter(reduce=...)).
 bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                         uint32_t op, bool include_self, at::Tensor& out) {
@@ -789,6 +827,41 @@ bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& i
     out.copy_(self);
   }
   if (index.numel() == 0) {
+    return true;
+  }
+  // Whole rows (dim 0, an index expanded along every other dim, as
+  // index.unsqueeze(1).expand(n, k)): one offset per row, as CUDA's
+  // vectorised path, instead of an offset (and a sort key) per element.
+  bool rows = dim == 0 && out.dim() >= 2 && out.is_contiguous() && src.dim() == out.dim() &&
+              src.size(0) >= index.size(0) && !at::isComplexType(out.scalar_type());
+  for (int64_t d = 1; rows && d < out.dim(); ++d) {
+    rows = index.stride(d) == 0 && index.size(d) == out.size(d) && src.size(d) == out.size(d);
+  }
+  if (rows) {
+    int64_t n = index.size(0), width = out.numel() / std::max<int64_t>(out.size(0), 1);
+    at::Tensor keys = index.as_strided({n}, {index.stride(0)}, index.storage_offset());
+    at::Tensor offsets = index_offsets({n}, {{keys, out.size(0), width}}, out.options(), /*wrap=*/false);
+    at::Tensor vals = src.narrow(0, 0, n).reshape({n, width});
+    if (accumulate_rows(out, offsets, vals, width, op, include_self)) return true;
+  }
+  // A large index in slices along its longest other dim: an int64 offset and
+  // a sort key per element would pass the 4 GiB a buffer may hold (the
+  // slices' destinations are disjoint, so the order of accumulation stays
+  // the index's).
+  constexpr int64_t kSlice = int64_t(1) << 26;
+  int64_t along = -1;
+  for (int64_t d = 0; d < index.dim(); ++d) {
+    if (d != dim && (along < 0 || index.size(d) > index.size(along))) along = d;
+  }
+  if (index.numel() > kSlice && along >= 0 && index.size(along) > 1 && src.dim() == index.dim()) {
+    int64_t total = index.size(along), per = std::max<int64_t>(1, total * kSlice / index.numel());
+    for (int64_t s = 0; s < total; s += per) {
+      int64_t len = std::min(per, total - s);
+      at::Tensor o = out.narrow(along, s, len);
+      if (!scatter_accumulate(o, dim, index.narrow(along, s, len), src.narrow(along, s, len), op, include_self, o)) {
+        TORCH_CHECK(false, "torch_vulkan: scatter of a slice declined after others ran");
+      }
+    }
     return true;
   }
   at::Tensor dst_view = restride_without(out, index.sizes(), dim);

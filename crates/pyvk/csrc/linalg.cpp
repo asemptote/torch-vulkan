@@ -649,8 +649,11 @@ at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
               other.size(0), " elements respectively");
   TORCH_CHECK(self.scalar_type() == other.scalar_type(), "dot : expected both vectors to have same dtype, but found ",
               self.scalar_type(), " and ", other.scalar_type());
-  // Element-wise product and a sum reduction (both Vulkan kernels).
-  return at::sum(at::mul(self, other)).to(self.scalar_type());
+  // Element-wise product and a sum reduction (both Vulkan kernels). dot
+  // falls through the Conjugate key, so self and other may be conjugate
+  // views: resolved here, as mul would not inside a TorchDispatchMode (which
+  // excludes that key).
+  return at::sum(at::mul(self.resolve_conj(), other.resolve_conj())).to(self.scalar_type());
 }
 
 }  // namespace

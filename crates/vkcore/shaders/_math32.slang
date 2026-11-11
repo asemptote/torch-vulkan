@@ -126,10 +126,8 @@ float2 two_prod32(float a, float b)
     return float2(p, ((x.x * y.x - p) + x.x * y.y + x.y * y.x) + x.y * y.y);
 }
 
-// x^y for finite x > 0 and finite y: ln x in two floats, y ln x with its
-// rounding error, then e^hi (1 + lo). A few ulp, where pow(x, y) as
-// exp2(y log2 x) in float loses about |y ln x| ulp.
-float pow32(float x, float y)
+// ln x as hi + lo (about 2^-40 relative) for finite x > 0.
+float2 ln_hilo32(float x)
 {
     uint bits = bit_cast<uint>(x);
     int e = int((bits >> 23) & 0xffu) - 127;
@@ -157,7 +155,15 @@ float pow32(float x, float y)
     // is exact) + 1.428606820309417e-6.
     float2 l = two_sum32(float(e) * 0.693145751953125f, 2.0f * s_hi);
     float lo = l.y + (2.0f * s_lo + 2.0f * s_hi * z * p + float(e) * 1.428606820309417e-6f);
-    float2 lx = two_sum32(l.x, lo);
+    return two_sum32(l.x, lo);
+}
+
+// x^y for finite x > 0 and finite y: ln x in two floats, y ln x with its
+// rounding error, then e^hi (1 + lo). A few ulp, where pow(x, y) as
+// exp2(y log2 x) in float loses about |y ln x| ulp.
+float pow32(float x, float y)
+{
+    float2 lx = ln_hilo32(x);
     float t = y * lx.x;
     if (!(abs(t) < 104.0f))  // overflow, underflow
         return t > 0.0f ? f32_inf() : 0.0f;
@@ -167,12 +173,21 @@ float pow32(float x, float y)
     return r + r * t_lo;
 }
 
+// ln(1 + x): 1 + x as u + c exactly (two-sum), then ln u in two floats
+// plus ln(1 + c / u) ~ c / u, rounded once: under 1 ulp (Goldberg's
+// log(u) x / (u - 1) carried log32's error, up to 2.8 ulp).
 float log1p32(float x)
 {
-    float u = 1.0f + x;
-    if (u == 1.0f) return x;
-    if (isinf(u) || u <= 0.0f) return log32(u);
-    return log32(u) * (x / (u - 1.0f));  // Goldberg: cancels the rounding of 1 + x
+    float2 u = two_sum32(1.0f, x);
+    if (u.x == 1.0f && u.y == x) return x;  // (|x| < 2^-24: x - x^2 / 2 rounds to x)
+    if (isnan(x) || isinf(u.x) || u.x <= 0.0f) return log32(u.x);
+    float2 l = ln_hilo32(u.x);
+    // c / u, corrected with its exact residual: OpFDiv may be 2.5 ulp off,
+    // and for x near -2^-25 the result cancels down to c's own size
+    float q = u.y / u.x;
+    float2 qu = two_prod32(q, u.x);
+    q += ((u.y - qu.x) - qu.y) / u.x;
+    return l.x + (l.y + q);
 }
 
 float expm1_32(float x)

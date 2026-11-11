@@ -8,7 +8,8 @@
 // loop, and writes dst[offset] once:
 //   acc = INCLUDE_SELF ? dst[off] : identity;  acc = op(acc, vals[...]) ...
 // OP: SEGREDUCE_SUM, _PROD, _MAX, _MIN (NaN propagates), _MEAN ((acc) / count,
-// counting dst when included; integer means round toward -inf).
+// correctly rounded, counting dst when included; integer means round toward
+// -inf).
 // Rows (width > 1): each source element is a row of `width` contiguous values
 // (vals[i * width + col]) and offs its destination row's first element
 // (dst[off + col]); a thread per (sorted position, col). scale_by_count (SUM)
@@ -40,6 +41,7 @@ const int INCLUDE_SELF = 1;
 
 #if defined(T_f32) || defined(T_f64)
 #define IS_FLOAT 1
+#include "_fmath.slang"  // (m_div: OpFDiv may be 2.5 ulp off, the CPU's mean is not)
 #endif
 
 T combine(T a, T b)
@@ -80,7 +82,7 @@ void main(uint3 id: SV_DispatchThreadID)
             uint run = 0;
             for (uint j = s; j < p.n && all(p.offs[p.order[min(j, last)]] == offw); j++)
                 run++;
-            scale = T(1) / T(run);
+            scale = m_div(T(1), T(run));
         }
 #endif
         bool have = INCLUDE_SELF != 0;
@@ -98,7 +100,7 @@ void main(uint3 id: SV_DispatchThreadID)
         if (OP == SEGREDUCE_MEAN)
         {
 #ifdef IS_FLOAT
-            acc = acc / T(count);
+            acc = m_div(acc, T(count));
 #else
             T c = T(count);
             T q = acc / c;

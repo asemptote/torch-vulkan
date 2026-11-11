@@ -94,6 +94,7 @@ fn main() {
             "csrc/reduce.cpp",
             "csrc/linalg.cpp",
             "csrc/quant.cpp",
+            "csrc/foreach.cpp",
             "csrc/fft.cpp",
             "csrc/dense.cpp",
             "csrc/special.cpp",

@@ -11,6 +11,7 @@ backward pass is exactly the adjoint of our forward pass. Average pooling is
 a depthwise convolution with a ones kernel, divided by the window sizes.
 """
 
+import contextlib
 import functools
 import math
 import struct
@@ -799,22 +800,45 @@ def _bucketize_scalar(x, boundaries, out_int32=False, right=False):
 
 def _ldexp(x, other):
     # PyTorch's x * pow(2, other), with 2 in x's dtype (float32 for integers),
-    # but a half-precision power computed in float32: 2^20 overflows float16
-    # while 2^-10 * 2^20 does not.
+    # rounding as the CPU's: the power in the half-precision dtype, then the
+    # product. Where that power overflows (2^20 in float16), it is taken in
+    # float32 instead, as 2^-10 * 2^20 does not overflow.
     two_dtype = x.dtype if x.is_floating_point() or x.is_complex() else torch.float32
     power_dtype = torch.result_type(torch.empty((), dtype=two_dtype), other)
     if power_dtype in (torch.float16, torch.bfloat16):
         dtype = torch.result_type(x, torch.empty((), dtype=power_dtype))
-        return (x.float() * torch.pow(x.new_full((), 2.0, dtype=torch.float32), other)).to(dtype)
+        power = torch.pow(x.new_full((), 2.0, dtype=power_dtype), other)
+        wide = (x.float() * torch.pow(x.new_full((), 2.0, dtype=torch.float32), other)).to(dtype)
+        return torch.where(torch.isinf(power), wide, (x * power).to(dtype))
     return x * torch.pow(x.new_full((), 2.0, dtype=two_dtype), other)
 
 
 # ---------------------------------------------------------------- rrelu
 
+@contextlib.contextmanager
+def _outside_vmap_modes():
+    """Neither vmap's random-op guard: a kernel runs below the batching
+    layers on plain tensors, and the CPU's rrelu kernel draws its noise
+    without the dispatcher. (torch.func's FuncTorchVmapMode is a key in the
+    thread's set; the legacy torch._vmap_internals' VmapMode is entered per
+    nesting level.)"""
+    levels = torch._C._vmapmode_increment_nesting() - 1
+    torch._C._vmapmode_decrement_nesting()
+    for _ in range(levels):
+        torch._C._vmapmode_decrement_nesting()
+    try:
+        with torch._C._ExcludeDispatchKeyGuard(torch._C.DispatchKeySet(torch._C.DispatchKey.FuncTorchVmapMode)):
+            yield
+    finally:
+        for _ in range(levels):
+            torch._C._vmapmode_increment_nesting()
+
+
 def _rrelu_with_noise(x, noise, lower=1.0 / 8, upper=1.0 / 3, training=False, generator=None):
     if not training:
         return F.leaky_relu(x, (lower + upper) / 2)
-    slopes = torch.empty_like(x).uniform_(lower, upper, generator=generator)
+    with _outside_vmap_modes():
+        slopes = torch.empty_like(x).uniform_(lower, upper, generator=generator)
     negative = x < 0
     noise.copy_(torch.where(negative, slopes, torch.ones_like(x)))
     return torch.where(negative, x * slopes, x)

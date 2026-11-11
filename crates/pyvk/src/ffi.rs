@@ -79,6 +79,34 @@ pub extern "C" fn vkt_synchronize() -> i32 {
     }
 }
 
+/// Releases cached, unused pool blocks back to the driver (after the queued
+/// work finishes), as torch.vk.empty_cache does.
+#[no_mangle]
+pub extern "C" fn vkt_empty_cache() -> i32 {
+    match RUNTIME.lock().unwrap().clone() {
+        Some(rt) => {
+            let r = rt.synchronize();
+            rt.pool.lock().unwrap().trim();
+            status(r)
+        }
+        None => 0,
+    }
+}
+
+/// The pool's allocated and reserved bytes (0 before the runtime starts).
+#[no_mangle]
+pub unsafe extern "C" fn vkt_memory_stats(allocated: *mut u64, reserved: *mut u64) {
+    let (a, r) = match RUNTIME.lock().unwrap().as_ref() {
+        Some(rt) => {
+            let s = rt.pool.lock().unwrap().stats();
+            (s.allocated, s.reserved)
+        }
+        None => (0, 0),
+    };
+    *allocated = a;
+    *reserved = r;
+}
+
 /// Queues kernel `name` specialized with `spec[..nspec]`, with `push[..npush]`
 /// as push constants, over a gx x gy x gz grid of workgroups.
 #[no_mangle]

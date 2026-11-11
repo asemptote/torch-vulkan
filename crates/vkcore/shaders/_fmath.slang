@@ -347,6 +347,44 @@ float m_div32(float a, float b)
     return bit_cast<float>(sign | keep);
 }
 
+// sqrt(x) correctly rounded, as the CPU's: Vulkan's Sqrt is only as accurate
+// as 1 / inversesqrt (ANV's float32 roots differed from the CPU's in 8% of
+// cases). The GPU's root c of the significand M (x scaled by an even power
+// of two into [1, 4)) is moved to a neighbour while the root lies beyond the
+// midpoint on that side: with u = ulp(c), (c + u/2)^2 = c (c + u) + u^2 / 4
+// and M - c (c + u) is a multiple of u^2, so sqrt(M) > c + u/2 exactly when
+// M - c next(c) > 0, an exact residual (Dekker's product) whose sign the
+// rounding keeps. Zeros (with their sign), +inf and NaNs as the CPU's.
+float m_sqrt(float x)
+{
+    uint b = bit_cast<uint>(x);
+    if ((b & 0x7fffffffu) == 0u || b == 0x7f800000u)
+        return x;
+    if (b > 0x7f800000u)
+        return f32_nan();  // (negative or NaN)
+    int e;
+    uint m = div32_unpack(x, e);  // (subnormals included, on the bits)
+    float M = bit_cast<float>(0x3f800000u | (m & 0x7fffffu));
+    if ((e & 1) != 0)
+    {
+        M *= 2.0f;
+        e -= 1;
+    }
+    float c = sqrt(M);
+    [ForceUnroll]
+    for (int i = 0; i < 3; i++)
+    {
+        uint cb = bit_cast<uint>(c);
+        float up = bit_cast<float>(cb + 1u), dn = bit_cast<float>(cb - 1u);
+        if (div32_residual(M, c, up) > 0.0f)
+            c = up;
+        else if (div32_residual(M, dn, c) <= 0.0f)
+            c = dn;
+    }
+    // (c in [1, 2): the root of M < 4 rounds below 2)
+    return bit_cast<float>((uint(e / 2 + 127) << 23) | (bit_cast<uint>(c) & 0x7fffffu));
+}
+
 #elif defined(T_f64) || defined(FMATH_F64)
 #include "_math64.slang"
 #include "_math64_ext.slang"
@@ -406,6 +444,59 @@ int m_ilogb(double x)
     if (e != 0) return e - 1023;
     uint hi = uint(bits >> 32), lo = uint(bits);
     return (hi != 0 ? firstbithigh(hi) + 32 : firstbithigh(lo)) - 1074;
+}
+
+// a * b exactly as p + e (Dekker's product, Veltkamp's split; unfused, as
+// div32_two_prod), for |a|, |b| within 2^+-490 of 1.
+void sqrt64_two_prod(double a, double b, out double p, out double e)
+{
+    p = a * b;
+    double t = 134217729.0l * a, ah = t - (t - a), al = a - ah;
+    t = 134217729.0l * b;
+    double bh = t - (t - b), bl = b - bh;
+    e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+}
+
+// a - q b, with the exact value's sign, for q b within a few ulps of a.
+double sqrt64_residual(double a, double q, double b)
+{
+    double p, e;
+    sqrt64_two_prod(q, b, p, e);
+    return (a - p) - e;
+}
+
+// sqrt(x) correctly rounded, as the float32 m_sqrt (no FMAs: not every
+// driver fuses them); x is first scaled by 2^+-600 into [2^-500, 2^500]
+// (a subnormal x, on a device that flushes float64 subnormals, is lost).
+double m_sqrt(double x)
+{
+    if (x == 0.0l || (isinf(x) && x > 0.0l))
+        return x;
+    if (!(x > 0.0l))
+        return f64_nan();
+    double back = 1.0l;
+    if (x < bit_cast<double>(uint64_t(1023 - 500) << 52))
+    {
+        x *= bit_cast<double>(uint64_t(1023 + 600) << 52);
+        back = bit_cast<double>(uint64_t(1023 - 300) << 52);
+    }
+    else if (x > bit_cast<double>(uint64_t(1023 + 500) << 52))
+    {
+        x *= bit_cast<double>(uint64_t(1023 - 600) << 52);
+        back = bit_cast<double>(uint64_t(1023 + 300) << 52);
+    }
+    double c = sqrt(x);
+    [ForceUnroll]
+    for (int i = 0; i < 3; i++)
+    {
+        uint64_t cb = bit_cast<uint64_t>(c);
+        double up = bit_cast<double>(cb + 1ull), dn = bit_cast<double>(cb - 1ull);
+        if (sqrt64_residual(x, c, up) > 0.0l)
+            c = up;
+        else if (sqrt64_residual(x, dn, c) <= 0.0l)
+            c = dn;
+    }
+    return c * back;
 }
 #endif
 

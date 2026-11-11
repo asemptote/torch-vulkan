@@ -57,6 +57,8 @@ const char* vkt_last_error();
 int vkt_alloc(uint64_t nbytes, VktAlloc* out);
 void vkt_free(void* handle);
 int vkt_synchronize();
+int vkt_empty_cache();
+void vkt_memory_stats(uint64_t* allocated, uint64_t* reserved);
 int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush, uint32_t gx,
                  uint32_t gy, uint32_t gz);
 int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
