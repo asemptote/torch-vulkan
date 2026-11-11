@@ -56,5 +56,5 @@ echo "[$(date +%T)] build"
 export CARGO_TARGET_DIR=/tmp/$USER-torch-vulkan-target
 .venv/bin/maturin develop --release --uv
 echo "[$(date +%T)] smoke"
-.venv/bin/python -c "import torch, torch_vulkan; x = torch.arange(5.0, device='vk'); print((x * 2).sum().item(), torch_vulkan.capabilities())"
+.venv/bin/python -c "import torch, torch_vulkan; x = torch.arange(5.0, device='vk'); print((x * 2).sum().item(), torch_vulkan.device_name())"
 echo "[$(date +%T)] done"
