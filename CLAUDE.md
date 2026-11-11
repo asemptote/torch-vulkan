@@ -20,3 +20,9 @@ kernel or algorithm.
 - Don't change the README's version numbers, benchmark figures or release
   notes: the maintainer updates them at release time.
 - Docs use Australian spelling (-ise, "licence" as the noun).
+- Attribution: commits end with a `Co-Authored-By:` trailer for the model,
+  pull-request descriptions end with "Generated with Claude Code", and every
+  GitHub issue and comment you write ends with:
+
+      ---
+      *Written by Claude Opus 5.5 (Claude Code), directed by the maintainer.*
