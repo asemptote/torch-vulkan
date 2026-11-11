@@ -7,7 +7,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from _util import check, make, on_gpu
+from _util import ARM32, check, make, on_gpu
+
+# (On the Mali phone, Termux's armv7 torch computed CPU convolutions wrong in
+# about 1 of 50 float32 and 5 of 50 float64 calls, against a pure-Python
+# convolution, while vk's matched that reference throughout: the CPU is no
+# reference for these tests there.)
+UNRELIABLE_CPU_CONV = pytest.mark.skipif(ARM32, reason="a 32-bit Arm CPU's convolutions are intermittently wrong")
 
 TOL = dict(rtol=2e-4, atol=2e-4)
 
@@ -41,6 +47,7 @@ CONV_CASES = [
 
 
 @pytest.mark.parametrize("dims,cin,cout,k,stride,pad,dil,groups", CONV_CASES)
+@UNRELIABLE_CPU_CONV
 def test_conv(dims, cin, cout, k, stride, pad, dil, groups):
     spatial = (11, 9, 7)[:dims]
     x = make((2, cin) + spatial, torch.float32)
@@ -57,6 +64,7 @@ def test_conv(dims, cin, cout, k, stride, pad, dil, groups):
     (2, 3, 4, (2, 4), (3, 1), (0, 2), (2, 1), 1, (2, 0)),
     (3, 2, 2, 3, 1, 0, 1, 2, 0),
 ])
+@UNRELIABLE_CPU_CONV
 def test_conv_transpose(dims, cin, cout, k, stride, pad, dil, groups, outpad):
     spatial = (6, 5, 4)[:dims]
     x = make((2, cin) + spatial, torch.float32)
@@ -139,6 +147,7 @@ def test_upsample_and_grid_sample():
                          x, grid.clone(), tol=dict(rtol=1e-4, atol=1e-4))
 
 
+@UNRELIABLE_CPU_CONV
 def test_embedding_and_small_model_training():
     torch.manual_seed(0)
     model = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),

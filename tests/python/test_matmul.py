@@ -215,6 +215,7 @@ print(worst)
 
 @pytest.mark.parametrize("env", [dict(TORCH_VK_SUBGROUP="8"), dict(TORCH_VK_SUBGROUP="16"), dict(TORCH_VK_SUBGROUP="32"),
                                  dict(TORCH_VK_GEMM="tiled")])
+@pytest.mark.float64
 def test_subgroup_gemm_kernel(env):
     # shaders/gemmsg.slang (the default where the device has subgroup size
     # control) at each subgroup size it is instantiated for (a size outside the

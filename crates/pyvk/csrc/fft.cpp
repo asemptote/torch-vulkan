@@ -255,7 +255,7 @@ at::Tensor rfft_last_even(const at::Tensor& x) {
   at::Tensor z = at::view_as_complex(moved.view({batch, h, 2}));
   at::Tensor spectrum = fft_rows(z, false);
   at::Tensor out = at::empty({batch, h + 1}, spectrum.options());
-  fft_phase(op::FFT_R2C, spectrum, out, n, h, batch, batch * (h + 1));
+  fft_phase(op::FFT_R2C, spectrum, out, n, h, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
   std::vector<int64_t> shape = moved.sizes().vec();
   shape.back() = h + 1;
   return out.view(shape);
@@ -347,7 +347,7 @@ at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
     // half length, whose inverse FFT, read as reals, is the output (times n).
     int64_t h = last_dim_size / 2;
     at::Tensor folded = at::empty({batch, h}, rows.options());
-    fft_phase(op::FFT_C2R, rows, folded, last_dim_size, m, batch, batch * h);
+    fft_phase(op::FFT_C2R, rows, folded, last_dim_size, m, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
     at::Tensor z = fft_rows(folded, true);
     out = at::view_as_real(z).view(shape).movedim(-1, last);
   } else {
