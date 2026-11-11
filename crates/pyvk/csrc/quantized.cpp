@@ -5,7 +5,8 @@
 // dequantize, views, clone, copies and flip. A quantized tensor's storage is
 // an ordinary vk buffer of its underlying integers, so the kernels are dense
 // ops on a view of it in that dtype, with the quantizer carried alongside.
-// The rounding is the CPU's (ATen's quantize_val and its dequantization):
+// The rounding is the CPU's (FBGEMM's Quantize, or ATen's quantize_val where
+// PyTorch is built without FBGEMM, and their dequantization):
 //   q = clamp(nearbyint(x * (1.0f / scale)) + zero_point, qmin, qmax)
 //   x = scale * (q - zero_point)                           (float32)
 
@@ -17,6 +18,9 @@
 #include <ATen/quantized/Quantizer.h>
 #include <torch/library.h>
 
+#include <ATen/Context.h>
+
+#include <algorithm>
 #include <limits>
 
 namespace vk {
@@ -54,6 +58,18 @@ at::Tensor like(const at::Tensor& q, at::IntArrayRef sizes, at::MemoryFormat mf 
   return at::new_qtensor(sizes, q.options().memory_format(mf), q.quantizer());
 }
 
+// Whether PyTorch's CPU kernels quantize through FBGEMM (its x86 builds;
+// not its Windows ones, which use ATen's quantize_val): they differ for
+// values out of range (inf, NaN, beyond int32), so vk follows the CPU it is
+// installed with.
+bool built_with_fbgemm() {
+  static const bool fbgemm = [] {
+    const auto& engines = at::globalContext().supportedQEngines();
+    return std::find(engines.begin(), engines.end(), at::QEngine::FBGEMM) != engines.end();
+  }();
+  return fbgemm;
+}
+
 at::Tensor quantize_per_tensor(const at::Tensor& self, double scale, int64_t zero_point, at::ScalarType dtype) {
   TORCH_CHECK(self.scalar_type() == at::kFloat, "Quantize only works on Float Tensor, got ", self.scalar_type());
   at::ScalarType ut = underlying(dtype);
@@ -61,17 +77,37 @@ at::Tensor quantize_per_tensor(const at::Tensor& self, double scale, int64_t zer
   int64_t qmax = ut == at::kByte ? 255 : ut == at::kChar ? 127 : std::numeric_limits<int32_t>::max();
   auto quantizer = at::make_per_tensor_affine_quantizer(scale, zero_point, dtype);
   at::Tensor q = at::new_qtensor(self.sizes(), self.options().dtype(dtype).memory_format(self.suggest_memory_format()), quantizer);
-  // (as ATen's quantize_val: 1.0f / float(scale), rounded once, and
-  // int64(zero_point + nearbyint(x * inv)) in float32 before the clamp, whose
-  // conversion of a value beyond int64 (inf, NaN) on x86 gives INT64_MIN, so qmin)
-  float inv = 1.0f / static_cast<float>(scale);
+  float inv = 1.0f / static_cast<float>(scale);  // (rounded once, as the CPU's)
   at::Tensor t = at::mul(self, at::scalar_tensor(inv, self.options()));
-  at::Tensor r = at::round(t) + static_cast<double>(zero_point);
-  r = at::where(at::lt(at::abs(r), 9.223372036854775808e18),  // (false for inf and NaN too)
-                at::clamp(r, static_cast<double>(qmin), static_cast<double>(qmax)),
-                at::full({}, static_cast<double>(qmin), r.options()));
-  // (qint32: its qmax is not a float32; the clamp again in int64)
-  raw(q).copy_(ut == at::kInt ? at::clamp(r.to(at::kLong), qmin, qmax) : r);
+  auto full = [&](double v) { return at::full({}, v, t.options()); };
+  at::Tensor out;
+  if (built_with_fbgemm() && ut != at::kInt) {
+    // FBGEMM's vector Quantize: t clipped at the largest float below 2^31
+    // (a NaN too: _mm256_min_ps returns that bound), rounded to int32 (below
+    // -2^31: INT32_MIN), plus the zero point in int32 (wrapping), clamped
+    constexpr double kTop = 2147483520.0;
+    at::Tensor tc = at::where(at::isnan(t), full(kTop), at::minimum(t, full(kTop)));
+    at::Tensor r = at::round(tc);
+    at::Tensor iv = at::where(at::lt(r, -2147483648.0), full(-2147483648.0), r).to(at::kLong) + zero_point;
+    out = at::clamp(iv.to(at::kInt), qmin, qmax);
+  } else if (built_with_fbgemm()) {
+    // FBGEMM's scalar Quantize (qint32): float(zero_point + nearbyint(t))
+    // clamped in double; a NaN converts to INT32_MIN
+    at::Tensor r = at::round(t) + static_cast<double>(zero_point);
+    at::Tensor c = at::clamp(at::where(at::isnan(r), full(static_cast<double>(qmin)), r), static_cast<double>(qmin),
+                             static_cast<double>(qmax));
+    out = at::clamp(c.to(at::kLong), qmin, qmax);  // (qmax is not a float32: again in int64)
+  } else {
+    // ATen's quantize_val (builds without FBGEMM): int64(zero_point +
+    // nearbyint(t)) in float32 before the clamp, a value beyond int64 (inf,
+    // NaN) converting to INT64_MIN on x86, so qmin
+    at::Tensor r = at::round(t) + static_cast<double>(zero_point);
+    at::Tensor c = at::where(at::lt(at::abs(r), 9.223372036854775808e18),
+                             at::clamp(r, static_cast<double>(qmin), static_cast<double>(qmax)),
+                             full(static_cast<double>(qmin)));
+    out = at::clamp(c.to(at::kLong), qmin, qmax);
+  }
+  raw(q).copy_(out);
   return q;
 }
 
