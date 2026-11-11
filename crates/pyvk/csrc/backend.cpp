@@ -402,6 +402,105 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
 
 // ---------------------------------------------------------------- copies
 
+// ---------------------------------------------------------------- float8
+
+bool is_float8(at::ScalarType s) {
+  return s == at::kFloat8_e4m3fn || s == at::kFloat8_e5m2 || s == at::kFloat8_e4m3fnuz || s == at::kFloat8_e5m2fnuz;
+}
+
+bool fnuz(at::ScalarType s) {
+  return s == at::kFloat8_e4m3fnuz || s == at::kFloat8_e5m2fnuz;
+}
+
+// A float8 format's conversions, as tables built once from the CPU's own
+// (c10's) conversions, so they are the CPU's bit for bit: `values` [256]
+// float32, each code's value; `thresholds` [K] int64, sorted, and `codes`
+// [K] uint8: a float32 of magnitude bits m (sign cleared, NaN included)
+// converts to codes[k] for the last k with thresholds[k] <= m (the
+// conversion's magnitude code is monotone in m), the sign then set as c10
+// does (fnuz formats: none on zero, NaN 0x80).
+struct Float8Tables {
+  at::Tensor values, thresholds, codes;
+};
+
+const Float8Tables& float8_tables(at::ScalarType t) {
+  static std::mutex mutex;
+  static std::map<at::ScalarType, Float8Tables> tables;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = tables.find(t);
+  if (it != tables.end()) return it->second;
+  auto cpu = at::TensorOptions().device(at::kCPU);
+  at::Tensor all = at::arange(256, cpu.dtype(at::kInt)).to(at::kByte);
+  at::Tensor values = all.view(t).to(at::kFloat);
+  // the magnitude code of float32 magnitude bits m: (conversion & 0x7f), or
+  // 0x80 for an fnuz NaN (above every other code)
+  auto code_of = [&](const at::Tensor& m) {
+    at::Tensor c = m.to(at::kInt).view(at::kFloat).to(t).view(at::kByte).to(at::kInt);
+    return fnuz(t) ? at::where(at::eq(c, 0x80), 0x80, at::bitwise_and(c, 0x7f)) : at::bitwise_and(c, 0x7f);
+  };
+  // each code's first magnitude, by bisection over [0, 2^31)
+  std::vector<int64_t> starts = {0};
+  std::vector<int64_t> codes = {code_of(at::zeros({1}, cpu.dtype(at::kLong))).item<int64_t>()};
+  int64_t m = 0;
+  const int64_t top = (int64_t(1) << 31) - 1;
+  int64_t current = codes[0];
+  int64_t last = code_of(at::full({1}, top, cpu.dtype(at::kLong))).item<int64_t>();
+  while (current != last) {
+    // the first magnitude whose code exceeds `current`
+    int64_t lo = m, hi = top;
+    while (lo + 1 < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (code_of(at::full({1}, mid, cpu.dtype(at::kLong))).item<int64_t>() > current) {
+        hi = mid;
+      } else {
+        lo = mid;
+      }
+    }
+    m = hi;
+    current = code_of(at::full({1}, m, cpu.dtype(at::kLong))).item<int64_t>();
+    starts.push_back(m);
+    codes.push_back(current);
+  }
+  Float8Tables f;
+  auto vk = at::TensorOptions().device(at::Device(kDevice, 0));
+  f.values = values.to(vk);
+  f.thresholds = at::tensor(starts, cpu.dtype(at::kLong)).to(vk);
+  f.codes = at::tensor(codes, cpu.dtype(at::kLong)).to(vk);
+  return tables.emplace(t, f).first->second;
+}
+
+// dst <- src where either is float8 (vk tensors): through float32 and the
+// tables. False if neither is.
+bool copy_float8(const at::Tensor& dst, const at::Tensor& src) {
+  at::ScalarType st = src.scalar_type(), dt = dst.scalar_type();
+  if (!is_float8(st) && !is_float8(dt)) return false;
+  if (st == dt) return false;  // (a same-dtype copy moves bytes)
+  at::Tensor f;  // the source's values as float32 (as c10: float8 <-> float)
+  if (is_float8(st)) {
+    f = float8_tables(st).values.index_select(0, src.view(at::kByte).reshape({-1}).to(at::kLong)).view(src.sizes());
+  } else {
+    f = src.to(at::kFloat);
+  }
+  if (!is_float8(dt)) {
+    dst.copy_(f.expand(dst.sizes()));
+    return true;
+  }
+  const Float8Tables& tb = float8_tables(dt);
+  at::Tensor bits = f.contiguous().view(at::kInt).to(at::kLong);
+  at::Tensor negative = at::lt(bits, 0);
+  at::Tensor mag = at::bitwise_and(bits, 0x7fffffff);
+  at::Tensor k = at::searchsorted(tb.thresholds, mag.reshape({-1}), false, true) - 1;
+  at::Tensor code = tb.codes.index_select(0, k).view(f.sizes());
+  if (fnuz(dt)) {
+    code = at::where(at::logical_and(negative, at::logical_and(at::ne(code, 0), at::ne(code, 0x80))),
+                     at::bitwise_or(code, 0x80), code);
+  } else {
+    code = at::where(negative, at::bitwise_or(code, 0x80), code);
+  }
+  dst.view(at::kByte).copy_(code.to(at::kByte).expand(dst.sizes()));
+  return true;
+}
+
 // uint16/32/64 have no cast kernels of their own: their bits are those of
 // int16/32/64, so conversions go through the signed twins, as the CPU's
 // static_casts on x86 (integers keep their low bits; floats truncate through
@@ -481,6 +580,7 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
     }
   }
   if (copy_unsigned(dst, src)) return;
+  if (copy_float8(dst, src)) return;
   const char* from = storage_label(src.scalar_type());
   const char* to = storage_label(dst.scalar_type());
   if (from == nullptr || to == nullptr || src.scalar_type() == dst.scalar_type()) {
@@ -984,8 +1084,8 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   }
   const auto& name = op.schema().operator_name();
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+  check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   record_fallback(key);
-  check_out_devices(op.schema(), *stack);
   try {
     at::native::cpu_fallback(op, stack, error_on_views);
   } catch (...) {

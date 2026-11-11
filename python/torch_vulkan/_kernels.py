@@ -812,7 +812,21 @@ def _rrelu_with_noise_(x, noise, lower=1.0 / 8, upper=1.0 / 3, training=False, g
 
 # ---------------------------------------------------------------- antialiased upsampling
 
+def _lanczos(x):
+    """HelperInterpLanczos::aa_filter: Lanczos-3, sinc(x) sinc(x / 3) for |x| < 3."""
+    def sinc(v):
+        return 1.0 if v == 0.0 else math.sin(v * math.pi) / (v * math.pi)
+
+    x = abs(x)
+    return sinc(x) * sinc(x / 3.0) if x < 3.0 else 0.0
+
+
+_INTERP = {"bilinear": 2, "bicubic": 4, "lanczos": 6}  # (HelperInterp*::interp_size)
+
+
 def _aa_filter(kind, x):
+    if kind == "lanczos":
+        return _lanczos(x)
     x = abs(x)
     if kind == "bilinear":
         return max(0.0, 1.0 - x)
@@ -831,7 +845,7 @@ def _aa_matrix(kind, n_in, n_out, align_corners, scale_opt, like):
         scale = (n_in - 1) / (n_out - 1) if n_out > 1 else 0.0
     else:
         scale = 1.0 / scale_opt if scale_opt is not None and scale_opt > 0 else n_in / n_out
-    interp = 2 if kind == "bilinear" else 4
+    interp = _INTERP[kind]
     support = interp * 0.5 * scale if scale >= 1.0 else interp * 0.5
     invscale = 1.0 / scale if scale >= 1.0 else 1.0
     m = torch.zeros(n_out, n_in, dtype=torch.float64)
@@ -851,6 +865,8 @@ def _aa_matrix(kind, n_in, n_out, align_corners, scale_opt, like):
 def _u8_filter(kind, antialias, x):
     """HelperInterpLinear / HelperInterpCubic::aa_filter (a = -0.5 with
     antialiasing, -0.75 without), in double."""
+    if kind == "lanczos":
+        return _lanczos(x)
     x = abs(x)
     if kind == "bilinear":
         return 1.0 - x if x < 1.0 else 0.0
@@ -871,7 +887,7 @@ def _u8_taps(kind, antialias, n_in, n_out, align_corners, scale_opt):
     """The CPU's fixed-point taps for one dim of a uint8 resize
     (_compute_index_ranges_int16_weights): per output its first input
     index, tap count and int16 weights, and the weights' precision (bits)."""
-    interp = 2 if kind == "bilinear" else 4
+    interp = _INTERP[kind]
     if align_corners:
         scale = (n_in - 1) / (n_out - 1) if n_out > 1 else 0.0
     else:
@@ -1735,6 +1751,7 @@ def _kernels():
     fmp3, fmp3_b = _make_fractional_max(3)
     aa_bilinear, aa_bilinear_b = _make_aa("bilinear")
     aa_bicubic, aa_bicubic_b = _make_aa("bicubic")
+    aa_lanczos, aa_lanczos_b = _make_aa("lanczos")
     upsample = {
         "upsample_nearest1d_backward": _make_upsample_backward("nearest1d", False),
         "upsample_nearest2d_backward": _make_upsample_backward("nearest2d", False),
@@ -1792,6 +1809,8 @@ def _kernels():
         "_upsample_bilinear2d_aa_backward": aa_bilinear_b,
         "_upsample_bicubic2d_aa": aa_bicubic,
         "_upsample_bicubic2d_aa_backward": aa_bicubic_b,
+        "_upsample_lanczos2d_aa": aa_lanczos,
+        "_upsample_lanczos2d_aa_backward": aa_lanczos_b,
         "_embedding_bag": _embedding_bag,
         "_embedding_bag_forward_only": _embedding_bag_forward_only,
         "_embedding_bag_dense_backward": _embedding_bag_dense_backward,

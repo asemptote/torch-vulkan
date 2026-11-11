@@ -392,3 +392,57 @@ def test_native_multi_head_attention_fast_path():
         mha_vk = mha.to("vk")
         got = no_fallback(lambda: mha_vk(x.to("vk"), x.to("vk"), x.to("vk"), need_weights=False)[0])
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.uint8])
+@pytest.mark.parametrize("out_size", [(3, 5), (16, 11)])
+@pytest.mark.parametrize("align_corners", [False, True])
+def test_upsample_lanczos_aa(dtype, out_size, align_corners):
+    x = make((2, 3, 8, 7), torch.float32, positive=True) * 100
+    x = x.to(dtype)
+    f = torch.ops.aten._upsample_lanczos2d_aa
+    got = no_fallback(lambda: f(x.to("vk"), out_size, align_corners))
+    want = f(x, out_size, align_corners)
+    if dtype == torch.uint8:
+        assert (got.cpu().int() - want.int()).abs().max() <= 1
+    else:
+        # (float32: the CPU forms the weights and the two passes in float32;
+        # values near 100 with negative lobes agree to a few ulps of 100)
+        tol = 1e-4 if dtype == torch.float32 else None
+        torch.testing.assert_close(got.cpu(), want, atol=tol, rtol=tol)
+    if dtype == torch.float64:
+        g = make(want.shape, torch.float64, seed=4)
+        b = torch.ops.aten._upsample_lanczos2d_aa_backward
+        got_b = no_fallback(lambda: b(g.to("vk"), out_size, x.shape, align_corners))
+        torch.testing.assert_close(got_b.cpu(), b(g, out_size, x.shape, align_corners))
+
+
+FLOAT8 = [torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz]
+
+
+@pytest.mark.parametrize("f8", FLOAT8, ids=str)
+@pytest.mark.parametrize("src", [torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.int64, torch.bool],
+                         ids=str)
+def test_float8_casts(f8, src):
+    # every float8 code to the other dtypes, and values that round, saturate,
+    # overflow and are NaN, inf or -0 to float8: bit for bit as the CPU's
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(f8)
+    x = torch.cat([make((300,), torch.float32) * 3, make((300,), torch.float32, seed=1) * 300,
+                   torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 448.0, 464.0, 57344.0, 61440.0,
+                                 1e-9, -1e-9, 2.0 ** -9, 2.0 ** -10, 2.0 ** -17, 1e30])]).to(src)
+    got = no_fallback(lambda: x.to("vk").to(f8))
+    assert torch.equal(got.cpu().view(torch.uint8), x.to(f8).view(torch.uint8))
+    back = no_fallback(lambda: codes.to("vk").to(src))
+    torch.testing.assert_close(back.cpu(), codes.to(src), equal_nan=True, atol=0, rtol=0)
+
+
+def test_out_on_another_device_raises_without_cpu():
+    # (PyTorch's test_out case 3: a CPU out= for vk inputs raises, from vk's
+    # own check, with nothing run on the CPU)
+    x = make((3,), torch.float32).to("vk")
+    for f in (lambda: torch.exp(x, out=torch.empty(3)), lambda: torch.cat([x, x], out=torch.empty(6)),
+              lambda: torch.sort(x, out=(torch.empty(3), torch.empty(3, dtype=torch.long)))):
+        before = torch_vulkan.fallback_counts()
+        with pytest.raises(RuntimeError, match="same device"):
+            f()
+        assert torch_vulkan.fallback_counts() == before
