@@ -219,7 +219,9 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
   portability. On the Intel UHD 620, float32 matrix products reach about
   35% of the GPU's peak (about 148 GFLOP/s at 2048^3, ahead of MKL on the
   CPU) and float64 about 30 GFLOP/s; per-op overhead is about 9 µs, close to
-  the CPU's. Cooperative-matrix GEMM and faster FFT kernels are future work.
+  the CPU's. A 2^20-point complex64 FFT takes about 12 ms (the CPU about
+  6 ms); long real and prime-length transforms are ahead of the CPU.
+  Cooperative-matrix GEMM is future work.
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
