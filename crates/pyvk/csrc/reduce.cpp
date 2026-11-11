@@ -437,12 +437,19 @@ at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
   if (complex_vk(input)) {
     return complex_prod_last(input.resolve_conj().reshape({-1}));
   }
+  // (the result in dtype if given, else int64 for integers and bools, as the CPU's)
+  at::ScalarType result = dtype.has_value()                                   ? *dtype
+                          : at::isIntegralType(input.scalar_type(), true) ? at::kLong
+                                                                          : input.scalar_type();
+  // 16-bit floats in float32; integers without a kernel in int64, whose
+  // product truncated is their wrapped product
+  at::Tensor wide = widen_half(input);
+  if (at::isIntegralType(wide.scalar_type(), true) && !reducible(wide)) wide = wide.to(at::kLong);
   Plan plan;
-  if (!reducible(input) || !plan_reduce(input, std::nullopt, false, plan)) {
+  if (!reducible(wide) || !plan_reduce(wide, std::nullopt, false, plan)) {
     return on_cpu("aten::prod", "", self, dtype)[0].toTensor();
   }
-  at::ScalarType result = at::isIntegralType(input.scalar_type(), true) ? at::kLong : input.scalar_type();
-  return run_reduce(input, plan, kProd, kNone, 0.0).view(at::IntArrayRef{}).to(result);
+  return run_reduce(wide, plan, kProd, kNone, 0.0).view(at::IntArrayRef{}).to(result);
 }
 
 template <ROp Op>
@@ -459,6 +466,14 @@ at::Tensor& any_all_dims_out(const at::Tensor& self, at::OptionalIntArrayRef dim
     at::Tensor r = at::ne(self, 0);
     at::native::resize_output(out, self.sizes());
     out.copy_(r);
+    return out;
+  }
+  if (self.numel() == 0 && is_vk(self) && is_vk(out)) {
+    // (nothing to reduce: all true, any false; the shape from the meta op)
+    at::Tensor m = at::empty(self.sizes(), self.options().device(at::kMeta));
+    at::Tensor r = Op == kAny ? at::any(m, dim, keepdim) : at::all(m, dim, keepdim);
+    at::native::resize_output(out, r.sizes());
+    out.fill_(Op == kAll);
     return out;
   }
   Plan plan;

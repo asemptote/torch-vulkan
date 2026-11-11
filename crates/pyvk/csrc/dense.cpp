@@ -967,6 +967,9 @@ at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bo
 }
 
 at::Tensor& cholesky_inverse_out(const at::Tensor& a, bool upper, at::Tensor& out) {
+  TORCH_CHECK(a.dim() >= 2, "cholesky_inverse", ": The input tensor A must have at least 2 dimensions.");
+  TORCH_CHECK(a.size(-1) == a.size(-2), "cholesky_inverse", ": A must be batches of square matrices, but they are ", a.size(-2), " by ",
+              a.size(-1), " matrices");
   check_castable_out(a, "cholesky_inverse", "result", a.scalar_type(), out);
   if (!gpu_matrices(a) || !is_vk(out)) {
     on_cpu("aten::cholesky_inverse", "out", a, upper, out);
@@ -1387,6 +1390,9 @@ bool eig_ok(const at::Tensor& a) {
 }
 
 std::tuple<at::Tensor&, at::Tensor&> eig_out(const at::Tensor& a, at::Tensor& values, at::Tensor& vectors) {
+  TORCH_CHECK(a.dim() >= 2, "linalg.eig", ": The input tensor A must have at least 2 dimensions.");
+  TORCH_CHECK(a.size(-1) == a.size(-2), "linalg.eig", ": A must be batches of square matrices, but they are ", a.size(-2), " by ",
+              a.size(-1), " matrices");
   check_castable_out(a, "torch.linalg.eig", "eigenvalues", complex_of(a.scalar_type()), values);
   check_castable_out(a, "torch.linalg.eig", "eigenvectors", complex_of(a.scalar_type()), vectors);
   if (!eig_ok(a) || !is_vk(values) || !is_vk(vectors)) {
@@ -1411,6 +1417,9 @@ std::tuple<at::Tensor, at::Tensor> eig_vk(const at::Tensor& a) {
 }
 
 at::Tensor& eigvals_out(const at::Tensor& a, at::Tensor& out) {
+  TORCH_CHECK(a.dim() >= 2, "linalg.eigvals", ": The input tensor A must have at least 2 dimensions.");
+  TORCH_CHECK(a.size(-1) == a.size(-2), "linalg.eigvals", ": A must be batches of square matrices, but they are ", a.size(-2), " by ",
+              a.size(-1), " matrices");
   check_castable_out(a, "torch.linalg.eigvals", "eigenvalues", complex_of(a.scalar_type()), out);
   if (!eig_ok(a) || !is_vk(out)) {
     on_cpu("aten::linalg_eigvals", "out", a, out);
@@ -1422,6 +1431,9 @@ at::Tensor& eigvals_out(const at::Tensor& a, at::Tensor& out) {
 }
 
 at::Tensor eigvals_vk(const at::Tensor& a) {
+  TORCH_CHECK(a.dim() >= 2, "linalg.eigvals", ": The input tensor A must have at least 2 dimensions.");
+  TORCH_CHECK(a.size(-1) == a.size(-2), "linalg.eigvals", ": A must be batches of square matrices, but they are ", a.size(-2), " by ",
+              a.size(-1), " matrices");
   if (!eig_ok(a)) {
     return on_cpu("aten::_linalg_eigvals", "", a)[0].toTensor();
   }

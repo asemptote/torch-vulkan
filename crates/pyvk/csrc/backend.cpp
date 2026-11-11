@@ -1434,19 +1434,126 @@ void raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& st
   }
 }
 
+// Every input empty (or a 0-d tensor whose dtype float32 holds exactly), in a
+// dtype without a vk kernel for the op (16-bit floats, integers, bools for
+// linalg, say): the op in float32 (complex64 for complex dtypes), as nothing
+// is computed from the inputs' values; its results of that dtype converted
+// back (an identity permutation, zeros), written arguments copied into.
+bool rescue_empty_cast(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  const auto& args = schema.arguments();
+  size_t n = args.size();
+  if (stack->size() < n) return false;
+  size_t base = stack->size() - n;
+  at::ScalarType main = at::ScalarType::Undefined;
+  for (size_t i = 0; i < n && main == at::ScalarType::Undefined; ++i) {
+    const c10::IValue& v = (*stack)[base + i];
+    if (v.isTensor() && v.toTensor().defined()) main = v.toTensor().scalar_type();
+  }
+  if (main == at::ScalarType::Undefined || main == at::kFloat || main == at::kComplexFloat) return false;
+  if (!at::isFloatingType(main) && !at::isComplexType(main)) {
+    // (integers and bools: only ops the CPU computes for them, whatever their emptiness)
+    const std::string& op_name = schema.name();
+    bool known = false;
+    for (const char* p : {"aten::linalg_lu", "aten::lu_unpack", "aten::mm", "aten::bmm", "aten::baddbmm",
+                          "aten::addmm", "aten::addbmm", "aten::mv", "aten::dot", "aten::vdot"}) {
+      known = known || op_name == p || (op_name.rfind(p, 0) == 0 && op_name.size() > strlen(p) && op_name[strlen(p)] == '_');
+    }
+    if (!known) return false;
+  }
+  at::ScalarType target = at::isComplexType(main) ? at::kComplexFloat : at::kFloat;
+  bool exact = main == at::kBool || main == at::kByte || main == at::kChar || main == at::kShort ||
+               main == at::kHalf || main == at::kBFloat16 || main == at::kComplexHalf;
+  // Written arguments of the op's dtype: all in float32 (P, L, U), else only the
+  // first (LU, where the pivots and info also have the integer dtype).
+  torch::jit::Stack retry;
+  bool ran = false;
+  for (int variant = 0; variant < 2 && !ran; ++variant) {
+    retry.assign(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
+    bool any_vk = false, first_written = true;
+    for (size_t i = 0; i < n; ++i) {
+      c10::IValue& v = retry[i];
+      if (v.isTensorList()) {
+        for (const at::Tensor& t : v.toTensorList()) {
+          if (t.defined() && t.numel() != 0) return false;
+        }
+        continue;
+      }
+      if (!v.isTensor() || !v.toTensor().defined()) continue;
+      at::Tensor t = v.toTensor();
+      if (t.layout() != at::kStrided || t.is_nested()) return false;
+      any_vk = any_vk || is_vk(t);
+      if (is_written(args[i])) {
+        if (t.scalar_type() == main && (variant == 0 || first_written)) {
+          v = at::empty(t.sizes(), t.options().dtype(target));
+        }
+        first_written = false;
+        continue;
+      }
+      if (t.numel() != 0 && !(t.dim() == 0 && exact)) return false;
+      if (t.scalar_type() == main) v = t.to(target);
+    }
+    if (!any_vk) return false;
+    RescueGuard guard;
+    try {
+      op.callBoxed(&retry);
+      ran = true;
+    } catch (const c10::Error&) {
+      // (the other variant, or the CPU decides)
+    }
+  }
+  if (!ran) return false;
+  const auto& returns = schema.returns();
+  if (retry.size() != returns.size()) return false;
+  torch::jit::Stack results;
+  for (size_t j = 0; j < returns.size(); ++j) {
+    const auto* alias = returns[j].alias_info();
+    const c10::IValue& rv = retry[j];
+    if (alias != nullptr && alias->isWrite()) {
+      bool found = false;
+      for (size_t i = 0; i < n && !found; ++i) {
+        const auto* ai = args[i].alias_info();
+        if (ai == nullptr || !ai->isWrite() || ai->beforeSets() != alias->beforeSets()) continue;
+        at::Tensor orig = (*stack)[base + i].toTensor();
+        const at::Tensor& r = rv.toTensor();
+        if (!orig.is_same(r)) {
+          if (!orig.sizes().equals(r.sizes())) orig.resize_(r.sizes());
+          orig.copy_(r);
+        }
+        results.push_back(orig);
+        found = true;
+      }
+      if (!found) return false;
+    } else if (rv.isTensor() && rv.toTensor().defined() && rv.toTensor().scalar_type() == target) {
+      results.push_back(rv.toTensor().to(main));
+    } else {
+      results.push_back(rv);
+    }
+  }
+  stack->resize(base);
+  stack->insert(stack->end(), results.begin(), results.end());
+  return true;
+}
+
 void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
+  const auto& name = op.schema().operator_name();
+  std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+  // (first: where the CPU raises, no other route may compute a result)
+  raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));  // (keyed with emptiness too)
   if (half_via_float(op, stack)) {
     return;
   }
-  if (g_rescue_depth == 0 && (rescue_cpu_scalars(op, stack) || rescue_out(op, stack) || rescue_empty(op, stack))) {
+  // (rescue_out's functional overload may call this op again: it is tried once; the
+  // others cannot recur, as their retry has no CPU scalar, runs on meta, or in float32)
+  if ((g_rescue_depth == 0 && (rescue_cpu_scalars(op, stack) || rescue_out(op, stack))) ||
+      (g_rescue_depth < 4 && (rescue_empty(op, stack) || rescue_empty_cast(op, stack)))) {
     return;
   }
-  const auto& name = op.schema().operator_name();
-  std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
-  raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));  // (keyed with emptiness too)
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   raise_meta_error(op, *stack);
+  TORCH_CHECK_NOT_IMPLEMENTED(op.hasComputedKernelForDispatchKey(c10::DispatchKey::CPU), "Could not run '",
+                              op.schema().name(), "' with arguments from the 'vk' backend: it has no vk or CPU kernel.");
   record_fallback(key);
   try {
     at::native::cpu_fallback(op, stack, error_on_views);

@@ -1481,6 +1481,36 @@ def _transform_bias_rescale_qkv(qkv, qkv_bias, num_head):
     return (x[0] * inv).contiguous(), x[1].contiguous(), x[2].contiguous()
 
 
+def _glu_jvp(glu, x, dx, dim):
+    """The forward derivative of glu = a * sigmoid(b) (x = [a, b] along dim)."""
+    b = x.chunk(2, dim)[1]
+    da, db = dx.chunk(2, dim)
+    sb = torch.sigmoid(b)
+    return da * sb + (glu - glu * sb) * db
+
+
+def _glu_backward_jvp(grad_x, grad_glu, x, dgrad_glu, dx, dim):
+    """The forward derivative of glu's backward (grad_a = g s, grad_b = g a s (1 - s),
+    s = sigmoid(b)) along (dgrad_glu, dx)."""
+    a, b = x.chunk(2, dim)
+    da, db = dx.chunk(2, dim)
+    s = torch.sigmoid(b)
+    ds = s * (1 - s)
+    d_grad_a = dgrad_glu * s + grad_glu * ds * db
+    d_grad_b = dgrad_glu * a * ds + grad_glu * (da * ds + a * ds * (1 - 2 * s) * db)
+    return torch.cat([d_grad_a, d_grad_b], dim)
+
+
+def _compute_linear_combination(x, coefficients):
+    """out[i] = sum over j < coefficients.shape[1] of coefficients[i, j] * x[j],
+    in the promoted dtype, as the CPU's (which reads only those rows of x)."""
+    torch._check(x.dim() > 0 and x.numel() > 0, lambda: "Empty tensor not supported")
+    dt = torch.promote_types(x.dtype, coefficients.dtype)
+    m, k = coefficients.shape
+    c = coefficients.to(dt).view(m, k, *([1] * (x.dim() - 1)))
+    return (c * x[:k].to(dt).unsqueeze(0)).sum(1).to(dt)
+
+
 def _masked_softmax(x, mask, dim=None, mask_type=None):
     """The CPU's masked softmax: masked positions excluded (0), a row with
     every position masked all NaN; mask_type 0 is an (L, L) attention mask and
@@ -1846,6 +1876,9 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "_compute_linear_combination": _compute_linear_combination,
+        "glu_jvp": _glu_jvp,
+        "glu_backward_jvp": _glu_backward_jvp,
         "_assert_async": _assert_async,
         "embedding_renorm_": _embedding_renorm_,
         "_assert_async.msg": _assert_async_msg,

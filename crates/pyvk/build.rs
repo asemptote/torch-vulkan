@@ -126,7 +126,7 @@ fn main() {
     let mut headers: Vec<PathBuf> = std::fs::read_dir("csrc")
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "h"))
+        .filter(|p| p.extension().is_some_and(|e| e == "h" || e == "inc"))  // (.inc: included tables)
         .collect();
     headers.sort();
     for h in &headers {

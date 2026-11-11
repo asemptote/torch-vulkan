@@ -317,8 +317,28 @@ at::Tensor& random_unsigned(at::Tensor& self, int64_t from, int64_t to, std::opt
   return self;
 }
 
+// random_ of a complex tensor: the CPU's errors (random_from_to_impl's), which
+// depend on from and to.
+void complex_random_error(const at::Tensor& self, int64_t from, std::optional<int64_t> to) {
+  if (!at::isComplexType(self.scalar_type()) || !is_vk(self)) return;
+  if (to.has_value()) {
+    TORCH_CHECK(from < *to, "random_ expects 'from' to be less than 'to', but got from=", from, " >= to=", *to);
+    TORCH_CHECK(false, "check_random_bounds handles only integral, floating-point and boolean types");
+  }
+  TORCH_CHECK(from == std::numeric_limits<int64_t>::lowest(),
+              "random_from_to_impl handles only integral, floating-point and boolean types");
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "\"random_full_64_bits_range_kernel_cpu\" not implemented for '",
+                              self.scalar_type(), "'");
+}
+
 at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<at::Generator> gen) {
+  complex_random_error(self, from, to);
   if (to.has_value() && wide_unsigned(self)) return random_unsigned(self, from, *to, gen);
+  if (!to.has_value() && wide_unsigned(self) && self.scalar_type() != at::kUInt64) {
+    int64_t top = self.scalar_type() == at::kUInt16 ? 65535 : 4294967295LL;
+    TORCH_CHECK(from <= top, "random_ expects 'from' casted to dtype to be less than or equal to 'to'");
+    return random_unsigned(self, from, top + 1, gen);
+  }
   if (!random_ok(self)) {
     on_cpu("aten::random_", "from", self, from, to, gen);
     return self;
@@ -339,6 +359,7 @@ at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> t
 
 at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator> gen) {
   if (wide_unsigned(self)) return random_unsigned(self, 0, to, gen);
+  complex_random_error(self, 0, to);
   if (!random_ok(self)) {
     on_cpu("aten::random_", "to", self, to, gen);
     return self;
@@ -351,6 +372,8 @@ at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator>
 }
 
 at::Tensor& random_full(at::Tensor& self, std::optional<at::Generator> gen) {
+  TORCH_CHECK_NOT_IMPLEMENTED(!at::isComplexType(self.scalar_type()) || !is_vk(self),
+                              "\"random_kernel_cpu\" not implemented for '", self.scalar_type(), "'");
   if (!random_ok(self)) {
     on_cpu("aten::random_", "", self, gen);
     return self;

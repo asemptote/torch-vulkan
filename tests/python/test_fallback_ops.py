@@ -518,3 +518,162 @@ def test_rescued_fallback_cases():
                                    rtol=1e-2 if want.dtype == torch.float16 else None)
     with pytest.raises(NotImplementedError, match="linspace_cpu"):
         torch.linspace(0, 3, 4, dtype=torch.bool, device="vk")
+
+
+@pytest.mark.parametrize("include_self", [True, False])
+def test_complex_scatter_products(include_self):
+    g = torch.Generator().manual_seed(0)
+    self_ = torch.randn(4, 5, dtype=torch.complex64, generator=g)
+    src = torch.randn(6, 5, dtype=torch.complex64, generator=g)
+    index = torch.randint(0, 4, (6, 5), generator=g)
+    cases = [
+        lambda d: d(self_).scatter_reduce(0, d(index), d(src), "prod", include_self=include_self),
+        lambda d: d(self_).scatter(0, d(index), d(src), reduce="multiply"),
+        lambda d: d(self_).scatter(0, d(index), 1.5, reduce="multiply"),
+    ]
+    if include_self:  # (the CPU raises otherwise: no complex kernel)
+        cases.append(lambda d: d(self_).index_reduce(0, d(index[:, 0]), d(src), "prod"))
+    for f in cases:
+        got = no_fallback(lambda: f(lambda t: t.to("vk")))
+        torch.testing.assert_close(got.cpu(), f(lambda t: t))
+
+
+@pytest.mark.parametrize("reduce", ["sum", "prod", "mean", "amax", "amin"])
+def test_scatter_reduce_empty_index(reduce):
+    x = torch.arange(6.0).view(2, 3)
+    idx = torch.empty(0, dtype=torch.long)
+    got = no_fallback(lambda: x.to("vk").scatter_reduce(0, idx.to("vk"), x.to("vk"), reduce))
+    torch.testing.assert_close(got.cpu(), x.scatter_reduce(0, idx, x, reduce))
+    got = no_fallback(lambda: x.to("vk").scatter(0, idx.to("vk"), x.to("vk"), reduce="add"))
+    torch.testing.assert_close(got.cpu(), x)
+
+
+def test_index_fill_cpu_index_isin_dtypes_where_unsigned():
+    x = torch.arange(12.0).view(3, 4)
+    idx = torch.tensor([0, 2])
+    got = no_fallback(lambda: x.to("vk").index_fill_(1, idx, -1.0))
+    torch.testing.assert_close(got.cpu(), x.clone().index_fill_(1, idx, -1.0))
+    e, t = torch.tensor([1.0, 2.5, 3.0], dtype=torch.half), torch.tensor([2.5, 3.0])
+    got = no_fallback(lambda: torch.isin(e.to("vk"), t.to("vk")))
+    torch.testing.assert_close(got.cpu(), torch.isin(e, t))
+    for dt in (torch.uint16, torch.uint32, torch.uint64):
+        a, b = torch.tensor([1, 60000, 3]).to(dt), torch.tensor([4, 5, 65535]).to(dt)
+        c = torch.tensor([True, False, True])
+        got = no_fallback(lambda: torch.where(c.to("vk"), a.to("vk"), b.to("vk")))
+        assert got.dtype == dt and torch.equal(got.cpu(), torch.where(c, a, b))
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_csr_to_coo_batched(transpose):
+    crow = torch.tensor([[0, 1, 3], [0, 2, 3]]).repeat(2, 1, 1)
+    col = torch.tensor([[1, 0, 1], [0, 1, 1]]).repeat(2, 1, 1)
+    for c, k in ((crow[0], col[0]), (crow, col)):
+        got = no_fallback(lambda: torch._convert_indices_from_csr_to_coo(c.to("vk"), k.to("vk"), transpose=transpose))
+        assert torch.equal(got.cpu(), torch._convert_indices_from_csr_to_coo(c, k, transpose=transpose))
+
+
+def _same(got, want):
+    for g_, w_ in zip(got, want):
+        assert g_.dtype == w_.dtype and torch.equal(g_.cpu(), w_)
+
+
+def test_empty_cases_without_cpu():
+    v = lambda t: t.to("vk")
+    s = torch.tensor([False, True])
+    got = no_fallback(lambda: torch.searchsorted(v(s), torch.empty(0, 3, dtype=torch.bool, device="vk")))
+    assert got.shape == (0, 3) and got.dtype == torch.long
+    with pytest.raises(NotImplementedError, match="not implemented for 'Bool'"):
+        torch.searchsorted(v(s), v(s))
+    e = torch.empty([1] * 9 + [0], dtype=torch.bool)
+    assert no_fallback(lambda: v(e).all()).item() is True
+    got = no_fallback(lambda: v(e).any(dim=(0, 9), keepdim=True))
+    assert torch.equal(got.cpu(), e.any(dim=(0, 9), keepdim=True))
+    a, b = torch.empty(2, 0, dtype=torch.bool), torch.empty(0, 3, dtype=torch.bool)
+    _same([no_fallback(lambda: torch.mm(v(a), v(b)))], [torch.mm(a, b)])
+    _same([no_fallback(lambda: torch.bmm(v(a)[None], v(b)[None]))], [torch.bmm(a[None], b[None])])
+    for dt in (torch.half, torch.int32, torch.bool):
+        for shape in ((2, 0, 0), (2, 3, 0)):
+            m = torch.empty(shape, dtype=dt)
+            _same(no_fallback(lambda: torch.linalg.lu(v(m))), torch.linalg.lu(m))
+        m = torch.empty(2, 0, 0, dtype=dt)
+        _same(no_fallback(lambda: torch.linalg.lu_factor_ex(v(m))), torch.linalg.lu_factor_ex(m))
+    m = torch.empty(0, 0, dtype=torch.half)
+    _same(no_fallback(lambda: torch.linalg.cholesky_ex(v(m))), torch.linalg.cholesky_ex(m))
+    t = torch.empty(4, dtype=torch.uint16, device="vk")
+    no_fallback(lambda: t.random_(65530, None))  # ([65530, 65535])
+    assert t.cpu().to(torch.int64).min().item() >= 65530
+
+
+@pytest.mark.parametrize("shape,dim", [((4, 6), 1), ((6, 3), 0), ((2, 0, 4), 2)])
+def test_glu_jvps(shape, dim):
+    g = torch.Generator().manual_seed(0)
+    x, dx = torch.randn(shape, generator=g), torch.randn(shape, generator=g)
+    glu = torch.nn.functional.glu(x, dim)
+    gg, dgg = torch.randn(glu.shape, generator=g), torch.randn(glu.shape, generator=g)
+    gx = torch.ops.aten.glu_backward(gg, x, dim)
+    v = lambda t: t.to("vk")
+    got = no_fallback(lambda: torch.ops.aten.glu_jvp(v(glu), v(x), v(dx), dim))
+    torch.testing.assert_close(got.cpu(), torch.ops.aten.glu_jvp(glu, x, dx, dim))
+    got = no_fallback(lambda: torch.ops.aten.glu_backward_jvp(v(gx), v(gg), v(x), v(dgg), v(dx), dim))
+    torch.testing.assert_close(got.cpu(), torch.ops.aten.glu_backward_jvp(gx, gg, x, dgg, dx, dim))
+
+
+def test_compute_linear_combination():
+    x, c = torch.arange(6.0).view(3, 2), torch.arange(6.0).view(2, 3)
+    got = no_fallback(lambda: torch.ops.aten._compute_linear_combination(x.to("vk"), c.to("vk")))
+    torch.testing.assert_close(got.cpu(), torch.ops.aten._compute_linear_combination(x, c))
+
+
+ERROR_CASES = {
+    "group_norm_int": lambda d: torch.ops.aten.native_group_norm(torch.ones(2, 4, 3, dtype=torch.int, device=d), None,
+                                                                None, 2, 4, 3, 2, 1e-5),
+    "random_complex": lambda d: torch.ones(3, dtype=torch.complex64, device=d).random_(0, 10),
+    "random_complex_full": lambda d: torch.ones(3, dtype=torch.complex64, device=d).random_(),
+    "sort_complex": lambda d: torch.sort(torch.ones(3, dtype=torch.complex64, device=d)),
+    "nll_target": lambda d: torch.ops.aten.nll_loss_forward(torch.ones(2, 3, device=d), torch.ones(2, device=d), None,
+                                                            1, -100),
+    "masked_scatter_mask": lambda d: torch.ones(2, 2, device=d).masked_scatter_(
+        torch.ones(2, 2, dtype=torch.uint8, device=d), torch.ones(4, device=d)),
+    "nan_to_num_out": lambda d: torch.nan_to_num(torch.ones(2, device=d), out=torch.empty(2, dtype=torch.long, device=d)),
+    "mm_dtypes": lambda d: torch.mm(torch.ones(2, 2, dtype=torch.int, device=d), torch.ones(2, 2, device=d),
+                                    out=torch.empty(2, 2, dtype=torch.int, device=d)),
+    "mm_out_dtype": lambda d: torch.mm(torch.ones(2, 2, device=d), torch.ones(2, 2, device=d),
+                                       out=torch.empty(2, 2, dtype=torch.int, device=d)),
+    "eigvals_1d": lambda d: torch.linalg.eigvals(torch.ones(3, device=d)),
+    "cholesky_inverse_nonsquare": lambda d: torch.cholesky_inverse(torch.ones(2, 3, device=d)),
+    "linear_combination_empty": lambda d: torch.ops.aten._compute_linear_combination(torch.ones((), device=d),
+                                                                                     torch.ones(2, 2, device=d)),
+}
+
+
+@pytest.mark.parametrize("name", list(ERROR_CASES))
+def test_cpu_errors_raised_on_vk(name):
+    """The CPU's error type and message, raised on vk with no fallback."""
+    f = ERROR_CASES[name]
+    with pytest.raises(Exception) as cpu:
+        f("cpu")
+    before = torch_vulkan.fallback_counts()
+    with pytest.raises(type(cpu.value)) as vk:
+        f("vk")
+    assert torch_vulkan.fallback_counts() == before
+    assert str(vk.value).splitlines()[0] == str(cpu.value).splitlines()[0]
+
+
+def test_op_without_cpu_kernel_raises_without_cpu():
+    q = torch.ones(1, 2, 1, 4, device="vk")
+    before = torch_vulkan.fallback_counts()
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten._efficient_attention_forward(q, q, q, None, None, None, None, None, 0.0, 0, False)
+    assert torch_vulkan.fallback_counts() == before
+
+
+@pytest.mark.parametrize("dtype", [None, torch.int64, torch.uint8, torch.int8, torch.half, torch.bfloat16, torch.bool])
+def test_prod_dtype(dtype):
+    x = torch.tensor([1.5, 2.0, 3.0, -1.0])
+    got = no_fallback(lambda: torch.prod(x.to("vk"), dtype=dtype))
+    want = torch.prod(x, dtype=dtype)
+    assert got.dtype == want.dtype
+    torch.testing.assert_close(got.cpu(), want)
+    b = torch.tensor([True, True, False])
+    got = no_fallback(lambda: torch.prod(b.to("vk")))
+    assert got.dtype == torch.int64 and got.item() == 0

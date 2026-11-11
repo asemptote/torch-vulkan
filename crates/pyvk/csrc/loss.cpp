@@ -75,6 +75,10 @@ std::tuple<at::Tensor, at::Tensor> nll_loss_forward(const at::Tensor& self, cons
                                                     const std::optional<at::Tensor>& weight, int64_t reduction,
                                                     int64_t ignore_index) {
   if (!kernel_ok(self, target, weight)) {
+    if (is_vk(self) && self.dim() >= 1 && self.dim() <= 2 && target.dim() <= 1) {
+      TORCH_CHECK(target.scalar_type() == at::kLong || target.scalar_type() == at::kByte,
+                  "expected target dtype to be Long or Byte, but got ", target.scalar_type());  // (the CPU's check)
+    }
     auto s = on_cpu("aten::nll_loss_forward", "", self, target, weight, reduction, ignore_index);
     return {s[0].toTensor(), s[1].toTensor()};
   }

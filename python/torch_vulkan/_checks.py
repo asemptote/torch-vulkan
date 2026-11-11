@@ -68,6 +68,8 @@ def _nll_loss(x, target, weight=None, *rest, **kw):
                            f"weight tensor of shape: {_sizes(weight)}")
     if target.dtype == torch.uint8:  # (the CPU kernel also takes byte targets)
         return (x, target.long(), weight, *rest), kw
+    if target.dtype != torch.int64:
+        raise RuntimeError(f"expected target dtype to be Long or Byte, but got {_C10_NAMES.get(str(target.dtype)[6:])}")
     return None
 
 

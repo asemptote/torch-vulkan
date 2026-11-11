@@ -229,6 +229,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm(const at::Tenso
     at::Tensor stats = at::empty({0, group}, input.options().dtype(t));
     return {at::empty(input.sizes(), input.options()), stats, stats.clone()};
   }
+  if (!kernel && is_vk(input) && !at::isFloatingType(input.scalar_type())) {
+    // (as the CPU's _check_group_norm_inputs, then GroupNormKernelImpl's dtype dispatch)
+    TORCH_CHECK(group > 0, "Expected num groups to be greater than 0, got ", group);
+    TORCH_CHECK(C % group == 0, "Expected number of channels in input to be divisible by num_groups, but got input of shape ",
+                input.sizes(), " and num_groups=", group);
+    for (const auto* p : {&weight, &bias}) {
+      TORCH_CHECK(!defined(*p) || ((*p)->dim() == 1 && (*p)->numel() == C), "Expected ",
+                  p == &weight ? "weight" : "bias", " to be a vector of size equal to the number of channels in input, but got ",
+                  p == &weight ? "weight" : "bias", " of shape ", (*p)->sizes(), " and input of shape ", input.sizes());
+    }
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "\"GroupNormKernelImpl\" not implemented for '", input.scalar_type(), "'");
+  }
   if (!kernel) {
     auto s = on_cpu("aten::native_group_norm", "", input, weight, bias, N, C, HxW, group, eps);
     return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};

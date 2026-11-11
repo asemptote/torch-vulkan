@@ -338,6 +338,14 @@ bool any_gemm(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& 
 
 at::Tensor& mm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
   at::native::resize_output(out, {self.size(0), mat2.size(1)});
+  TORCH_CHECK(out.dtype() == self.dtype(), "Expected out tensor to have dtype ", self.dtype(), ", but got ", out.dtype(),
+              " instead");
+  TORCH_CHECK(self.dtype() == mat2.dtype(), "expected m1 and m2 to have the same dtype, but got: ", self.dtype(),
+              " != ", mat2.dtype());  // (the CPU's check; its type names, too)
+  if (is_vk(self) && is_vk(mat2) && is_vk(out) && (out.numel() == 0 || self.size(1) == 0)) {
+    if (out.numel() != 0) out.zero_();  // (k = 0: sums of nothing)
+    return out;
+  }
   if (!any_gemm(self.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), nullptr, 1, 0)) {
     on_cpu("aten::mm", "out", self, mat2, out);
   }
@@ -346,6 +354,11 @@ at::Tensor& mm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& o
 
 at::Tensor& bmm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
   at::native::resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
+  if (is_vk(self) && is_vk(mat2) && is_vk(out) && self.dim() == 3 && mat2.dim() == 3 &&
+      self.scalar_type() == mat2.scalar_type() && (out.numel() == 0 || self.size(2) == 0)) {
+    if (out.numel() != 0) out.zero_();  // (k = 0: sums of nothing)
+    return out;
+  }
   if (!any_gemm(self, mat2, out, nullptr, 1, 0)) {
     on_cpu("aten::bmm", "out", self, mat2, out);
   }
@@ -357,8 +370,8 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
   int64_t m = mat1.size(0), n = mat2.size(1);
   at::native::resize_output(out, {m, n});
   bool done = false;
-  if (self.dim() <= 2 && is_vk(self)) {
-    at::Tensor cin = self.expand({m, n}).unsqueeze(0);
+  if (is_vk(self)) {
+    at::Tensor cin = self.expand({m, n}).unsqueeze(0);  // (more than 2 dims: expand's error, as the CPU's)
     done = any_gemm(mat1.unsqueeze(0), mat2.unsqueeze(0), out.unsqueeze(0), &cin, alpha, beta);
   }
   if (!done) {

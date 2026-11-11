@@ -54,22 +54,41 @@ DTYPE_ERROR = re.compile("|".join([
 ]))
 
 
-def make_arg(text):
-    """A CPU value for one described argument, or raise ValueError."""
+def make_list(arg):
+    """A plausible value for a list argument described only as "GenericList"."""
+    t = str(arg.type) if arg is not None else ""
+    m = re.match(r"^(?:Sym)?[Ii]nt\[(\d*)\]", t)
+    if m:
+        n = int(m.group(1) or 2)
+        if "dim" in arg.name:
+            return [0]
+        return [0] * n if "padding" in arg.name else [1] * n
+    if t.startswith("float["):
+        return [1.0]
+    raise ValueError(t)
+
+
+def make_arg(text, arg=None, device=None):
+    """A value for one described argument (CPU tensors, or on `device` where the
+    description has no " cpu"), or raise ValueError. `arg`: its schema argument."""
     text = text.strip()
-    if text == "None":
+    if text in ("None", "undef"):
         return None
     if text in ("int", "float", "bool", "complex"):
         return {"int": 1, "float": 0.5, "bool": True, "complex": 1j}[text]
+    if text == "GenericList":
+        return make_list(arg)
     if text.startswith("list(") and text.endswith(")"):
         inner = text[5:-1]
-        return [make_arg(inner)] if inner else []
+        return [make_arg(inner, None, device)] if inner else []
     m = re.match(r"^(\w+)( cpu| nested)? (\d+)d( empty)?( sparse)?$", text)
-    if not m or m.group(1) not in C10_NAMES or m.group(2) == " nested" or m.group(5):
-        raise ValueError(text)
-    dims = int(m.group(3))
-    shape = [0 if m.group(4) else 2] * dims
-    return torch.ones(shape, dtype=C10_NAMES[m.group(1)])
+    if m and m.group(1) in C10_NAMES and m.group(2) != " nested" and not m.group(5):
+        dims = int(m.group(3))
+        t = torch.ones([0 if m.group(4) else 2] * dims, dtype=C10_NAMES[m.group(1)])
+        return t.to(device) if device is not None and m.group(2) != " cpu" else t
+    if arg is not None and str(arg.type).startswith("str") and re.match(r"^\w+$", text):
+        return text  # (a string argument: "amax", "floor", ...)
+    raise ValueError(text)
 
 
 def dtype_signature(name, described):
@@ -104,11 +123,11 @@ def probe(name, described):
     qualified = name.removeprefix("aten::")
     packet, _, overload = qualified.partition(".")
     op = getattr(getattr(torch.ops.aten, packet), overload or "default")
+    schema = op._schema
     try:
-        values = [make_arg(t) for t in described]
+        values = [make_arg(t, a) for t, a in zip(described, schema.arguments)]
     except ValueError:
         return None
-    schema = op._schema
     args, kwargs = [], {}
     for a, v in zip(schema.arguments, values):
         if a.kwarg_only:

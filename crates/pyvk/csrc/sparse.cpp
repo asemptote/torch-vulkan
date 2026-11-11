@@ -561,6 +561,33 @@ at::Tensor convert_csr_to_coo(const at::Tensor& crow, const at::Tensor& col, boo
   TORCH_CHECK(crow.dim() == col.dim(), "crow_indices and col_indices are supposed to have the same dimensionality, but got ",
               crow.dim(), " and ", col.dim(), " dimensional tensors, respectively.");
   at::ScalarType t = out_int32 ? at::kInt : at::kLong;
+  if (crow.dim() > 1 && is_vk(crow) && is_vk(col)) {
+    // batched: [batch dims..., row, col] per entry, the batches one after another
+    int64_t nb = crow.dim() - 1, rows1 = crow.size(-1), nnz = col.size(-1);
+    int64_t batches = 1;
+    for (int64_t d = 0; d < nb; ++d) batches *= crow.size(d);
+    at::Tensor c = crow.to(at::kLong).reshape({batches, rows1});
+    at::Tensor entry = at::arange(nnz, c.options()).expand({batches, nnz}).contiguous();
+    at::Tensor rows = at::searchsorted(c, entry, false, true) - 1;
+    // (entries past a batch's last row start: row 0, as the CPU leaves them)
+    rows = at::where(at::lt(entry, c.slice(1, rows1 - 1, rows1)), rows, at::zeros_like(rows));
+    std::vector<at::Tensor> parts;
+    at::Tensor b = at::arange(batches, c.options()).unsqueeze(1).expand({batches, nnz});
+    int64_t inner = batches;
+    for (int64_t d = 0; d < nb; ++d) {
+      inner /= crow.size(d);
+      parts.push_back(at::remainder(at::floor_divide(b, inner), crow.size(d)).reshape({-1}));
+    }
+    at::Tensor cols = col.to(at::kLong).reshape({-1});
+    if (transpose) {
+      parts.push_back(cols);
+      parts.push_back(rows.reshape({-1}));
+    } else {
+      parts.push_back(rows.reshape({-1}));
+      parts.push_back(cols);
+    }
+    return at::stack(parts).to(t);
+  }
   if (crow.dim() != 1) {
     auto stack = on_cpu("aten::_convert_indices_from_csr_to_coo", "", crow, col, out_int32, transpose);
     return stack[0].toTensor();

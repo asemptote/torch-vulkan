@@ -160,6 +160,8 @@ at::Tensor& logit_out(const at::Tensor& self, std::optional<double> eps, at::Ten
 
 at::Tensor& nan_to_num_out(const at::Tensor& self, std::optional<double> nan, std::optional<double> posinf,
                            std::optional<double> neginf, at::Tensor& out) {
+  TORCH_CHECK(self.scalar_type() == out.scalar_type(), "nan_to_num: dtype of out: ", out.scalar_type(),
+              " should be same as input: ", self.scalar_type());  // (the CPU's check, first)
   if (!at::isFloatingType(self.scalar_type()) && !at::isComplexType(self.scalar_type()) && is_vk(self) &&
       is_vk(out)) {
     resize_elementwise_output(out, self.sizes(), &self);
@@ -425,6 +427,17 @@ void where_operand(const at::Tensor& t, const at::Tensor*& tensor, std::optional
 
 at::Tensor& where_out(const at::Tensor& cond, const at::Tensor& self, const at::Tensor& other, at::Tensor& out) {
   check_out_cast(at::result_type(self, other), out);
+  at::ScalarType ut = self.scalar_type();
+  if ((ut == at::kUInt16 || ut == at::kUInt32 || ut == at::kUInt64) && other.scalar_type() == ut &&
+      out.scalar_type() == ut && is_vk(self) && is_vk(other) && is_vk(out) && is_vk(cond) && self.dim() > 0 &&
+      other.dim() > 0) {
+    // (unsigned: the same bits, selected as the signed dtype of their width)
+    at::ScalarType st = ut == at::kUInt16 ? at::kShort : ut == at::kUInt32 ? at::kInt : at::kLong;
+    at::Tensor r = at::where(cond, self.view(st), other.view(st));
+    resize_elementwise_output(out, r.sizes(), &r);
+    out.view(st).copy_(r);
+    return out;
+  }
   const at::Tensor *a = nullptr, *b = nullptr;
   std::optional<at::Scalar> sa, sb;
   where_operand(self, a, sa);

@@ -544,6 +544,9 @@ at::Tensor& index_fill_scalar(at::Tensor& self, int64_t dim, const at::Tensor& i
   TORCH_CHECK(!value.isComplex() || self.is_complex(),
               "index_fill_(): Converting complex Scalar to non-complex type is not supported");
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+  if (index.is_cpu() && is_vk(self) && index.scalar_type() == at::kLong) {
+    return index_fill_scalar(self, dim, index.to(self.device()), value);  // (a CPU index: moved to the device)
+  }
   if (!movable(self) || !is_vk(index) || index.scalar_type() != at::kLong || index.dim() > 1) {
     on_cpu("aten::index_fill_", "int_Scalar", self, dim, index, value);
     return self;
@@ -824,15 +827,80 @@ void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, cons
   accumulate(dst_view, offsets, values, op::SEGREDUCE_SUM, true);
 }
 
+// No index (scatter's, or index_reduce's source empty): out is self, as the
+// CPU's, whose shape checks skip an empty index.
+bool copy_self_if_no_index(const at::Tensor& self, const at::Tensor& index, at::Tensor& out) {
+  if (index.numel() != 0 || !is_vk(self) || !is_vk(out) || !is_vk(index)) return false;
+  if (!out.is_same(self)) {
+    at::native::resize_output(out, self.sizes());
+    out.copy_(self);
+  }
+  return true;
+}
+
+// out = self, then out[index along dim] *= src for complex tensors (no atomic
+// complex multiply on the GPU): the index's targets ranked by occurrence (a
+// stable sort, so the products go in index order, as the CPU's), and one
+// gather-multiply-scatter pass per rank, whose targets are all distinct.
+bool complex_scatter_prod(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
+                          bool include_self, at::Tensor& out) {
+  if (!at::isComplexType(self.scalar_type()) || self.dim() == 0 || !is_vk(self) || !is_vk(index) || !is_vk(src) ||
+      !is_vk(out) || out.scalar_type() != self.scalar_type() || index.scalar_type() != at::kLong ||
+      index.dim() != self.dim() || (src.dim() != 0 && src.dim() != self.dim())) {
+    return false;
+  }
+  dim = at::maybe_wrap_dim(dim, self.dim());
+  for (int64_t d = 0; d < self.dim(); ++d) {
+    TORCH_CHECK(index.size(d) <= (src.dim() == 0 ? index.size(d) : src.size(d)),
+                "Expected index ", index.sizes(), " to be smaller than src ", src.sizes(), " apart from dimension ", dim);
+    TORCH_CHECK(d == dim || index.size(d) <= self.size(d), "Expected index ", index.sizes(), " to be smaller than self ",
+                self.sizes(), " apart from dimension ", dim);
+  }
+  at::Tensor work = self.contiguous().clone();
+  if (index.numel() > 0) {
+    int64_t bound = self.size(dim);
+    auto [lo, hi] = at::aminmax(index);
+    TORCH_CHECK(lo.item<int64_t>() >= -bound && hi.item<int64_t>() < bound, "index out of range in self");
+    at::Tensor idx = at::where(at::lt(index, 0), index + bound, index);
+    at::Tensor lin = at::zeros(idx.sizes(), idx.options());
+    for (int64_t d = 0; d < idx.dim(); ++d) {
+      at::Tensor c = idx;
+      if (d != dim) {
+        std::vector<int64_t> shape(idx.dim(), 1);
+        shape[d] = idx.size(d);
+        c = at::arange(idx.size(d), idx.options()).view(shape);
+      }
+      lin = lin + c * work.stride(d);
+    }
+    lin = lin.reshape({-1});
+    at::Tensor vals = src.dim() == 0 ? src.expand(idx.sizes())
+                                     : src.as_strided(idx.sizes(), src.strides(), src.storage_offset());
+    vals = vals.to(self.scalar_type()).reshape({-1});
+    at::Tensor flat = work.view({-1});
+    if (!include_self) flat.index_fill_(0, lin, 1);
+    auto [sorted, order] = at::sort(lin, /*stable=*/true, 0, false);
+    at::Tensor v = vals.index_select(0, order);
+    int64_t n = sorted.numel();
+    at::Tensor pos = at::arange(n, sorted.options());
+    at::Tensor start = at::ones({n}, sorted.options().dtype(at::kBool));
+    if (n > 1) start.slice(0, 1).copy_(at::ne(sorted.slice(0, 1), sorted.slice(0, 0, n - 1)));
+    at::Tensor first = std::get<0>(at::cummax(at::where(start, pos, at::zeros_like(pos)), 0));
+    at::Tensor rank = pos - first;
+    int64_t passes = rank.max().item<int64_t>() + 1;
+    for (int64_t r = 0; r < passes; ++r) {
+      at::Tensor m = at::eq(rank, r);
+      at::Tensor t = sorted.masked_select(m);
+      flat.index_copy_(0, t, flat.index_select(0, t) * v.masked_select(m));
+    }
+  }
+  at::native::resize_output(out, self.sizes());
+  out.copy_(work);
+  return true;
+}
+
 at::Tensor& scatter_add_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                             at::Tensor& out) {
-  if (index.numel() == 0 && is_vk(self) && is_vk(out) && is_vk(index)) {
-    if (!out.is_same(self)) {  // (no index: self, as the CPU)
-      at::native::resize_output(out, self.sizes());
-      out.copy_(self);
-    }
-    return out;
-  }
+  if (copy_self_if_no_index(self, index, out)) return out;
   if (!scatter_accumulate(self, dim, index, src, op::SEGREDUCE_SUM, true, out)) {
     on_cpu("aten::scatter_add", "out", self, dim, index, src, out);
   }
@@ -843,6 +911,8 @@ at::Tensor& scatter_reduce_two_out(const at::Tensor& self, int64_t dim, const at
                                    const at::Tensor& src, c10::string_view reduce, bool include_self,
                                    at::Tensor& out) {
   reject_dtype("scatter_reduce", self.scalar_type(), self.scalar_type() == at::kBool && reduce == "mean");
+  if (copy_self_if_no_index(self, index, out)) return out;
+  if (reduce == "prod" && complex_scatter_prod(self, dim, index, src, include_self, out)) return out;
   if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), include_self, out)) {
     on_cpu("aten::scatter_reduce", "two_out", self, dim, index, src, reduce, include_self, out);
   }
@@ -851,6 +921,8 @@ at::Tensor& scatter_reduce_two_out(const at::Tensor& self, int64_t dim, const at
 
 at::Tensor& scatter_reduce_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                                c10::string_view reduce, at::Tensor& out) {
+  if (copy_self_if_no_index(self, index, out)) return out;
+  if (reduce == "multiply" && complex_scatter_prod(self, dim, index, src, true, out)) return out;
   if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), true, out)) {
     on_cpu("aten::scatter", "reduce_out", self, dim, index, src, reduce, out);
   }
@@ -860,6 +932,8 @@ at::Tensor& scatter_reduce_out(const at::Tensor& self, int64_t dim, const at::Te
 at::Tensor& scatter_value_reduce_out(const at::Tensor& self, int64_t dim, const at::Tensor& index,
                                      const at::Scalar& value, c10::string_view reduce, at::Tensor& out) {
   at::Tensor src = at::scalar_tensor(value, self.options());
+  if (copy_self_if_no_index(self, index, out)) return out;
+  if (reduce == "multiply" && complex_scatter_prod(self, dim, index, src, true, out)) return out;
   if (!scatter_accumulate(self, dim, index, src, reduce_code(reduce), true, out)) {
     on_cpu("aten::scatter", "value_reduce_out", self, dim, index, value, reduce, out);
   }
@@ -881,6 +955,17 @@ at::Tensor& index_reduce_out(const at::Tensor& self, int64_t dim, const at::Tens
   TORCH_CHECK(reduce == "prod" || reduce == "mean" || reduce == "amax" || reduce == "amin",
               "index_reduce(): Expected reduce to be one of prod, mean, amax or amin but got ", reduce, ".");
   reject_dtype("index_reduce", self.scalar_type(), self.scalar_type() == at::kBool);
+  if (copy_self_if_no_index(self, source, out)) return out;
+  if (reduce == "prod" && at::isComplexType(self.scalar_type()) && index.dim() <= 1 && source.dim() == self.dim() &&
+      source.dim() > 0 && is_vk(index)) {
+    // (as a scatter: index along dim, expanded to source's shape; the CPU's
+    // exclude-self initialisation has no complex kernel)
+    TORCH_CHECK_NOT_IMPLEMENTED(include_self, "\"index_reduce_func_exclude_input_init\" not implemented for '",
+                                self.scalar_type(), "'");
+    int64_t d = at::maybe_wrap_dim(dim, self.dim());
+    at::Tensor full = index_along(index.to(at::kLong).reshape({-1}), d, source.dim()).expand(source.sizes());
+    if (complex_scatter_prod(self, d, full, source, include_self, out)) return out;
+  }
   if (!index_accumulate(self, dim, index, source, reduce_code(reduce), include_self, out)) {
     on_cpu("aten::index_reduce", "out", self, dim, index, source, reduce, include_self, out);
   }
@@ -1064,6 +1149,10 @@ at::Tensor masked_select(const at::Tensor& self, const at::Tensor& mask) {
 
 at::Tensor& masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::Tensor& source) {
   at::assert_no_internal_overlap(self);
+  TORCH_CHECK(self.scalar_type() == source.scalar_type(), "masked_scatter: expected self and source to have same dtypes but got",
+              self.scalar_type(), " and ", source.scalar_type());  // (sic: the CPU's message)
+  TORCH_CHECK(mask.scalar_type() == at::kBool, "masked_scatter_ only supports boolean masks, but got mask with dtype ",
+              mask.scalar_type());
   bool ok = movable(self) && is_vk(mask) && is_vk(source) && mask.scalar_type() == at::kBool &&
             source.scalar_type() == self.scalar_type();
   if (!ok) {
@@ -1514,6 +1603,10 @@ at::Tensor& isin_out(const at::Tensor& elements, const at::Tensor& test, bool as
   TORCH_CHECK(elements.device() == test.device(), "Expected all tensors to be on the same device, but found at "
               "least two devices, ", elements.device(), " and ", test.device(), "!");
   // Broadcast comparison: fine for moderate sizes (a sort-based method comes with M10).
+  at::ScalarType common = at::result_type(elements, test);
+  if (is_vk(elements) && is_vk(test) && (elements.scalar_type() != common || test.scalar_type() != common)) {
+    return isin_out(elements.to(common), test.to(common), assume_unique, invert, out);
+  }
   bool small = elements.numel() * std::max<int64_t>(test.numel(), 1) <= (int64_t(1) << 24);
   if (!is_vk(elements) || !is_vk(test) || !is_vk(out) || !small || dtype_label(elements.scalar_type()) == nullptr ||
       dtype_label(test.scalar_type()) == nullptr) {

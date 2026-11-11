@@ -137,6 +137,10 @@ void assign_out(at::Tensor& out, const at::Tensor& result) {
 
 std::tuple<at::Tensor&, at::Tensor&> sort_out(const at::Tensor& self, std::optional<bool> stable, int64_t dim,
                                               bool descending, at::Tensor& values, at::Tensor& indices) {
+  if (at::isComplexType(self.scalar_type()) && is_vk(self)) {
+    at::maybe_wrap_dim(dim, self.dim());  // (as sort's meta function, first)
+    TORCH_CHECK(false, " Sort does not support complex dtypes on CPU");  // (the CPU's message)
+  }
   if (!sortable(self) || !is_vk(values) || !is_vk(indices)) {
     on_cpu("aten::sort", "values_stable", self, stable, dim, descending, values, indices);
     return {values, indices};
@@ -558,6 +562,17 @@ bool right_side(bool right, std::optional<c10::string_view> side) {
 at::Tensor& searchsorted_out(const at::Tensor& sorted, const at::Tensor& self, bool out_int32, bool right,
                              std::optional<c10::string_view> side, const std::optional<at::Tensor>& sorter,
                              at::Tensor& out) {
+  if (sorted.scalar_type() == at::kBool && self.scalar_type() == at::kBool && is_vk(sorted) && is_vk(self) &&
+      is_vk(out)) {
+    // (the CPU has no bool kernel, but searches no values without one)
+    TORCH_CHECK_NOT_IMPLEMENTED(self.numel() == 0, "\"searchsorted_out_cpu\" not implemented for 'Bool'");
+    at::Tensor r = at::empty(self.sizes(), self.options().dtype(out_int32 ? at::kInt : at::kLong));
+    TORCH_CHECK(out.scalar_type() == r.scalar_type(), "torch.searchsorted(): output tensor's dtype is wrong, it can only "
+                "be Int(int32) or Long(int64) depending on whether out_int32 flag is True, but we got output tensor's "
+                "dtype ", out.scalar_type(), " and out_int32 flag is ", out_int32 ? "True" : "False");
+    at::native::resize_output(out, r.sizes());
+    return out;
+  }
   return searchsorted_impl(sorted, self, out_int32, right_side(right, side), sorter, out);
 }
 
