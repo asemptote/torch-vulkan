@@ -367,8 +367,12 @@ EXPECTED = [
      "division rounds as the CPU's (lavapipe), not on NVIDIA or Intel"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
-    (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
+    (r"_int4|int4pack|_weight_int4", r"",
      "int4 packed-weight matmuls: packed layouts specific to x86/ARM CPUs and CUDA (out of scope)"),
+    (r"test__dyn_quant_matmul_4bit_", r"Some elements have error >= 0\.06",
+     "a bound on the int4 / int8 quantisation error that holds for the CPU's random draws only: vk's generator "
+     "(Philox) draws other numbers for the seed, and on them one output of 352,256 is 0.061 off a float32 mm, "
+     "with the CPU's kernels too; vk's kernel gives the CPU's results bit for bit on the same inputs"),
     (r"", r"InductorError: KeyError: 'vk'",
      "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
 ]
