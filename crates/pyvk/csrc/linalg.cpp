@@ -48,11 +48,14 @@ static_assert(sizeof(GemvParams) == 96 && offsetof(GemvParams, m_sr) == 56 && of
 constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
 constexpr int64_t kGemvRows0 = 8, kGemvRows1 = 64;  // rows per workgroup in shaders/gemv.slang's modes
 constexpr int64_t kSgThreads = 128, kSgRows = 8;  // WG and MR in shaders/gemmsg.slang
+constexpr int64_t kCoopTileM = 128, kCoopTileN = 256;  // BM and BN in shaders/gemmcm.slang
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
 
 // TORCH_VK_GEMM: "tiled" (gemm.slang), "float4" (gemm4.slang where it can),
-// "subgroup" (gemmsg.slang where the device can run it), or unset.
+// "subgroup" (gemmsg.slang where the device can run it), or unset. Any but
+// unset turns off gemmcm.slang (float16 on cooperative matrices), so that
+// float16 products then run in float32 like other 16-bit ones.
 std::string gemm_choice() {
   static const std::string choice = [] {
     const char* env = std::getenv("TORCH_VK_GEMM");
@@ -76,6 +79,14 @@ uint32_t subgroup_lanes(at::ScalarType t) {
   static const uint32_t f32 = wanted ? vkt_kernel_subgroup_size("gemmsg_f32") : 0;
   static const uint32_t f64 = wanted && vkt_has_float64() ? vkt_kernel_subgroup_size("gemmsg_f64") : 0;
   return t == at::kFloat ? f32 : t == at::kDouble ? f64 : 0;
+}
+
+// Whether float16 products use shaders/gemmcm.slang: where the device has
+// float16 cooperative matrices in subgroups of 32 (and TORCH_VK_GEMM is unset).
+bool use_coopmat_f16() {
+  static const bool use = gemm_choice().empty() && has_feature(kFeatureCoopMatF16) &&
+                          vkt_kernel_subgroup_size("gemmcm_f16") == 32;
+  return use;
 }
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
@@ -196,12 +207,57 @@ GemmParams gemm_params(const at::Tensor& a, const at::Tensor& b, const at::Tenso
   return p;
 }
 
+// How gemmcm.slang stages an operand [B, R, C] (A: R = m, C = k; B: R = k,
+// C = n): 1 in 16-byte pieces along C (unit C stride), 2 along R (unit R
+// stride), where the pieces are 16-byte aligned; else 0, value by value.
+uint32_t coop_mode(const at::Tensor& t) {
+  bool aligned = gpu_address(t) % 16 == 0 && t.stride(0) % 8 == 0;
+  if (aligned && t.stride(2) == 1 && t.stride(1) % 8 == 0) return 1;
+  if (aligned && t.stride(1) == 1 && t.stride(2) % 8 == 0) return 2;
+  return 0;
+}
+
+// gemm() for float16: shaders/gemmcm.slang on cooperative matrices, products
+// accumulated in float32 and rounded once. Returns false where it does not
+// run (no cooperative matrices, matrix-vector products: those take the
+// float32 route of other 16-bit products).
+bool coop_gemm_f16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+                   double alpha, double beta) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2);
+  if (!use_coopmat_f16() || a.scalar_type() != at::kHalf || b.scalar_type() != at::kHalf ||
+      (cin != nullptr && cin->scalar_type() != at::kHalf) || m == 1 || n == 1) {
+    return false;
+  }
+  for (const at::Tensor* t : {&a, &b, &c, cin}) {
+    if (t != nullptr && (!is_vk(*t) || max_offset(*t) < 0 || max_offset(*t) >= (int64_t(1) << 31))) {
+      return false;
+    }
+  }
+  int64_t gx = (n + kCoopTileN - 1) / kCoopTileN, gy = (m + kCoopTileM - 1) / kCoopTileM;
+  if (gx > kMaxGroups || gy > kMaxGroups || batch > kMaxGroups) {
+    return false;
+  }
+  if (c.numel() == 0) {
+    return true;
+  }
+  GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
+  p.alpha = pack_param(alpha, at::kFloat);  // (the kernel scales in float32)
+  p.beta = pack_param(beta, at::kFloat);
+  dispatch("gemmcm_f16", {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b)}, p, static_cast<uint32_t>(gx),
+           static_cast<uint32_t>(gy),
+           static_cast<uint32_t>(batch));
+  return true;
+}
+
 // c = alpha * a @ b (+ beta * cin), all 3-D views: a [B, M, K], b [B, K, N],
 // c and cin [B, M, N] (cin may broadcast through zero strides). Returns false
 // if the kernel cannot handle the case.
 bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
           double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
+  if (c.scalar_type() == at::kHalf) {
+    return coop_gemm_f16(a, b, c, cin, alpha, beta);
+  }
   if (!gemm_dtype(c.scalar_type()) || a.scalar_type() != c.scalar_type() || b.scalar_type() != c.scalar_type() ||
       (cin != nullptr && cin->scalar_type() != c.scalar_type())) {
     return false;

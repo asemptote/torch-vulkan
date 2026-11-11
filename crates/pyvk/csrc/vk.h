@@ -87,7 +87,13 @@ uint64_t device_error_address();
 std::array<uint64_t, 2> fill_bits(const at::Scalar& value, at::ScalarType dtype);
 
 // Optional device features (bits of vkt_capabilities).
-enum Feature : uint32_t { kFeatureFloat64 = 1, kFeatureInt16 = 2, kFeatureFloat16 = 4, kFeatureInt8 = 8 };
+enum Feature : uint32_t {
+  kFeatureFloat64 = 1,
+  kFeatureInt16 = 2,
+  kFeatureFloat16 = 4,
+  kFeatureInt8 = 8,
+  kFeatureCoopMatF16 = 16,  // float16 cooperative matrices (shaders/gemmcm.slang)
+};
 
 inline bool has_feature(Feature f) {
   static const uint32_t caps = vkt_capabilities();

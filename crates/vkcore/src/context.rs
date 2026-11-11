@@ -43,6 +43,11 @@ pub struct Capabilities {
     pub subgroup_size_control: bool,
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
+    /// VK_KHR_cooperative_matrix with 16 x 16 x 16 float16 products into
+    /// float32 at subgroup scope, in subgroups of 32 (gemmcm.slang), with
+    /// what that kernel also needs: float16 arithmetic and storage, the
+    /// Vulkan memory model with device scope, 38 KiB of shared memory.
+    pub cooperative_matrix_f16: bool,
     pub max_shared_memory: u32,
     pub max_workgroup_count_x: u32,
     pub max_push_constants: u32,
@@ -207,7 +212,7 @@ impl Context {
 
             let exts = device_extensions(&instance, physical_device);
             let api = effective_api_version(props.api_version);
-            let caps = query_capabilities(&instance, physical_device, &props, api, &exts);
+            let caps = query_capabilities(&entry, &instance, physical_device, &props, api, &exts);
             // (shaderInt64 and shaderFloat64 are optional: see kernels.rs)
             for (ok, what) in [
                 (caps.buffer_device_address, "bufferDeviceAddress"),
@@ -262,6 +267,9 @@ impl Context {
             if caps.subgroup_size_control && api < vk::API_VERSION_1_3 {
                 names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
             }
+            if caps.cooperative_matrix_f16 {
+                names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
             let mut device_info = vk::DeviceCreateInfo::default()
@@ -286,6 +294,10 @@ impl Context {
                 .compute_full_subgroups(true);
             if caps.subgroup_size_control {
                 device_info = device_info.push_next(&mut ssc);
+            }
+            let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+            if caps.cooperative_matrix_f16 {
+                device_info = device_info.push_next(&mut coop);
             }
             let device = instance.create_device(physical_device, &device_info, None)?;
             let queue = device.get_device_queue(queue_family, 0);
@@ -379,15 +391,17 @@ fn effective_api_version(device: u32) -> u32 {
 }
 
 /// Whether `TORCH_VK_DISABLE` (comma-separated: int64, float64, int16,
-/// float16, int8, storage16, storage8, denorm, subgroups) names `what`: the
-/// feature is then treated as missing, to test the paths for devices without
-/// it (Mali GPUs have neither int64 nor float64; "subgroups" hides subgroup
-/// size control, so no kernel written for subgroups runs).
+/// float16, int8, storage16, storage8, denorm, subgroups, coopmat) names
+/// `what`: the feature is then treated as missing, to test the paths for
+/// devices without it (Mali GPUs have neither int64 nor float64; "subgroups"
+/// hides subgroup size control, so no kernel written for subgroups runs;
+/// "coopmat" hides cooperative matrices).
 fn disabled(what: &str) -> bool {
     std::env::var("TORCH_VK_DISABLE").is_ok_and(|v| v.split(',').any(|x| x.trim() == what))
 }
 
 unsafe fn query_capabilities(
+    entry: &ash::Entry,
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,
     props: &vk::PhysicalDeviceProperties,
@@ -406,7 +420,12 @@ unsafe fn query_capabilities(
     let mut s16 = vk::PhysicalDevice16BitStorageFeatures::default();
     let size_control = api >= vk::API_VERSION_1_3 || has(ash::ext::subgroup_size_control::NAME);
     let mut ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+    let has_coop = has(ash::khr::cooperative_matrix::NAME);
+    let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut s16);
+    if has_coop {
+        features = features.push_next(&mut coop);
+    }
     if size_control {
         features = features.push_next(&mut ssc);
     }
@@ -461,6 +480,19 @@ unsafe fn query_capabilities(
         && !disabled("subgroups");
     let (min_size, max_size) =
         if subgroup_size_control { (sscp.min_subgroup_size, sscp.max_subgroup_size) } else { (sub.subgroup_size, sub.subgroup_size) };
+    // The cooperative-matrix shapes the device multiplies: gemmcm.slang's is
+    // 16 x 16 x 16, float16 A and B into float32 C, one subgroup each.
+    let coop_f16_shape = has_coop && coop.cooperative_matrix == vk::TRUE && {
+        let ext = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+        ext.get_physical_device_cooperative_matrix_properties(pd).unwrap_or_default().iter().any(|c| {
+            (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
+                && c.a_type == vk::ComponentTypeKHR::FLOAT16
+                && c.b_type == vk::ComponentTypeKHR::FLOAT16
+                && c.c_type == vk::ComponentTypeKHR::FLOAT32
+                && c.result_type == vk::ComponentTypeKHR::FLOAT32
+                && c.scope == vk::ScopeKHR::SUBGROUP
+        })
+    };
 
 
     let memory = instance.get_physical_device_memory_properties(pd);
@@ -490,6 +522,17 @@ unsafe fn query_capabilities(
         subgroup_size_control,
         min_subgroup_size: min_size,
         max_subgroup_size: max_size,
+        cooperative_matrix_f16: coop_f16_shape
+            && subgroup_size_control
+            && (min_size..=max_size).contains(&32)
+            && props.limits.max_compute_shared_memory_size >= 38912
+            && b(f16i8.shader_float16)
+            && b(s16.storage_buffer16_bit_access)
+            && b(vmm.vulkan_memory_model)
+            && b(vmm.vulkan_memory_model_device_scope)
+            && !disabled("float16")
+            && !disabled("storage16")
+            && !disabled("coopmat"),
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
         max_push_constants: props.limits.max_push_constants_size,
