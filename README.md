@@ -218,16 +218,14 @@ The full reference, including dtypes and every environment variable, is
 
 ### Environment variables
 
+The ones most often needed (all of them are in [docs/api.md](docs/api.md#environment-variables)):
+
 | Variable | Effect |
 |---|---|
 | `TORCH_VK_STRICT=1` | Raise instead of running an op on the CPU. |
-| `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted, and the tests fail on any. |
-| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU, as a reference for testing and comparison. |
-| `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | Choose the matrix-multiply kernel (`float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere). By default float16 products run on cooperative matrices (tensor cores) where the device has them (VK_KHR_cooperative_matrix); with any choice set they run in float32 like other 16-bit products. |
-| `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size of the `subgroup` kernels (by default 16 for float32 and 8 for float64), within the device's range. |
-| `TORCH_VK_API=1.1` | Use the Vulkan 1.1 code path on a newer driver. |
-| `TORCH_VK_DISABLE=int64,float64,int16,float16,int8,storage16,storage8,denorm,subgroups,coopmat` | Hide device features, to test a small GPU's code paths on a bigger one. |
-| `TORCH_VK_CACHE_DIR` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, or `$XDG_CACHE_HOME/torch-vulkan`, or `~/.cache/torch-vulkan`). |
+| `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
+| `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache. |
+| `TORCH_VK_DISABLE=a,b,...` | Hide device features (e.g. `float64`, `coopmat`), to test a small GPU's code paths on a bigger one. |
 
 ## Limitations
 
@@ -240,7 +238,7 @@ The full reference, including dtypes and every environment variable, is
   products on tensor cores reach about 160 TFLOP/s on an H100 NVL and an L40S
   (CUDA: about 400 and 180-200), float32 products run at about 2.3x CUDA's
   time, float64 `svd` at 0.3-1.1x (faster than CUDA in most cases), `eigh` at
-  1.6-3.5x, FFTs at 1-4x, element-wise bandwidth at 1-1.3x, and per-op overhead
+  1.6-3.5x, `solve` at 1.4-3.5x, FFTs at 1-4x, element-wise bandwidth at 1-1.3x, and per-op overhead
   is slightly lower than CUDA's.
 <!-- FINAL (#36): replace with the final benchmarks (solve #34, FFT #35, the HD 530 and the UHD 620) -->
 - **`torch.compile`**: the default Inductor backend has no code generator for
