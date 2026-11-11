@@ -101,6 +101,22 @@ def test_fft_radix_passes(dtype, n):
     check(back, x, **fft_tol(dtype, n))
 
 
+@pytest.mark.parametrize("dtype", COMPLEX)
+@pytest.mark.parametrize("shape", [(1000, 2), (333, 16), (7, 5, 64), (129, 512), (3, 1024), (70000, 4)])
+def test_fft_short_rows(dtype, shape):
+    # rows up to fft_radix.slang's BUDGET: one radix-n pass, several rows per
+    # workgroup, a partial last block, and more blocks than workgroups
+    x = make_complex(shape, dtype, 7)
+    n = shape[-1]
+    with on_gpu():
+        got = torch.fft.fft(x.to("vk"))
+        back = torch.fft.ifft(got)
+        cols = torch.fft.fft(x.to("vk"), dim=0)
+    check(got, torch.fft.fft(x), **fft_tol(dtype, n))
+    check(back, x, **fft_tol(dtype, n))
+    check(cols, torch.fft.fft(x, dim=0), **fft_tol(dtype, shape[0] * 4))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("n", [2, 4, 6, 30, 2048, 1 << 13, 1 << 15 | 2, 5, 9])
 def test_real_transforms_half_length(dtype, n):

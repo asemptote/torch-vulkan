@@ -86,9 +86,13 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
   }
   at::Tensor table = twiddles(n, x.scalar_type());
   std::string kernel = std::string("fft_") + dtype_label(x.scalar_type());
-  // Rows that fit in shared memory (fft.slang LOCAL_MAX) take one pass.
-  int64_t local_max = x.scalar_type() == at::kComplexFloat ? 2048 : 1024;
-  if (n <= local_max) {
+  // fft_radix.slang's workgroups hold `budget` values (1024 complex64 or 512
+  // complex128, 8 KiB): rows up to that long take one radix-n pass, budget / n
+  // rows per workgroup. Rows up to twice that (fft.slang LOCAL_MAX, 32 KiB)
+  // take its radix-2 FFT_LOCAL pass, one row per workgroup (faster there
+  // than two radix passes).
+  int64_t budget = x.scalar_type() == at::kComplexFloat ? 1024 : 512;
+  if (n > budget && n <= 2 * budget) {
     at::Tensor out = at::empty_like(x);
     FftParams p{};
     p.in = gpu_address(x);
@@ -100,20 +104,18 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     dispatch(kernel, {op::FFT_LOCAL, inverse ? 1u : 0u}, p, p.ngroups);
     return out;
   }
-  // Longer rows: radix-r Stockham passes (shaders/fft_radix.slang), r <= 128,
-  // as few passes as that allows with the bits of n split evenly between
-  // them, and g = budget / r groups per workgroup (its shared memory: 1024
-  // complex64 or 512 complex128 values) so that every workgroup is full.
-  int64_t budget = x.scalar_type() == at::kComplexFloat ? 1024 : 512;
+  // Longer rows: radix-r Stockham passes, r <= 128, as few passes as that
+  // allows with the bits of n split evenly between them, and g = budget / r
+  // groups per workgroup so that every workgroup is full.
   int64_t bits = 0;
   while ((int64_t(1) << bits) < n) ++bits;
-  int64_t passes = (bits + 6) / 7;
+  int64_t passes = n <= budget ? 1 : (bits + 6) / 7;
   std::string radix = std::string("fft_radix_") + dtype_label(x.scalar_type());
   at::Tensor src = x, buffers[2] = {at::empty_like(x), at::empty_like(x)};
   int which = 0;
   for (int64_t pass = 0, ns = 1; pass < passes; ++pass) {
     int64_t r = int64_t(1) << (bits / passes + (pass < bits % passes ? 1 : 0));
-    int64_t g = std::min(budget / r, n / r);
+    int64_t g = n <= budget ? budget / n : budget / r;
     at::Tensor& dst = buffers[which];
     RadixParams p{};
     p.in = gpu_address(src);
@@ -124,7 +126,7 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     p.batch = static_cast<uint32_t>(batch);
     p.r = static_cast<uint32_t>(r);
     p.g = static_cast<uint32_t>(g);
-    p.ngroups = static_cast<uint32_t>(std::min<int64_t>(batch * (n / r) / g, 65535));
+    p.ngroups = static_cast<uint32_t>(std::min<int64_t>((batch * (n / r) + g - 1) / g, 65535));
     dispatch(radix, {inverse ? 1u : 0u}, p, p.ngroups);
     src = dst;
     which ^= 1;

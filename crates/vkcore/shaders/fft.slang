@@ -4,14 +4,15 @@
 //
 // `table` holds exp(-2 pi i t / n) for t < n/2, computed on the host in
 // float64 (GPU sin/cos are far too inaccurate for twiddles); INVERSE
-// conjugates it. Rows longer than LOCAL_MAX take fft_radix.slang's radix-r
-// passes (which replaced this file's radix-2 pass, opcode 0, now free).
+// conjugates it. Power-of-two rows up to LOCAL_MAX / 2 and longer than
+// LOCAL_MAX take fft_radix.slang's radix-r passes (which replaced this
+// file's radix-2 pass, opcode 0, now free).
 //
 // PHASE 1, Hermitian extension for C2R: out[k] = in[k] for k <= n/2, else
 //   conj(in[n - k]); input rows have `m` elements.
 //
-// PHASE 2, a whole power-of-two FFT of rows with n <= LOCAL_MAX in shared
-//   memory: one workgroup per row runs every Stockham pass between two
+// PHASE 2, a whole power-of-two FFT of rows with LOCAL_MAX / 2 < n <=
+//   LOCAL_MAX in shared memory: one workgroup per row runs every pass between two
 //   shared buffers, so the row is read and written once instead of log2(n)
 //   times.
 //
