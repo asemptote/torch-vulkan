@@ -39,8 +39,11 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
   (Bessel, incomplete gamma, zeta/polygamma, erfcx, orthogonal polynomials),
   activations, `where`, `lerp`/`addcmul`/`addcdiv`. float16 and bfloat16 are
   computed in float32 and rounded once; 8/16-bit integers are computed in int32;
-  float8 converts exactly. float32 division is correctly rounded on every
-  driver, as on the CPU.
+  float8 converts exactly. float32 division, sqrt and rsqrt are correctly
+  rounded on every driver, and float64 division too, without fused
+  multiply-adds. (The CPU's own vectorised float32 sqrt is not always correctly
+  rounded, so a result can differ from a particular CPU's by 1 ulp while being
+  the correctly rounded one.)
 - **Reductions and scans**: sum, mean, prod, max/min, argmax, var/std, norms,
   any/all, cumsum/cumprod, cummax/cummin, logcumsumexp.
 - **Matrix products**: mm, bmm, matmul, addmm, baddbmm, addmv, dot, `nn.Linear`,
@@ -131,7 +134,7 @@ Tested on:
 | Intel UHD Graphics 620 | Intel, Windows | main development machine; unified memory, no copies between CPU and GPU |
 | Intel HD Graphics 530 | Mesa (ANV), Linux | validation layer clean |
 | NVIDIA H100 NVL, L40S | NVIDIA, Linux | PyTorch's test files; float16 on tensor cores; [benchmarks against CUDA](benchmarks/results/) |
-| Arm Mali-G57 (Galaxy A13 5G) | Arm, Android (Termux) | Vulkan 1.1, no float64, no int64 |
+| Arm Mali-G57 (Galaxy A13 5G) | Arm, Android (Termux) | Vulkan 1.1, no float64, no int64; the tests pass except where that phone's own CPU reference is wrong ([#13](https://github.com/asemptote/torch-vulkan/issues/13)) |
 | Mesa lavapipe | Mesa, Linux | CI, with the validation layer; PyTorch's test files |
 
 Apple GPUs (through MoltenVK) are untested: MoltenVK provides buffer device
@@ -165,8 +168,8 @@ compiler `slangc` (in the Vulkan SDK, or from Slang's releases), and a Vulkan
 driver. `build.rs` finds `slangc` through `SLANGC`, then `VULKAN_SDK`, then
 `PATH`. The extension is compiled against the PyTorch of the environment it is
 installed into, so rebuild it after upgrading PyTorch. The tests and CI use
-PyTorch 2.14.1; with 2.15, float16 `linspace` differs from the CPU's by a few
-units in the last place.
+PyTorch 2.14.1; with 2.15, two of the CPU's error messages differ from the
+table generated for 2.14 (sorting complex tensors, `matrix_exp` of integers).
 
 Linux (as the CI does; lavapipe gives a Vulkan driver on any machine):
 
@@ -222,7 +225,7 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 
 | Variable | Effect |
 |---|---|
-| `TORCH_VK_STRICT=1` | Raise instead of running an op on the CPU. |
+| `TORCH_VK_STRICT=1` | Raise `NotImplementedError` where an op would compute on the CPU (an op whose CPU check only raises gives the CPU's error). |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache. |
 | `TORCH_VK_DISABLE=a,b,...` | Hide device features (e.g. `float64`, `coopmat`), to test a small GPU's code paths on a bigger one. |
@@ -244,7 +247,7 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
-- **One device**; no pinned memory.
+- **One device.**
 - **Tensors of 2^31 or more elements** are not supported (32-bit element
   offsets).
 - **Quantised tensors** are per-tensor affine only; per-channel quantised
@@ -252,7 +255,9 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 - **float32 subnormals** are flushed to zero on GPUs that flush them in
   shaders (e.g. the H100).
 - **Long float64 kernels** can trip the Windows GPU watchdog on small
-  integrated GPUs.
+  integrated GPUs; on Linux's i915 (Intel Gen9), a single dispatch running
+  for a second or more can lose its results without a device-lost error
+  (the stream bounds batches on Intel GPUs, `TORCH_VK_MAX_BATCH_GROUPS`).
 
 ## How it works
 

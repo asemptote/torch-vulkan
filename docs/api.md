@@ -14,6 +14,7 @@ functions, reached as `torch.vk.synchronize()` and so on), and the
 
 | Function | Returns / does |
 |---|---|
+| `__version__` | The installed package's version, e.g. `"0.2.0"`. |
 | `is_available()` | `True` if a Vulkan device that torch-vulkan can use was found. |
 | `device_count()` | `1` if a device is available, else `0` (one device for now). |
 | `device_name()` | The device's name, e.g. `"Intel(R) UHD Graphics 620"`. |
