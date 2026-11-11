@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, HAS_FLOAT64, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 def mm_tol(dtype, k):
@@ -223,6 +223,16 @@ def test_subgroup_gemm_kernel(env):
                          text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     assert float(out.stdout.strip().splitlines()[-1]) < 1.0  # (errors in units of 1e-5 / 1e-13 of the largest entry)
+
+
+def test_subgroup_gemm_coverage():
+    # which kernel float products take: a subgroup size the kernel is built for
+    # (0 where the device cannot run it); on lavapipe (llvmpipe, 256-bit
+    # vectors, the CI's driver) gemmsg must run, with 8 lanes, so CI covers it
+    sizes = [tv._native.kernel_subgroup_size(f"gemmsg_{t}") for t in ("f32", "f64")]
+    assert all(s in (0, 8, 16, 32) for s in sizes), sizes
+    if "llvmpipe" in tv.device_name() and "256 bits" in tv.device_name():
+        assert sizes[0] == 8 and (sizes[1] == 8 or not HAS_FLOAT64), sizes
 
 
 def test_float4_gemm_kernel():
