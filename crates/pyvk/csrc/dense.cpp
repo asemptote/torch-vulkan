@@ -867,6 +867,17 @@ at::Tensor& lu_solve_out(const at::Tensor& lu, const at::Tensor& pivots, const a
   return out;
 }
 
+// The functional linalg_lu_solve: its result laid out as PyTorch's meta kernel
+// says (for left=False, complex: a conjugate view of a row-major solution,
+// as the CPU's), then solved into.
+at::Tensor lu_solve_vk(const at::Tensor& lu, const at::Tensor& pivots, const at::Tensor& b, bool left, bool adjoint) {
+  at::Tensor m = at::linalg_lu_solve(meta_of(lu), meta_of(pivots), meta_of(b), left, adjoint);
+  at::Tensor phys = m.is_conj() ? m.conj() : m;
+  at::Tensor out = at::empty_strided(phys.sizes(), phys.strides(), b.options());
+  if (m.is_conj()) out = out.conj();
+  return lu_solve_out(lu, pivots, b, left, adjoint, out);
+}
+
 at::Tensor& solve_triangular_out(const at::Tensor& a, const at::Tensor& b, bool upper, bool left, bool unit,
                                  at::Tensor& out) {
   at::ScalarType st = a.scalar_type();
@@ -1559,6 +1570,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_linalg_det.result", &det_out);
   m.impl("_linalg_slogdet.sign", &slogdet_out);
   m.impl("linalg_lu_solve.out", &lu_solve_out);
+  m.impl("linalg_lu_solve", &vk::lu_solve_vk);
   m.impl("linalg_solve_triangular.out", &solve_triangular_out);
   m.impl("linalg_solve_triangular", &solve_triangular_vk);
   m.impl("triangular_solve.X", &triangular_solve_legacy_out);
