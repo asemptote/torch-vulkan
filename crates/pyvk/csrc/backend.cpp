@@ -475,6 +475,26 @@ bool copy_float8(const at::Tensor& dst, const at::Tensor& src) {
   at::ScalarType st = src.scalar_type(), dt = dst.scalar_type();
   if (!is_float8(st) && !is_float8(dt)) return false;
   if (st == dt) return false;  // (a same-dtype copy moves bytes)
+  if (is_float8(st) && !at::isFloatingType(dt) && !at::isComplexType(dt)) {
+    // (to an integer or bool dtype: each code's value as the CPU converts
+    // it directly, NaN included, which a cast through float32 would not
+    // give: an fnuz NaN is 0 there)
+    static std::mutex mutex;
+    static std::map<std::pair<at::ScalarType, at::ScalarType>, at::Tensor> tables;
+    at::Tensor table;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto& t = tables[{st, dt}];
+      if (!t.defined()) {
+        at::Tensor codes = at::arange(256, at::TensorOptions().dtype(at::kInt)).to(at::kByte).view(st);
+        t = codes.to(dt).to(at::Device(kDevice, 0));
+      }
+      table = t;
+    }
+    at::Tensor r = table.index_select(0, src.view(at::kByte).reshape({-1}).to(at::kLong)).view(src.sizes());
+    dst.copy_(r.expand(dst.sizes()));
+    return true;
+  }
   at::Tensor f;  // the source's values as float32 (as c10: float8 <-> float)
   if (is_float8(st)) {
     f = float8_tables(st).values.index_select(0, src.view(at::kByte).reshape({-1}).to(at::kLong)).view(src.sizes());
@@ -1372,7 +1392,17 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   }
   const auto& name = op.schema().operator_name();
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
-  raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));
+  {
+    // (the table's errors are the CPU's for non-empty inputs: its kernels
+    // return before dispatching on the dtype when there is nothing to do)
+    size_t n = op.schema().arguments().size(), base = stack->size() - std::min(n, stack->size());
+    bool any_elements = false;
+    for (size_t i = base; i < stack->size(); ++i) {
+      const c10::IValue& v = (*stack)[i];
+      if (v.isTensor() && v.toTensor().defined() && v.toTensor().numel() > 0) any_elements = true;
+    }
+    if (any_elements) raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));
+  }
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   record_fallback(key);
