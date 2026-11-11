@@ -272,7 +272,9 @@ at::Tensor fft_c2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
     n *= self.size(d);
     out = fft_dim(out, d, !forward);
   }
-  out = dim.empty() ? self.clone() : out.contiguous();
+  if (dim.empty()) {
+    out = self.clone();
+  }
   return normalize(out, normalization, n);
 }
 
@@ -313,7 +315,6 @@ at::Tensor fft_r2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
       out = out.narrow(last, 0, out.size(last) / 2 + 1);
     }
   }
-  out = out.contiguous();
   return normalize(out, normalization, n);
 }
 
@@ -346,13 +347,13 @@ at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
     at::Tensor folded = at::empty({batch, h}, rows.options());
     fft_phase(op::FFT_C2R, rows, folded, last_dim_size, m, batch, batch * h);
     at::Tensor z = fft_rows(folded, true);
-    out = at::view_as_real(z).view(shape).movedim(-1, last).contiguous();
+    out = at::view_as_real(z).view(shape).movedim(-1, last);
   } else {
     // Rebuild the full Hermitian spectrum along the last dim, then invert it.
     at::Tensor full = at::empty({batch, n == 0 ? 0 : last_dim_size}, rows.options());
     fft_phase(op::FFT_HERMITIAN, rows, full, last_dim_size, m, batch, batch * last_dim_size);
     at::Tensor spectrum = fft_rows(full, true);
-    out = at::real(spectrum).view(shape).movedim(-1, last).contiguous();
+    out = at::real(spectrum).view(shape).movedim(-1, last);
   }
   return normalize(out, normalization, n);
 }
@@ -394,16 +395,33 @@ std::vector<int64_t> sort_dims(at::IntArrayRef in_strides, at::IntArrayRef dim, 
   return sorted;
 }
 
-at::Tensor with_strides(const at::Tensor& result, const std::vector<int64_t>& strides) {
-  if (!at::hasMKL() || result.strides() == at::IntArrayRef(strides)) {
-    // (Without MKL the CPU's outputs are contiguous, as ours.) A result that
-    // is a view of a working buffer (e.g. the onesided half of a full
-    // spectrum) is copied: an op's output must not be a view.
-    return result.is_view() ? result.clone() : result;
+at::Tensor with_strides(const at::Tensor& result, std::vector<int64_t> strides) {
+  // The transforms above leave each result in the layout of its last pass
+  // (e.g. a column transform's, transposed), often the CPU's own: copied
+  // only when it differs. Without MKL the CPU's outputs are contiguous.
+  if (!at::hasMKL()) {
+    int64_t step = 1;
+    for (int64_t d = result.dim() - 1; d >= 0; --d) {
+      strides[d] = step;
+      step *= std::max<int64_t>(result.size(d), 1);
+    }
   }
-  at::Tensor out = at::empty_strided(result.sizes(), strides, result.options());
-  out.copy_(result);
-  return out;
+  if (result.strides() != at::IntArrayRef(strides)) {
+    at::Tensor out = at::empty_strided(result.sizes(), strides, result.options());
+    out.copy_(result);
+    return out;
+  }
+  if (!result.is_view()) {
+    return result;
+  }
+  // An op's output must not be a view: a view covering all of its storage
+  // (a permutation of a working buffer) takes the storage over, any other
+  // (e.g. the onesided half of a full spectrum) is copied.
+  if (result.storage_offset() == 0 && result.is_non_overlapping_and_dense() &&
+      result.storage().nbytes() == static_cast<size_t>(result.numel()) * result.element_size()) {
+    return at::empty({0}, result.options()).set_(result.storage(), 0, result.sizes(), result.strides());
+  }
+  return result.clone();
 }
 
 // The registered kernels: results in the CPU's layouts.
