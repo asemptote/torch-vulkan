@@ -18,6 +18,7 @@ typedef double S;
 #define IN_T T
 #include "_strided.slang"
 #include "_fmath.slang"
+#define CDIV_EXACT 1  // (complex division as the CPU's: _complex.slang)
 #include "_cmath.slang"
 
 [vk::constant_id(0)]

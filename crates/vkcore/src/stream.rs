@@ -39,6 +39,14 @@ pub fn spin_us(discrete: bool) -> u64 {
         .unwrap_or(if discrete { 500 } else { 0 })
 }
 
+/// TORCH_VK_BARRIERS=full: a full compute + transfer memory barrier before
+/// every command, instead of one from the previous command's kind to the
+/// next's (a debugging switch).
+pub fn full_barriers() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("TORCH_VK_BARRIERS").is_ok_and(|v| v == "full"))
+}
+
 pub struct Stream {
     ctx: Arc<Context>,
     layout: vk::PipelineLayout,
@@ -138,7 +146,18 @@ impl Stream {
         // earlier barrier become visible to later accesses with this one's
         // visibility operation. (The full compute + transfer barrier cost about
         // 5.5 us of GPU time per dispatch on the H100.)
-        if let Some(prev) = self.last_transfer {
+        if full_barriers() {
+            // (TORCH_VK_BARRIERS=full: the full compute + transfer barrier
+            // before every command, as before cccade8, to rule out the
+            // narrowed barriers when a race is suspected)
+            let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                );
+            unsafe { d.cmd_pipeline_barrier(cb, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
+        } else if let Some(prev) = self.last_transfer {
             let (src_stage, src_access) = if prev {
                 (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
             } else {

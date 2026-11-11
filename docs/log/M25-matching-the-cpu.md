@@ -30,10 +30,14 @@ round as the CPU does, step by step.
   - rsqrt is `m_div(1, m_sqrt(x))`, rounded twice, like the CPU's
     `1 / std::sqrt(x)`. pow(x, 0.5) is sqrt, as on the CPU.
   - Caveat: the CPU's own vectorised sqrt is not always correctly rounded.
-    It is MKL's on AVX2 builds (float64: 1.4% of results 1 ulp off; float32:
-    about 0.1% of all inputs) and Sleef's on AVX-512 CPUs (the CI runners).
-    The tests compare against the correctly rounded root, which is what the
-    CPU's scalar path gives, and vk keeps correct rounding.
+    It is MKL's vsSqrt (ATen's vml.h), through ATen's AVX2 kernel on AVX-512
+    CPUs too, where MKL picks its own code path: float64 had 1.4% of results
+    1 ulp off and float32 about 0.1% of all inputs on an AVX2 CPU, and the CI
+    runners' (AVX-512) differed from the correctly rounded root in 481 of the
+    test's 65547 values. (An earlier note here blamed Sleef on AVX-512 CPUs:
+    no PyTorch path calls Sleef for sqrt.) The tests compare against the
+    correctly rounded root, which is what the CPU's scalar path gives, and vk
+    keeps correct rounding.
 - **log1p32**:
   - Old method: Goldberg's `log(u) x / (u - 1)` inherited log32's error, up
     to 2.8 ulp.
@@ -48,6 +52,14 @@ round as the CPU does, step by step.
 - **scatter_reduce / index_reduce "mean"** (`segreduce.slang`) divide with
   `m_div`. Their sums were already in the CPU's order, but OpFDiv's quotient
   was not correctly rounded.
+- **Complex division** (`cbinary.slang`, `_complex.slang`'s `cdiv`): Smith's
+  algorithm, as c10::complex's scalar `operator/`, with each quotient
+  correctly rounded (`m_div`, under `CDIV_EXACT`), where it divided with
+  OpFDiv. Complex scatter means divide each part with `m_div`, and
+  test_scatter_reduce_mean (complex64) compares them with `x / count` on vk,
+  which then differed by an ulp. (The CPU's vectorised complex division
+  scales by 1 / max(|c|, |d|) instead, so it is not matched bit for bit.)
+  The linear-algebra kernels' cdiv keeps OpFDiv.
 - **16-bit ops whose intermediates the CPU rounds to the 16-bit dtype**:
   - nll_loss_backward rounds g = -(grad / total_weight) to the 16-bit dtype,
     then rounds each w g once. vk used to widen the whole op to float32.
@@ -80,6 +92,28 @@ round as the CPU does, step by step.
     forward-mode check uses and which is entered per nesting level.
   - The kernel already runs below the batching layers, on plain tensors, so
     it now draws its noise outside both guards.
+
+## Barriers between commands (#35)
+
+- `vkcore::Stream` puts a barrier before every command. Since cccade8 it is a
+  memory dependency from the previous command's stage and writes to the next
+  command's stage and accesses (compute -> compute between dispatches,
+  transfer bits only next to a copy or fill), no longer a full compute +
+  transfer barrier: about 0.5 us less per dispatch on the H100 NVL.
+  Every command still depends on the one before it, and so, through the
+  chain, on all earlier ones.
+- The evidence is the spec argument and tests, not the validation layer:
+  synchronisation validation tracks accesses to resources bound through
+  descriptors and by transfer commands, and every vk kernel reads and writes
+  through buffer device addresses in push constants, which it does not see.
+  So cccade8's clean TORCH_VK_VALIDATE=1 run checked the transfers'
+  barriers only. (cccade8's message suggests more.) The checks that do bear
+  on it: long chains of small dependent ops (element-wise, FFT round trips,
+  index_add_ into one buffer, small matmuls, writes into views) bitwise equal
+  with the narrowed and with full barriers on the H100 and L40S, and
+  PyTorch's test files on both GPUs.
+- `TORCH_VK_BARRIERS=full` restores the full barrier, to rule the narrowed
+  ones out when a race is suspected.
 
 ## Large inputs (found on the way)
 

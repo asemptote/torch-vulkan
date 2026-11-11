@@ -32,8 +32,9 @@ def assert_bitwise(got, want):
 def test_sqrt_rsqrt_float32_bitwise():
     # Against the correctly rounded root (float64's, rounded: 53 >= 2 * 24 + 2
     # bits), as the CPU's scalar sqrt: its vectorised float32 sqrt is not
-    # always correctly rounded (MKL's on AVX2 builds, Sleef's on AVX-512 CPUs:
-    # CI's runners differed from it in 481 of these 65547 values, by 1 ulp).
+    # always correctly rounded (MKL's vsSqrt, through ATen's AVX2 kernel also on
+    # AVX-512 CPUs, where MKL picks its own code path: CI's runners differed
+    # from the correctly rounded root in 481 of these 65547 values, by 1 ulp).
     # rsqrt as the CPU's 1 / sqrt(x), that root divided into 1 in float32.
     x = wide_range(1 << 16, torch.float32)
     vx = x.to("vk")

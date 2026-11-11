@@ -11,20 +11,35 @@ vector<S, 2> cconj(vector<S, 2> a)
     return vector<S, 2>(a.x, -a.y);
 }
 
-// Smith's algorithm: avoids overflow/underflow of |b|^2 for large or small b.
+// The parts' quotient in cdiv: _fmath.slang's correctly rounded m_div where
+// the including file asks for it (CDIV_EXACT, after including _fmath.slang:
+// the element-wise division, which must equal c10::complex's, whose
+// divisions are IEEE ones), else OpFDiv (up to 2.5 ulp; the linear-algebra
+// kernels' pivots and rotations).
+S cdiv_part(S a, S b)
+{
+#ifdef CDIV_EXACT
+    return m_div(a, b);
+#else
+    return a / b;
+#endif
+}
+
+// Smith's algorithm, as c10::complex's operator/: avoids overflow/underflow
+// of |b|^2 for large or small b.
 vector<S, 2> cdiv(vector<S, 2> a, vector<S, 2> b)
 {
     if (abs(b.x) >= abs(b.y))
     {
         if (b.x == S(0) && b.y == S(0))  // (as c10::complex: (a.x / 0, a.y / 0), inf or NaN by part)
             return vector<S, 2>(a.x / abs(b.x), a.y / abs(b.y));
-        S r = b.y / b.x;
+        S r = cdiv_part(b.y, b.x);
         S d = b.x + b.y * r;
-        return vector<S, 2>((a.x + a.y * r) / d, (a.y - a.x * r) / d);
+        return vector<S, 2>(cdiv_part(a.x + a.y * r, d), cdiv_part(a.y - a.x * r, d));
     }
-    S r = b.x / b.y;
+    S r = cdiv_part(b.x, b.y);
     S d = b.x * r + b.y;
-    return vector<S, 2>((a.x * r + a.y) / d, (a.y * r - a.x) / d);
+    return vector<S, 2>(cdiv_part(a.x * r + a.y, d), cdiv_part(a.y * r - a.x, d));
 }
 
 // |a| without overflow for large parts.
