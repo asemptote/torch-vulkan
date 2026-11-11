@@ -188,6 +188,43 @@ print(max(float((g - w).abs().max() / w.abs().max().clamp_min(1)) for g, w in ca
 """
 
 
+SUBGROUP_GEMM_SCRIPT = r"""
+import torch, torch_vulkan
+torch.manual_seed(0)
+worst = 0.0
+for dt in (torch.float32, torch.float64):
+    cases = []
+    for m, k, n in [(2, 3, 2), (8, 16, 32), (65, 17, 130), (130, 257, 70), (33, 1, 40), (5, 0, 8), (200, 64, 129)]:
+        a, b = torch.randn(m, k, dtype=dt), torch.randn(k, n, dtype=dt)
+        cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
+        cases.append(((a.to("vk") @ b.t().contiguous().to("vk").t()).cpu(), a @ b))  # column-major B
+        cases.append(((a.t().contiguous().to("vk").t() @ b.to("vk")).cpu(), a @ b))  # column-major A
+    a, b, c = torch.randn(3, 40, 24, dtype=dt), torch.randn(3, 24, 50, dtype=dt), torch.randn(40, 50, dtype=dt)
+    cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
+    cases.append((torch.baddbmm(c.to("vk"), a.to("vk"), b.to("vk"), beta=0.5, alpha=2).cpu(), torch.baddbmm(c, a, b, beta=0.5, alpha=2)))
+    nan = torch.full((40, 50), float("nan"), dtype=dt)
+    cases.append((torch.addmm(nan.to("vk"), a[0].to("vk"), b[0].to("vk"), beta=0).cpu(), torch.addmm(nan, a[0], b[0], beta=0)))
+    x = torch.randn(70, 90, dtype=dt)
+    cases.append(((x.to("vk")[3:, 5:61] @ x.to("vk")[:56, 10:80]).cpu(), x[3:, 5:61] @ x[:56, 10:80]))  # strided views
+    for g, w in cases:
+        assert not torch.isnan(g).any(), "NaN"
+        worst = max(worst, float((g - w).abs().max() / w.abs().max().clamp_min(1)) / (1e-5 if dt == torch.float32 else 1e-13))
+print(worst)
+"""
+
+
+@pytest.mark.parametrize("env", [dict(TORCH_VK_SUBGROUP="8"), dict(TORCH_VK_SUBGROUP="16"), dict(TORCH_VK_SUBGROUP="32"),
+                                 dict(TORCH_VK_GEMM="tiled")])
+def test_subgroup_gemm_kernel(env):
+    # shaders/gemmsg.slang (the default where the device has subgroup size
+    # control) at each subgroup size it is instantiated for (a size outside the
+    # device's range falls back to one inside it), and gemm.slang's tiles
+    out = subprocess.run([sys.executable, "-c", SUBGROUP_GEMM_SCRIPT], env=dict(os.environ, **env), capture_output=True,
+                         text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert float(out.stdout.strip().splitlines()[-1]) < 1.0  # (errors in units of 1e-5 / 1e-13 of the largest entry)
+
+
 def test_float4_gemm_kernel():
     # shaders/gemm4.slang (the Mali default) on any GPU, through its env switch
     env = dict(os.environ, TORCH_VK_GEMM="float4")

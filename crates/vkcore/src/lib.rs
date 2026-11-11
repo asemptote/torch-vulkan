@@ -15,7 +15,7 @@ pub mod stream;
 use std::sync::{Arc, Mutex};
 
 pub use context::{last_validation_message, validation_issues, validation_requested, version_string, Capabilities, Context};
-pub use kernels::{Kernel, KernelCache, PUSH_CONSTANT_BYTES};
+pub use kernels::{kernel_subgroup_size, Kernel, KernelCache, PUSH_CONSTANT_BYTES};
 pub use memory::{Allocation, Pool, PoolStats};
 pub use stream::Stream;
 

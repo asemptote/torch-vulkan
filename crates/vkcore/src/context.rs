@@ -35,6 +35,14 @@ pub struct Capabilities {
     pub denorm_preserve_f32: bool,
     pub denorm_preserve_f64: bool,
     pub subgroup_size: u32,
+    /// Subgroup operations available to compute shaders (none if compute is
+    /// not among the device's subgroup stages).
+    pub subgroup_ops: vk::SubgroupFeatureFlags,
+    /// VK_EXT_subgroup_size_control (core in 1.3) with full subgroups, for
+    /// compute: a pipeline can then require a subgroup size.
+    pub subgroup_size_control: bool,
+    pub min_subgroup_size: u32,
+    pub max_subgroup_size: u32,
     pub max_shared_memory: u32,
     pub max_workgroup_count_x: u32,
     pub max_push_constants: u32,
@@ -43,6 +51,26 @@ pub struct Capabilities {
     /// A memory type that is device-local *and* host-visible + coherent:
     /// on integrated GPUs this lets CPU and GPU share tensors without copies.
     pub unified_memory_type: Option<u32>,
+}
+
+impl Capabilities {
+    /// The subgroup size for a kernel written for subgroups that prefers
+    /// `preferred` lanes (gemmsg.slang: 16 for float32, 8 for float64, where a
+    /// lane has more registers), or 0 where such kernels cannot run: they
+    /// need size control with full subgroups, shuffles and broadcasts, and
+    /// are instantiated for 8, 16 and 32 lanes. `TORCH_VK_SUBGROUP` overrides
+    /// the preference (to test each size on one device).
+    pub fn subgroup_size_for(&self, preferred: u32) -> u32 {
+        let ops = vk::SubgroupFeatureFlags::SHUFFLE | vk::SubgroupFeatureFlags::BALLOT;
+        if !self.subgroup_size_control || !self.subgroup_ops.contains(ops) {
+            return 0;
+        }
+        let wanted = std::env::var("TORCH_VK_SUBGROUP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(preferred);
+        [wanted, preferred, 16, 8, 32]
+            .into_iter()
+            .find(|&s| [8, 16, 32].contains(&s) && s >= self.min_subgroup_size && s <= self.max_subgroup_size)
+            .unwrap_or(0)
+    }
 }
 
 /// One Vulkan device with one compute queue.
@@ -231,6 +259,9 @@ impl Context {
                     }
                 }
             }
+            if caps.subgroup_size_control && api < vk::API_VERSION_1_3 {
+                names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
+            }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
             let mut device_info = vk::DeviceCreateInfo::default()
@@ -249,6 +280,12 @@ impl Context {
             }
             if caps.storage_buffer_8bit {
                 device_info = device_info.push_next(&mut s8);
+            }
+            let mut ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+                .subgroup_size_control(true)
+                .compute_full_subgroups(true);
+            if caps.subgroup_size_control {
+                device_info = device_info.push_next(&mut ssc);
             }
             let device = instance.create_device(physical_device, &device_info, None)?;
             let queue = device.get_device_queue(queue_family, 0);
@@ -342,9 +379,10 @@ fn effective_api_version(device: u32) -> u32 {
 }
 
 /// Whether `TORCH_VK_DISABLE` (comma-separated: int64, float64, int16,
-/// float16, int8, storage16, storage8, denorm) names `what`: the feature is
-/// then treated as missing, to test the paths for devices without it (Mali
-/// GPUs have neither int64 nor float64).
+/// float16, int8, storage16, storage8, denorm, subgroups) names `what`: the
+/// feature is then treated as missing, to test the paths for devices without
+/// it (Mali GPUs have neither int64 nor float64; "subgroups" hides subgroup
+/// size control, so no kernel written for subgroups runs).
 fn disabled(what: &str) -> bool {
     std::env::var("TORCH_VK_DISABLE").is_ok_and(|v| v.split(',').any(|x| x.trim() == what))
 }
@@ -366,7 +404,12 @@ unsafe fn query_capabilities(
     let mut f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
     let mut s8 = vk::PhysicalDevice8BitStorageFeatures::default();
     let mut s16 = vk::PhysicalDevice16BitStorageFeatures::default();
+    let size_control = api >= vk::API_VERSION_1_3 || has(ash::ext::subgroup_size_control::NAME);
+    let mut ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut s16);
+    if size_control {
+        features = features.push_next(&mut ssc);
+    }
     if promoted(ash::khr::buffer_device_address::NAME) {
         features = features.push_next(&mut bda);
     }
@@ -394,6 +437,7 @@ unsafe fn query_capabilities(
     let mut fc = vk::PhysicalDeviceFloatControlsProperties::default();
     let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut m4 = vk::PhysicalDeviceMaintenance4Properties::default();
+    let mut sscp = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
     let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut sub).push_next(&mut m3);
     if float_controls {
         properties = properties.push_next(&mut fc);
@@ -401,7 +445,23 @@ unsafe fn query_capabilities(
     if maintenance4 {
         properties = properties.push_next(&mut m4);
     }
+    if size_control {
+        properties = properties.push_next(&mut sscp);
+    }
     instance.get_physical_device_properties2(pd, &mut properties);
+    let subgroup_ops = if sub.supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
+        sub.supported_operations
+    } else {
+        vk::SubgroupFeatureFlags::empty()
+    };
+    let subgroup_size_control = size_control
+        && ssc.subgroup_size_control == vk::TRUE
+        && ssc.compute_full_subgroups == vk::TRUE
+        && sscp.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
+        && !disabled("subgroups");
+    let (min_size, max_size) =
+        if subgroup_size_control { (sscp.min_subgroup_size, sscp.max_subgroup_size) } else { (sub.subgroup_size, sub.subgroup_size) };
+
 
     let memory = instance.get_physical_device_memory_properties(pd);
     let unified = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -426,6 +486,10 @@ unsafe fn query_capabilities(
         denorm_preserve_f32: float_controls && b(fc.shader_denorm_preserve_float32) && !disabled("denorm"),
         denorm_preserve_f64: float_controls && b(fc.shader_denorm_preserve_float64) && !disabled("denorm"),
         subgroup_size: sub.subgroup_size,
+        subgroup_ops,
+        subgroup_size_control,
+        min_subgroup_size: min_size,
+        max_subgroup_size: max_size,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
         max_push_constants: props.limits.max_push_constants_size,
