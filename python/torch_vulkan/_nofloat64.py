@@ -283,9 +283,14 @@ def _batch_norm_impl_index(input, weight, bias, running_mean, running_var, train
 def _patch_grad_scaler():
     """GradScaler.unscale_ takes the scale's reciprocal in float64 on its
     device (except on MPS): without float64 the scale is lent as a CPU
-    tensor for that call, so the reciprocal is the CPU's (float64, rounded to
-    float32) and the rest runs on vk as before (found_inf and the inverse
-    scale are copied to each gradient's device)."""
+    tensor for that call. The reciprocal of that one value is then host
+    arithmetic on a CPU tensor (float64, rounded to float32, as the CPU's),
+    not a vk op run on the CPU, so it is no fallback (fallback_counts()
+    stays the same: test_optim's test_grad_scaler_steps checks it). The
+    unscaling itself runs on vk as before; GradScaler copies found_inf and the
+    inverse scale to each gradient's device. Cost, on GPUs without float64
+    only: per unscale_, one read-back of the scale (a device sync) and those
+    two 0-dim uploads (each waits for queued work)."""
     from torch.amp import grad_scaler
 
     original = grad_scaler.GradScaler.unscale_
