@@ -821,6 +821,13 @@ at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::
 at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, at::Tensor& out) {
   TORCH_CHECK(!(at::isIntegralType(self.scalar_type(), true) && exponent.isIntegral(true) && exponent.toLong() < 0),
               "Integers to negative integer powers are not allowed.");  // (as the CPU)
+  if (self.scalar_type() == at::kBool && exponent.isBoolean() && is_vk(self) && is_vk(out)) {
+    // (bool ** bool, as the CPU: x ** True is x, x ** False is True)
+    at::Tensor r = exponent.toBool() ? self.clone() : at::ones_like(self);
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
+  }
   if (!binary_gpu(kBinary[kPow], self, nullptr, &exponent, 1, out)) {
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);
   }
@@ -877,6 +884,13 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
     return false;
   }
   at::ScalarType rt = scalar ? at::result_type(self, *scalar) : at::result_type(self, *other);
+  if (rt == at::kFloat8_e4m3fn || rt == at::kFloat8_e5m2 || rt == at::kFloat8_e4m3fnuz || rt == at::kFloat8_e5m2fnuz) {
+    // (float8: compared as float32, exact)
+    at::Tensor a = self.to(at::kFloat);
+    if (scalar) return compare_gpu(code, a, nullptr, &*scalar, out);
+    at::Tensor b = other->to(at::kFloat);
+    return compare_gpu(code, a, &b, nullptr, out);
+  }
   if (rt == at::kUInt16 || rt == at::kUInt32 || rt == at::kUInt64) {
     // (the CPU has eq and ne for these, and raises for the ordered ones)
     static const char* const names[] = {"eq_cpu", "ne_cpu", "lt_cpu", "le_cpu", "gt_cpu", "ge_cpu"};

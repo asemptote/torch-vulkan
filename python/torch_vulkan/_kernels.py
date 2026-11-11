@@ -1502,6 +1502,23 @@ def _masked_softmax(x, mask, dim=None, mask_type=None):
     return torch.softmax(x.masked_fill(m, -math.inf), d if x.dim() else 0)
 
 
+def _embedding_renorm_(weight, indices, max_norm, norm_type):
+    """The CPU's: each distinct indexed row with a norm above max_norm scaled
+    by max_norm / (norm + 1e-7) (the norm in the weight's dtype, the scale in
+    double where the device has it)."""
+    if weight.dim() != 2 or indices.dtype not in (torch.int32, torch.int64):
+        return _on_cpu("embedding_renorm_", weight, indices, max_norm, norm_type)
+    rows = torch.unique(indices.reshape(-1).to(torch.int64))
+    if rows.numel() == 0:
+        return weight
+    sub = weight.index_select(0, rows)
+    norms = torch.linalg.vector_norm(sub, norm_type, dim=1)
+    wide = torch.float64 if _native_has_float64() else torch.float32
+    n = norms.to(wide)
+    scale = torch.where(n > max_norm, max_norm / (n + 1e-7), torch.ones((), dtype=wide, device=n.device))
+    return weight.index_copy_(0, rows, sub * scale.to(weight.dtype).unsqueeze(1))
+
+
 def _assert_async_msg(x, assert_msg):
     """The CPU's: x's one value must be nonzero (one host transfer)."""
     if x.numel() != 1:
@@ -1830,6 +1847,7 @@ def _kernels():
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
         "_assert_async": _assert_async,
+        "embedding_renorm_": _embedding_renorm_,
         "_assert_async.msg": _assert_async_msg,
         "_ctc_loss": _ctc_loss,
         "_ctc_loss.Tensor": _ctc_loss_tensor,

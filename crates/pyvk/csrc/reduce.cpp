@@ -579,6 +579,14 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
   at::Tensor src = widen_half(self);
   bool ok = arg_reducible(src) && is_vk(out) &&
             plan_reduce(src, dim.has_value() ? at::OptionalIntArrayRef(dims) : std::nullopt, keepdim, plan);
+  if (ok && !dim.has_value() && keepdim && self.numel() > 0) {
+    // (no dim, keepdim: the flat index, in a tensor of self's dims, all 1)
+    at::Tensor flat = Op == 0 ? at::argmax(self.reshape({-1}), 0) : at::argmin(self.reshape({-1}), 0);
+    std::vector<int64_t> ones(self.dim(), 1);
+    at::native::resize_output(out, ones);
+    out.copy_(flat.view(ones));
+    return out;
+  }
   if (!ok || (!dim.has_value() && keepdim)) {
     on_cpu(Op == 0 ? "aten::argmax" : "aten::argmin", "out", self, dim, keepdim, out);
     return out;
@@ -633,6 +641,13 @@ at::Tensor var_std(const at::Tensor& self, at::OptionalIntArrayRef dim, const st
 at::Tensor& vector_norm_out(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                             std::optional<at::ScalarType> dtype, at::Tensor& out) {
   check_iterator_out_device(self, out);
+  if (self.scalar_type() == at::kComplexHalf && is_vk(self) && is_vk(out) && !dtype.has_value()) {
+    // (complex32: |z| from complex64, the norm in float32, rounded to out's float16)
+    at::Tensor r = at::linalg_vector_norm(self.to(at::kComplexFloat), ord, dim, keepdim);
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
+  }
   at::Tensor input = widen_half(as_dtype(self, dtype));  // (|x|^p in float32: it overflows 16 bits)
   if (complex_vk(input) && is_vk(out)) {  // the norm of |z|
     at::Tensor r = at::linalg_vector_norm(at::abs(input), ord, dim, keepdim);

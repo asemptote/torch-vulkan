@@ -695,6 +695,15 @@ at::Tensor rows_along(const at::Tensor& self, int64_t dim, const at::Tensor& x2,
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_dim(const at::Tensor& self, int64_t dim, bool sorted,
                                                           bool return_inverse, bool return_counts) {
+  at::ScalarType st = self.scalar_type();
+  if (is_vk(self) && self.dim() > 0 && (st == at::kUInt16 || st == at::kUInt32 || st == at::kUInt64)) {
+    // (as unique2: in an order-preserving signed dtype)
+    at::Tensor key = st == at::kUInt64 ? at::bitwise_xor(self.view(at::kLong), INT64_MIN)
+                                       : self.to(st == at::kUInt16 ? at::kInt : at::kLong);
+    auto [values, inverse, counts] = vk::unique_dim(key, dim, sorted, return_inverse, return_counts);
+    values = st == at::kUInt64 ? at::bitwise_xor(values, INT64_MIN).view(at::kUInt64) : values.to(st);
+    return {values, inverse, counts};
+  }
   if (!sortable(self) || self.dim() == 0) {
     auto stack = on_cpu("aten::unique_dim", "", self, dim, sorted, return_inverse, return_counts);
     return {stack[0].toTensor(), stack[1].toTensor(), stack[2].toTensor()};

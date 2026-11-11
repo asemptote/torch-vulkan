@@ -1176,8 +1176,198 @@ void raise_cpu_dtype_error(const std::string& signature) {
   TORCH_CHECK(false, it->second->message);
 }
 
+// ---------------------------------------------------------------- before the CPU: other ways to run an op
+
+thread_local int g_rescue_depth = 0;  // (each rescue below runs the op again: once)
+
+struct RescueGuard {
+  RescueGuard() { ++g_rescue_depth; }
+  ~RescueGuard() { --g_rescue_depth; }
+};
+
+bool is_written(const c10::Argument& a) {
+  return a.alias_info() != nullptr && a.alias_info()->isWrite();
+}
+
+// A CPU 0-dim tensor among vk tensors (a Python number, wrapped): moved to the
+// device, keeping its wrapped-number flag (so type promotion is unchanged),
+// and the op run again, so kernels that take only vk tensors run.
+bool rescue_cpu_scalars(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  const auto& args = op.schema().arguments();
+  size_t n = args.size();
+  if (stack->size() < n) return false;
+  size_t base = stack->size() - n;
+  bool any_vk = false, moved = false;
+  for (size_t i = 0; i < n; ++i) {
+    const c10::IValue& v = (*stack)[base + i];
+    if (v.isTensor() && v.toTensor().defined() && is_vk(v.toTensor())) any_vk = true;
+  }
+  if (!any_vk) return false;
+  torch::jit::Stack retry(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
+  for (size_t i = 0; i < n; ++i) {
+    c10::IValue& v = retry[i];
+    if (!is_written(args[i]) && v.isTensor() && v.toTensor().defined() && v.toTensor().is_cpu() &&
+        v.toTensor().dim() == 0) {
+      const at::Tensor& t = v.toTensor();
+      at::Tensor d = t.to(at::Device(kDevice, 0));
+      if (t.unsafeGetTensorImpl()->is_wrapped_number()) d.unsafeGetTensorImpl()->set_wrapped_number(true);
+      v = d;
+      moved = true;
+    }
+  }
+  if (!moved) return false;
+  RescueGuard guard;
+  op.callBoxed(&retry);
+  stack->resize(base);
+  stack->insert(stack->end(), retry.begin(), retry.end());
+  return true;
+}
+
+// An out= op whose functional overload has a vk kernel: that overload, its
+// results copied into the out tensors, as TensorIterator's out= casts (an
+// out of another dtype the result can be cast to, resized if needed).
+bool rescue_out(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  const auto& args = schema.arguments();
+  size_t n = args.size();
+  if (stack->size() < n) return false;
+  size_t base = stack->size() - n;
+  size_t first_out = n;
+  for (size_t i = 0; i < n; ++i) {
+    if (args[i].kwarg_only() && is_written(args[i])) {
+      first_out = std::min(first_out, i);
+    } else if (first_out < n) {
+      return false;  // (outs last)
+    }
+  }
+  size_t nout = n - first_out;
+  if (nout == 0) return false;
+  std::string overload = schema.overload_name();
+  std::string functional;
+  if (overload == "out" || overload == "grad_input" || overload == "output") {
+    functional = "";
+  } else if (overload.size() > 4 && overload.compare(overload.size() - 4, 4, "_out") == 0) {
+    functional = overload.substr(0, overload.size() - 4);
+  } else {
+    return false;
+  }
+  auto f = c10::Dispatcher::singleton().findOp({schema.name(), functional});
+  // (a functional overload with a vk kernel, or a structured one, whose
+  // kernel calls this out= overload with an out of the result's dtype)
+  bool has_kernel = f.has_value() && (f->hasKernelForDispatchKey(c10::DispatchKey::PrivateUse1) ||
+                                      f->hasKernelForDispatchKey(c10::DispatchKey::CompositeExplicitAutogradNonFunctional));
+  if (!has_kernel || f->schema().arguments().size() != first_out || f->schema().returns().size() != nout) {
+    return false;
+  }
+  for (size_t i = first_out; i < n; ++i) {
+    if (!(*stack)[base + i].isTensor() || !is_vk((*stack)[base + i].toTensor())) return false;
+  }
+  torch::jit::Stack call(stack->begin() + static_cast<std::ptrdiff_t>(base),
+                         stack->begin() + static_cast<std::ptrdiff_t>(base + first_out));
+  RescueGuard guard;
+  f->callBoxed(&call);
+  if (call.size() != nout) return false;
+  for (size_t j = 0; j < nout; ++j) {
+    if (!call[j].isTensor()) return false;
+  }
+  torch::jit::Stack results;
+  for (size_t j = 0; j < nout; ++j) {
+    at::Tensor out = (*stack)[base + first_out + j].toTensor();
+    const at::Tensor& r = call[j].toTensor();
+    TORCH_CHECK(at::canCast(r.scalar_type(), out.scalar_type()), "result type ", r.scalar_type(),
+                " can't be cast to the desired output type ", out.scalar_type());
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    results.push_back(out);
+  }
+  stack->resize(base);
+  stack->insert(stack->end(), results.begin(), results.end());
+  return true;
+}
+
+// Every tensor input empty: no element to compute. The op on meta tensors
+// gives the results' shapes and dtypes (and PyTorch's argument checks); the
+// results are empty vk tensors (the CPU's kernels return early on empty
+// tensors, whatever their dtype). Written arguments (in place, out=) are
+// resized as the meta op resized theirs.
+bool rescue_empty(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  size_t n = schema.arguments().size();
+  if (stack->size() < n) return false;
+  size_t base = stack->size() - n;
+  bool any_vk = false;
+  for (size_t i = 0; i < n; ++i) {
+    const c10::IValue& v = (*stack)[base + i];
+    if (v.isTensor() && v.toTensor().defined()) {
+      const at::Tensor& t = v.toTensor();
+      if (t.layout() != at::kStrided || t.is_nested()) return false;
+      if (!is_written(schema.arguments()[i]) && t.numel() != 0) return false;
+      any_vk = any_vk || is_vk(t);
+    } else if (v.isTensorList()) {
+      for (const at::Tensor& t : v.toTensorList()) {
+        if (t.defined() && t.numel() != 0) return false;
+      }
+    }
+  }
+  if (!any_vk) return false;
+  torch::jit::Stack meta(stack->begin() + static_cast<std::ptrdiff_t>(base), stack->end());
+  for (c10::IValue& v : meta) {
+    if (v.isTensor() && v.toTensor().defined()) {
+      const at::Tensor& t = v.toTensor();
+      v = at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta));
+    }
+  }
+  try {
+    op.callBoxed(&meta);
+  } catch (const std::exception&) {
+    // (an in-place op on an empty tensor, which the meta kernel refuses for
+    // its dtype, as normal_ an int tensor: the CPU's kernel returns at once)
+    const auto* alias = schema.returns().size() == 1 ? schema.returns()[0].alias_info() : nullptr;
+    const auto* self_alias = schema.arguments()[0].alias_info();
+    if (alias != nullptr && alias->isWrite() && self_alias != nullptr && self_alias->isWrite() &&
+        (*stack)[base].isTensor() && (*stack)[base].toTensor().numel() == 0 && schema.name().back() == '_') {
+      at::Tensor self = (*stack)[base].toTensor();
+      stack->resize(base);
+      stack->push_back(self);
+      return true;
+    }
+    return false;  // (the CPU decides: its error, or a result)
+  }
+  size_t nr = schema.returns().size();
+  if (meta.size() != nr) return false;
+  torch::jit::Stack results;
+  for (size_t j = 0; j < nr; ++j) {
+    const c10::IValue& r = meta[j];
+    const auto* alias = schema.returns()[j].alias_info();
+    if (!r.isTensor()) return false;
+    const at::Tensor& m = r.toTensor();
+    if (m.numel() != 0) return false;  // (a result with elements from empty inputs, e.g. a sum: the CPU's)
+    if (alias != nullptr && alias->isWrite()) {
+      bool found = false;
+      for (size_t i = 0; i < n && !found; ++i) {
+        const auto* ai = schema.arguments()[i].alias_info();
+        if (ai != nullptr && ai->isWrite() && ai->beforeSets() == alias->beforeSets()) {
+          at::Tensor t = (*stack)[base + i].toTensor();
+          if (!t.sizes().equals(m.sizes())) t.resize_(m.sizes());
+          results.push_back(t);
+          found = true;
+        }
+      }
+      if (!found) return false;
+    } else {
+      results.push_back(at::empty_strided(m.sizes(), m.strides(), m.options().device(at::Device(kDevice, 0))));
+    }
+  }
+  stack->resize(base);
+  stack->insert(stack->end(), results.begin(), results.end());
+  return true;
+}
+
 void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
   if (half_via_float(op, stack)) {
+    return;
+  }
+  if (g_rescue_depth == 0 && (rescue_cpu_scalars(op, stack) || rescue_out(op, stack) || rescue_empty(op, stack))) {
     return;
   }
   const auto& name = op.schema().operator_name();

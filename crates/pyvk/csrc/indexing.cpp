@@ -473,6 +473,14 @@ at::Tensor& scatter_src_out(const at::Tensor& self, int64_t dim, const at::Tenso
                             at::Tensor& out) {
   check_out_cast(self.scalar_type(), out);
   dim = at::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+  if (index.numel() == 0 && is_vk(self) && is_vk(out) && is_vk(index)) {
+    // (no index: self, as the CPU, whose shape checks skip an empty index)
+    if (!out.is_same(self)) {
+      at::native::resize_output(out, self.sizes());
+      out.copy_(self);
+    }
+    return out;
+  }
   if (!scatter_ok(self, index, dim) || !is_vk(src) || !is_vk(out)) {
     on_cpu("aten::scatter", "src_out", self, dim, index, src, out);
     return out;
@@ -818,6 +826,13 @@ void accumulate_into(const at::Tensor& dst_view, const at::Tensor& offsets, cons
 
 at::Tensor& scatter_add_out(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                             at::Tensor& out) {
+  if (index.numel() == 0 && is_vk(self) && is_vk(out) && is_vk(index)) {
+    if (!out.is_same(self)) {  // (no index: self, as the CPU)
+      at::native::resize_output(out, self.sizes());
+      out.copy_(self);
+    }
+    return out;
+  }
   if (!scatter_accumulate(self, dim, index, src, op::SEGREDUCE_SUM, true, out)) {
     on_cpu("aten::scatter_add", "out", self, dim, index, src, out);
   }
@@ -1359,6 +1374,13 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
   at::assert_no_internal_overlap(out);
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
   at::ScalarType dtype = out.scalar_type();
+  if (dtype == at::kBool && is_vk(out)) {
+    // (the CPU: no bool kernel, but 0 or 1 steps need none)
+    TORCH_CHECK_NOT_IMPLEMENTED(steps <= 1, "\"linspace_cpu\" not implemented for 'Bool'");
+    if (out.numel() != steps) at::native::resize_output(out, {steps});
+    if (steps == 1) out.fill_(start.toDouble() != 0);
+    return out;
+  }
   if (is_vk(out) && at::isComplexType(dtype) && storage_label(c10::toRealValueType(dtype)) != nullptr) {
     // (the real and imaginary parts each a linspace: the CPU's complex
     // step and halfway formula are componentwise)
@@ -1416,6 +1438,12 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
 at::Tensor& logspace_out(const at::Scalar& start, const at::Scalar& end, int64_t steps, double base, at::Tensor& out) {
   at::assert_no_internal_overlap(out);
   at::ScalarType dtype = out.scalar_type();
+  if (dtype == at::kBool && is_vk(out)) {
+    TORCH_CHECK_NOT_IMPLEMENTED(steps <= 1, "\"logspace_cpu\" not implemented for 'Bool'");
+    if (out.numel() != steps) at::native::resize_output(out, {steps});
+    if (steps == 1) out.fill_(std::pow(base, start.toDouble()) != 0);
+    return out;
+  }
   bool complex = at::isComplexType(dtype) && dtype_label(dtype) != nullptr;  // (complex32 stays the CPU's)
   if (!is_vk(out) || (at::isComplexType(dtype) && !complex) || dtype == at::kBool) {
     on_cpu("aten::logspace", "out", start, end, steps, base, out);

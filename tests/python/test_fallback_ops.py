@@ -483,3 +483,38 @@ def test_scalar_minus_complex_and_float8_isnan():
     x = torch.tensor([1.0, float("nan"), float("inf"), 0.0])
     for f8 in FLOAT8:
         torch.testing.assert_close(no_fallback(lambda: torch.isnan(x.to(f8).to("vk"))).cpu(), torch.isnan(x.to(f8)))
+
+
+def test_rescued_fallback_cases():
+    # (cases that went to the CPU in full-43, now on vk: CPU scalars among vk
+    # tensors, out= of another dtype, empty inputs, empty scatter indices,
+    # bool powers and linspace, argmax without dim, float8 equality, unsigned
+    # unique_dim, complex32 norms, embedding_renorm_)
+    b = torch.tensor([True, False, True])
+    f = make((3,), torch.float32)
+    d = make((3,), torch.float64, seed=1)
+    cases = [
+        lambda dev: b.to(dev) * True,
+        lambda dev: torch.bitwise_xor(b.to(dev), True),
+        lambda dev: torch.clamp_max(f.to(dev), d.to(dev), out=torch.empty(3, dtype=torch.complex64, device=dev)),
+        lambda dev: torch.empty(0, 3, dtype=torch.int32, device=dev).normal_(),
+        lambda dev: torch.scatter(make((2, 3), torch.float32).to(dev), 0, torch.empty(0, dtype=torch.long, device=dev),
+                                  make((2, 3), torch.float32).to(dev)),
+        lambda dev: b.to(dev) ** False,
+        lambda dev: torch.linspace(2, 3, 1, dtype=torch.bool, device=dev),
+        lambda dev: torch.argmax(make((2, 3), torch.float32).to(dev), keepdim=True),
+        lambda dev: torch.tensor([1.0, float("nan")]).to(torch.float8_e4m3fn).to(dev) ==
+        torch.tensor([1.0, float("nan")]).to(torch.float8_e4m3fn).to(dev),
+        lambda dev: torch.unique(torch.tensor([[3, 1], [3, 1], [0, 2**15]], dtype=torch.uint16).to(dev), dim=0),
+        lambda dev: torch.linalg.vector_norm(make_complex((4,), torch.complex64).to(torch.complex32).to(dev)),
+        lambda dev: torch.embedding_renorm_(make((5, 3), torch.float32).to(dev) * 3, torch.tensor([[0, 2], [2, 4]]).to(dev),
+                                            1.0, 2.0),
+    ]
+    for case in cases:
+        want = case("cpu")
+        got = no_fallback(lambda: case("vk"))
+        torch.testing.assert_close(got.cpu() if isinstance(got, torch.Tensor) else got, want, equal_nan=True,
+                                   atol=1e-2 if want.dtype == torch.float16 else None,
+                                   rtol=1e-2 if want.dtype == torch.float16 else None)
+    with pytest.raises(NotImplementedError, match="linspace_cpu"):
+        torch.linspace(0, 3, 4, dtype=torch.bool, device="vk")
