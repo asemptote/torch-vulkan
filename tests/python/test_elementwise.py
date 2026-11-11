@@ -258,7 +258,7 @@ def test_float32_division_correctly_rounded():
         return torch.from_numpy(u.numpy().astype("uint32").view("float32"))
 
     special = torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.0, -3.0, 2.0**-126, 2.0**-149,
-                            1.1754942e-38, 3.4028235e38, 7.0, 0.1])
+                            -(2.0**-140), 2.0**-128, 1.1754942e-38, 3.4028235e38, 2.0**127, 7.0, 0.1])
     xs = [bits(n), torch.randn(n, generator=g) * 1e30, torch.randn(n, generator=g) * 1e-30,
           special.repeat_interleave(len(special))]
     ys = [bits(n), torch.randn(n, generator=g) * 1e-8, torch.randn(n, generator=g) * 1e10, special.repeat(len(special))]

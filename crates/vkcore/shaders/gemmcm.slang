@@ -180,20 +180,25 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         for (uint j = 0; j < WN; j++)
             acc[i][j] = FragC(0.0);
 
-    // the first block's pieces
-    [ForceUnroll]
-    for (uint s = 0; s < PA; s++)
+    // the first block's pieces (none for k = 0: the loads clamp k to k - 1,
+    // and empty operands may have no memory; csrc/linalg.cpp declines k = 0
+    // too, which hung NVIDIA GPUs)
+    if (p.k != 0)
     {
-        uint o, ii;
-        piece_at(t + s * WG, a_row, o, ii);
-        ra[s] = load_a_piece(abase, row0, 0, o, ii);
-    }
-    [ForceUnroll]
-    for (uint s = 0; s < PB; s++)
-    {
-        uint o, ii;
-        piece_at(t + s * WG, b_row, o, ii);
-        rb[s] = load_b_piece(bbase, 0, col0, o, ii);
+        [ForceUnroll]
+        for (uint s = 0; s < PA; s++)
+        {
+            uint o, ii;
+            piece_at(t + s * WG, a_row, o, ii);
+            ra[s] = load_a_piece(abase, row0, 0, o, ii);
+        }
+        [ForceUnroll]
+        for (uint s = 0; s < PB; s++)
+        {
+            uint o, ii;
+            piece_at(t + s * WG, b_row, o, ii);
+            rb[s] = load_b_piece(bbase, 0, col0, o, ii);
+        }
     }
 
     for (uint k0 = 0; k0 < p.k; k0 += BK)

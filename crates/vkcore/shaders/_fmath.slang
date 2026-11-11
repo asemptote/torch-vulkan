@@ -282,12 +282,20 @@ uint div32_unpack(float x, out int e)
 // NaNs keep the GPU's division (exact there).
 float m_div32(float a, float b)
 {
-    // (zeros, infinities and NaNs told apart on the bits: a device that
-    // flushes subnormals may compare them equal to 0, and they are divided
-    // exactly below)
+    // Zeros, infinities and NaNs, told apart on the bits (a device that
+    // flushes subnormals may compare them equal to 0; they are divided exactly
+    // below). Their results are built here, not left to the GPU's division:
+    // drivers divide as a * (1 / b), and 1 / b overflows for |b| < 2^-128, so
+    // that 0 / 2^-149 came out 0 * inf = NaN (Mesa's ANV on Gen9). Only the
+    // NaN results (0 / 0, inf / inf, NaN operands) keep the GPU's division.
     uint aa = bit_cast<uint>(a) & 0x7fffffffu, ab = bit_cast<uint>(b) & 0x7fffffffu;
-    if (aa >= 0x7f800000u || ab >= 0x7f800000u || aa == 0u || ab == 0u)
+    uint zero = (bit_cast<uint>(a) ^ bit_cast<uint>(b)) & 0x80000000u, inf = zero | 0x7f800000u;
+    if (aa > 0x7f800000u || ab > 0x7f800000u || (aa == 0u && ab == 0u) || (aa == 0x7f800000u && ab == 0x7f800000u))
         return a / b;
+    if (aa == 0u || ab == 0x7f800000u)
+        return bit_cast<float>(zero);
+    if (aa == 0x7f800000u || ab == 0u)
+        return bit_cast<float>(inf);
     // The common case: a, b and a / b within 2^+-60 (no overflow in the
     // split, Dekker's error terms normal), the GPU's quotient corrected once
     // and kept when its exact residual is clearly under half an ulp of b q.
