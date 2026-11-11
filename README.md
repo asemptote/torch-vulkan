@@ -44,8 +44,8 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
 - **Reductions and scans**: sum, mean, prod, max/min, argmax, var/std, norms,
   any/all, cumsum/cumprod, cummax/cummin, logcumsumexp.
 - **Matrix products**: mm, bmm, matmul, addmm, baddbmm, addmv, dot, `nn.Linear`,
-  einsum; integer and 16-bit products too, and float16 on tensor cores
-  (cooperative matrices) where the GPU has them.
+  einsum; integer and 16-bit products too, and float16 and bfloat16 on tensor
+  cores (cooperative matrices) where the GPU has them.
 - **Quantisation**: int8 weight-only and dynamic 4-bit matrix products
   (`_weight_int8pack_mm`, `_dyn_quant_matmul_4bit`), float8 `_scaled_mm`,
   per-tensor affine quantised tensors, and quantisation-aware training's fake
@@ -234,12 +234,13 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
   GFLOP/s at 2048^3 (ahead of MKL on the CPU) and float64 about 30 GFLOP/s; a
   2^20-point complex64 FFT takes about 12 ms (the CPU about 6 ms), and long
   real and prime-length transforms are ahead of the CPU. Against CUDA on the
-  same GPUs ([tables](benchmarks/results/)): float16 matrix products on tensor
-  cores reach about 160 TFLOP/s on an H100 NVL and an L40S (CUDA: about 400
-  and 180), float32 products run at about 2.3x CUDA's time, FFTs at 1-4x,
-  element-wise bandwidth at 1-1.3x, and per-op overhead is slightly lower than
-  CUDA's.
-<!-- FINAL: re-measure bfloat16 matmul (#26) and eigh (#27) against CUDA before the release -->
+  same GPUs ([tables](benchmarks/results/)): float16 and bfloat16 matrix
+  products on tensor cores reach about 160 TFLOP/s on an H100 NVL and an L40S
+  (CUDA: about 400 and 180-200), float32 products run at about 2.3x CUDA's
+  time, float64 `svd` at 0.3-1.1x (faster than CUDA in most cases), `eigh` at
+  1.6-3.5x, FFTs at 1-4x, element-wise bandwidth at 1-1.3x, and per-op overhead
+  is slightly lower than CUDA's.
+<!-- FINAL (#36): replace with the final benchmarks (solve #34, FFT #35, the HD 530 and the UHD 620) -->
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
