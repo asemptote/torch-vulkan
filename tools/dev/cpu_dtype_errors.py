@@ -129,6 +129,24 @@ def probe(name, described):
         values = [make_arg(t, a) for t, a in zip(described, schema.arguments)]
     except ValueError:
         return None
+    # Scalar arguments (histc's min and max, clamp's...) in several values: the
+    # error must be the same for each, or it depends on them (min > max raises
+    # first on the CPU), and vk leaves the signature to the CPU's checks.
+    scalars = [i for i, (t, a) in enumerate(zip(described, schema.arguments))
+               if t.strip() in ("int", "float") and str(a.type).removeprefix("Optional[").startswith("number")]
+    found = set()
+    for variant in range(len(SCALAR_VARIANTS) if scalars else 1):
+        vals = list(values)
+        for k, i in enumerate(scalars):
+            vals[i] = SCALAR_VARIANTS[(variant + k) % len(SCALAR_VARIANTS)]
+        found.add(run_probe(op, schema, vals))
+    return found.pop() if len(found) == 1 else None
+
+
+SCALAR_VARIANTS = [0.5, -1.0, 2.0, 0.0]
+
+
+def run_probe(op, schema, values):
     args, kwargs = [], {}
     for a, v in zip(schema.arguments, values):
         if a.kwarg_only:

@@ -1511,6 +1511,13 @@ def _compute_linear_combination(x, coefficients):
     return (c * x[:k].to(dt).unsqueeze(0)).sum(1).to(dt)
 
 
+def _compute_linear_combination_out(x, coefficients, *, out):
+    """The CPU's out= adds the combination to out (matrix_exp accumulates so)."""
+    r = _compute_linear_combination(x, coefficients)
+    torch._check(out.shape == r.shape, lambda: f"out has shape {tuple(out.shape)}, expected {tuple(r.shape)}")
+    return out.add_(r)
+
+
 def _masked_softmax(x, mask, dim=None, mask_type=None):
     """The CPU's masked softmax: masked positions excluded (0), a row with
     every position masked all NaN; mask_type 0 is an (L, L) attention mask and
@@ -1877,6 +1884,7 @@ def _kernels():
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
         "_compute_linear_combination": _compute_linear_combination,
+        "_compute_linear_combination.out": _compute_linear_combination_out,
         "glu_jvp": _glu_jvp,
         "glu_backward_jvp": _glu_backward_jvp,
         "_assert_async": _assert_async,
@@ -1946,7 +1954,8 @@ def register():
         return []
     _lib = torch.library.Library("aten", "IMPL")
     names = []
-    for name, fn in _kernels().items():
+    kernels = _kernels()
+    for name, fn in kernels.items():
         if torch._C._dispatch_has_kernel_for_dispatch_key("aten::" + name, "PrivateUse1"):
             continue  # a C++ or decomposed kernel exists
         base, _, overload = name.partition(".")
@@ -1957,7 +1966,8 @@ def register():
         found = _out_overload(op) if not op._schema.is_mutable else None
         if found is not None:
             out_op, out_names = found
-            if not torch._C._dispatch_has_kernel_for_dispatch_key(out_op.name(), "PrivateUse1"):
+            own = out_op.name().removeprefix("aten::") in kernels  # (an out= kernel of its own, registered later)
+            if not own and not torch._C._dispatch_has_kernel_for_dispatch_key(out_op.name(), "PrivateUse1"):
                 out_fn = _checks.with_cpu_checks(out_op, _make_out_kernel(checked, out_names, base.startswith("linalg_")))
                 _lib.impl(out_op._schema.name.split("::", 1)[1] + "." + out_op._overloadname,
                           _layout.with_layout(out_op, out_fn), "PrivateUse1")

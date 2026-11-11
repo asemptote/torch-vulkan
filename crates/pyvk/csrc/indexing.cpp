@@ -998,10 +998,27 @@ at::Tensor bincount(const at::Tensor& self, const std::optional<at::Tensor>& wei
 
 at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& min, const at::Scalar& max,
                       at::Tensor& out) {
-  TORCH_CHECK(bins > 0, "torch.histc(): bins must be > 0, but got ", bins);
+  TORCH_CHECK(bins > 0, "torch.histogram(): bins must be > 0, but got ", bins, " for dimension 0");  // (the CPU's message)
   TORCH_CHECK(self.dtype() == out.dtype(), "torch.histc: input tensor and hist tensor should have the same dtype, "
               "but got input ", self.dtype(), " and hist ", out.dtype());  // (as the CPU)
   at::ScalarType t = self.scalar_type();
+  if (is_vk(self) && is_vk(out) && at::isIntegralType(t, /*includeBool=*/false)) {
+    // (integers, as CUDA bins them (the CPU has no kernel): their values in a
+    // floating type that holds them, the counts back in the input's dtype)
+    at::ScalarType ft = has_feature(kFeatureFloat64) ? at::kDouble : at::kFloat;
+    at::Tensor hist = at::empty({0}, self.options().dtype(ft));
+    histc_out(self.to(ft), bins, min, max, hist);
+    at::native::resize_output(out, hist.sizes());
+    out.copy_(hist);
+    return out;
+  }
+  if (is_vk(self) && !at::isFloatingType(t)) {
+    // (bools and complex numbers: the CPU's range checks, then its dtype error)
+    double lo = min.toDouble(), hi = max.toDouble();
+    TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc: range of [", lo, ", ", hi, "] is not finite");
+    TORCH_CHECK(lo <= hi, "torch.histc: max must be larger than min");
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "\"histogram_cpu\" not implemented for '", t, "'");
+  }
   if (!is_vk(self) || !is_vk(out) || !at::isFloatingType(t) || accum_label(t) == nullptr) {
     on_cpu("aten::histc", "out", self, bins, min, max, out);
     return out;
@@ -1016,8 +1033,8 @@ at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& mi
     lo -= 1;
     hi += 1;
   }
-  TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc(): range of [", lo, ", ", hi, "] is not finite");
-  TORCH_CHECK(lo < hi, "torch.histc(): max must be larger than min");
+  TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc: range of [", lo, ", ", hi, "] is not finite");
+  TORCH_CHECK(lo < hi, "torch.histc: max must be larger than min");
   at::native::resize_output(out, {bins});
   out.zero_();
   if (self.numel() == 0) {
@@ -1054,7 +1071,9 @@ static_assert(sizeof(NonzeroParams) == 72, "must match shaders/nonzero.slang");
 at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
   TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
               "devices, ", self.device(), " and ", out.device(), "!");
-  if (!is_vk(self) || !is_vk(out) || out.scalar_type() != at::kLong) {
+  TORCH_CHECK(out.scalar_type() == at::kLong, "nonzero: Expected out tensor to have scalar type Long but got scalar type",
+              out.scalar_type());  // (sic: the CPU's message)
+  if (!is_vk(self) || !is_vk(out)) {
     on_cpu("aten::nonzero", "out", self, out);
     return out;
   }
@@ -1119,6 +1138,18 @@ at::Tensor nonzero_static(const at::Tensor& self, int64_t size, int64_t fill_val
   if (n > 0) {
     out.narrow(0, 0, n).copy_(all.narrow(0, 0, n));
   }
+  return out;
+}
+
+at::Tensor& nonzero_static_out(const at::Tensor& self, int64_t size, int64_t fill_value, at::Tensor& out) {
+  TORCH_CHECK(size >= 0, "nonzero_static: 'size' must be an non-negative integer");
+  TORCH_CHECK(out.scalar_type() == at::kLong,
+              "nonzero_static: Expected out tensor to have scalar type Long but got scalar type", out.scalar_type());
+  TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", self.device(), " and ", out.device(), "!");
+  at::Tensor r = vk::nonzero_static(self, size, fill_value);
+  at::native::resize_output(out, r.sizes());
+  out.copy_(r);
   return out;
 }
 
@@ -1678,6 +1709,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("nonzero", &vk::nonzero_vk);
   m.impl("nonzero.out", &nonzero_out);
   m.impl("nonzero_static", &vk::nonzero_static);
+  m.impl("nonzero_static.out", &nonzero_static_out);
   m.impl("count_nonzero.dim_IntList", &vk::count_nonzero);
   m.impl("masked_select", &vk::masked_select);
   m.impl("masked_select.out", &masked_select_out);

@@ -701,3 +701,54 @@ def test_adaptive_max_pool_out(k):
     want, want_idx = op(x, [3] * k, out=torch.empty(0), indices=torch.empty(0, dtype=torch.long))
     torch.testing.assert_close(out.cpu(), want)
     assert torch.equal(idx.cpu(), want_idx)
+
+
+BCOMPLEX32_CASES = {
+    "c64_to": lambda t, d: t.to(torch.complex64).to(torch.bcomplex32),
+    "to_c64": lambda t, d: t.to(torch.complex64),
+    "to_c32": lambda t, d: t.to(torch.complex32),
+    "real_to_f32": lambda t, d: t.real.to(torch.float32),
+    "eq": lambda t, d: t == t,
+    "isnan": lambda t, d: t.isnan(),
+    "where": lambda t, d: torch.where(torch.tensor([True, False, True], device=d), t, torch.zeros_like(t)),
+}
+
+
+@pytest.mark.skipif(not hasattr(torch, "bcomplex32"), reason="torch without bcomplex32")
+@pytest.mark.parametrize("name", list(BCOMPLEX32_CASES))
+def test_bcomplex32(name):
+    x = torch.tensor([1 + 2j, float("nan") + 0j, -3.5 + 0.25j]).to(torch.bcomplex32)
+    f = BCOMPLEX32_CASES[name]
+    got = no_fallback(lambda: f(x.to("vk"), "vk"))
+    want = f(x, "cpu")
+    assert got.dtype == want.dtype
+    widen = (lambda t: t.to(torch.complex64)) if want.is_complex() else (lambda t: t)
+    torch.testing.assert_close(widen(got.cpu()), widen(want), equal_nan=True)
+
+
+def test_d45_regressions():
+    v = lambda t: t.to("vk")
+    # an out= on another device raises, even for an empty input (no rescue first)
+    with pytest.raises(RuntimeError, match="device"):
+        torch.nan_to_num(torch.empty(1, 0, 3, device="vk"), out=torch.empty(0))
+    # nonzero's out= must be int64, as the CPU's
+    with pytest.raises(RuntimeError, match="scalar type Long"):
+        torch.nonzero(torch.ones(3, device="vk"), out=torch.empty([], device="vk"))
+    with pytest.raises(RuntimeError, match="nonzero_static: Expected out tensor to have scalar type Long"):
+        torch.nonzero_static(torch.ones(3, device="vk"), size=2, out=torch.empty(0, device="vk"))
+    x = torch.tensor([0.0, 1, 1])
+    out = torch.empty(0, dtype=torch.long, device="vk")
+    no_fallback(lambda: torch.nonzero_static(v(x), size=4, fill_value=-7, out=out))
+    assert torch.equal(out.cpu(), torch.nonzero_static(x, size=4, fill_value=-7))
+    # histc of integers, as CUDA's; its range errors
+    got = no_fallback(lambda: torch.histc(torch.tensor([1, 2, 1], dtype=torch.int8, device="vk"), bins=4, min=5, max=5))
+    assert got.dtype == torch.int8 and got.tolist() == [2, 0, 0, 1]
+    with pytest.raises(RuntimeError, match="max must be larger than min"):
+        torch.histc(torch.ones(3, dtype=torch.int32, device="vk"), bins=4, min=1, max=0)
+    # _compute_linear_combination's out= adds to out, as the CPU's
+    xs, c = torch.rand(3, 2, 2), torch.rand(1, 3)
+    want = torch.ones(1, 2, 2)
+    torch._compute_linear_combination(xs, c, out=want)
+    got = torch.ones(1, 2, 2, device="vk")
+    no_fallback(lambda: torch._compute_linear_combination(v(xs), v(c), out=got))
+    torch.testing.assert_close(got.cpu(), want)

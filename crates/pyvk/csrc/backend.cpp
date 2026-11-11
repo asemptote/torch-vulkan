@@ -568,12 +568,20 @@ bool copy_unsigned(const at::Tensor& dst, const at::Tensor& src) {
 
 // dst (vk) <- src (vk), with broadcasting and dtype conversion.
 void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
-  bool chalf_src = src.scalar_type() == at::kComplexHalf, chalf_dst = dst.scalar_type() == at::kComplexHalf;
-  if (chalf_src != chalf_dst && storage_label(at::kHalf) != nullptr) {
-    // complex32 holds two halves: convert its parts.
+  // (complex32 and bcomplex32: pairs of float16 or bfloat16)
+  auto pair16 = [](at::ScalarType t) { return t == at::kComplexHalf || t == at::ScalarType::BComplex32; };
+  bool chalf_src = pair16(src.scalar_type()), chalf_dst = pair16(dst.scalar_type());
+  if ((chalf_src || chalf_dst) && src.scalar_type() != dst.scalar_type() &&
+      (!chalf_src || storage_label(c10::toRealValueType(src.scalar_type())) != nullptr) &&
+      (!chalf_dst || storage_label(c10::toRealValueType(dst.scalar_type())) != nullptr)) {
+    // complex32 holds two halves (bcomplex32 two bfloat16s): convert its parts.
     at::Tensor s = src.expand(dst.sizes());
     if (chalf_dst) {
       at::Tensor parts = at::view_as_real(dst);
+      if (chalf_src) {  // (both pairs: part by part)
+        parts.copy_(at::view_as_real(s));
+        return;
+      }
       parts.select(-1, 0).copy_(s.is_complex() ? at::real(s) : s);
       if (s.is_complex()) {
         parts.select(-1, 1).copy_(at::imag(s));
@@ -659,11 +667,12 @@ void fix_up_in_place(const at::Tensor& t, bool conj, bool neg) {
     return;
   }
   at::ScalarType st = t.scalar_type();
-  if (label == nullptr && (st == at::kComplexHalf || st == at::kHalf || st == at::kBFloat16)) {
+  if (label == nullptr && (st == at::kComplexHalf || st == at::ScalarType::BComplex32 || st == at::kHalf ||
+                           st == at::kBFloat16)) {
     // (no 16-bit kernel: in complex64/float32 on the GPU, through an alias of t
     // without its lazy bits)
     at::Tensor raw = at::empty({0}, t.options()).set_(t.storage(), t.storage_offset(), t.sizes(), t.strides());
-    at::Tensor w = raw.to(st == at::kComplexHalf ? at::kComplexFloat : at::kFloat);
+    at::Tensor w = raw.to(at::isComplexType(st) ? at::kComplexFloat : at::kFloat);
     if (conj) w = w.conj_physical();
     if (neg) w = w.neg();
     raw.copy_(w);
@@ -862,13 +871,15 @@ bool complex32_op(const std::string& name) {
 bool is_half_vk(const at::Tensor& t) {
   if (!t.defined() || !is_vk(t)) return false;
   at::ScalarType s = t.scalar_type();
-  if (s == at::kComplexHalf) return g_complex_half && storage_label(at::kHalf) != nullptr;
+  if (s == at::kComplexHalf || s == at::ScalarType::BComplex32) {
+    return g_complex_half && storage_label(c10::toRealValueType(s)) != nullptr;
+  }
   if (storage_label(s) == nullptr) return false;
   return s == at::kHalf || s == at::kBFloat16 || is_small_int(s);
 }
 
 at::ScalarType widened(at::ScalarType s) {
-  return is_small_int(s) ? at::kInt : (s == at::kComplexHalf ? at::kComplexFloat : at::kFloat);
+  return is_small_int(s) ? at::kInt : (at::isComplexType(s) ? at::kComplexFloat : at::kFloat);
 }
 
 at::Tensor widen_half_arg(const at::Tensor& t) {
@@ -1044,7 +1055,9 @@ bool half_via_float(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
       auto d = static_cast<at::ScalarType>(v.toInt());
       if (is_small_int(d)) v = static_cast<int64_t>(at::kInt);
       if (d == at::kHalf || d == at::kBFloat16) v = static_cast<int64_t>(at::kFloat);
-      if (d == at::kComplexHalf && g_complex_half) v = static_cast<int64_t>(at::kComplexFloat);
+      if ((d == at::kComplexHalf || d == at::ScalarType::BComplex32) && g_complex_half) {
+        v = static_cast<int64_t>(at::kComplexFloat);
+      }
       continue;
     }
     if (v.isTensor() && is_half_vk(v.toTensor())) {
@@ -1256,6 +1269,8 @@ bool rescue_cpu_scalars(const c10::OperatorHandle& op, torch::jit::Stack* stack)
   return true;
 }
 
+bool raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& stack);
+
 // An out= op whose functional overload has a vk kernel: that overload, its
 // results copied into the out tensors, as TensorIterator's out= casts (an
 // out of another dtype the result can be cast to, resized if needed).
@@ -1303,6 +1318,15 @@ bool rescue_out(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   for (size_t j = 0; j < nout; ++j) {
     if (!call[j].isTensor()) return false;
   }
+  // An out of another dtype than the result: cast into only where PyTorch's
+  // own checks (the op on meta tensors) take it, with their error otherwise;
+  // without a conclusive meta kernel (nonzero, say), the CPU decides.
+  bool other_dtype = false;
+  for (size_t j = 0; j < nout; ++j) {
+    other_dtype = other_dtype ||
+                  call[j].toTensor().scalar_type() != (*stack)[base + first_out + j].toTensor().scalar_type();
+  }
+  if (other_dtype && !raise_meta_error(op, *stack)) return false;
   torch::jit::Stack results;
   for (size_t j = 0; j < nout; ++j) {
     at::Tensor out = (*stack)[base + first_out + j].toTensor();
@@ -1399,11 +1423,11 @@ bool rescue_empty(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 // PyTorch's own argument checks (shapes, out= dtypes, dims...), by running the
 // op on meta tensors: an error there is raised as is, the CPU not asked. Errors
 // that only say the meta kernel is missing or cannot run are ignored (the CPU
-// then decides).
-void raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& stack) {
+// then decides). Returns whether the meta op ran.
+bool raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& stack) {
   const auto& schema = op.schema();
   size_t n = schema.arguments().size();
-  if (stack.size() < n) return;
+  if (stack.size() < n) return false;
   torch::jit::Stack meta(stack.end() - static_cast<std::ptrdiff_t>(n), stack.end());
   auto to_meta = [](const at::Tensor& t) {
     if (!t.defined() || (t.is_cpu() && t.dim() == 0)) return t;  // (CPU scalars stay: meta takes them)
@@ -1424,25 +1448,26 @@ void raise_meta_error(const c10::OperatorHandle& op, const torch::jit::Stack& st
       } else if (v.isList()) {
         const auto& elems = v.toListRef();
         for (const c10::IValue& e : elems) {
-          if (e.isTensor()) return;  // (lists of optional tensors: left to the CPU)
+          if (e.isTensor()) return false;  // (lists of optional tensors: left to the CPU)
         }
       }
     }
   } catch (const std::invalid_argument&) {
-    return;
+    return false;
   }
   try {
     op.callBoxed(&meta);
   } catch (const c10::Error& e) {
     std::string msg = e.what_without_backtrace();
     for (const char* skip : {"Meta", "meta", "Could not run", "data-dependent", "data dependent", "fake", "symbolic",
-                             "SymInt", "not implemented for", "not supported"}) {
-      if (msg.find(skip) != std::string::npos) return;
+                             "SymInt", "not implemented for", "not supported", "unimplemented"}) {
+      if (msg.find(skip) != std::string::npos) return false;
     }
     throw;
   } catch (const std::exception&) {
-    return;
+    return false;
   }
+  return true;
 }
 
 // Every input empty (or a 0-d tensor whose dtype float32 holds exactly), in a
@@ -1551,6 +1576,7 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
   // (first: where the CPU raises, no other route may compute a result)
   raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));  // (keyed with emptiness too)
+  check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   if (half_via_float(op, stack)) {
     return;
   }
@@ -1561,7 +1587,6 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
     return;
   }
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
-  check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   raise_meta_error(op, *stack);
   TORCH_CHECK_NOT_IMPLEMENTED(op.hasComputedKernelForDispatchKey(c10::DispatchKey::CPU), "Could not run '",
                               op.schema().name(), "' with arguments from the 'vk' backend: it has no vk or CPU kernel.");
