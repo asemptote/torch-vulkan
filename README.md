@@ -239,10 +239,7 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
   and 180), float32 products run at about 2.3x CUDA's time, FFTs at 1-4x,
   element-wise bandwidth at 1-1.3x, and per-op overhead is slightly lower than
   CUDA's.
-- **Known slow paths** (planned for 0.3.0): bfloat16 matrix products have no
-  tensor-core path yet (10-28x CUDA's time), and `eigh` runs its tridiagonal
-  eigenvalue step in one thread, which is fine on small GPUs but 50-110x
-  CUDA's time on large ones.
+<!-- FINAL: re-measure bfloat16 matmul (#26) and eigh (#27) against CUDA before the release -->
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
