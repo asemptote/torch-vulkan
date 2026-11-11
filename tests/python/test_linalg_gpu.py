@@ -233,6 +233,34 @@ def test_svd_rank_deficient(dtype):
     check_close(U[:, :5] @ torch.diag(S) @ Vh, a, dtype, 100)
 
 
+@pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
+@pytest.mark.parametrize("shape,full", [((70, 40), False), ((40, 70), True), ((2, 64, 64), False), ((90, 50), True)])
+def test_svd_bidiagonal(dtype, shape, full):
+    # from 32 columns up: bidiagonal reduction, the Golub-Kahan tridiagonal's
+    # divide and conquer, back-transforms; random, rank-deficient and zero
+    # matrices
+    m, n = shape[-2:]
+    r = min(m, n) // 4
+    lead = shape[:-2]
+    gen = make_complex if dtype.is_complex else make
+    cases = [gen(shape, dtype, 4),
+             gen(lead + (m, r), dtype, 5) @ gen(lead + (r, n), dtype, 6),
+             torch.zeros(shape, dtype=dtype)]
+    real = torch.float32 if dtype in (torch.float32, torch.complex64) else torch.float64
+    for a in cases:
+        with on_gpu():
+            U, S, Vh = torch.linalg.svd(a.to("vk"), full_matrices=full)
+        U, S, Vh = U.cpu(), S.cpu(), Vh.cpu()
+        scale = max(1.0, float(torch.linalg.svdvals(a).max()))
+        check_close(S, torch.linalg.svdvals(a), real, 10 * scale)
+        k = S.shape[-1]
+        check_close(U[..., :, :k] @ torch.diag_embed(S).to(dtype) @ Vh[..., :k, :], a, real, 10 * scale)
+        eye_u = torch.eye(U.shape[-1], dtype=dtype).expand(U.shape[:-2] + (U.shape[-1],) * 2)
+        eye_v = torch.eye(Vh.shape[-2], dtype=dtype).expand(Vh.shape[:-2] + (Vh.shape[-2],) * 2)
+        check_close(U.mH @ U, eye_u, real)
+        check_close(Vh @ Vh.mH, eye_v, real)
+
+
 @pytest.mark.parametrize("dtype", FLOATS)
 def test_lstsq(dtype):
     for shape in [(8, 3), (3, 8), (2, 6, 4)]:
