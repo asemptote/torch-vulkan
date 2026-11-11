@@ -96,6 +96,9 @@ impl KernelCache {
             }
         }
         strip_denorm_preserve(&mut words, !caps.denorm_preserve_f32, !caps.denorm_preserve_f64);
+        if caps.nan_preserve_f64 && declared.contains(&CAP_FLOAT64) {
+            add_nan_preserve_f64(&mut words);
+        }
         let d = &self.ctx.device;
         unsafe {
             let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
@@ -245,6 +248,71 @@ pub fn strip_denorm_preserve(words: &mut Vec<u32>, width32: bool, width64: bool)
     *words = out;
 }
 
+/// Adds `OpExecutionMode SignedZeroInfNanPreserve 64` (with its capability,
+/// and `SPV_KHR_float_controls` if the module no longer declares it) to every
+/// entry point: float64 NaNs, infinities and signed zeros kept as IEEE says.
+/// Without it Mesa's ANV lowers a float64 1.0 / NaN to 0 (its software
+/// reciprocal assumes finite inputs), so sigmoid(NaN) or i0e(NaN) came out 0.
+pub fn add_nan_preserve_f64(words: &mut Vec<u32>) {
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_EXECUTION_MODE: u32 = 16;
+    const OP_EXTENSION: u32 = 10;
+    const NAN_PRESERVE_MODE: u32 = 4461;
+    const NAN_PRESERVE_CAPABILITY: u32 = 4466;
+    if words.len() < 5 {
+        return;
+    }
+    let (mut last_capability, mut last_mode, mut first_entry) = (None, None, None);
+    let mut entries = Vec::new();
+    let mut has_extension = false;
+    let mut i = 5;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        let opcode = words[i] & 0xffff;
+        if count == 0 || i + count > words.len() {
+            return;  // malformed: leave the module untouched
+        }
+        let inst = &words[i..i + count];
+        match opcode {
+            OP_CAPABILITY if count == 2 => {
+                if inst[1] == NAN_PRESERVE_CAPABILITY {
+                    return;  // (already declared)
+                }
+                last_capability = Some(i + count);
+            }
+            OP_EXTENSION if extension_name(&inst[1..]) == "SPV_KHR_float_controls" => has_extension = true,
+            OP_ENTRY_POINT if count >= 3 => {
+                entries.push(inst[2]);
+                first_entry.get_or_insert(i);
+            }
+            OP_EXECUTION_MODE => last_mode = Some(i + count),
+            _ => {}
+        }
+        i += count;
+    }
+    let (Some(cap_at), Some(entry_at)) = (last_capability, first_entry) else { return };
+    // Later positions first, so earlier ones stay valid.
+    let modes: Vec<u32> = entries.iter().flat_map(|&id| [(4 << 16) | OP_EXECUTION_MODE, id, NAN_PRESERVE_MODE, 64]).collect();
+    let mode_at = last_mode.unwrap_or_else(|| {
+        // (after the entry points)
+        let mut j = entry_at;
+        while j < words.len() && words[j] & 0xffff == OP_ENTRY_POINT {
+            j += (words[j] >> 16) as usize;
+        }
+        j
+    });
+    words.splice(mode_at..mode_at, modes);
+    let mut header = vec![(2 << 16) | OP_CAPABILITY, NAN_PRESERVE_CAPABILITY];
+    if !has_extension {
+        let mut name: Vec<u8> = b"SPV_KHR_float_controls".to_vec();
+        name.resize((name.len() / 4 + 1) * 4, 0);
+        let packed: Vec<u32> = name.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        header.push((((packed.len() + 1) as u32) << 16) | OP_EXTENSION);
+        header.extend(packed);
+    }
+    words.splice(cap_at..cap_at, header);
+}
+
 /// The literal string of an instruction operand (UTF-8, nul-terminated, packed
 /// four bytes a word, little-endian).
 fn extension_name(words: &[u32]) -> String {
@@ -268,7 +336,7 @@ impl Drop for KernelCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_capabilities, strip_denorm_preserve, CAP_FLOAT64, SPIRV};
+    use super::{add_nan_preserve_f64, declared_capabilities, strip_denorm_preserve, CAP_FLOAT64, SPIRV};
 
     // Header + OpCapability Shader + OpCapability DenormPreserve +
     // OpExecutionMode %4 DenormPreserve 32 + ... 64 + OpNop.
@@ -320,6 +388,25 @@ mod tests {
             }
         }
         assert!(offenders.is_empty(), "declare Float64: {offenders:?}");
+    }
+
+    #[test]
+    fn adds_float64_nan_preservation() {
+        // Header + OpCapability Shader + OpCapability Float64 + OpEntryPoint
+        // GLCompute %4 "main" + OpExecutionMode %4 LocalSize 1 1 1 + OpNop.
+        let main = u32::from_le_bytes(*b"main");
+        let mut w = vec![0x0723_0203, 0x0001_0300, 0, 10, 0, (2 << 16) | 17, 1, (2 << 16) | 17, 10,
+                         (5 << 16) | 15, 5, 4, main, 0, (6 << 16) | 16, 4, 17, 1, 1, 1, (1 << 16)];
+        add_nan_preserve_f64(&mut w);
+        let caps = declared_capabilities(&w);
+        assert!(caps.contains(&4466) && caps.contains(&CAP_FLOAT64));
+        let mode = w.windows(4).any(|m| m == [(4 << 16) | 16, 4, 4461, 64]);
+        assert!(mode, "{w:?}");
+        let ext = w.windows(2).any(|e| e[0] & 0xffff == 10 && e[1] == u32::from_le_bytes(*b"SPV_"));
+        assert!(ext, "{w:?}");
+        let n = w.len();
+        add_nan_preserve_f64(&mut w);  // (once only)
+        assert_eq!(w.len(), n);
     }
 
     /// build.rs removes every OpTypeForwardPointer (spirv_fix.rs).

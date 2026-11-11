@@ -34,6 +34,9 @@ pub struct Capabilities {
     /// Shaders can keep float32 / float64 denormals (otherwise they may flush to zero).
     pub denorm_preserve_f32: bool,
     pub denorm_preserve_f64: bool,
+    /// Shaders can ask for float64 NaN/inf/signed zero to be kept
+    /// (SignedZeroInfNanPreserve): Mesa's ANV otherwise lowers 1.0 / NaN to 0.
+    pub nan_preserve_f64: bool,
     pub subgroup_size: u32,
     /// Subgroup operations available to compute shaders (none if compute is
     /// not among the device's subgroup stages).
@@ -517,6 +520,7 @@ unsafe fn query_capabilities(
         float_controls,
         denorm_preserve_f32: float_controls && b(fc.shader_denorm_preserve_float32) && !disabled("denorm"),
         denorm_preserve_f64: float_controls && b(fc.shader_denorm_preserve_float64) && !disabled("denorm"),
+        nan_preserve_f64: float_controls && b(fc.shader_signed_zero_inf_nan_preserve_float64) && !disabled("nanpreserve"),
         subgroup_size: sub.subgroup_size,
         subgroup_ops,
         subgroup_size_control,
