@@ -1248,15 +1248,20 @@ def _frexp_out(self, *, mantissa, exponent):
         mantissa.resize_(x.shape)
         mantissa.copy_(m)
         return mantissa, exponent
-    itype, mbits, mask, bias, k = _FREXP[x.dtype]
-    field = (x.view(itype) >> mbits) & mask
-    sub = (field == 0) & (x != 0)
-    a = torch.where(sub, x * 2.0 ** k, x)
-    bits = a.view(itype)
-    e = ((bits >> mbits) & mask) - bias - torch.where(sub, k, 0)
-    m = ((bits & ~(mask << mbits)) | (bias << mbits)).view(x.dtype)
-    nonfinite = ~torch.isfinite(x)
-    special = (x == 0) | nonfinite
+    # In integer arithmetic on the bits only: a GPU that flushes subnormals to
+    # zero (NVIDIA's drivers) would compare 1e-40 equal to 0 and scale it to 0.
+    itype, mbits, mask, bias, _ = _FREXP[x.dtype]
+    bits = x.view(itype)
+    field = (bits >> mbits) & mask
+    frac = bits & ((1 << mbits) - 1)
+    sign = bits & torch.iinfo(itype).min
+    sub = (field == 0) & (frac != 0)
+    # (a subnormal x is frac * 2^(-bias - mbits); frac as a float is normal)
+    a = torch.where(sub, frac.to(x.dtype).view(itype), bits)
+    e = ((a >> mbits) & mask) - bias - torch.where(sub, bias + mbits, 0)
+    m = ((a & ~(mask << mbits)) | (bias << mbits) | sign).view(x.dtype)
+    nonfinite = field == mask
+    special = ((field == 0) & (frac == 0)) | nonfinite
     from torch._prims_common.wrappers import _maybe_resize_out
     _maybe_resize_out(mantissa, x.shape)  # (warns on resizing a non-empty out, as the CPU)
     _maybe_resize_out(exponent, x.shape)
