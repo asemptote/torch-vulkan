@@ -830,6 +830,19 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
   bool copy = schema.name().find("copy") != std::string::npos;
   TORCH_CHECK(!any_vk || !any_cpu || copy, "Expected all tensors to be on the same device, but found at least two "
               "devices, ", kDevice, " and cpu!");
+  // (a tensor on a third device, meta say, as FakeTensor's cross-checks pass:
+  // the CPU would raise the same, after copying the rest over)
+  for (size_t i = 0; i < arguments.size() && any_vk && !copy; ++i) {
+    const c10::IValue& v = stack[first + i];
+    std::vector<at::Tensor> ts = v.isTensor() ? std::vector<at::Tensor>{v.toTensor()}
+                                 : v.isTensorList() ? v.toTensorList().vec() : std::vector<at::Tensor>{};
+    for (const at::Tensor& t : ts) {
+      if (!t.defined()) continue;
+      at::DeviceType d = t.device().type();
+      TORCH_CHECK(d == kDevice || d == at::kCPU, "Expected all tensors to be on the same device, but found at least two "
+                  "devices, ", at::Device(kDevice, 0), " and ", t.device(), "!");
+    }
+  }
   if (!vk_input) {
     return;
   }
@@ -1606,6 +1619,14 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
   // (first: where the CPU raises, no other route may compute a result)
   raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));  // (keyed with emptiness too)
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
+  // (a meta tensor that reached a vk kernel, as FakeTensor's cross-checks run
+  // kernels on: the error the CPU route would give, copying it over)
+  for (const c10::IValue& v : torch::jit::Stack(stack->end() - static_cast<std::ptrdiff_t>(
+                                                                std::min(stack->size(), op.schema().arguments().size())),
+                                                stack->end())) {
+    TORCH_CHECK_NOT_IMPLEMENTED(!(v.isTensor() && v.toTensor().defined() && v.toTensor().is_meta()),
+                                "Cannot copy out of meta tensor; no data!");
+  }
   if (half_via_float(op, stack)) {
     return;
   }

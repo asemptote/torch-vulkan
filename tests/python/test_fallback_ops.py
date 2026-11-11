@@ -953,3 +953,15 @@ def test_quantized_per_tensor(qdtype):
     assert back.is_quantized and torch.equal(back.int_repr().cpu(), c.int_repr())
     e = no_fallback(lambda: torch._empty_affine_quantized([5, 5, 5, 5], scale=2, zero_point=3, dtype=qdtype, device="vk"))
     assert e.flatten(0, -1).shape == (625,) and e.ravel().shape == (625,)
+
+
+def test_meta_tensor_among_vk_raises_without_cpu():
+    """FakeTensor's cross-checks pass meta tensors among vk ones: the CPU's
+    device error, raised on vk."""
+    x = torch.zeros(2, 3, 5, device="vk")
+    idx = torch.zeros(2, 3, 2, dtype=torch.long, device="meta")
+    src = torch.ones(2, 3, 2, device="meta")
+    before = torch_vulkan.fallback_counts()
+    with pytest.raises(RuntimeError, match="Expected all tensors to be on the same device"):
+        torch.scatter_add(x, -1, idx, src)
+    assert torch_vulkan.fallback_counts() == before

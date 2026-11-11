@@ -216,7 +216,22 @@ def _raise_cpu_dtype_error(op, name, args, kwargs):
         raise (NotImplementedError if hit[0] else RuntimeError)(hit[1])
 
 
+def _check_devices(args, kwargs):
+    """A tensor on a third device (meta, as FakeTensor's cross-checks pass) among
+    vk ones: the error the CPU would raise, without it."""
+    flat, _ = tree_flatten((args, kwargs))
+    ts = [t for t in flat if isinstance(t, torch.Tensor)]
+    if any(t.device.type == "meta" for t in ts):  # (FakeTensor's cross-checks: no data to copy over)
+        raise NotImplementedError("Cannot copy out of meta tensor; no data!")
+    if any(t.device.type == "vk" for t in ts):
+        for t in ts:
+            if t.device.type not in ("vk", "cpu"):
+                raise RuntimeError("Expected all tensors to be on the same device, but found at least two devices, "
+                                   f"vk:0 and {t.device}!")
+
+
 def _cpu_fallback(op, name, args, kwargs):
+    _check_devices(args, kwargs)
     _raise_cpu_dtype_error(op, name, args, kwargs)
     result = _half_via_float(op, args, kwargs)
     if result is not NotImplemented:
