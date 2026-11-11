@@ -1,17 +1,14 @@
 // axis T: f32=float f64=double c64=float2 c128=double2
 //
 // Small dense factorization steps for csrc/dense.cpp (M13), the parts of
-// blocked LU, Cholesky, QR and Jacobi eigen/SVD that LAPACK would do on the
-// CPU. Matrices are row-major and batched: matrix z starts at a + z * sa
+// blocked LU (its panels are getrf.slang), Cholesky, QR and Jacobi eigen/SVD
+// that LAPACK would do on the CPU. Matrices are row-major and batched: matrix
+// z starts at a + z * sa
 // (row i, column j at [i * ld + j]). One workgroup works on one matrix (or
 // one Jacobi pair of one matrix), so steps that depend on each other are
 // separated by workgroup barriers; global memory is used throughout.
 //
 // OP (FACTOR_*):
-//   LU_PANEL    partial-pivoting LU of columns [k, k + b) over rows [k, rows),
-//               swapping whole rows; pivots (1-based, absolute) into piv,
-//               the first zero pivot into info (LAPACK's getrf2 semantics);
-//               with UNIT, no pivoting (pivots j + 1, as CUDA's)
 //   LASWP       apply the first b row interchanges in piv to the rows x cols
 //               matrix (in order, or in reverse with UPPER)
 //   TRI_INV     inverse of the b x b triangular block at (k, k) (lower or
@@ -108,7 +105,7 @@ struct Params
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
 [vk::constant_id(0)]
-const int OP = FACTOR_LU_PANEL;
+const int OP = FACTOR_TRI_INV;
 [vk::constant_id(1)]
 const int UPPER = 0;
 [vk::constant_id(2)]
@@ -116,7 +113,6 @@ const int UNIT = 0;
 
 #define WG 256
 groupshared T sval[WG];
-groupshared int sidx[WG];
 groupshared R rval[WG];
 groupshared R rval2[WG];
 
@@ -209,82 +205,7 @@ R sign_of(R x)
     return x < R(0) ? R(-1) : R(1);
 }
 
-// ---------------------------------------------------------------- LU
-
-void lu_panel(uint t, uint z)
-{
-    T* a = p.a + z * p.sa;
-    uint n = p.rows, ld = p.ld;
-    for (uint j = p.k; j < p.k + p.b; j++)
-    {
-        // Pivot: the first row with the largest |a[i, j]|, i >= j (row j itself with UNIT).
-        R best = UNIT != 0 && t == 0 ? mag1(a[j * ld + j]) : R(-1);
-        int at = int(j);
-        // (Loads index rows min(i, n - 1), here and below: lavapipe performs a
-        // loop's first loads before testing its condition, for every lane.)
-        for (uint i = j + t; UNIT == 0 && i < n; i += WG)
-        {
-            R v = mag1(a[min(i, n - 1) * ld + j]);
-            if (v > best || (isnan(v) && !isnan(best)))
-            {
-                best = v;
-                at = int(i);
-            }
-        }
-        rval[t] = best;
-        sidx[t] = at;
-        barrier();
-        for (uint s = WG / 2; s > 0; s >>= 1)
-        {
-            if (t < s)
-            {
-                R o = rval[t + s];
-                int oi = sidx[t + s];
-                if (o > rval[t] || (o == rval[t] && oi < sidx[t]))
-                {
-                    rval[t] = o;
-                    sidx[t] = oi;
-                }
-            }
-            barrier();
-        }
-        uint piv = uint(sidx[0]);
-        R pivot_abs = rval[0];
-        barrier();
-        if (t == 0)
-            p.piv[z * p.spiv + j] = int(piv) + 1;
-        if (piv != j)
-        {
-            for (uint c = t; c < p.cols; c += WG)
-            {
-                uint cl = min(c, p.cols - 1);
-                T tmp = a[j * ld + cl];
-                a[j * ld + c] = a[piv * ld + cl];
-                a[piv * ld + c] = tmp;
-            }
-        }
-        barrier();
-        if (pivot_abs == R(0))
-        {
-            if (t == 0 && p.info[z] == 0)
-                p.info[z] = int(j) + 1;
-            continue;  // LAPACK leaves the column unscaled
-        }
-        T d = a[j * ld + j];
-        for (uint i = j + 1 + t; i < n; i += WG)
-            a[i * ld + j] = dv(a[min(i, n - 1) * ld + j], d);
-        barrier();
-        uint width = p.k + p.b - j - 1;
-        uint height = n - j - 1;
-        uint w = max(width, 1u);  // (no division by zero where the loop does not run)
-        for (uint e = t; e < width * height; e += WG)
-        {
-            uint i = min(j + 1 + e / w, n - 1), c = min(j + 1 + e % w, p.cols - 1);
-            a[i * ld + c] = a[i * ld + c] - mul(a[i * ld + j], a[j * ld + c]);
-        }
-        barrier();
-    }
-}
+// ---------------------------------------------------------------- row interchanges
 
 void laswp(uint t, uint z)
 {
@@ -300,7 +221,7 @@ void laswp(uint t, uint z)
         {
             for (uint c = t; c < p.cols; c += WG)
             {
-                uint cl = min(c, p.cols - 1);  // (see lu_panel)
+                uint cl = min(c, p.cols - 1);  // (lavapipe loads before testing a loop's condition)
                 T tmp = a[i * ld + cl];
                 a[i * ld + c] = a[r * ld + cl];
                 a[r * ld + c] = tmp;
@@ -935,7 +856,6 @@ void main(uint3 gid: SV_GroupID, uint3 lid: SV_GroupThreadID)
     uint t = lid.x;
     switch (OP)
     {
-    case FACTOR_LU_PANEL: lu_panel(t, gid.x); break;
     case FACTOR_LASWP: laswp(t, gid.x); break;
     case FACTOR_TRI_INV: tri_inv(t, gid.x); break;
     case FACTOR_CHOL_BLOCK: chol_block(t, gid.x); break;

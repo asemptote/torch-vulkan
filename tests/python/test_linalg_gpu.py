@@ -47,6 +47,41 @@ def test_lu_family(dtype, shape):
             check(x, y, **tol(dtype, 10))
 
 
+@pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
+@pytest.mark.parametrize("case", ["random", "ties", "zero column", "zeros", "no pivoting"])
+@pytest.mark.parametrize("shape", [(300, 300), (2, 130, 130), (200, 90), (90, 200)])
+def test_lu_panel_pivots(dtype, case, shape):
+    # the panel over many workgroups (shaders/getrf.slang; 32 rows each, rows
+    # kept in place and swapped after the panel): LAPACK's pivots (the lowest
+    # position on ties), info and factors
+    a = make_complex(shape, dtype, 5) if dtype.is_complex else make(shape, dtype, 5)
+    if case == "ties":
+        a = torch.randint(-2, 3, shape).to(dtype)
+    elif case == "zero column":
+        a[..., 40] = 0
+    elif case == "zeros":
+        a = torch.zeros(shape, dtype=dtype)
+    elif case == "no pivoting":
+        n = min(shape[-2:])
+        a[..., :n, :n] += n * torch.eye(n, dtype=dtype)
+    pivot = case != "no pivoting"
+    with on_gpu():
+        vlu, vpiv, vinfo = torch.linalg.lu_factor_ex(a.to("vk"), pivot=pivot)
+    lu, piv, info = vlu.cpu(), vpiv.cpu(), vinfo.cpu()
+    real = torch.float32 if dtype in (torch.float32, torch.complex64) else torch.float64
+    if pivot:
+        wlu, wpiv, winfo = torch.linalg.lu_factor_ex(a)
+        assert torch.equal(info, winfo)
+        if case != "ties":  # (integer entries: later pivots can tie within rounding)
+            assert torch.equal(piv, wpiv)
+            check(vlu, wlu, **tol(real, 100))
+    else:
+        assert torch.equal(piv, torch.arange(1, piv.shape[-1] + 1, dtype=piv.dtype).expand_as(piv))
+    P, L, U = torch.lu_unpack(lu, piv)
+    size = max(float(a.abs().max()), 1.0)
+    torch.testing.assert_close((P @ L @ U) / size, a / size, **tol(real, 100))
+
+
 @pytest.mark.parametrize("dtype", FLOATS)
 @pytest.mark.parametrize("shape", [(5, 3), (3, 6), (2, 7, 7), (80, 70)])
 def test_rectangular_lu_and_unpack(dtype, shape):
@@ -254,6 +289,16 @@ def test_svd_rank_deficient(dtype):
     check_close(S, torch.linalg.svdvals(a), dtype, 100)
     check_close(U.T @ U, torch.eye(6, dtype=dtype), dtype)
     check_close(U[:, :5] @ torch.diag(S) @ Vh, a, dtype, 100)
+
+
+@pytest.mark.parametrize("shape", [(0, 40, 40), (2, 0, 50, 70)])
+def test_svd_empty_batch(shape):
+    # (no matrices of the bidiagonal path's size: PyTorch's test helpers make these)
+    a = torch.randn(shape)
+    with on_gpu():
+        u, s, vh = torch.linalg.svd(a.to("vk"), full_matrices=False)
+    wu, ws, wvh = torch.linalg.svd(a, full_matrices=False)
+    assert u.shape == wu.shape and s.shape == ws.shape and vh.shape == wvh.shape
 
 
 @pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
