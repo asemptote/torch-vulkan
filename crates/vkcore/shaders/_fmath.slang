@@ -235,6 +235,110 @@ int m_ilogb(float x)
     return e != 0 ? e - 127 : firstbithigh(bits) - 149;
 }
 
+// a * b exactly as p + e: Dekker's product with Veltkamp's split, plain
+// multiplications and additions (kernels are compiled with -fp-mode precise,
+// which keeps them unfused), for |a|, |b| and |a b| within 2^+-64 of 1.
+void div32_two_prod(float a, float b, out float p, out float e)
+{
+    p = a * b;
+    float t = 4097.0f * a, ah = t - (t - a), al = a - ah;
+    t = 4097.0f * b;
+    float bh = t - (t - b), bl = b - bh;
+    e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+}
+
+// a - q b exactly, for q within a few ulps of a / b (a, b in [1, 2), or
+// a, b, q within 2^+-60 of 1: no overflow, Dekker's error terms normal).
+float div32_residual(float a, float q, float b)
+{
+    float p, e;
+    div32_two_prod(q, b, p, e);
+    return (a - p) - e;
+}
+
+// |x|'s significand as an int in [2^23, 2^24) and its exponent: |x| = m 2^(e - 23).
+uint div32_unpack(float x, out int e)
+{
+    uint u = bit_cast<uint>(x) & 0x7fffffffu;
+    uint f = u >> 23;
+    if (f != 0u)
+    {
+        e = int(f) - 127;
+        return (u & 0x7fffffu) | 0x800000u;
+    }
+    int shift = 23 - firstbithigh(u);  // a subnormal, normalised on the bits
+    e = -126 - shift;
+    return u << uint(shift);
+}
+
+// a / b correctly rounded to nearest even, as the CPU divides, on any GPU:
+// Vulkan allows OpFDiv 2.5 ulp, and an FMA-based correction needs the driver
+// to fuse FMAs, which the UHD 620's does not (about 12% of its quotients came
+// out 1 ulp off). The significands' quotient, in (0.5, 2), is corrected with
+// its exact residual (Dekker's product) and chosen among its neighbours by
+// their exact residuals; the exponent and the rounding of subnormal results
+// (ties broken by the residual's sign) are done on the bits, so neither
+// overflow nor a subnormal intermediate can interfere. Zeros, infinities and
+// NaNs keep the GPU's division (exact there).
+float m_div32(float a, float b)
+{
+    // (zeros, infinities and NaNs told apart on the bits: a device that
+    // flushes subnormals may compare them equal to 0, and they are divided
+    // exactly below)
+    uint aa = bit_cast<uint>(a) & 0x7fffffffu, ab = bit_cast<uint>(b) & 0x7fffffffu;
+    if (aa >= 0x7f800000u || ab >= 0x7f800000u || aa == 0u || ab == 0u)
+        return a / b;
+    // The common case: a, b and a / b within 2^+-60 (no overflow in the
+    // split, Dekker's error terms normal), the GPU's quotient corrected once
+    // and kept when its exact residual is clearly under half an ulp of b q.
+    int fa = int((bit_cast<uint>(a) >> 23) & 255u), fb = int((bit_cast<uint>(b) >> 23) & 255u);
+    if (fa >= 67 && fa <= 187 && fb >= 67 && fb <= 187 && abs(fa - fb) <= 60)
+    {
+        float q = a / b;
+        q += div32_residual(a, q, b) / b;
+        float ulp = bit_cast<float>((bit_cast<uint>(q) & 0x7f800000u) - (23u << 23));  // 2^(exponent(q) - 23)
+        if (abs(div32_residual(a, q, b)) < 0.4999f * ulp * abs(b))
+            return q;
+    }
+    int ea, eb;
+    uint ia = div32_unpack(a, ea), ib = div32_unpack(b, eb);
+    float ma = bit_cast<float>(0x3f800000u | (ia & 0x7fffffu)), mb = bit_cast<float>(0x3f800000u | (ib & 0x7fffffu));
+    float q = ma / mb;
+    q += div32_residual(ma, q, mb) / mb;
+    uint qb = bit_cast<uint>(q);
+    float r = div32_residual(ma, q, mb);
+    [ForceUnroll]
+    for (int d = -1; d <= 1; d += 2)
+    {
+        float c = bit_cast<float>(uint(int(qb) + d));
+        float rc = div32_residual(ma, c, mb);
+        if (abs(rc) < abs(r) || (abs(rc) == abs(r) && (bit_cast<uint>(c) & 1u) == 0u))
+        {
+            q = c;
+            r = rc;
+        }
+    }
+    // q: the significands' quotient rounded to 24 bits; r = ma - q mb exactly
+    qb = bit_cast<uint>(q);
+    uint m = (qb & 0x7fffffu) | 0x800000u;
+    int e = int(qb >> 23) - 127 + ea - eb;
+    uint sign = (bit_cast<uint>(a) ^ bit_cast<uint>(b)) & 0x80000000u;
+    if (e > 127)
+        return bit_cast<float>(sign | 0x7f800000u);
+    if (e >= -126)
+        return bit_cast<float>(sign | (uint(e + 127) << 23) | (m & 0x7fffffu));
+    // a subnormal (or zero) result: m 2^(e - 23) in units of 2^-149 is m / 2^d
+    int d = -126 - e;
+    if (d > 24)
+        return bit_cast<float>(sign);
+    uint keep = m >> uint(d), rem = m & ((1u << uint(d)) - 1u), half = 1u << uint(d - 1);
+    // (|rem - half| >= 1 unit of q, more than q's error: only exact halves
+    // depend on which side of q the quotient lies)
+    if (rem > half || (rem == half && (r > 0.0f || (r == 0.0f && (keep & 1u) != 0u))))
+        keep += 1u;
+    return bit_cast<float>(sign | keep);
+}
+
 #elif defined(T_f64) || defined(FMATH_F64)
 #include "_math64.slang"
 #include "_math64_ext.slang"
@@ -340,12 +444,16 @@ FT m_fmod(FT a, FT b)
 }
 
 // a / b correctly rounded: Vulkan allows OpFDiv 2.5 ulp, so 6 / 3 can be
-// 1.9999999 (and trunc it 1). One correction with the exact remainder (an
-// FMA) fixes the last bit. For |b| > 2^126 both are quartered (exactly)
-// first: GPUs may divide as a * (1 / b) (NVIDIA does in float32), and 1 / b
-// is then subnormal, which devices without subnormals flush to 0.
+// 1.9999999 (and trunc it 1). float32: m_div32, without FMAs (not every
+// driver fuses them). float64: one correction with the exact remainder (an
+// FMA) fixes the last bit; for |b| > 2^126 both are quartered (exactly)
+// first: GPUs may divide as a * (1 / b), and 1 / b is then subnormal, which
+// devices without subnormals flush to 0.
 FT m_div(FT a, FT b)
 {
+#if defined(T_f32) || defined(FMATH_F32)
+    return m_div32(a, b);  // (no FMA needed)
+#else
     if (abs(b) > LIT(8.5070591730234616e37))
     {
         a *= FT(0.25);
@@ -354,6 +462,7 @@ FT m_div(FT a, FT b)
     FT q = a / b;
     if (isnan(q) || isinf(q) || q == FT(0) || isinf(b)) return q;
     return q + fma(-q, b, a) / b;
+#endif
 }
 
 // Python-style floor division, as PyTorch's div_floor for floats.
