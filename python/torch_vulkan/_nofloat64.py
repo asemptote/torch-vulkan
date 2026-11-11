@@ -9,7 +9,8 @@ for a float32 q and n - 1 < 2^31 that product is exact in 55-bit integer
 arithmetic, so the integer part and the (once rounded) fraction are the
 CPU's. pinv and matrix_rank compare singular values with a float64
 tolerance; without float64 the tolerance is float32 (a different decision
-only for a singular value within an ulp of it).
+only for a singular value within an ulp of it). torch.amp.GradScaler's
+unscale_ takes a float64 reciprocal of its scale: that one is lent to the CPU.
 
 Registered on the AutogradPrivateUse1 key (these are composite ops, so
 autograd differentiates the ops they call), except linalg_pinv.atol_rtol_tensor:
@@ -277,11 +278,41 @@ def _batch_norm_impl_index(input, weight, bias, running_mean, running_var, train
     return out, stats, stats.clone(), torch.empty(0, dtype=torch.uint8, device=input.device), 0
 
 
+# ---------------------------------------------------------------- torch.amp.GradScaler
+
+def _patch_grad_scaler():
+    """GradScaler.unscale_ takes the scale's reciprocal in float64 on its
+    device (except on MPS): without float64 the scale is lent as a CPU
+    tensor for that call, so the reciprocal is the CPU's (float64, rounded to
+    float32) and the rest runs on vk as before (found_inf and the inverse
+    scale are copied to each gradient's device)."""
+    from torch.amp import grad_scaler
+
+    original = grad_scaler.GradScaler.unscale_
+    if getattr(original, "_torch_vulkan", False):
+        return
+
+    def unscale_(self, optimizer):
+        scale = self._scale
+        if scale is None or scale.device.type != "vk" or _has_float64():
+            return original(self, optimizer)
+        self._scale = scale.cpu()
+        try:
+            return original(self, optimizer)
+        finally:
+            self._scale = scale
+
+    unscale_._torch_vulkan = True
+    unscale_.__doc__ = original.__doc__
+    grad_scaler.GradScaler.unscale_ = unscale_
+
+
 def register():
     """Registers the kernels on AutogradPrivateUse1; returns their names."""
     global _lib
     if _lib is not None:
         return []
+    _patch_grad_scaler()
     _lib = torch.library.Library("aten", "IMPL")
     kernels = {
         "quantile": _make_quantile(False, aten.quantile.default),

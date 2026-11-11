@@ -370,7 +370,11 @@ float m_sqrt(float x)
         M *= 2.0f;
         e -= 1;
     }
+    // (one Newton step on the exact residual M - c^2 first: a driver's Sqrt
+    // may be an approximation good to a few thousand ulp, and the
+    // neighbour steps below move one ulp each)
     float c = sqrt(M);
+    c += div32_residual(M, c, c) * (0.5f / c);
     [ForceUnroll]
     for (int i = 0; i < 3; i++)
     {
@@ -457,7 +461,8 @@ void sqrt64_two_prod(double a, double b, out double p, out double e)
     e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
 }
 
-// a - q b, with the exact value's sign, for q b within a few ulps of a.
+// a - q b, exactly (and so with the exact value's sign), for q b within a few
+// ulps of a.
 double sqrt64_residual(double a, double q, double b)
 {
     double p, e;
@@ -486,6 +491,7 @@ double m_sqrt(double x)
         back = bit_cast<double>(uint64_t(1023 + 300) << 52);
     }
     double c = sqrt(x);
+    c += sqrt64_residual(x, c, c) * (0.5l / c);  // (as the float32 m_sqrt)
     [ForceUnroll]
     for (int i = 0; i < 3; i++)
     {
@@ -544,10 +550,14 @@ FT m_fmod(FT a, FT b)
 
 // a / b correctly rounded: Vulkan allows OpFDiv 2.5 ulp, so 6 / 3 can be
 // 1.9999999 (and trunc it 1). float32: m_div32, without FMAs (not every
-// driver fuses them). float64: one correction with the exact remainder (an
-// FMA) fixes the last bit; for |b| > 2^126 both are quartered (exactly)
-// first: GPUs may divide as a * (1 / b), and 1 / b is then subnormal, which
-// devices without subnormals flush to 0.
+// driver fuses them). float64: for a, b and the quotient within 2^+-480 of 1,
+// the quotient corrected once with its exact remainder (Dekker's product, no
+// FMA: the UHD 620's driver does not fuse them, and 6 of 50 float64 means came
+// out 1 ulp off there) and then the neighbour with the smallest exact
+// remainder (ties to even); elsewhere one correction with an FMA. For
+// |b| > 2^126 both are quartered (exactly) first: GPUs may divide as
+// a * (1 / b), and 1 / b is then subnormal, which devices without subnormals
+// flush to 0.
 FT m_div(FT a, FT b)
 {
 #if defined(T_f32) || defined(FMATH_F32)
@@ -560,7 +570,24 @@ FT m_div(FT a, FT b)
     }
     FT q = a / b;
     if (isnan(q) || isinf(q) || q == FT(0) || isinf(b)) return q;
-    return q + fma(-q, b, a) / b;
+    int ea = m_ilogb(a), eb = m_ilogb(b), eq = m_ilogb(q);
+    if (abs(ea) > 480 || abs(eb) > 480 || abs(eq) > 480)
+        return q + fma(-q, b, a) / b;
+    q += sqrt64_residual(a, q, b) / b;
+    FT r = abs(sqrt64_residual(a, q, b));
+    uint64_t qb = bit_cast<uint64_t>(q);
+    [ForceUnroll]
+    for (int d = -1; d <= 1; d += 2)
+    {
+        FT c = bit_cast<FT>(qb + uint64_t(int64_t(d)));
+        FT rc = abs(sqrt64_residual(a, c, b));
+        if (rc < r || (rc == r && (bit_cast<uint64_t>(c) & 1ull) == 0ull))
+        {
+            q = c;
+            r = rc;
+        }
+    }
+    return q;
 #endif
 }
 

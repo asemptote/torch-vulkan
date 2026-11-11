@@ -255,7 +255,7 @@ def test_float32_division_correctly_rounded():
     def bits(count):
         u = torch.randint(0, 0x7F800000, (count,), generator=g, dtype=torch.int64)
         u |= torch.randint(0, 2, (count,), generator=g, dtype=torch.int64) << 31
-        return torch.from_numpy(u.numpy().astype("uint32").view("float32"))
+        return u.to(torch.int32).view(torch.float32)  # (the low 32 bits: no numpy view, which 32-bit builds refuse)
 
     special = torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.0, -3.0, 2.0**-126, 2.0**-149,
                             -(2.0**-140), 2.0**-128, 1.1754942e-38, 3.4028235e38, 2.0**127, 7.0, 0.1])

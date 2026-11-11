@@ -71,3 +71,27 @@ def test_float64_free_helpers():
     check(pooled, F.adaptive_avg_pool2d(x, (4, 3)), rtol=1e-6, atol=1e-6)
     assert empty_bn.shape == (0, 3)
     assert "device='vk:0'" in repr(x.to("vk"))
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_searchsorted_python_float_positions(side):
+    # (a Python float is the CPU's 0-dim double, a wrapped number: the search
+    # runs in float32 here, as without float64, where it is a float32 one)
+    f = torch.tensor([-1.0, 0.1, 0.1, 0.5, 2.0, 2.0, 7.0])  # 0.1: float32(0.1) > 0.1
+    i = torch.tensor([-3, 0, 2, 2, 3, 9])
+    for s, values in ((f, (0.1, 0.10000000149011612, 2.0, -7.5, 1e30, float("inf"))), (i, (2.0, 2.5, -2.5, 0.0, 1e30))):
+        for v in values:
+            with on_gpu():
+                got = torch.searchsorted(s.to("vk"), v, side=side)
+            check(got, torch.searchsorted(s, v, side=side))
+
+
+def test_grad_scaler_unscale():
+    # (GradScaler.unscale_ takes a float64 reciprocal of its scale)
+    p = torch.nn.Parameter(torch.ones(3, device="vk"))
+    opt = torch.optim.SGD([p], lr=0.1)
+    scaler = torch.amp.GradScaler("vk", init_scale=3.0)
+    scaler.scale((p * 2).sum()).backward()
+    scaler.unscale_(opt)
+    check(p.grad, torch.full((3,), 2.0))
+    assert scaler._scale.device.type == "vk"
