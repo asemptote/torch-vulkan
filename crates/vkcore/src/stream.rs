@@ -58,6 +58,9 @@ pub struct Stream {
     batch_groups: u64,
     /// Kernels dispatched since the stream was created.
     pub dispatches: u64,
+    /// Whether the last command recorded (in this batch or an earlier one) was
+    /// a transfer (copy, fill) rather than a dispatch; None before the first.
+    last_transfer: Option<bool>,
 }
 
 // The stream owns its queue: only one stream is created per Context.
@@ -94,13 +97,15 @@ impl Stream {
                 max_batch_groups,
                 batch_groups: 0,
                 dispatches: 0,
+                last_transfer: None,
             })
         }
     }
 
     /// The command buffer being recorded, starting one if needed, with a
     /// barrier against the previous command (in this batch or an earlier one).
-    fn begin_command(&mut self) -> Result<vk::CommandBuffer> {
+    /// `transfer`: the new command is a copy or fill rather than a dispatch.
+    fn begin_command(&mut self, transfer: bool) -> Result<vk::CommandBuffer> {
         let ctx = self.ctx.clone();
         let d = &ctx.device;
         let cb = match self.recording {
@@ -126,15 +131,28 @@ impl Stream {
         // nothing, and a barrier's first scope reaches back into earlier
         // submissions on the queue. (Without it, lavapipe could start a batch's
         // first dispatch while the previous batch's last one still ran.)
-        {
-            let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
-                );
-            unsafe { d.cmd_pipeline_barrier(cb, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
+        // Still a full memory dependency on the previous command, but with only
+        // the stages and accesses of the two commands' kinds (compute ->
+        // compute for consecutive dispatches): earlier commands are ordered
+        // through the chain of barriers, and writes made available by an
+        // earlier barrier become visible to later accesses with this one's
+        // visibility operation. (The full compute + transfer barrier cost about
+        // 5.5 us of GPU time per dispatch on the H100.)
+        if let Some(prev) = self.last_transfer {
+            let (src_stage, src_access) = if prev {
+                (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
+            } else {
+                (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE)
+            };
+            let (dst_stage, dst_access) = if transfer {
+                (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+            } else {
+                (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            };
+            let barrier = vk::MemoryBarrier::default().src_access_mask(src_access).dst_access_mask(dst_access);
+            unsafe { d.cmd_pipeline_barrier(cb, src_stage, dst_stage, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
         }
+        self.last_transfer = Some(transfer);
         Ok(cb)
     }
 
@@ -156,7 +174,7 @@ impl Stream {
         let mut padded = [0u8; PUSH_CONSTANT_BYTES as usize];
         padded[..push.len()].copy_from_slice(push);
 
-        let cb = self.begin_command()?;
+        let cb = self.begin_command(false)?;
         self.batch_groups += groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
         let d = &self.ctx.device;
         unsafe {
@@ -176,7 +194,7 @@ impl Stream {
         if bytes == 0 {
             return Ok(());
         }
-        let cb = self.begin_command()?;
+        let cb = self.begin_command(true)?;
         let region = vk::BufferCopy::default().src_offset(src.offset + src_offset).dst_offset(dst.offset + dst_offset).size(bytes);
         unsafe { self.ctx.device.cmd_copy_buffer(cb, src.buffer, dst.buffer, &[region]) };
         self.end_command()
@@ -189,7 +207,7 @@ impl Stream {
         if bytes == 0 {
             return Ok(());
         }
-        let cb = self.begin_command()?;
+        let cb = self.begin_command(true)?;
         unsafe { self.ctx.device.cmd_fill_buffer(cb, dst.buffer, dst.offset + offset, bytes, value) };
         self.end_command()
     }
