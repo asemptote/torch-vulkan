@@ -1125,12 +1125,64 @@ std::string describe_args(const c10::FunctionSchema& schema, const torch::jit::S
   return out + "]";
 }
 
+// The key of cpu_dtype_errors.inc: the op and its arguments' dtypes (tensors),
+// "list" (tensor lists) and kinds (scalars), as tools/dev/cpu_dtype_errors.py.
+std::string dtype_signature(const std::string& op, const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
+  size_t n = schema.arguments().size();
+  std::string out = op + " [";
+  for (size_t i = 0; i < n && stack.size() >= n; ++i) {
+    const c10::IValue& v = stack[stack.size() - n + i];
+    if (i) out += ", ";
+    if (v.isTensor()) {
+      out += v.toTensor().defined() ? c10::toString(v.toTensor().scalar_type()) : "undef";
+    } else if (v.isTensorList()) {
+      out += "list";
+    } else if (v.isNone()) {
+      out += "None";
+    } else if (v.isScalar()) {
+      out += v.isDouble() ? "float" : v.isComplexDouble() ? "complex" : v.isBool() ? "bool" : "int";
+    } else if (v.isString()) {
+      out += std::string(v.toStringRef());
+    } else {
+      out += v.tagKind();
+    }
+  }
+  return out + "]";
+}
+
+struct CpuDtypeError {
+  const char* signature;
+  bool not_implemented;  // NotImplementedError, else RuntimeError
+  const char* message;
+};
+
+// The CPU's dtype errors (dispatch errors such as '"lerp_kernel_scalar" not
+// implemented for 'Int''), by signature: raised here, so the op does not go
+// to the CPU only to fail there.
+void raise_cpu_dtype_error(const std::string& signature) {
+  static const CpuDtypeError table[] = {
+#include "cpu_dtype_errors.inc"
+      {nullptr, false, nullptr}};
+  static const std::map<std::string, const CpuDtypeError*> index = [] {
+    std::map<std::string, const CpuDtypeError*> m;
+    for (const CpuDtypeError& e : table) {
+      if (e.signature != nullptr) m.emplace(e.signature, &e);
+    }
+    return m;
+  }();
+  auto it = index.find(signature);
+  if (it == index.end()) return;
+  TORCH_CHECK_NOT_IMPLEMENTED(!it->second->not_implemented, it->second->message);
+  TORCH_CHECK(false, it->second->message);
+}
+
 void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool error_on_views) {
   if (half_via_float(op, stack)) {
     return;
   }
   const auto& name = op.schema().operator_name();
   std::string key = name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+  raise_cpu_dtype_error(dtype_signature(key, op.schema(), *stack));
   if (fallback_detail()) key += describe_args(op.schema(), *stack);
   check_out_devices(op.schema(), *stack);  // (the device errors raised here: no CPU involved, not a fallback)
   record_fallback(key);

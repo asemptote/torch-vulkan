@@ -13,6 +13,7 @@ decomposition that ends up calling its own op (or raises) runs that call on
 the CPU instead, counted in fallback_counts() like any other fallback.
 """
 
+import os
 import threading
 
 import torch
@@ -151,12 +152,46 @@ def _half_via_float(op, args, kwargs):
     return spec.unflatten(cast)
 
 
+_STRICT = os.environ.get("TORCH_VK_STRICT", "0") not in ("", "0")
+_DETAIL = os.environ.get("TORCH_VK_FALLBACK_DETAIL", "0") not in ("", "0")
+
+
+def _describe(op, args, kwargs):
+    """The argument signature backend.cpp gives with TORCH_VK_FALLBACK_DETAIL."""
+    def one(v):
+        if isinstance(v, torch.Tensor):
+            s = repr(v.dtype).removeprefix("torch.")
+            return f"{_C10_NAMES.get(s, s)}{' cpu' if v.device.type == 'cpu' else ''} {v.dim()}d" +                 (" empty" if v.numel() == 0 else "")
+        if isinstance(v, (list, tuple)) and v and isinstance(v[0], torch.Tensor):
+            return f"list({one(v[0])})"
+        if v is None:
+            return "None"
+        return {bool: "bool", int: "int", float: "float", complex: "complex"}.get(type(v), str(v))
+    values = list(args) + [kwargs[a.name] for a in op._schema.arguments[len(args):] if a.name in kwargs]
+    return " [" + ", ".join(one(v) for v in values) + "]"
+
+
+_C10_NAMES = {"float32": "Float", "float64": "Double", "float16": "Half", "bfloat16": "BFloat16", "complex32": "ComplexHalf",
+              "complex64": "ComplexFloat", "complex128": "ComplexDouble", "bool": "Bool", "uint8": "Byte", "int8": "Char",
+              "int16": "Short", "int32": "Int", "int64": "Long", "uint16": "UInt16", "uint32": "UInt32",
+              "uint64": "UInt64"}
+
+
 def _cpu_fallback(op, name, args, kwargs):
     result = _half_via_float(op, args, kwargs)
     if result is not NotImplemented:
         return result
-    if not _native.record_fallback(name):
+    if _STRICT:
         raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
+    key = name + (_describe(op, args, kwargs) if _DETAIL else "")
+    try:
+        return _run_on_cpu(op, args, kwargs, key)
+    except Exception:
+        _native.record_fallback(key + " (raised)")  # (as backend.cpp: the CPU only checked)
+        raise
+
+
+def _run_on_cpu(op, args, kwargs, key):
     device = _device_of(args, kwargs)
 
     def to_cpu(x):
@@ -167,6 +202,7 @@ def _cpu_fallback(op, name, args, kwargs):
 
     cpu_args, cpu_kwargs = tree_map(to_cpu, args), tree_map(to_cpu, kwargs)
     result = op(*cpu_args, **cpu_kwargs)
+    _native.record_fallback(key)
     # out= arguments (keyword-only, written): copy the CPU results back into the
     # caller's tensors and return those, as the op would.
     written = [a.name for a in op._schema.arguments if a.alias_info and a.alias_info.is_write]
