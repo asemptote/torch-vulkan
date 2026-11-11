@@ -28,6 +28,13 @@ pub const DEFAULT_MAX_BATCH: u32 = 256;
 /// batch up to DEFAULT_MAX_BATCH), with a margin: 2^13 workgroups.
 pub const INTEL_MAX_BATCH_GROUPS: u64 = 1 << 13;
 
+/// Microseconds [`Stream::wait`] polls before blocking: TORCH_VK_SPIN_US, by
+/// default 500 (0: block at once).
+pub fn spin_us() -> u64 {
+    static SPIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SPIN.get_or_init(|| std::env::var("TORCH_VK_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
+}
+
 pub struct Stream {
     ctx: Arc<Context>,
     layout: vk::PipelineLayout,
@@ -224,8 +231,22 @@ impl Stream {
         Ok(unsafe { self.ctx.semaphore_counter_value(self.timeline)? })
     }
 
-    /// Blocks until the batch with timeline value `value` has finished.
+    /// Blocks until the batch with timeline value `value` has finished: by
+    /// polling the timeline for up to [`spin_us`] microseconds, then in the
+    /// driver's wait. (A driver's blocking wait wakes the thread late: on the
+    /// H100 NVL, a tiny kernel followed by a synchronize took 43 us, most of
+    /// it the wake-up; CUDA's synchronize spins likewise by default.)
     pub fn wait(&self, value: u64) -> Result<()> {
+        let spin = spin_us();
+        if spin > 0 {
+            let start = std::time::Instant::now();
+            while start.elapsed().as_micros() < spin as u128 {
+                if self.completed()? >= value {
+                    return Ok(());
+                }
+                std::hint::spin_loop();
+            }
+        }
         let semaphores = [self.timeline];
         let values = [value];
         unsafe { self.ctx.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values), u64::MAX)? };
