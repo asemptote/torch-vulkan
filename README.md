@@ -38,11 +38,18 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
   arithmetic, comparisons, logical ops, transcendental and special functions
   (Bessel, incomplete gamma, zeta/polygamma, erfcx, orthogonal polynomials),
   activations, `where`, `lerp`/`addcmul`/`addcdiv`. float16 and bfloat16 are
-  computed in float32 and rounded once; 8/16-bit integers are computed in int32.
+  computed in float32 and rounded once; 8/16-bit integers are computed in int32;
+  float8 converts exactly. float32 division is correctly rounded on every
+  driver, as on the CPU.
 - **Reductions and scans**: sum, mean, prod, max/min, argmax, var/std, norms,
   any/all, cumsum/cumprod, cummax/cummin, logcumsumexp.
 - **Matrix products**: mm, bmm, matmul, addmm, baddbmm, addmv, dot, `nn.Linear`,
-  einsum; integer and 16-bit products too.
+  einsum; integer and 16-bit products too, and float16 on tensor cores
+  (cooperative matrices) where the GPU has them.
+- **Quantisation**: int8 weight-only and dynamic 4-bit matrix products
+  (`_weight_int8pack_mm`, `_dyn_quant_matmul_4bit`), float8 `_scaled_mm`,
+  per-tensor affine quantised tensors, and quantisation-aware training's fake
+  quantisation.
 - **FFTs**: all of `torch.fft`, any length.
 - **Dense linear algebra**, real and complex, any size and batch, without
   LAPACK: solve, inv, det, slogdet, LU, Cholesky, QR, eigh, SVD, least
@@ -57,20 +64,26 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
 - **Random numbers**: rand, randn, randint, bernoulli, multinomial, randperm,
   dropout, poisson, gamma, binomial, Dirichlet.
 - **Neural-network ops** with their backward passes: convolution (1-D to 3-D,
-  transposed), pooling, normalisation, softmax, losses, upsampling, grid
-  sampling, embeddings, attention.
+  transposed), pooling, normalisation, softmax, losses, upsampling (Lanczos
+  included), grid sampling, embeddings, attention and `nn.MultiheadAttention`'s
+  fast path, nested tensors, `segment_reduce`.
+- **Training**: the optimisers' fused (`fused=True`) and foreach updates for
+  Adam, AdamW, SGD and Adagrad, and `torch.amp.GradScaler`.
 
-All numerical work is meant to run on the GPU (see the design principles in
-[CONTRIBUTING.md](CONTRIBUTING.md#design-principles)). Anything that does not
-run there yet falls back to the CPU through PyTorch's fallback and is counted
-in `torch_vulkan.fallback_counts()`; `TORCH_VK_STRICT=1` turns those fallbacks
-into errors. In the OpInfo sweep (`tools/opinfo_coverage.py`, PyTorch's
-sample inputs for every op compared against the CPU) every op runs fully on
-the GPU and matches the CPU. PyTorch's own device-generic test files
+All numerical work runs on the GPU (see the design principles in
+[CONTRIBUTING.md](CONTRIBUTING.md#design-principles)). **No op runs on the CPU
+in PyTorch's own tests**: across 36 of PyTorch's device-generic test files
 (`test_ops.py`, `test_torch.py`, `test_linalg.py`, `test_nn.py`,
-`test_sparse.py` and others, run by `tools/pytorch_tests.py`) pass on `"vk"`.
-Every remaining failure also fails on the CPU or has a written reason in that
-script's `EXPECTED` table.
+`test_autograd.py`, `test_optim.py`, `test_sparse.py`, `test_nestedtensor.py`
+and others; about 160,000 tests each on lavapipe and an NVIDIA GPU, run by
+`tools/pytorch_tests.py` with every CPU call recorded), no op computes on the
+CPU or calls it to raise an error. <!-- FINAL: confirm with #7's rerun --> Every remaining failure also fails on
+the CPU or has a written reason in that script's `EXPECTED` table. In the
+OpInfo sweep (`tools/opinfo_coverage.py --strict`, PyTorch's sample inputs for
+every op compared against the CPU) every op runs on the GPU and matches the
+CPU. PyTorch's CPU fallback remains as a safety net for anything the tests
+don't reach: it is counted in `torch_vulkan.fallback_counts()`, and
+`TORCH_VK_STRICT=1` turns it into an error.
 
 ## A scientific example
 
@@ -116,7 +129,8 @@ Tested on:
 | Device | Driver | Notes |
 |---|---|---|
 | Intel UHD Graphics 620 | Intel, Windows | main development machine; unified memory, no copies between CPU and GPU |
-| NVIDIA H100 | NVIDIA, Linux | PyTorch's test files |
+| Intel HD Graphics 530 | Mesa (ANV), Linux | validation layer clean |
+| NVIDIA H100 NVL, L40S | NVIDIA, Linux | PyTorch's test files; float16 on tensor cores; [benchmarks against CUDA](benchmarks/results/) |
 | Arm Mali-G57 (Galaxy A13 5G) | Arm, Android (Termux) | Vulkan 1.1, no float64, no int64 |
 | Mesa lavapipe | Mesa, Linux | CI, with the validation layer; PyTorch's test files |
 
@@ -133,13 +147,13 @@ PyTorch 2.14, which they are compiled against, and a Vulkan driver:
 ```sh
 pip install "torch==2.14.*"
 # Windows
-pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.1.0/torch_vulkan-0.1.0-cp310-abi3-win_amd64.whl
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.0/torch_vulkan-0.2.0-cp310-abi3-win_amd64.whl
 # Linux
-pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.1.0/torch_vulkan-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.0/torch_vulkan-0.2.0-cp310-abi3-manylinux_2_28_x86_64.whl
 ```
 
 On Android (Termux), build from source with the release's prebuilt kernels:
-extract `torch-vulkan-spirv-v0.1.0.tar.gz` and run `tools/build-termux.sh`
+extract `torch-vulkan-spirv-v0.2.0.tar.gz` and run `tools/build-termux.sh`
 with that directory (the script describes the setup). Other platforms build
 from source as below.
 
@@ -215,22 +229,28 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
 
 ## Limitations
 
-- **Performance is not the focus yet.** Kernels favour correctness and
-  portability. On the Intel UHD 620, float32 matrix products reach about
-  35% of the GPU's peak (about 148 GFLOP/s at 2048^3, ahead of MKL on the
-  CPU) and float64 about 30 GFLOP/s; per-op overhead is about 9 µs, close to
-  the CPU's. A 2^20-point complex64 FFT takes about 12 ms (the CPU about
-  6 ms); long real and prime-length transforms are ahead of the CPU.
-  float16 products use cooperative matrices (tensor cores) where the device
-  has them: about 150 TFLOP/s on an H100 or L40S (float32 products on the
-  H100: 16-18).
+- **Performance** comes after correctness and portability, and varies by
+  operation. On an Intel UHD 620, float32 matrix products reach about 148
+  GFLOP/s at 2048^3 (ahead of MKL on the CPU) and float64 about 30 GFLOP/s; a
+  2^20-point complex64 FFT takes about 12 ms (the CPU about 6 ms), and long
+  real and prime-length transforms are ahead of the CPU. Against CUDA on the
+  same GPUs ([tables](benchmarks/results/)): float16 matrix products on tensor
+  cores reach about 160 TFLOP/s on an H100 NVL and an L40S (CUDA: about 400
+  and 180), float32 products run at about 2.3x CUDA's time, FFTs at 1-4x,
+  element-wise bandwidth at 1-1.3x, and per-op overhead is slightly lower than
+  CUDA's.
+- **Known slow paths** (planned for 0.3.0): bfloat16 matrix products have no
+  tensor-core path yet (10-28x CUDA's time), and `eigh` runs its tridiagonal
+  eigenvalue step in one thread, which is fine on small GPUs but 50-110x
+  CUDA's time on large ones.
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
 - **One device**; no pinned memory.
 - **Tensors of 2^31 or more elements** are not supported (32-bit element
   offsets).
-- **Quantised and int4 tensors** are out of scope.
+- **Quantised tensors** are per-tensor affine only; per-channel quantised
+  tensors and the int4 dtypes are not supported.
 - **float32 subnormals** are flushed to zero on GPUs that flush them in
   shaders (e.g. the H100).
 - **Long float64 kernels** can trip the Windows GPU watchdog on small
