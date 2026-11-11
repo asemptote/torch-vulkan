@@ -1,12 +1,15 @@
 #!/bin/bash
 # Copies this working tree (the files git tracks or would track, so
 # uncommitted changes too, and the site's tools/cluster/cluster.env) to
-# ~/torch-vulkan on HOST, and optionally builds there:
-#   tools/cluster/sync.sh HOST [--build] [ssh options, e.g. -J GATEWAY]
+# ~/torch-vulkan on HOST (or ~/$TORCH_VULKAN_DIR, so that two working trees
+# can share a host), and optionally builds there:
+#   [TORCH_VULKAN_DIR=torch-vulkan-perf] tools/cluster/sync.sh HOST [--build] [ssh options, e.g. -J GATEWAY]
 # Without ssh options, cluster.env's CLUSTER_SSH (and CLUSTER_USER). Run
 # from the repo root.
 set -euo pipefail
 HOST=$1; shift
+DIR=${TORCH_VULKAN_DIR:-torch-vulkan}
+case "$DIR" in */*|.*|"") echo "TORCH_VULKAN_DIR: a directory name under ~" >&2; exit 2 ;; esac
 BUILD=0
 if [ "${1:-}" = "--build" ]; then BUILD=1; shift; fi
 if [ $# = 0 ]; then
@@ -20,7 +23,7 @@ trap 'rm -f "$archive"' EXIT
   tar czf "$archive" --force-local -T -
 # (-m: the files dated now, not with their local times, which can be older
 # than the host's last build: cargo would then see nothing to rebuild)
-ssh "$@" "$HOST" "mkdir -p ~/torch-vulkan && tar xzmf - -C ~/torch-vulkan" < "$archive"
+ssh "$@" "$HOST" "mkdir -p ~/$DIR && tar xzmf - -C ~/$DIR" < "$archive"
 if [ $BUILD = 1 ]; then
-  ssh "$@" "$HOST" "bash ~/torch-vulkan/tools/cluster/build.sh; tail -1 \${LOG:-\$HOME/torch-vulkan-build.log}"
+  ssh "$@" "$HOST" "TORCH_VULKAN=\$HOME/$DIR bash ~/$DIR/tools/cluster/build.sh; tail -1 \${LOG:-\$HOME/$DIR-build.log}"
 fi
