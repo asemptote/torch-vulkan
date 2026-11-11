@@ -63,6 +63,22 @@ static const uint LOCAL_MAX = 1024;
 #endif
 groupshared T sbuf[2][LOCAL_MAX];
 
+// X[k] = (A + B) / 2 + w^k (A - B) / (2i), w^h = -1 (FFT_R2C).
+T r2c_point(T a, T c, uint k, uint h)
+{
+    T w = k == h ? T(S(-1), S(0)) : p.table[min(k, h - 1)];
+    T e = (a + c) * S(0.5), d = (a - c) * S(0.5);
+    T o = T(d.y, -d.x);  // (A - B) / (2i)
+    return e + cmul(w, o);
+}
+
+// Z'[k] = (A + B) + i conj(w^k) (A - B), k < h (FFT_C2R).
+T c2r_point(T a, T c, uint k, uint h)
+{
+    T d = cmul(cconj(p.table[min(k, max(h, 1u) - 1)]), a - c);
+    return (a + c) + T(-d.y, d.x);  // + i d
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
@@ -102,35 +118,41 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     }
     else if (PHASE == FFT_R2C)
     {
-        uint h = p.n / 2, total = p.batch * (h + 1);
+        // One thread per pair (k, h - k), k <= h/2: Z[k] and Z[h - k] are
+        // read once for both outputs (the pair's A and B swap and conjugate:
+        // for X[h - k], A = Z[h - k] and B = conj(Z[k])).
+        uint h = p.n / 2, pairs = h / 2 + 1, total = p.batch * pairs;
         for (uint t = gid.x * 256 + tid.x; t < total; t += stride)
         {
-            uint b = t / (h + 1), k = t % (h + 1);
-            T a = p.in[b * h + (k == h ? 0 : k)];
-            T c = cconj(p.in[b * h + (k == 0 ? 0 : h - k)]);
-            T w = k == h ? T(S(-1), S(0)) : p.table[min(k, h - 1)];
-            T e = (a + c) * S(0.5), d = (a - c) * S(0.5);
-            T o = T(d.y, -d.x);  // (A - B) / (2i)
-            p.out[t] = e + cmul(w, o);
+            uint b = t / pairs, k = t - b * pairs, km = k == 0 ? 0 : h - k;
+            T zk = p.in[b * h + k], zm = p.in[b * h + km];
+            uint row = b * (h + 1);
+            p.out[row + k] = r2c_point(zk, cconj(zm), k, h);
+            if (h - k != k)
+                p.out[row + h - k] = r2c_point(zm, cconj(zk), h - k, h);
         }
     }
     else if (PHASE == FFT_C2R)
     {
-        uint h = p.n / 2, total = p.batch * h;
+        // One thread per pair (k, h - k), k <= h/2, as FFT_R2C; k = 0 has the
+        // one output Z'[0] (from X[0] and X[h]).
+        uint h = p.n / 2, pairs = h / 2 + 1, total = p.batch * pairs;
         for (uint t = gid.x * 256 + tid.x; t < total; t += stride)
         {
-            uint b = t / h, k = t % h;
-            T a = p.in[b * p.m + k];
-            T c = cconj(p.in[b * p.m + (h - k)]);
+            uint b = t / pairs, k = t - b * pairs;
+            if (k >= h)
+                continue;  // (h = 1: the one pair is k = 0)
+            T xk = p.in[b * p.m + k], xm = p.in[b * p.m + (h - k)];
             if (k == 0)
             {
                 // (X[0] and X[h] count as real, as the full-length inverse's
                 // real part has them: their imaginary parts are dropped)
-                a.y = S(0);
-                c.y = S(0);
+                xk.y = S(0);
+                xm.y = S(0);
             }
-            T d = cmul(cconj(p.table[min(k, max(h, 1u) - 1)]), a - c);
-            p.out[t] = (a + c) + T(-d.y, d.x);  // + i d
+            p.out[b * h + k] = c2r_point(xk, cconj(xm), k, h);
+            if (k != 0 && h - k != k)
+                p.out[b * h + h - k] = c2r_point(xm, cconj(xk), h - k, h);
         }
     }
     else

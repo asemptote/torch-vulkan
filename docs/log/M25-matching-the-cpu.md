@@ -9,25 +9,31 @@ round as the CPU does, step by step.
 
 - **sqrt is correctly rounded** (`_fmath.slang`, `m_sqrt`). Vulkan's Sqrt is
   only as accurate as 1 / inversesqrt, and ANV's float32 roots differed from
-  the CPU's in 8% of cases.
-  - Method: x is scaled by an even power of two so its significand M lies in
-    [1, 4). The GPU's root c of M is then moved to a neighbour while the true
-    root lies beyond the midpoint on that side.
-  - Test: (c + u/2)^2 = c (c + u) + u^2 / 4, and M - c (c + u) is a multiple
-    of u^2. So the root exceeds the midpoint exactly when M - c next(c) > 0.
-    That residual is computed exactly from Dekker's product, so its sign is
-    exact.
-  - float64 runs the same tests, also without FMAs, after scaling x by
-    2^Â±600 into [2^-500, 2^500].
+  the correctly rounded ones in 8% of cases.
+  - float32, in integers: x = m' 2^t with t even and m' < 2^25, and R = m' 2^S
+    (47 or 48 bits, S = 22 or 24). The 24-bit root c = floor(sqrt(R)) is found
+    from the GPU's float root by exact comparisons of c^2 with R, in products
+    of 16-bit halves (no 64-bit integers, which not every GPU has). It rounds
+    up iff R > c (c + 1), as (c + 1/2)^2 = c (c + 1) + 1/4 and R is an
+    integer.
+  - A first version corrected the GPU's root in floating point, with Dekker
+    residuals. It was exact on ANV and on lavapipe on AVX2 CPUs. On the CI
+    runners' AVX-512 CPUs, lavapipe left 481 of 65547 results 1 ulp off,
+    11096 before a Newton step was added. Integers depend on no driver's
+    rounding.
+  - Checked against float64's root rounded to float32 (correctly rounded, as
+    53 >= 2 * 24 + 2) for every non-negative float32 bit pattern on ANV: no
+    differences.
+  - float64 keeps the floating-point method: a Newton step on a Dekker
+    residual, then neighbour tests, without FMAs, after scaling x by 2^±600
+    into [2^-500, 2^500].
   - rsqrt is `m_div(1, m_sqrt(x))`, rounded twice, like the CPU's
     `1 / std::sqrt(x)`. pow(x, 0.5) is sqrt, as on the CPU.
-  - Result: float32 sqrt, rsqrt and pow(x, 0.5) are bit-identical to the
-    CPU's (0 of 2^20 values differ).
-  - One caveat: the CPU's own float64 sqrt on large contiguous tensors (MKL,
-    on the Linux wheels) is not correctly rounded. It differs from
-    `math.sqrt` in 1.4% of cases, by 1 ulp. vk keeps correct rounding, which
-    is what the CPU's scalar path gives. The CPU's float64 rsqrt does match
-    1 / (correctly rounded sqrt), and so does vk's.
+  - Caveat: the CPU's own vectorised sqrt is not always correctly rounded.
+    It is MKL's on AVX2 builds (float64: 1.4% of results 1 ulp off; float32:
+    about 0.1% of all inputs) and Sleef's on AVX-512 CPUs (the CI runners).
+    The tests compare against the correctly rounded root, which is what the
+    CPU's scalar path gives, and vk keeps correct rounding.
 - **log1p32**:
   - Old method: Goldberg's `log(u) x / (u - 1)` inherited log32's error, up
     to 2.8 ulp.

@@ -17,6 +17,7 @@ def no_fallback(f):
     return r
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("ord", [2, 1, 0, 3.5])
 @pytest.mark.parametrize("shape,dim", [((0,), None), ((3, 0), 1), ((0, 4), 0), ((0, 4), None)])
 def test_vector_norm_empty(shape, dim, ord):
@@ -276,6 +277,7 @@ def test_replication_pad_backward(dims, shape, pad, dtype):
     torch.testing.assert_close(vk[0], cpu[0])
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("p", [1, 2])
 @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
 @pytest.mark.parametrize("weighted", [False, True])
@@ -288,6 +290,7 @@ def test_multi_margin_loss_backward(p, reduction, weighted):
     torch.testing.assert_close(vk[0], cpu[0])
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
 @pytest.mark.parametrize("shape", [(3, 5), (5,)])
 def test_multilabel_margin_loss_backward(reduction, shape):
@@ -332,6 +335,7 @@ def test_channels_last_layouts_as_cpu(case):
     assert layouts[1] == layouts[0]
 
 
+@pytest.mark.float64
 def test_strided_nested_tensor_autograd():
     # (PyTorch's device-generic NestedTensor kernels for vk nested tensors: no
     # CPU fallback, and autograd through them, which used to abort the process)
@@ -354,6 +358,7 @@ def test_strided_nested_tensor_autograd():
         torch.testing.assert_close(g, w)
 
 
+@pytest.mark.float64
 @pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min", "prod"])
 def test_segment_reduce_backward(reduce):
     d = torch.tensor([1.0, 0.0, 3.0, 3.0, float("nan"), 2.0, 0.0, 0.0, 5.0, -1.0], dtype=torch.float64)
@@ -485,6 +490,7 @@ def test_scalar_minus_complex_and_float8_isnan():
         torch.testing.assert_close(no_fallback(lambda: torch.isnan(x.to(f8).to("vk"))).cpu(), torch.isnan(x.to(f8)))
 
 
+@pytest.mark.float64
 def test_rescued_fallback_cases():
     # (cases that went to the CPU in full-43, now on vk: CPU scalars among vk
     # tensors, out= of another dtype, empty inputs, empty scatter indices,

@@ -213,6 +213,8 @@ torch_vulkan.fallback_counts()  # {op: count} of ops that ran on the CPU
 
 Importing `torch_vulkan` also registers `torch.vk` (PyTorch's device-module
 interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
+The full reference, including dtypes and every environment variable, is
+[docs/api.md](docs/api.md).
 
 ### Environment variables
 

@@ -2,6 +2,8 @@
 
 import contextlib
 import math
+import platform
+import sys
 
 import pytest
 import torch
@@ -17,6 +19,10 @@ COMPLEX = [torch.complex64, torch.complex128]
 # (conftest.py skips the tests of that dtype there); WIDE is the widest float.
 HAS_FLOAT64 = bool(tv._native.capabilities() & 1)
 WIDE = torch.float64 if HAS_FLOAT64 else torch.float32
+
+# A 32-bit Arm userspace (Termux on Android phones), whose CPU kernels differ
+# from x86's in a few results the tests compare against (see their uses).
+ARM32 = platform.machine().startswith("arm") and sys.maxsize < 2**32
 
 
 @contextlib.contextmanager
