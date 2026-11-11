@@ -1,12 +1,14 @@
-// axis T: f16=half
+// axis T: f16=half bf16=uint16_t
 //
-// Batched float16 GEMM on cooperative matrices (VK_KHR_cooperative_matrix):
+// Batched float16 or bfloat16 GEMM on cooperative matrices
+// (VK_KHR_cooperative_matrix; bfloat16 fragments with VK_KHR_shader_bfloat16):
 // C[b] = alpha * A[b] @ B[b] (+ beta * Cin[b] when USE_CIN), operands
 // addressed through element strides as in gemm.slang (whose Params this is).
-// Products of float16 values accumulate in float32 (as the CPU's float16
+// Products of 16-bit values accumulate in float32 (as the CPU's 16-bit
 // matmul and the other kernels' float32 path do; tensor cores sum them in
-// another order, with float32-like error), and each result is rounded to
-// float16 once, to nearest even.
+// another order, with float32-like error), and each result is rounded to the
+// 16-bit type once, to nearest even. Values move as their 16 bits (T is the
+// storage type: bfloat16 is stored as uint16_t); E is the fragments' type.
 //
 // A workgroup of WG threads (subgroups of 32 lanes: vkcore requires that
 // size) computes a BM x BN tile of C, its 8 subgroups in a 2 x 4 grid, each
@@ -28,6 +30,25 @@
 
 #include "_slot.slang"
 #include "_half.slang"
+
+#if defined(T_bf16)
+typealias E = BFloat16;
+uint bits_of(T x) { return uint(x); }
+float to_f(T x) { return bit_cast<float>(uint(x) << 16); }
+T from_f(float f)
+{
+    if (isnan(f))
+        return uint16_t(0x7fc0);
+    uint u = bit_cast<uint>(f);
+    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even
+    return uint16_t(u >> 16);
+}
+#else
+typealias E = half;
+uint bits_of(T x) { return uint(bit_cast<uint16_t>(x)); }
+float to_f(T x) { return float(x); }
+T from_f(float f) { return to_half(f); }
+#endif
 
 using namespace linalg;
 
@@ -80,17 +101,17 @@ struct Params
 #define PB (BN * BK / 8 / WG)  // and B
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-typealias FragA = CoopMat<half, MemoryScope.Subgroup, 16, 16, CoopMatMatrixUse.MatrixA>;
-typealias FragB = CoopMat<half, MemoryScope.Subgroup, 16, 16, CoopMatMatrixUse.MatrixB>;
+typealias FragA = CoopMat<E, MemoryScope.Subgroup, 16, 16, CoopMatMatrixUse.MatrixA>;
+typealias FragB = CoopMat<E, MemoryScope.Subgroup, 16, 16, CoopMatMatrixUse.MatrixB>;
 typealias FragC = CoopMat<float, MemoryScope.Subgroup, 16, 16, CoopMatMatrixUse.MatrixAccumulator>;
 
 groupshared uint4 As[MAX(BM * RK, BK * RM)];  // [m][k] (A_MODE 0, 1) or [k][m] (A_MODE 2)
 groupshared uint4 Bs[MAX(BK * RN, BN * RK)];  // [k][n] (B_MODE 0, 1) or [n][k] (B_MODE 2)
 groupshared float Cs[WG / LANES * 256];
 
-uint pack2(half lo, half hi)
+uint pack2(uint lo, uint hi)
 {
-    return uint(bit_cast<uint16_t>(lo)) | (uint(bit_cast<uint16_t>(hi)) << 16);
+    return lo | (hi << 16);
 }
 
 // Piece v (< BM BK / 8) of an operand block in its [outer][inner] shared
@@ -111,13 +132,13 @@ uint4 load_a(int base, uint gm, uint gk, bool k_inner, bool vec)
         uint4* q = (uint4*)(p.a + (base + int(gm) * p.a_sm + int(gk) * p.a_sk));
         return loadAligned<16>(q);
     }
-    half h[8];
+    uint h[8];
     [ForceUnroll]
     for (uint i = 0; i < 8; i++)
     {
         uint r = k_inner ? gm : gm + i, c = k_inner ? gk + i : gk;
-        half v = p.a[base + int(min(r, p.m - 1)) * p.a_sm + int(min(c, p.k - 1)) * p.a_sk];
-        h[i] = r < p.m && c < p.k ? v : half(0);
+        uint v = bits_of(p.a[base + int(min(r, p.m - 1)) * p.a_sm + int(min(c, p.k - 1)) * p.a_sk]);
+        h[i] = r < p.m && c < p.k ? v : 0u;  // (0 bits: +0 in both types)
     }
     return uint4(pack2(h[0], h[1]), pack2(h[2], h[3]), pack2(h[4], h[5]), pack2(h[6], h[7]));
 }
@@ -130,13 +151,13 @@ uint4 load_b(int base, uint gk, uint gn, bool n_inner, bool vec)
         uint4* q = (uint4*)(p.b + (base + int(gk) * p.b_sk + int(gn) * p.b_sn));
         return loadAligned<16>(q);
     }
-    half h[8];
+    uint h[8];
     [ForceUnroll]
     for (uint i = 0; i < 8; i++)
     {
         uint r = n_inner ? gk : gk + i, c = n_inner ? gn + i : gn;
-        half v = p.b[base + int(min(r, p.k - 1)) * p.b_sk + int(min(c, p.n - 1)) * p.b_sn];
-        h[i] = r < p.k && c < p.n ? v : half(0);
+        uint v = bits_of(p.b[base + int(min(r, p.k - 1)) * p.b_sk + int(min(c, p.n - 1)) * p.b_sn]);
+        h[i] = r < p.k && c < p.n ? v : 0u;
     }
     return uint4(pack2(h[0], h[1]), pack2(h[2], h[3]), pack2(h[4], h[5]), pack2(h[6], h[7]));
 }
@@ -286,8 +307,8 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                 {
                     float v = alpha * Cs[sg * 256 + e];
                     if (USE_CIN != 0)  // beta == 0 must ignore Cin entirely (it may hold NaN)
-                        v += beta * float(p.cin[batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn]);
-                    p.c[batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = to_half(v);
+                        v += beta * to_f(p.cin[batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn]);
+                    p.c[batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = from_f(v);
                 }
             }
             GroupMemoryBarrierWithWaveSync();
