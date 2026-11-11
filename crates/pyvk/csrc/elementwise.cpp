@@ -77,6 +77,10 @@ at::Tensor& elu_out(const at::Tensor& self, const at::Scalar& alpha, const at::S
 }
 
 at::Tensor& hardtanh_out(const at::Tensor& self, const at::Scalar& min, const at::Scalar& max, at::Tensor& out) {
+  at::ScalarType st = self.scalar_type();
+  if (st == at::kByte || st == at::kUInt16 || st == at::kUInt32 || st == at::kUInt64) {
+    TORCH_CHECK(min.toDouble() >= 0 && max.toDouble() >= 0, "cannot do hardtanh on an unsigned type with negative limits");
+  }
   if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
     // (as the CPU: integer bounds, so the result keeps the integer dtype)
     return at::clamp_out(out, self, at::Scalar(min.toLong()), at::Scalar(max.toLong()));

@@ -511,6 +511,12 @@ at::Tensor& binary_alpha_out(const at::Tensor& self, const at::Tensor& other, co
     at::Tensor scaled = alpha.isComplex() ? at::mul(other, alpha) : alpha.toBool() ? other : at::zeros_like(other);
     if (binary_gpu(kBinary[I], self, &scaled, nullptr, 1, out)) return out;
   }
+  if (I == 0 && alpha.isIntegral(false) && at::result_type(self, other) == at::kBool && is_vk(self) && is_vk(out) &&
+      (is_vk(other) || other.dim() == 0)) {
+    // (bools plus an integer alpha, as the CPU: other times alpha, as a bool)
+    at::Tensor scaled = alpha.toLong() != 0 ? other : at::zeros_like(other);
+    if (binary_gpu(kBinary[I], self, &scaled, nullptr, 1, out)) return out;
+  }
   if (!binary_gpu(kBinary[I], self, &other, nullptr, alpha, out)) {
     on_cpu(kBinary[I].name, kBinary[I].overload, self, other, alpha, out);
   }

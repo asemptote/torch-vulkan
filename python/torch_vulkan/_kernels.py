@@ -545,9 +545,9 @@ def _multi_margin_loss_backward(grad_output, x, target, p, margin, weight=None, 
     target y with z = margin - x[y] + x[d] > 0, h = g (p = 1) or 2 g z (times
     weight[y]) at d and -sum h at y; g = 1 / C (1 / (N C) for mean)."""
     args = (grad_output, x, target, p, margin, weight, reduction)
-    if not (x.is_floating_point() and target.dtype == torch.int64 and p in (1, 2) and 1 <= x.dim() <= 2) or             (weight is not None and (weight.dim() != 1 or weight.numel() != x.shape[-1])):
+    if not (x.is_floating_point() and target.dtype == torch.int64 and p in (1, 2) and x.dim() <= 2) or             (weight is not None and (weight.dim() != 1 or weight.numel() != (x.shape[-1] if x.dim() else 1))):
         return _on_cpu("multi_margin_loss_backward", *args)
-    xs = x.reshape(-1, x.shape[-1])
+    xs = x.reshape(-1, x.shape[-1] if x.dim() else 1)  # (a 0-d input: one sample of one class)
     n, c = xs.shape
     t = target.reshape(-1)
     if t.numel() != n or c == 0 or not _targets_in_range(t, 0, c):
@@ -570,10 +570,10 @@ def _multilabel_margin_loss_backward(grad_output, x, target, reduction, is_targe
     first -1) and each non-target d with z = 1 - x[j] + x[d] > 0, -g at j and
     +g at d; g = 1 / C (1 / (N C) for mean)."""
     args = (grad_output, x, target, reduction, is_target)
-    if not (x.is_floating_point() and target.dtype == torch.int64 and 1 <= x.dim() <= 2 and
+    if not (x.is_floating_point() and target.dtype == torch.int64 and x.dim() <= 2 and
             target.shape == x.shape and is_target.shape == x.shape):
         return _on_cpu("multilabel_margin_loss_backward", *args)
-    xs = x.reshape(-1, x.shape[-1])
+    xs = x.reshape(-1, x.shape[-1] if x.dim() else 1)  # (a 0-d input: one sample of one class)
     n, c = xs.shape
     tg = target.reshape(n, c)
     if c == 0 or not _targets_in_range(tg, -1, c):

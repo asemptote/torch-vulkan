@@ -397,6 +397,17 @@ at::Tensor& bmm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& 
     if (out.numel() != 0) out.zero_();  // (k = 0: sums of nothing)
     return out;
   }
+  constexpr int64_t kMaxBatch = 65535;  // (workgroups per dispatch dimension)
+  if (is_vk(self) && is_vk(mat2) && is_vk(out) && self.dim() == 3 && mat2.dim() == 3 && self.size(0) > kMaxBatch &&
+      out.is_contiguous()) {
+    // (more matrices than one dispatch takes: in chunks)
+    bool ok = true;
+    for (int64_t s = 0; s < self.size(0) && ok; s += kMaxBatch) {
+      int64_t len = std::min(kMaxBatch, self.size(0) - s);
+      ok = any_gemm(self.narrow(0, s, len), mat2.narrow(0, s, len), out.narrow(0, s, len), nullptr, 1, 0);
+    }
+    if (ok) return out;
+  }
   if (!any_gemm(self, mat2, out, nullptr, 1, 0)) {
     on_cpu("aten::bmm", "out", self, mat2, out);
   }

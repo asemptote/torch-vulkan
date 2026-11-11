@@ -752,3 +752,34 @@ def test_d45_regressions():
     got = torch.ones(1, 2, 2, device="vk")
     no_fallback(lambda: torch._compute_linear_combination(v(xs), v(c), out=got))
     torch.testing.assert_close(got.cpu(), want)
+
+
+def test_large_batches_in_chunks():
+    g = torch.Generator().manual_seed(0)
+    a, b = torch.randn(70000, 2, 2, generator=g), torch.randn(70000, 2, 3, generator=g)
+    got = no_fallback(lambda: torch.bmm(a.to("vk"), b.to("vk")))
+    torch.testing.assert_close(got.cpu(), torch.bmm(a, b), rtol=1e-4, atol=1e-5)
+    m = a @ a.mT + 2 * torch.eye(2)
+    l_, info = no_fallback(lambda: torch.linalg.cholesky_ex(m.to("vk")))
+    torch.testing.assert_close(l_.cpu(), torch.linalg.cholesky(m), rtol=1e-4, atol=1e-5)
+    assert info.shape == (70000,) and not info.cpu().any()
+    x = no_fallback(lambda: torch.cholesky_solve(b.to("vk"), l_))
+    torch.testing.assert_close(x.cpu(), torch.cholesky_solve(b, torch.linalg.cholesky(m)), rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("loss", ["multi_margin", "multilabel_margin"])
+def test_margin_loss_backward_0d(loss):
+    x = torch.tensor(0.3, requires_grad=True)
+    t = torch.tensor(0)
+    f = getattr(torch.nn.functional, loss + "_loss")
+    f(x, t).backward()
+    xv = torch.tensor(0.3, device="vk", requires_grad=True)
+    no_fallback(lambda: f(xv, t.to("vk")).backward())
+    torch.testing.assert_close(xv.grad.cpu(), x.grad)
+
+
+@pytest.mark.parametrize("alpha", [0, 2, -1])
+def test_add_bool_integer_alpha(alpha):
+    a, b = torch.tensor([[True, False], [False, False]]), torch.tensor([[True, True], [False, True]])
+    got = no_fallback(lambda: torch.add(a.to("vk"), b.to("vk"), alpha=alpha))
+    assert torch.equal(got.cpu(), torch.add(a, b, alpha=alpha))

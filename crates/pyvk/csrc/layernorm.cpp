@@ -121,6 +121,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tenso
                                                                  double eps) {
   at::Tensor weight = weight_opt.value_or(at::Tensor()), bias = bias_opt.value_or(at::Tensor());
   check_inputs(input, normalized_shape, weight, bias);
+  // (the CPU's kernel: floating types only, even for an empty input)
+  TORCH_CHECK_NOT_IMPLEMENTED(!is_vk(input) || at::isFloatingType(input.scalar_type()),
+                              "\"LayerNormKernelImpl\" not implemented for '", input.scalar_type(), "'");
   int64_t k = static_cast<int64_t>(normalized_shape.size());
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;

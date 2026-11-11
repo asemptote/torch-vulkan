@@ -32,6 +32,8 @@ C10_NAMES = {
     "Float8_e4m3fn": torch.float8_e4m3fn, "Float8_e5m2": torch.float8_e5m2,
     "Float8_e4m3fnuz": torch.float8_e4m3fnuz, "Float8_e5m2fnuz": torch.float8_e5m2fnuz,
 }
+if hasattr(torch, "bcomplex32"):
+    C10_NAMES["BComplex32"] = torch.bcomplex32
 SIGNATURE = re.compile(r"^(aten::[\w.]+) \[(.*)\] \(raised\)$")
 # CPU errors that depend on the argument dtypes (and emptiness) alone
 DTYPE_ERROR = re.compile("|".join([
@@ -45,6 +47,7 @@ DTYPE_ERROR = re.compile("|".join([
     r"softmax with half to float conversion is not supported on CPU",
     r"Integer division with addcdiv is no longer supported",
     r"input dtype should be either floating point or complex",
+    r"Expected a floating point or complex tensor as input",
     r"result type \w+ can't be cast to the desired output type",
     r"Expected out tensor to have dtype",
     r"expected to have the same dtype",
@@ -79,15 +82,21 @@ def make_arg(text, arg=None, device=None):
         return {"int": 1, "float": 0.5, "bool": True, "complex": 1j}[text]
     if text == "GenericList":
         return make_list(arg)
+    if re.match(r"^\[[-\d, ]*\]$", text):  # (an int list, described by value)
+        return [int(v) for v in text[1:-1].split(",") if v.strip()]
     if text.startswith("list(") and text.endswith(")"):
         inner = text[5:-1]
         return [make_arg(inner, None, device)] if inner else []
     m = re.match(r"^(\w+)( cpu| nested)? (\d+)d( empty)?( sparse)?$", text)
     if m and m.group(1) in C10_NAMES and m.group(2) != " nested" and not m.group(5):
         dims = int(m.group(3))
-        t = torch.ones([0 if m.group(4) else 2] * dims, dtype=C10_NAMES[m.group(1)])
+        dt = C10_NAMES[m.group(1)]
+        try:
+            t = torch.ones([0 if m.group(4) else 2] * dims, dtype=dt)
+        except (RuntimeError, NotImplementedError):  # (no CPU fill for this dtype: through complex64)
+            t = torch.ones([0 if m.group(4) else 2] * dims, dtype=torch.complex64).to(dt)
         return t.to(device) if device is not None and m.group(2) != " cpu" else t
-    if arg is not None and str(arg.type).startswith("str") and re.match(r"^\w+$", text):
+    if arg is not None and str(arg.type).removeprefix("Optional[").startswith("str") and re.match(r"^\w+$", text):
         return text  # (a string argument: "amax", "floor", ...)
     raise ValueError(text)
 
@@ -105,9 +114,9 @@ def dtype_signature(name, described):
 def split_args(body):
     out, depth, cur = [], 0, ""
     for ch in body:
-        if ch == "(":
+        if ch in "([":
             depth += 1
-        elif ch == ")":
+        elif ch in ")]":
             depth -= 1
         if ch == "," and depth == 0:
             out.append(cur)
@@ -129,6 +138,11 @@ def probe(name, described):
         values = [make_arg(t, a) for t, a in zip(described, schema.arguments)]
     except ValueError:
         return None
+    # (shape lists, layer_norm's normalized_shape: the next tensor's dims, of size 2)
+    for i, a in enumerate(schema.arguments):
+        if i < len(described) and described[i].strip() == "GenericList" and "shape" in a.name:
+            later = [v for v in values[i + 1:] if isinstance(v, torch.Tensor)]
+            values[i] = [2] * (later[0].dim() if later else 1)
     # Scalar arguments (histc's min and max, clamp's...) in several values: the
     # error must be the same for each, or it depends on them (min > max raises
     # first on the CPU), and vk leaves the signature to the CPU's checks.

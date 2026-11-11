@@ -101,6 +101,15 @@ bool gpu_matrices(const at::Tensor& t) {
   return batch <= kMaxBatch;
 }
 
+// More matrices than one dispatch takes, otherwise as gpu_matrices: done in
+// chunks of kMaxBatch (by the callers below).
+bool gpu_matrices_chunked(const at::Tensor& t) {
+  if (linalg_on_cpu() || !is_vk(t) || t.dim() < 3 || !float_dtype(t.scalar_type())) return false;
+  int64_t batch = 1;
+  for (int64_t d = 0; d + 2 < t.dim(); ++d) batch *= t.size(d);
+  return batch > kMaxBatch;
+}
+
 // [B, rows, cols] view (or copy) of t's matrices; B explicit so empty
 // batches work. Lazy conjugate / negative views are materialized: the
 // kernels read raw memory (and .contiguous() keeps a contiguous view lazy).
@@ -860,6 +869,10 @@ at::Tensor& lu_solve_out(const at::Tensor& lu, const at::Tensor& pivots, const a
 
 at::Tensor& solve_triangular_out(const at::Tensor& a, const at::Tensor& b, bool upper, bool left, bool unit,
                                  at::Tensor& out) {
+  at::ScalarType st = a.scalar_type();
+  // (16-bit floats: no kernel on the CPU, as on CUDA, even with nothing to solve)
+  TORCH_CHECK_NOT_IMPLEMENTED(!is_vk(a) || (st != at::kHalf && st != at::kBFloat16),
+                              "\"triangular_solve_cpu\" not implemented for '", st, "'");
   if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || b.dim() < 2 ||
       !is_vk(out)) {
     on_cpu("aten::linalg_solve_triangular", "out", a, b, upper, left, unit, out);
@@ -940,6 +953,22 @@ at::Tensor cholesky_inplace(const at::Tensor& a3) {
 
 std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, bool upper, bool check, at::Tensor& l,
                                                      at::Tensor& info) {
+  if (gpu_matrices_chunked(self) && is_square(self) && is_vk(l) && is_vk(info)) {
+    int64_t n = self.size(-1);
+    at::Tensor a3 = self.reshape({-1, n, n});
+    int64_t B = a3.size(0);
+    at::Tensor l3 = at::empty_like(a3), info1 = at::empty({B}, info.options());
+    for (int64_t s = 0; s < B; s += kMaxBatch) {
+      int64_t len = std::min(kMaxBatch, B - s);
+      auto [lc, ic] = at::linalg_cholesky_ex(a3.narrow(0, s, len), upper, false);
+      l3.narrow(0, s, len).copy_(lc);
+      info1.narrow(0, s, len).copy_(ic);
+    }
+    assign(l, l3.view(self.sizes()));
+    assign(info, info1.view(batch_shape(self)));
+    if (check) check_errors(info, "torch.linalg.cholesky_ex", false);
+    return {l, info};
+  }
   if (!gpu_matrices(self) || !is_square(self) || !is_vk(l)) {
     on_cpu("aten::linalg_cholesky_ex", "L", self, upper, check, l, info);
     return {l, info};
@@ -958,6 +987,18 @@ std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, boo
 
 // cholesky_solve: A X = B with A = L L^H (or U^H U), self = B.
 at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bool upper) {
+  if (gpu_matrices_chunked(a) && is_vk(self) && self.dim() == a.dim() &&
+      self.sizes().slice(0, a.dim() - 2).equals(a.sizes().slice(0, a.dim() - 2))) {
+    // (its inputs come broadcast to one batch shape: in chunks of kMaxBatch)
+    int64_t n = a.size(-1), k = self.size(-1);
+    at::Tensor a3 = a.reshape({-1, n, n}), b3 = self.reshape({-1, self.size(-2), k});
+    std::vector<at::Tensor> parts;
+    for (int64_t s = 0; s < a3.size(0); s += kMaxBatch) {
+      int64_t len = std::min(kMaxBatch, a3.size(0) - s);
+      parts.push_back(at::_cholesky_solve_helper(b3.narrow(0, s, len), a3.narrow(0, s, len), upper));
+    }
+    return at::cat(parts).view(self.sizes());
+  }
   if (!gpu_matrices(a) || !is_vk(self)) {
     return on_cpu("aten::_cholesky_solve_helper", "", self, a, upper)[0].toTensor();
   }
