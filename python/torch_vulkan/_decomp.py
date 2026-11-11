@@ -213,7 +213,35 @@ def _raise_cpu_dtype_error(op, name, args, kwargs):
 
     hit = TABLE.get(_dtype_signature(name, op, args, kwargs))
     if hit is not None:
-        raise (NotImplementedError if hit[0] else RuntimeError)(hit[1])
+        raise (NotImplementedError if hit[0] else RuntimeError)(_render_type_names(hit[1]))
+
+
+_TYPE_NAMES = {}
+
+
+def _render_type_names(msg):
+    """{c10:Long} in a table message: this platform's C++ name for the dtype
+    (c10's TypeMeta name, as the CPU's message gives it), found once from the
+    CPU's own out= dtype error on 1x1 tensors."""
+    import re
+
+    def name(m):
+        c10 = m.group(1)
+        if c10 not in _TYPE_NAMES:
+            dt = {v: k for k, v in _C10_NAMES.items()}.get(c10)
+            dtype = getattr(torch, dt) if dt else None
+            found = c10
+            if dtype is not None:
+                src = torch.float64 if dtype == torch.float32 else torch.float32
+                try:
+                    torch.mm(torch.ones(1, 1, dtype=src), torch.ones(1, 1, dtype=src), out=torch.empty(1, 1, dtype=dtype))
+                except RuntimeError as e:
+                    got = re.search(r"but got (.*) instead", str(e))
+                    found = got.group(1) if got else c10
+            _TYPE_NAMES[c10] = found
+        return _TYPE_NAMES[c10]
+
+    return re.sub(r"\{c10:(\w+)\}", name, msg)
 
 
 def _check_devices(args, kwargs):

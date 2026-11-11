@@ -168,6 +168,51 @@ def probe(name, described):
 SCALAR_VARIANTS = [0.5, -1.0, 2.0, 0.0]
 
 
+_CPP_NAMES = None
+
+
+def cpp_names():
+    """{c10 name: this platform's C++ type name} (c10's TypeMeta names, as messages
+    such as "but got long int instead" print them), from the CPU's own out= dtype
+    error on 1x1 tensors."""
+    global _CPP_NAMES
+    if _CPP_NAMES is None:
+        _CPP_NAMES = {}
+        for c10, dtype in C10_NAMES.items():
+            src = torch.float64 if dtype == torch.float32 else torch.float32
+            try:
+                torch.mm(torch.ones(1, 1, dtype=src), torch.ones(1, 1, dtype=src), out=torch.empty(1, 1, dtype=dtype))
+            except RuntimeError as e:
+                m = re.search(r"but got (.*) instead", str(e))
+                if m:
+                    _CPP_NAMES[c10] = m.group(1)
+    return _CPP_NAMES
+
+
+# Messages that name dtypes by their C++ types: those names become {c10:Name}.
+CPP_NAMED = [re.compile(r"(have dtype )(.+?)(, but got )(.+?)( instead)"), re.compile(r"(you specified )(.+)$")]
+
+
+def templatize(msg):
+    """msg with C++ type names, where it prints them, as {c10:Name} (the table
+    is the same on every platform; backend.cpp and _decomp.py fill them in)."""
+    back = {v: k for k, v in cpp_names().items()}
+    for pat in CPP_NAMED:
+        m = pat.search(msg)
+        if m:
+            parts = list(m.groups())
+            for i in range(1, len(parts), 2):
+                if parts[i] in back:
+                    parts[i] = "{c10:" + back[parts[i]] + "}"
+            msg = msg[:m.start()] + "".join(parts) + msg[m.end():]
+    return msg
+
+
+def render(msg):
+    """templatize's inverse, with this platform's names."""
+    return re.sub(r"\{c10:(\w+)\}", lambda m: cpp_names().get(m.group(1), m.group(1)), msg)
+
+
 def run_probe(op, schema, values):
     args, kwargs = [], {}
     for a, v in zip(schema.arguments, values):
@@ -179,10 +224,10 @@ def run_probe(op, schema, values):
         op(*args, **kwargs)
     except NotImplementedError as e:
         msg = str(e).splitlines()[0]
-        return ("NotImplementedError", msg) if DTYPE_ERROR.search(msg) else None
+        return ("NotImplementedError", templatize(msg)) if DTYPE_ERROR.search(msg) else None
     except RuntimeError as e:
         msg = str(e).splitlines()[0]
-        return ("RuntimeError", msg) if DTYPE_ERROR.search(msg) else None
+        return ("RuntimeError", templatize(msg)) if DTYPE_ERROR.search(msg) else None
     except Exception:
         return None
     return None

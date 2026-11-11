@@ -23,6 +23,7 @@
 
 #include <c10/util/safe_numerics.h>
 
+#include <c10/core/ScalarTypeToTypeMeta.h>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -1260,8 +1261,26 @@ void raise_cpu_dtype_error(const std::string& signature) {
   }();
   auto it = index.find(signature);
   if (it == index.end()) return;
-  TORCH_CHECK_NOT_IMPLEMENTED(!it->second->not_implemented, it->second->message);
-  TORCH_CHECK(false, it->second->message);
+  // Messages that name a dtype's C++ type ("but got long int instead") hold
+  // {c10:Long} in the table: filled in with this platform's name for it (as
+  // c10's TypeMeta gives it: __int64 with MSVC), so they read as the CPU's here.
+  std::string msg = it->second->message;
+  for (size_t at = msg.find("{c10:"); at != std::string::npos; at = msg.find("{c10:", at)) {
+    size_t end = msg.find('}', at);
+    if (end == std::string::npos) break;
+    std::string name = msg.substr(at + 5, end - at - 5), cpp = name;
+    for (int i = 0; i < static_cast<int>(at::ScalarType::NumOptions); ++i) {
+      auto st = static_cast<at::ScalarType>(i);
+      if (name == c10::toString(st)) {
+        cpp = std::string(c10::scalarTypeToTypeMeta(st).name());
+        break;
+      }
+    }
+    msg.replace(at, end - at + 1, cpp);
+    at += cpp.size();
+  }
+  TORCH_CHECK_NOT_IMPLEMENTED(!it->second->not_implemented, msg);
+  TORCH_CHECK(false, msg);
 }
 
 // ---------------------------------------------------------------- before the CPU: other ways to run an op
