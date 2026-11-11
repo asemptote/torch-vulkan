@@ -81,12 +81,15 @@ uint32_t subgroup_lanes(at::ScalarType t) {
   return t == at::kFloat ? f32 : t == at::kDouble ? f64 : 0;
 }
 
-// Whether float16 products use shaders/gemmcm.slang: where the device has
-// float16 cooperative matrices in subgroups of 32 (and TORCH_VK_GEMM is unset).
-bool use_coopmat_f16() {
-  static const bool use = gemm_choice().empty() && has_feature(kFeatureCoopMatF16) &&
+// Whether float16 (bfloat16) products use shaders/gemmcm.slang: where the
+// device has float16 (bfloat16) cooperative matrices in subgroups of 32 (and
+// TORCH_VK_GEMM is unset).
+bool use_coopmat(at::ScalarType t) {
+  static const bool f16 = gemm_choice().empty() && has_feature(kFeatureCoopMatF16) &&
                           vkt_kernel_subgroup_size("gemmcm_f16") == 32;
-  return use;
+  static const bool bf16 = gemm_choice().empty() && has_feature(kFeatureCoopMatBf16) &&
+                           vkt_kernel_subgroup_size("gemmcm_bf16") == 32;
+  return t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
 }
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
@@ -217,15 +220,16 @@ uint32_t coop_mode(const at::Tensor& t) {
   return 0;
 }
 
-// gemm() for float16: shaders/gemmcm.slang on cooperative matrices, products
-// accumulated in float32 and rounded once. Returns false where it does not
-// run (no cooperative matrices, matrix-vector products: those take the
-// float32 route of other 16-bit products).
-bool coop_gemm_f16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
-                   double alpha, double beta) {
+// gemm() for float16 and bfloat16: shaders/gemmcm.slang on cooperative
+// matrices, products accumulated in float32 and rounded once. Returns false
+// where it does not run (no cooperative matrices of the type, matrix-vector
+// products: those take the float32 route of other 16-bit products).
+bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+                  double alpha, double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2);
-  if (!use_coopmat_f16() || a.scalar_type() != at::kHalf || b.scalar_type() != at::kHalf ||
-      (cin != nullptr && cin->scalar_type() != at::kHalf) || m == 1 || n == 1 || a.size(2) == 0) {
+  at::ScalarType t = c.scalar_type();
+  if (!use_coopmat(t) || a.scalar_type() != t || b.scalar_type() != t || (cin != nullptr && cin->scalar_type() != t) ||
+      m == 1 || n == 1 || a.size(2) == 0) {
     return false;  // (k = 0 too: gemmcm.slang's pipelined k loop needs one tile; it hung on NVIDIA)
   }
   for (const at::Tensor* t : {&a, &b, &c, cin}) {
@@ -243,7 +247,8 @@ bool coop_gemm_f16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
   GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
   p.alpha = pack_param(alpha, at::kFloat);  // (the kernel scales in float32)
   p.beta = pack_param(beta, at::kFloat);
-  dispatch("gemmcm_f16", {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b)}, p, static_cast<uint32_t>(gx),
+  dispatch(t == at::kHalf ? "gemmcm_f16" : "gemmcm_bf16", {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b)}, p,
+           static_cast<uint32_t>(gx),
            static_cast<uint32_t>(gy),
            static_cast<uint32_t>(batch));
   return true;
@@ -255,8 +260,8 @@ bool coop_gemm_f16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
           double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
-  if (c.scalar_type() == at::kHalf) {
-    return coop_gemm_f16(a, b, c, cin, alpha, beta);
+  if (c.scalar_type() == at::kHalf || c.scalar_type() == at::kBFloat16) {
+    return coop_gemm_16(a, b, c, cin, alpha, beta);
   }
   if (!gemm_dtype(c.scalar_type()) || a.scalar_type() != c.scalar_type() || b.scalar_type() != c.scalar_type() ||
       (cin != nullptr && cin->scalar_type() != c.scalar_type())) {
@@ -644,8 +649,11 @@ at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
               other.size(0), " elements respectively");
   TORCH_CHECK(self.scalar_type() == other.scalar_type(), "dot : expected both vectors to have same dtype, but found ",
               self.scalar_type(), " and ", other.scalar_type());
-  // Element-wise product and a sum reduction (both Vulkan kernels).
-  return at::sum(at::mul(self, other)).to(self.scalar_type());
+  // Element-wise product and a sum reduction (both Vulkan kernels). dot
+  // falls through the Conjugate key, so self and other may be conjugate
+  // views: resolved here, as mul would not inside a TorchDispatchMode (which
+  // excludes that key).
+  return at::sum(at::mul(self.resolve_conj(), other.resolve_conj())).to(self.scalar_type());
 }
 
 }  // namespace

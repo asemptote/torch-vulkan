@@ -23,6 +23,8 @@
 
 #include <c10/util/safe_numerics.h>
 
+#include <c10/core/CachingDeviceAllocator.h>
+#include <c10/core/impl/alloc_cpu.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
 #include <cstring>
 #include <iostream>
@@ -111,7 +113,28 @@ void delete_allocation(void* p) {
   vkt_free(handle);
 }
 
-struct VkAllocator final : c10::Allocator {
+// A c10::DeviceAllocator, so torch.accelerator's memory functions
+// (empty_cache, memory_allocated, ...) work for "vk" as for CUDA.
+struct VkAllocator final : c10::DeviceAllocator {
+  bool initialized() override { return true; }
+
+  void emptyCache(c10::MempoolId_t /*mempool_id*/) override { check(vkt_empty_cache()); }
+
+  void recordStream(const c10::DataPtr& /*ptr*/, c10::Stream /*stream*/) override {}  // (one queue)
+
+  c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex /*device*/) override {
+    uint64_t allocated = 0, reserved = 0;
+    vkt_memory_stats(&allocated, &reserved);
+    c10::CachingDeviceAllocator::DeviceStats stats;
+    for (auto& s : stats.allocated_bytes) s.current = static_cast<int64_t>(allocated);
+    for (auto& s : stats.reserved_bytes) s.current = static_cast<int64_t>(reserved);
+    return stats;
+  }
+
+  void resetAccumulatedStats(c10::DeviceIndex /*device*/) override {}
+
+  void resetPeakStats(c10::DeviceIndex /*device*/) override {}
+
   c10::DataPtr allocate(size_t nbytes) override {
     c10::Device device(kDevice, 0);
     if (nbytes == 0) {
@@ -287,6 +310,44 @@ C10_REGISTER_GUARD_IMPL(PrivateUse1, VkGuardImpl);
 void resize_storage(const c10::Storage& storage, size_t nbytes);
 void resize_storage_bytes(const c10::Storage& storage, size_t nbytes);
 
+// Pinned (page-locked) host memory for "vk": vk's own buffers are host-visible
+// already, so pinning gives ordinary CPU memory, recorded so is_pinned()
+// answers for it (torch.save's use_pinned_memory_for_d2h, Tensor.pin_memory).
+std::mutex g_pinned_mutex;
+std::map<const uint8_t*, size_t> g_pinned;  // start -> size
+
+void free_pinned(void* p) {
+  {
+    std::lock_guard<std::mutex> lock(g_pinned_mutex);
+    g_pinned.erase(static_cast<const uint8_t*>(p));
+  }
+  c10::free_cpu(p);
+}
+
+struct PinnedAllocator final : c10::Allocator {
+  c10::DataPtr allocate(size_t nbytes) override {
+    void* p = nbytes == 0 ? nullptr : c10::alloc_cpu(nbytes);
+    if (p != nullptr) {
+      std::lock_guard<std::mutex> lock(g_pinned_mutex);
+      g_pinned[static_cast<const uint8_t*>(p)] = nbytes;
+    }
+    return {p, p, &free_pinned, c10::Device(c10::kCPU)};
+  }
+  c10::DeleterFnPtr raw_deleter() const override { return &free_pinned; }
+  void copy_data(void* dest, const void* src, std::size_t count) const override { std::memcpy(dest, src, count); }
+};
+
+PinnedAllocator g_pinned_allocator;
+
+bool is_pinned_ptr(const void* data) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  std::lock_guard<std::mutex> lock(g_pinned_mutex);
+  auto it = g_pinned.upper_bound(p);
+  if (it == g_pinned.begin()) return false;
+  --it;
+  return p < it->first + it->second;
+}
+
 struct VkHooks final : at::PrivateUse1HooksInterface {
   bool isBuilt() const override { return true; }
   bool isAvailable() const override { return true; }
@@ -300,8 +361,8 @@ struct VkHooks final : at::PrivateUse1HooksInterface {
     return new_generator();
   }
   at::Device getDeviceFromPtr(void*) const override { return {kDevice, 0}; }
-  bool isPinnedPtr(const void*) const override { return false; }
-  c10::Allocator* getPinnedMemoryAllocator() const override { return at::getCPUAllocator(); }
+  bool isPinnedPtr(const void* data) const override { return is_pinned_ptr(data); }
+  c10::Allocator* getPinnedMemoryAllocator() const override { return &g_pinned_allocator; }
   void resizePrivateUse1Bytes(const c10::Storage& storage, size_t newsize) const override {
     resize_storage_bytes(storage, newsize);
   }

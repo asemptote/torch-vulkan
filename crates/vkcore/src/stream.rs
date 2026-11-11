@@ -18,6 +18,16 @@ use crate::{Context, Result};
 /// Commands per batch before the stream submits on its own.
 pub const DEFAULT_MAX_BATCH: u32 = 256;
 
+/// Workgroups per batch before the stream submits on its own, on Intel GPUs
+/// (0: no limit, elsewhere). On Linux, a submission that kept a Gen9 GPU
+/// (HD 530, Mesa's ANV, i915) busy for a couple of seconds came back with
+/// its later commands' results missing, and no lost device reported: a
+/// 2^27-entry sort, whose bitonic passes of 65535 workgroups take about a
+/// second each there, was unsorted with two passes per submission and
+/// right with one. A big dispatch is then submitted alone (small ones still
+/// batch up to DEFAULT_MAX_BATCH), with a margin: 2^13 workgroups.
+pub const INTEL_MAX_BATCH_GROUPS: u64 = 1 << 13;
+
 pub struct Stream {
     ctx: Arc<Context>,
     layout: vk::PipelineLayout,
@@ -31,6 +41,10 @@ pub struct Stream {
     in_flight: VecDeque<(u64, vk::CommandBuffer)>,
     spare: Vec<vk::CommandBuffer>,
     pub max_batch: u32,
+    /// Workgroups per batch before it is submitted (0: no limit; see
+    /// INTEL_MAX_BATCH_GROUPS; TORCH_VK_MAX_BATCH_GROUPS overrides).
+    pub max_batch_groups: u64,
+    batch_groups: u64,
     /// Kernels dispatched since the stream was created.
     pub dispatches: u64,
 }
@@ -50,6 +64,10 @@ impl Stream {
             )?;
             let mut kind = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             let timeline = d.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut kind), None)?;
+            let max_batch_groups = std::env::var("TORCH_VK_MAX_BATCH_GROUPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(if ctx.vendor_id == 0x8086 { INTEL_MAX_BATCH_GROUPS } else { 0 });
             Ok(Self {
                 ctx,
                 layout,
@@ -62,6 +80,8 @@ impl Stream {
                 in_flight: VecDeque::new(),
                 spare: Vec::new(),
                 max_batch: DEFAULT_MAX_BATCH,
+                max_batch_groups,
+                batch_groups: 0,
                 dispatches: 0,
             })
         }
@@ -109,7 +129,7 @@ impl Stream {
 
     fn end_command(&mut self) -> Result<()> {
         self.commands += 1;
-        if self.commands >= self.max_batch {
+        if self.commands >= self.max_batch || (self.max_batch_groups > 0 && self.batch_groups >= self.max_batch_groups) {
             self.flush()?;
         }
         Ok(())
@@ -126,6 +146,7 @@ impl Stream {
         padded[..push.len()].copy_from_slice(push);
 
         let cb = self.begin_command()?;
+        self.batch_groups += groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
         let d = &self.ctx.device;
         unsafe {
             if self.bound != kernel.pipeline {
@@ -194,6 +215,7 @@ impl Stream {
             self.in_flight.push_back((value, cb));
         }
         self.commands = 0;
+        self.batch_groups = 0;
         Ok(self.submitted)
     }
 

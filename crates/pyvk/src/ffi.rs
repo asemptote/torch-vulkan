@@ -79,6 +79,34 @@ pub extern "C" fn vkt_synchronize() -> i32 {
     }
 }
 
+/// Releases cached, unused pool blocks back to the driver (after the queued
+/// work finishes), as torch.vk.empty_cache does.
+#[no_mangle]
+pub extern "C" fn vkt_empty_cache() -> i32 {
+    match RUNTIME.lock().unwrap().clone() {
+        Some(rt) => {
+            let r = rt.synchronize();
+            rt.pool.lock().unwrap().trim();
+            status(r)
+        }
+        None => 0,
+    }
+}
+
+/// The pool's allocated and reserved bytes (0 before the runtime starts).
+#[no_mangle]
+pub unsafe extern "C" fn vkt_memory_stats(allocated: *mut u64, reserved: *mut u64) {
+    let (a, r) = match RUNTIME.lock().unwrap().as_ref() {
+        Some(rt) => {
+            let s = rt.pool.lock().unwrap().stats();
+            (s.allocated, s.reserved)
+        }
+        None => (0, 0),
+    };
+    *allocated = a;
+    *reserved = r;
+}
+
 /// Queues kernel `name` specialized with `spec[..nspec]`, with `push[..npush]`
 /// as push constants, over a gx x gy x gz grid of workgroups.
 #[no_mangle]
@@ -160,7 +188,8 @@ pub unsafe extern "C" fn vkt_kernel_subgroup_size(name: *const c_char) -> u32 {
 
 /// Optional device features as bits (csrc/vk.h `Feature`): 1 float64,
 /// 2 int16 (with 16-bit storage), 4 float16 (with 16-bit storage), 8 int8
-/// (with 8-bit storage), 16 float16 cooperative matrices (gemmcm.slang).
+/// (with 8-bit storage), 16 float16 and 32 bfloat16 cooperative matrices
+/// (gemmcm.slang).
 #[no_mangle]
 pub extern "C" fn vkt_capabilities() -> u32 {
     let Ok(rt) = runtime() else { return 0 };
@@ -170,4 +199,5 @@ pub extern "C" fn vkt_capabilities() -> u32 {
         | (((c.shader_float16 && c.storage_buffer_16bit) as u32) << 2)
         | (((c.shader_int8 && c.storage_buffer_8bit) as u32) << 3)
         | ((c.cooperative_matrix_f16 as u32) << 4)
+        | ((c.cooperative_matrix_bf16 as u32) << 5)
 }

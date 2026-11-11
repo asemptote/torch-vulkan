@@ -27,8 +27,10 @@ static_assert(sizeof(NllParams) == 80 && offsetof(NllParams, ignore) == 64, "mus
 
 constexpr int64_t kNone = 0, kMean = 1;
 
-bool kernel_ok(const at::Tensor& self, const at::Tensor& target, const std::optional<at::Tensor>& weight) {
-  at::ScalarType t = self.scalar_type();
+// (t: the kernel's dtype, by default self's)
+bool kernel_ok(const at::Tensor& self, const at::Tensor& target, const std::optional<at::Tensor>& weight,
+               at::ScalarType t = at::ScalarType::Undefined) {
+  if (t == at::ScalarType::Undefined) t = self.scalar_type();
   bool dtype = t == at::kFloat || (t == at::kDouble && vkt_has_float64());
   bool w = !weight.has_value() || !weight->defined() || (is_vk(*weight) && weight->scalar_type() == t);
   return is_vk(self) && is_vk(target) && dtype && w &&
@@ -118,8 +120,16 @@ std::tuple<at::Tensor, at::Tensor> nll_loss_forward(const at::Tensor& self, cons
 at::Tensor nll_loss_backward(const at::Tensor& grad_output, const at::Tensor& self, const at::Tensor& target,
                              const std::optional<at::Tensor>& weight, int64_t reduction, int64_t ignore_index,
                              const at::Tensor& total_weight) {
-  if (!kernel_ok(self, target, weight) || !is_vk(grad_output) || !is_vk(total_weight) ||
-      grad_output.scalar_type() != self.scalar_type() || total_weight.scalar_type() != self.scalar_type()) {
+  // 16-bit: the float32 kernel, on g rounded to the 16-bit dtype first and
+  // each w g rounded once, as the CPU's (whose scalar_t arithmetic is that)
+  at::ScalarType t = self.scalar_type();
+  bool half = (t == at::kHalf || t == at::kBFloat16) && is_vk(self) &&
+              (!weight.has_value() || !weight->defined() || weight->scalar_type() == t);
+  at::ScalarType kt = half ? at::kFloat : t;
+  std::optional<at::Tensor> kweight =
+      half && weight.has_value() && weight->defined() ? std::optional<at::Tensor>(weight->to(at::kFloat)) : weight;
+  if (!kernel_ok(self, target, kweight, kt) || !is_vk(grad_output) ||
+      !is_vk(total_weight) || grad_output.scalar_type() != t || total_weight.scalar_type() != t) {
     return on_cpu("aten::nll_loss_backward", "", grad_output, self, target, weight, reduction, ignore_index,
                   total_weight)[0]
         .toTensor();
@@ -136,23 +146,24 @@ at::Tensor nll_loss_backward(const at::Tensor& grad_output, const at::Tensor& se
                 "Expected a single element grad_output tensor, but got: ", grad_output.sizes());
   }
   int64_t c = self.size(-1), n = self.dim() == 1 ? 1 : self.size(0);
-  at::Tensor gx = at::zeros(self.sizes(), self.options());
+  at::Tensor gx = at::zeros(self.sizes(), self.options().dtype(kt));
   if (n == 0) {
-    return gx;
+    return gx.to(t);
   }
   at::Tensor tg = target.to(at::kLong).contiguous();
-  at::Tensor w = weight.has_value() && weight->defined() ? weight->contiguous() : at::Tensor();
+  at::Tensor w = kweight.has_value() && kweight->defined() ? kweight->contiguous() : at::Tensor();
   bool per_sample = reduction == kNone && self.dim() == 2;
   // (as the CPU: -(grad_output / total_weight) for "mean", -grad_output for "sum")
   at::Tensor g = per_sample ? grad_output.contiguous()
                             : at::neg(reduction == kMean ? grad_output.reshape({1}) / total_weight.reshape({1})
                                                          : grad_output.reshape({1}));
+  g = g.to(kt).contiguous();
   NllParams p = params(self, tg, w, n, c, ignore_index);
   p.x = 0;
   p.out = gpu_address_out(gx);
   p.gout = gpu_address(g);
-  launch(op::NLL_BACKWARD, p, self.scalar_type(), w.defined(), per_sample);
-  return gx;
+  launch(op::NLL_BACKWARD, p, kt, w.defined(), per_sample);
+  return half ? gx.to(t) : gx;
 }
 
 }  // namespace

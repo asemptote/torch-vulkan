@@ -51,6 +51,9 @@ pub struct Capabilities {
     /// what that kernel also needs: float16 arithmetic and storage, the
     /// Vulkan memory model with device scope, 38 KiB of shared memory.
     pub cooperative_matrix_f16: bool,
+    /// The same for bfloat16 A and B (VK_KHR_shader_bfloat16's
+    /// shaderBFloat16Type and shaderBFloat16CooperativeMatrix).
+    pub cooperative_matrix_bf16: bool,
     pub max_shared_memory: u32,
     pub max_workgroup_count_x: u32,
     pub max_push_constants: u32,
@@ -270,8 +273,11 @@ impl Context {
             if caps.subgroup_size_control && api < vk::API_VERSION_1_3 {
                 names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
             }
-            if caps.cooperative_matrix_f16 {
+            if caps.cooperative_matrix_f16 || caps.cooperative_matrix_bf16 {
                 names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            }
+            if caps.cooperative_matrix_bf16 {
+                names.push(SHADER_BFLOAT16_NAME.as_ptr());
             }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
@@ -299,8 +305,16 @@ impl Context {
                 device_info = device_info.push_next(&mut ssc);
             }
             let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
-            if caps.cooperative_matrix_f16 {
+            if caps.cooperative_matrix_f16 || caps.cooperative_matrix_bf16 {
                 device_info = device_info.push_next(&mut coop);
+            }
+            let mut bf16 = ShaderBfloat16Features {
+                shader_bfloat16_type: vk::TRUE,
+                shader_bfloat16_cooperative_matrix: vk::TRUE,
+                ..ShaderBfloat16Features::default()
+            };
+            if caps.cooperative_matrix_bf16 {
+                device_info = device_info.push_next(&mut bf16);
             }
             let device = instance.create_device(physical_device, &device_info, None)?;
             let queue = device.get_device_queue(queue_family, 0);
@@ -393,8 +407,39 @@ fn effective_api_version(device: u32) -> u32 {
     }
 }
 
+/// VK_KHR_shader_bfloat16 (newer than ash 0.38's headers): the extension's
+/// name, its feature structure and the bfloat16 component type.
+const SHADER_BFLOAT16_NAME: &CStr = c"VK_KHR_shader_bfloat16";
+const COMPONENT_TYPE_BFLOAT16: vk::ComponentTypeKHR = vk::ComponentTypeKHR::from_raw(1_000_141_000);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShaderBfloat16Features {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_bfloat16_type: vk::Bool32,
+    shader_bfloat16_dot_product: vk::Bool32,
+    shader_bfloat16_cooperative_matrix: vk::Bool32,
+}
+
+impl Default for ShaderBfloat16Features {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_141_000),
+            p_next: std::ptr::null_mut(),
+            shader_bfloat16_type: vk::FALSE,
+            shader_bfloat16_dot_product: vk::FALSE,
+            shader_bfloat16_cooperative_matrix: vk::FALSE,
+        }
+    }
+}
+
+// (a structure that leads with sType and pNext, as the chains require)
+unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for ShaderBfloat16Features {}
+unsafe impl vk::ExtendsDeviceCreateInfo for ShaderBfloat16Features {}
+
 /// Whether `TORCH_VK_DISABLE` (comma-separated: int64, float64, int16,
-/// float16, int8, storage16, storage8, denorm, subgroups, coopmat) names
+/// float16, int8, storage16, storage8, denorm, subgroups, coopmat, bfloat16) names
 /// `what`: the feature is then treated as missing, to test the paths for
 /// devices without it (Mali GPUs have neither int64 nor float64; "subgroups"
 /// hides subgroup size control, so no kernel written for subgroups runs;
@@ -425,9 +470,14 @@ unsafe fn query_capabilities(
     let mut ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
     let has_coop = has(ash::khr::cooperative_matrix::NAME);
     let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let has_bf16 = has(SHADER_BFLOAT16_NAME);
+    let mut bf16 = ShaderBfloat16Features::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut s16);
     if has_coop {
         features = features.push_next(&mut coop);
+    }
+    if has_bf16 {
+        features = features.push_next(&mut bf16);
     }
     if size_control {
         features = features.push_next(&mut ssc);
@@ -484,18 +534,27 @@ unsafe fn query_capabilities(
     let (min_size, max_size) =
         if subgroup_size_control { (sscp.min_subgroup_size, sscp.max_subgroup_size) } else { (sub.subgroup_size, sub.subgroup_size) };
     // The cooperative-matrix shapes the device multiplies: gemmcm.slang's is
-    // 16 x 16 x 16, float16 A and B into float32 C, one subgroup each.
-    let coop_f16_shape = has_coop && coop.cooperative_matrix == vk::TRUE && {
+    // 16 x 16 x 16, float16 (or bfloat16) A and B into float32 C, one
+    // subgroup each.
+    let shapes = if has_coop && coop.cooperative_matrix == vk::TRUE {
         let ext = ash::khr::cooperative_matrix::Instance::new(entry, instance);
-        ext.get_physical_device_cooperative_matrix_properties(pd).unwrap_or_default().iter().any(|c| {
-            (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
-                && c.a_type == vk::ComponentTypeKHR::FLOAT16
-                && c.b_type == vk::ComponentTypeKHR::FLOAT16
-                && c.c_type == vk::ComponentTypeKHR::FLOAT32
-                && c.result_type == vk::ComponentTypeKHR::FLOAT32
-                && c.scope == vk::ScopeKHR::SUBGROUP
-        })
+        ext.get_physical_device_cooperative_matrix_properties(pd)
+            .unwrap_or_default()
+            .iter()
+            .filter(|c| {
+                (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
+                    && c.a_type == c.b_type
+                    && c.c_type == vk::ComponentTypeKHR::FLOAT32
+                    && c.result_type == vk::ComponentTypeKHR::FLOAT32
+                    && c.scope == vk::ScopeKHR::SUBGROUP
+            })
+            .map(|c| c.a_type)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
     };
+    let coop_f16_shape = shapes.contains(&vk::ComponentTypeKHR::FLOAT16);
+    let coop_bf16_shape = shapes.contains(&COMPONENT_TYPE_BFLOAT16);
 
 
     let memory = instance.get_physical_device_memory_properties(pd);
@@ -503,6 +562,15 @@ unsafe fn query_capabilities(
     let unified_memory_type = (0..memory.memory_type_count).find(|&i| memory.memory_types[i as usize].property_flags.contains(unified));
 
     let b = |v: vk::Bool32| v == vk::TRUE;
+    // what gemmcm.slang needs besides its fragment types
+    let coop_base = subgroup_size_control
+        && (min_size..=max_size).contains(&32)
+        && props.limits.max_compute_shared_memory_size >= 38912
+        && b(s16.storage_buffer16_bit_access)
+        && b(vmm.vulkan_memory_model)
+        && b(vmm.vulkan_memory_model_device_scope)
+        && !disabled("storage16")
+        && !disabled("coopmat");
     Capabilities {
         api_version: props.api_version,
         shader_float64: b(core.shader_float64) && !disabled("float64"),
@@ -526,17 +594,13 @@ unsafe fn query_capabilities(
         subgroup_size_control,
         min_subgroup_size: min_size,
         max_subgroup_size: max_size,
-        cooperative_matrix_f16: coop_f16_shape
-            && subgroup_size_control
-            && (min_size..=max_size).contains(&32)
-            && props.limits.max_compute_shared_memory_size >= 38912
-            && b(f16i8.shader_float16)
-            && b(s16.storage_buffer16_bit_access)
-            && b(vmm.vulkan_memory_model)
-            && b(vmm.vulkan_memory_model_device_scope)
-            && !disabled("float16")
-            && !disabled("storage16")
-            && !disabled("coopmat"),
+        cooperative_matrix_f16: coop_base && coop_f16_shape && b(f16i8.shader_float16) && !disabled("float16"),
+        cooperative_matrix_bf16: coop_base
+            && coop_bf16_shape
+            && has_bf16
+            && b(bf16.shader_bfloat16_type)
+            && b(bf16.shader_bfloat16_cooperative_matrix)
+            && !disabled("bfloat16"),
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
         max_push_constants: props.limits.max_push_constants_size,

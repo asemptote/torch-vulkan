@@ -341,18 +341,25 @@ at::Tensor reflectors(const at::Tensor& a3, int64_t k, int64_t b) {
   return v;
 }
 
-// T [B, b, b] of the panel's block reflector (from the reflectors in a3 and tau).
-at::Tensor block_t(const at::Tensor& a3, const at::Tensor& tau, int64_t k, int64_t b) {
-  at::Tensor t = at::empty({a3.size(0), b, b}, a3.options());
-  FactorParams p = params_for(a3);
-  p.aux = gpu_address(tau);
-  p.saux = static_cast<uint32_t>(tau.stride(0));
-  p.aux2 = gpu_address(t);
-  p.saux2 = static_cast<uint32_t>(b * b);
-  p.k = static_cast<uint32_t>(k);
-  p.b = static_cast<uint32_t>(b);
-  factor(op::FACTOR_LARFT, p, a3.size(0), a3.scalar_type());
-  return t;
+// T [B, b, b] of a panel's block reflector I - V T V^H, for its reflectors v
+// [B, rows, b] (unit lower trapezoidal, from reflectors()) and tau: T^-1 =
+// diag(1 / tau) + the strict upper triangle of V^H V (the compact WY form's
+// inverse), so T is one batched product and a small triangular inverse.
+// (factor.slang's FACTOR_LARFT built T column by column on one workgroup per
+// matrix: a second of eigh's back-transform at n = 4096 on an H100, against
+// 36 ms for the products.) A reflector with tau = 0
+// (H = I) gets a zero column in V and 1 on the diagonal for the inverse.
+at::Tensor block_t_gemm(const at::Tensor& v_in, const at::Tensor& tau_panel) {
+  int64_t B = v_in.size(0), b = v_in.size(2);
+  at::Tensor zero = tau_panel == 0;
+  at::Tensor v = v_in * at::logical_not(zero).unsqueeze(1).to(v_in.scalar_type());
+  at::Tensor diag = at::where(zero, at::ones_like(tau_panel), at::reciprocal(tau_panel));
+  at::Tensor r = at::bmm(adj(v), v).triu(1) + at::diag_embed(diag);
+  at::Tensor eye = at::eye(b, v_in.options()).expand({B, b, b});
+  at::Tensor t = at::linalg_solve_triangular(r, eye, /*upper=*/true);
+  // (T's row and column of such a reflector are then 0 but for the 1 on
+  // the diagonal: 0 there too, as LAPACK's, since V keeps its column)
+  return t - at::diag_embed(zero.to(t.scalar_type()));
 }
 
 // In-place geqrf of a3 [B, m, n]; returns tau [B, min(m, n)].
@@ -373,7 +380,7 @@ at::Tensor geqrf_inplace(const at::Tensor& a3) {
     if (k + b < n) {
       // A2 <- H^H A2 = A2 - V T^H (V^H A2)
       at::Tensor v = reflectors(a3, k, b);
-      at::Tensor t = block_t(a3, tau, k, b);
+      at::Tensor t = block_t_gemm(v, tau.narrow(1, k, b));
       at::Tensor a2 = a3.narrow(1, k, m - k).narrow(2, k + b, n - k - b);
       at::Tensor w = at::bmm(adj(t), at::bmm(adj(v), a2));
       a2.baddbmm_(v, w, 1.0, -1.0);
@@ -385,17 +392,20 @@ at::Tensor geqrf_inplace(const at::Tensor& a3) {
 // C <- op(Q) C (left) or C op(Q) (right) for Q = H_0 ... H_{k-1} from
 // reflectors in a3 [B, m, k'] and tau [B, k]; c3 [B, ...] contiguous.
 void apply_q(const at::Tensor& a3, const at::Tensor& tau, const at::Tensor& c3, bool left, bool transpose) {
+  // Panels of kApplyBlock reflectors (any blocking applies the same Q; wider
+  // than geqrf's panels: half the panels' T, and products with more rows)
+  constexpr int64_t kApplyBlock = 128;
   int64_t kmax = tau.size(1);
   std::vector<int64_t> starts;
-  for (int64_t k = 0; k < kmax; k += kBlock) starts.push_back(k);
+  for (int64_t k = 0; k < kmax; k += kApplyBlock) starts.push_back(k);
   // Q C applies the last panel first; Q^H C the first; on the right the reverse.
   bool forward = left == transpose;
   if (!forward) std::reverse(starts.begin(), starts.end());
   int64_t m = a3.size(1);
   for (int64_t k : starts) {
-    int64_t b = std::min(kBlock, kmax - k);
+    int64_t b = std::min(kApplyBlock, kmax - k);
     at::Tensor v = reflectors(a3, k, b);
-    at::Tensor t = block_t(a3, tau, k, b);
+    at::Tensor t = block_t_gemm(v, tau.narrow(1, k, b));
     at::Tensor tt = transpose ? adj(t) : t;
     if (left) {
       at::Tensor c = c3.narrow(1, k, m - k);
@@ -491,96 +501,419 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(const at::Tensor& a3, bool want_v
 // ---------------------------------------------------------------- tridiagonal eigh
 
 struct TridiagParams {
-  uint64_t a, tau, w, d, e, zt, logi, logcs, state;
-  uint32_t n, ld, sa, k, cap, groups;
+  uint64_t w, d, e, zt, logi, logcs, state;
+  uint32_t n, cap, groups, pad;
 };
-static_assert(sizeof(TridiagParams) == 96, "must match shaders/tridiag.slang");
+static_assert(sizeof(TridiagParams) == 72, "must match shaders/tridiag.slang");
 
 void tridiag(uint32_t op, const TridiagParams& p, at::ScalarType dtype, uint32_t gx, uint32_t gy = 1,
-             bool log = false) {
-  dispatch(std::string("tridiag_") + dtype_label(dtype), {op, log ? 1u : 0u}, p, gx, gy);
+             bool log = false, uint32_t gz = 1) {
+  dispatch(std::string("tridiag_") + dtype_label(dtype), {op, log ? 1u : 0u}, p, gx, gy, gz);
 }
 
-// Symmetric (Hermitian) eigendecomposition of a3 [B, n, n] (contiguous, both
-// triangles; overwritten) as LAPACK does it, on the GPU (shaders/tridiag.slang):
-// Householder reduction to a real tridiagonal T = Q^H A Q, one column at a
-// time (dsytd2 / zhetd2; each step's A v is a matrix-vector product in
-// shaders/gemv.slang), implicit QL on T (tqli) with its plane rotations
-// accumulated into Z, then the eigenvectors Q Z (apply_q's blocked
-// reflectors). Eigenvalues ascending. False if QL did not converge (LAPACK's
-// info > 0; the caller then uses Jacobi).
-bool tridiag_eigh(const at::Tensor& a3, bool want_vectors, at::Tensor& values, at::Tensor& vectors) {
-  int64_t B = a3.size(0), n = a3.size(2);
-  at::ScalarType t = a3.scalar_type();
-  at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
-  at::Tensor tau = at::zeros({B, n}, a3.options());
-  at::Tensor w = at::zeros({B, n, 1}, a3.options());
-  at::Tensor e = at::zeros({B, n}, real);  // (e[n - 1] stays 0)
+// Implicit QL (tqli) on B real tridiagonals d, e [B, n] (contiguous; d
+// becomes the eigenvalues, unsorted), with the eigenvectors' transpose Z^T
+// [B, n, n] (dtype `zt_type`: the plane rotations are real) when `zt` is
+// given. False if QL did not converge.
+bool ql_tridiagonal(at::Tensor& d, at::Tensor& e, int64_t B, int64_t n, at::Tensor* zt, at::ScalarType zt_type) {
+  at::Tensor state = at::zeros({B, 8}, d.options().dtype(at::kInt));
+  // (QL keeps its scale factor in w[0])
+  at::Tensor w = at::zeros({B, n}, d.options().dtype(zt != nullptr ? zt_type : d.scalar_type()));
   TridiagParams p{};
-  p.a = gpu_address(a3);
-  p.tau = gpu_address(tau);
-  p.w = gpu_address(w);
-  p.e = gpu_address(e);
-  p.n = static_cast<uint32_t>(n);
-  p.ld = static_cast<uint32_t>(a3.stride(1));
-  p.sa = static_cast<uint32_t>(a3.stride(0));
-  for (int64_t k = 0; k + 1 < n; ++k) {
-    int64_t m = n - 1 - k;
-    p.k = static_cast<uint32_t>(k);
-    tridiag(op::TRIDIAG_REFLECT, p, t, static_cast<uint32_t>(B));
-    // w = A22 v (v: column k below the diagonal, its first entry now 1)
-    at::Tensor a22 = a3.narrow(1, k + 1, m).narrow(2, k + 1, m);
-    at::Tensor wk = w.narrow(1, 0, m);
-    at::bmm_out(wk, a22, a3.narrow(1, k + 1, m).narrow(2, k, 1));
-    tridiag(op::TRIDIAG_UPDATE_W, p, t, static_cast<uint32_t>(B));
-    p.groups = groups_for(m * m);
-    tridiag(op::TRIDIAG_RANK2, p, t, p.groups, static_cast<uint32_t>(B));
-  }
-
-  at::Tensor d = at::real(a3.diagonal(0, 1, 2)).contiguous();
-  at::Tensor state = at::zeros({B, 8}, a3.options().dtype(at::kInt));
   p.d = gpu_address(d);
+  p.e = gpu_address(e);
+  p.w = gpu_address(w);
   p.state = gpu_address(state);
-  at::Tensor zt;
-  if (!want_vectors) {
-    tridiag(op::TRIDIAG_QL, p, t, static_cast<uint32_t>(B));
+  p.n = static_cast<uint32_t>(n);
+  if (zt == nullptr) {
+    tridiag(op::TRIDIAG_QL, p, d.scalar_type(), static_cast<uint32_t>(B));
   } else {
     // The rotations of QL passes go to a log, applied to Z^T (rows i, i + 1
     // of Z^T, coalesced) after each pass: about 0.75 n^2 of them in all, so
     // usually one pass; at most 2^22 entries over the batch, and at least n
     // per matrix (one iteration's worth, so every pass makes progress).
     int64_t cap = std::max<int64_t>(n, std::min<int64_t>(n * n, (int64_t(1) << 22) / std::max<int64_t>(B, 1)));
-    at::Tensor logi = at::empty({B, cap}, a3.options().dtype(at::kInt));
-    at::Tensor logcs = at::empty({B, cap, 2}, real);
-    zt = at::zeros({B, n, n}, a3.options());
-    zt.diagonal(0, 1, 2).fill_(1);
-    p.zt = gpu_address(zt);
+    at::Tensor logi = at::empty({B, cap}, d.options().dtype(at::kInt));
+    at::Tensor logcs = at::empty({B, cap, 2}, d.options());
+    *zt = at::zeros({B, n, n}, d.options().dtype(zt_type));
+    zt->diagonal(0, 1, 2).fill_(1);
+    p.zt = gpu_address(*zt);
     p.logi = gpu_address(logi);
     p.logcs = gpu_address(logcs);
     p.cap = static_cast<uint32_t>(cap);
     p.groups = groups_for(n);
     for (int64_t pass = 0;; ++pass) {
-      tridiag(op::TRIDIAG_QL, p, t, static_cast<uint32_t>(B), 1, /*log=*/true);
-      tridiag(op::TRIDIAG_ROT, p, t, p.groups, static_cast<uint32_t>(B));
+      tridiag(op::TRIDIAG_QL, p, zt_type, static_cast<uint32_t>(B), 1, /*log=*/true);
+      tridiag(op::TRIDIAG_ROT, p, zt_type, p.groups, static_cast<uint32_t>(B));
       if (state.select(1, 3).all().item<bool>() || pass > 30 * n) {
         break;
       }
     }
   }
-  if (state.select(1, 4).any().item<bool>() || !state.select(1, 3).all().item<bool>()) {
+  return !state.select(1, 4).any().item<bool>() && state.select(1, 3).all().item<bool>();
+}
+
+struct StedcParams {
+  uint64_t d, e, q, u, rw, iw;
+  uint32_t m, G;
+};
+static_assert(sizeof(StedcParams) == 56, "must match shaders/stedc.slang");
+
+constexpr int64_t kStedcLeaf = 32;  // leaves of at most this size (LAPACK's SMLSIZ is 25)
+constexpr int64_t kStedcMin = 64;   // divide and conquer from this size up (QL below)
+
+// Divide and conquer (shaders/stedc.slang; LAPACK's dstedc) on B real
+// tridiagonals d, e [B, n] (e[n - 1] = 0): eigenvalues ascending [B, n] and
+// eigenvectors [B, n, n] (columns). The tridiagonal is padded to n' = L s
+// (L a power of two, leaves of s <= kStedcLeaf) with diagonal entries above
+// its spectrum, coupled by 0: they stay their own eigenpairs, sort last and
+// are dropped. False if a leaf's QL did not converge.
+bool stedc(const at::Tensor& d0, const at::Tensor& e0, int64_t B, int64_t n, at::Tensor& values, at::Tensor& vectors) {
+  at::ScalarType rt = d0.scalar_type();
+  // scaled to largest entry 1, as dstedc: the deflation tolerances are
+  // relative to the merged matrices' size, which counts the padding
+  at::Tensor scale = at::maximum(d0.abs().amax(1), e0.abs().amax(1)).unsqueeze(1);
+  scale.masked_fill_(scale == 0, 1);
+  at::Tensor d = d0 / scale, e = e0 / scale;
+  int64_t L = 1;
+  while (L * kStedcLeaf < n) L *= 2;
+  int64_t s = (n + L - 1) / L, np = L * s;
+  // the padding: Gershgorin's bound on the spectrum, doubled, plus 1
+  at::Tensor bound = (d.abs().amax(1) + 2 * e.abs().amax(1)) * 2 + 1;
+  at::Tensor D = at::empty({B, np}, d.options());
+  D.narrow(1, 0, n).copy_(d);
+  if (np > n) D.narrow(1, n, np - n).copy_(bound.unsqueeze(1).expand({B, np - n}));
+  at::Tensor E = at::zeros({B, np}, d.options());
+  if (n > 1) E.narrow(1, 0, n - 1).copy_(e.narrow(1, 0, n - 1));
+  // tear at every leaf boundary: d_p and d_{p+1} lose |e_p| (put back by the merges' rank-one terms)
+  at::Tensor tears = E.view({B, L, s}).select(2, s - 1).narrow(1, 0, L - 1).abs();
+  if (L > 1) {
+    D.view({B, L, s}).select(2, s - 1).narrow(1, 0, L - 1).sub_(tears);
+    D.view({B, L, s}).select(2, 0).narrow(1, 1, L - 1).sub_(tears);
+  }
+  // leaves: QL on the B L independent tridiagonals of size s
+  at::Tensor dl = D.view({B * L, s}).clone(), el = E.view({B * L, s}).clone();
+  el.select(1, s - 1).zero_();
+  at::Tensor zt;
+  if (!ql_tridiagonal(dl, el, B * L, s, &zt, rt)) {
     return false;
   }
-  auto [sorted, order] = at::sort(d, /*stable=*/true, 1, false);
-  values = sorted;
+  auto [lv, lorder] = at::sort(dl, /*stable=*/true, 1, false);
+  at::Tensor Qb = at::gather(zt.transpose(1, 2), 2, lorder.unsqueeze(1).expand({B * L, s, s}));
+  at::Tensor Dc = lv.reshape({B * np});
+  // merges, level by level: G merges of m = 2h rows
+  for (int64_t m = 2 * s; m <= np; m *= 2) {
+    int64_t h = m / 2, G = B * np / m;
+    at::Tensor QM = at::zeros({G, m, m}, d.options());
+    at::Tensor kids = Qb.view({G, 2, h, h});
+    QM.narrow(1, 0, h).narrow(2, 0, h).copy_(kids.select(1, 0));
+    QM.narrow(1, h, h).narrow(2, h, h).copy_(kids.select(1, 1));
+    at::Tensor U = at::zeros({G, m, m}, d.options());
+    at::Tensor rw = at::empty({7 * G * m + G}, d.options());
+    at::Tensor iw = at::empty({4 * G * m + 4 * G}, d.options().dtype(at::kInt));
+    StedcParams p{};
+    p.d = gpu_address(Dc);
+    p.e = gpu_address(E);
+    p.q = gpu_address(QM);
+    p.u = gpu_address(U);
+    p.rw = gpu_address(rw);
+    p.iw = gpu_address(iw);
+    p.m = static_cast<uint32_t>(m);
+    p.G = static_cast<uint32_t>(G);
+    std::string kernel = std::string("stedc_") + dtype_label(rt);
+    uint32_t rows = static_cast<uint32_t>((m + 63) / 64), g = static_cast<uint32_t>(G);
+    dispatch(kernel, {op::STEDC_PREP}, p, g);
+    dispatch(kernel, {op::STEDC_ROT}, p, rows, g);
+    // (stedc.slang: SEC_ROOTS = 2 roots per workgroup, 32 lanes each)
+    dispatch(kernel, {op::STEDC_SECULAR}, p, static_cast<uint32_t>((m + 1) / 2), g);
+    dispatch(kernel, {op::STEDC_ZHAT}, p, rows, g);
+    dispatch(kernel, {op::STEDC_VEC}, p, static_cast<uint32_t>(m), g);
+    at::Tensor vals = rw.narrow(0, 4 * G * m, G * m).view({G, m});
+    auto [sv, order] = at::sort(vals, /*stable=*/true, 1, false);
+    at::Tensor Us = at::gather(U, 2, order.unsqueeze(1).expand({G, m, m}));
+    // QM is diag(Q1, Q2) unless a deflation rotation mixed the halves: then
+    // QM U is two products of half the size
+    bool cross = iw.narrow(0, 4 * G * m, 4 * G).view({G, 4}).select(1, 2).any().item<bool>();
+    if (cross) {
+      Qb = at::bmm(QM, Us);
+    } else {
+      Qb = at::empty({G, m, m}, d.options());
+      at::Tensor top = Qb.narrow(1, 0, h), bottom = Qb.narrow(1, h, h);
+      at::bmm_out(top, QM.narrow(1, 0, h).narrow(2, 0, h), Us.narrow(1, 0, h));
+      at::bmm_out(bottom, QM.narrow(1, h, h).narrow(2, h, h), Us.narrow(1, h, h));
+    }
+    Dc = sv.reshape({B * np});
+  }
+  values = Dc.view({B, np}).narrow(1, 0, n) * scale;
+  vectors = Qb.view({B, np, np}).narrow(1, 0, n).narrow(2, 0, n);
+  return true;
+}
+
+struct LatrdParams {
+  uint64_t a, tau, e, v, w, c, y, part;
+  uint32_t n, ld, sa, k, i, groups;
+};
+static_assert(sizeof(LatrdParams) == 88, "must match shaders/latrd.slang");
+constexpr int64_t kLatrdNb = 32;   // NB in shaders/latrd.slang
+constexpr int64_t kLatrdRows = 8;  // ROWS (SYMV rows per workgroup)
+
+// Reduction of a3 [B, n, n] (n > 1; Hermitian, both triangles, row-major) to
+// a real tridiagonal T = Q^H A Q, blocked as LAPACK's zhetrd (lower; panels
+// by zlatrd, shaders/latrd.slang): T's diagonal on a3's, its off-diagonal
+// into e [B, n], and Q's reflectors as a QR's in a3[1:, :n-1] with tau.
+void latrd_reduce(const at::Tensor& a3, at::Tensor& tau, at::Tensor& e) {
+  int64_t B = a3.size(0), n = a3.size(2);
+  at::ScalarType t = a3.scalar_type();
+  int64_t groups = (n - 1 + kLatrdRows - 1) / kLatrdRows;
+  at::Tensor v = at::empty({B, kLatrdNb, n}, a3.options());
+  at::Tensor w = at::empty({B, kLatrdNb, n}, a3.options());
+  at::Tensor c = a3.select(2, 0).contiguous();  // the column to reflect next
+  at::Tensor y = at::empty({B, n}, a3.options());
+  at::Tensor part = at::zeros({B, groups, 2 * kLatrdNb}, a3.options());
+  LatrdParams p{};
+  p.a = gpu_address(a3);
+  p.tau = gpu_address(tau);
+  p.e = gpu_address(e);
+  p.v = gpu_address(v);
+  p.w = gpu_address(w);
+  p.c = gpu_address(c);
+  p.y = gpu_address(y);
+  p.part = gpu_address(part);
+  p.n = static_cast<uint32_t>(n);
+  p.ld = static_cast<uint32_t>(a3.stride(1));
+  p.sa = static_cast<uint32_t>(a3.stride(0));
+  p.groups = static_cast<uint32_t>(groups);
+  std::string kernel = std::string("latrd_") + dtype_label(t);
+  for (int64_t k0 = 0; k0 + 1 < n; k0 += kLatrdNb) {
+    int64_t k1 = std::min(k0 + kLatrdNb, n - 1);
+    for (int64_t k = k0; k < k1; ++k) {
+      int64_t m = n - 1 - k;
+      p.k = static_cast<uint32_t>(k);
+      p.i = static_cast<uint32_t>(k - k0);
+      dispatch(kernel, {op::LATRD_SYMV}, p, static_cast<uint32_t>((m + kLatrdRows - 1) / kLatrdRows),
+               static_cast<uint32_t>(B));
+      dispatch(kernel, {op::LATRD_FIN}, p, static_cast<uint32_t>((m + 255) / 256), static_cast<uint32_t>(B));
+    }
+    if (k1 - k0 == kLatrdNb) {
+      // A22 -= V W^H + W V^H on the rows and columns after the panel (FIN
+      // brought the panel's own columns up to date)
+      int64_t m = n - k1;
+      at::Tensor vt = v.narrow(2, k1, m).transpose(1, 2), wt = w.narrow(2, k1, m).transpose(1, 2);
+      a3.narrow(1, k1, m).narrow(2, k1, m).baddbmm_(at::cat({vt, wt}, 2), adj(at::cat({wt, vt}, 2)), 1.0, -1.0);
+      if (k1 + 1 < n) {
+        c.narrow(1, k1, m).copy_(a3.narrow(1, k1, m).select(2, k1));
+      }
+    }
+  }
+}
+
+// Symmetric (Hermitian) eigendecomposition of a3 [B, n, n] (contiguous, both
+// triangles; overwritten) as LAPACK does it, on the GPU: reduction to a real
+// tridiagonal T = Q^H A Q (latrd_reduce), T's eigenvectors Z by divide and
+// conquer (stedc; implicit QL, tqli, below kStedcMin), then the eigenvectors
+// Q Z (apply_q's blocked reflectors). Eigenvalues ascending. False if QL did
+// not converge (LAPACK's info > 0; the caller then uses Jacobi).
+bool tridiag_eigh(const at::Tensor& a3, bool want_vectors, at::Tensor& values, at::Tensor& vectors) {
+  int64_t B = a3.size(0), n = a3.size(2);
+  at::ScalarType t = a3.scalar_type();
+  at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
+  at::Tensor tau = at::zeros({B, n}, a3.options());
+  at::Tensor e = at::zeros({B, n}, real);  // (e[n - 1] stays 0)
+  if (n > 1) {
+    latrd_reduce(a3, tau, e);
+  }
+
+  at::Tensor d = at::real(a3.diagonal(0, 1, 2)).contiguous();
+  at::Tensor z;  // the eigenvectors of T, columns in ascending order of the eigenvalues
+  if (n >= kStedcMin && std::getenv("TORCH_VK_EIGH_QL") == nullptr) {
+    // divide and conquer (its vectors are part of the method)
+    at::Tensor zr;
+    if (!stedc(d, e, B, n, values, zr)) {
+      return false;
+    }
+    if (want_vectors) {
+      z = zr.to(t).contiguous();
+    }
+  } else {
+    at::Tensor zt;
+    if (!ql_tridiagonal(d, e, B, n, want_vectors ? &zt : nullptr, t)) {
+      return false;
+    }
+    auto [sorted, order] = at::sort(d, /*stable=*/true, 1, false);
+    values = sorted;
+    if (want_vectors) {
+      z = at::gather(zt.transpose(1, 2), 2, order.unsqueeze(1).expand({B, n, n})).contiguous();
+    }
+  }
   if (want_vectors) {
-    at::Tensor z = zt.transpose(1, 2).contiguous();  // eigenvectors of T
     if (n > 1) {
       // Q = H_0 ... H_{n-2} acts on rows 1.. : the reflectors are a QR's in
       // A[1:, :n-1] (v_0 = 1 on that view's diagonal).
       apply_q(a3.narrow(1, 1, n - 1).narrow(2, 0, n - 1), tau.narrow(1, 0, n - 1), z.narrow(1, 1, n - 1),
               /*left=*/true, /*transpose=*/false);
     }
-    vectors = at::gather(z, 2, order.unsqueeze(1).expand({B, n, n}));
+    vectors = z;
+  }
+  return true;
+}
+
+// Eigenvalues (ascending) and eigenvectors (columns, real) of B real
+// symmetric tridiagonals d, e [B, n] (e[n - 1] = 0; both overwritten):
+// divide and conquer from kStedcMin up, QL below. False if QL did not converge.
+bool tridiagonal_eigen(at::Tensor d, at::Tensor e, int64_t B, int64_t n, at::Tensor& values, at::Tensor& vectors) {
+  if (n >= kStedcMin) {
+    return stedc(d, e, B, n, values, vectors);
+  }
+  at::Tensor zt;
+  if (!ql_tridiagonal(d, e, B, n, &zt, d.scalar_type())) {
+    return false;
+  }
+  auto [sorted, order] = at::sort(d, /*stable=*/true, 1, false);
+  values = sorted;
+  vectors = at::gather(zt.transpose(1, 2), 2, order.unsqueeze(1).expand({B, n, n}));
+  return true;
+}
+
+struct BidiagParams {
+  uint64_t a, tau, beta;
+  uint32_t sa, start, len, stride, k, ntau;
+};
+static_assert(sizeof(BidiagParams) == 48, "must match shaders/bidiag.slang");
+
+// Q of a QR of q3 [B, n, n] (Householder), its columns' phases matched to q3's:
+// q3's columns made orthonormal, in order, with an orthonormal completion
+// where they are (numerically) dependent.
+at::Tensor orthonormalize(const at::Tensor& q3) {
+  int64_t n = q3.size(2);
+  at::Tensor qr = q3.contiguous().clone();
+  at::Tensor tau = geqrf_inplace(qr);
+  at::Tensor q = form_q(qr, tau, n);
+  at::Tensor r = qr.diagonal(0, 1, 2);  // [B, n]
+  at::Tensor mag = at::abs(r);
+  at::Tensor phase = at::where(mag > 0, r / mag.to(r.scalar_type()), at::ones_like(r));
+  return q * phase.unsqueeze(1);
+}
+
+// x3 [B, n, n] (columns nearly orthonormal) made orthonormal with the least
+// change: its polar factor, by Newton-Schulz iterations X <- X (3 I - X^H X) / 2
+// (two GEMMs each; the error squares each time). Columns too far from
+// orthonormal for that (|X^H X - I| > 1/2: dependent ones, where singular
+// values at 0 leave them in any mix) take orthonormalize()'s QR instead.
+at::Tensor polar_orthonormalize(const at::Tensor& x3) {
+  int64_t n = x3.size(2);
+  double eps = epsilon(x3.scalar_type());
+  at::Tensor x = x3.contiguous();
+  at::Tensor eye = at::eye(n, x.options());
+  for (int it = 0; it < 8; ++it) {
+    at::Tensor e = at::bmm(adj(x), x) - eye;
+    double d = at::abs(e).amax().item<double>();
+    if (d <= 64 * eps) {
+      break;
+    }
+    if (d > 0.5) {
+      return orthonormalize(x3);
+    }
+    x = x - 0.5 * at::bmm(x, e);
+  }
+  return x;
+}
+
+constexpr int64_t kSvdBidiagMin = 32;  // the bidiagonal route from this many columns up (Jacobi below)
+
+// SVD of a3 [B, m, n], m >= n (overwritten) as LAPACK's gesdd does it, on the
+// GPU: Householder reduction to a real upper bidiagonal B = Q^H A P (zgebd2:
+// a column reflector, then a row reflector per step; each reflector by
+// shaders/bidiag.slang, the updates as matrix-vector products and rank-one
+// updates), B's SVD through the eigendecomposition of its Golub-Kahan
+// tridiagonal (zero diagonal, off-diagonal d_1, e_1, d_2, ..., d_n; its
+// eigenvalues are +-sigma, an eigenvector of sigma interleaves v and u:
+// (v_1, u_1, v_2, u_2, ...) / sqrt 2) by divide and conquer (stedc), then U =
+// Q U_B and V = P V_B (apply_q). U_B's and V_B's halves of the eigenvectors
+// are made orthonormal by a QR, which also completes them where singular
+// values near 0 leave the +-sigma pairs mixed. Returns (sigma descending
+// [B, n], U [B, m, ucols], V [B, n, n]) (ucols = m with full matrices, n
+// otherwise); false (with nothing returned) if the eigensolver failed.
+bool bidiag_svd(const at::Tensor& a3, bool full, at::Tensor& sigma, at::Tensor& u, at::Tensor& v) {
+  int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2);
+  at::ScalarType t = a3.scalar_type();
+  at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
+  bool complex = at::isComplexType(t);
+  at::Tensor tauq = at::zeros({B, n}, a3.options()), taup = at::zeros({B, n}, a3.options());
+  at::Tensor d = at::zeros({B, n}, real), e = at::zeros({B, n}, real);
+  int64_t ld = a3.stride(1), sa = a3.stride(0);
+  auto reflect = [&](const at::Tensor& tau, const at::Tensor& beta, int64_t start, int64_t len, int64_t stride,
+                     int64_t k) {
+    BidiagParams p{};
+    p.a = gpu_address(a3);
+    p.tau = gpu_address(tau);
+    p.beta = gpu_address(beta);
+    p.sa = static_cast<uint32_t>(sa);
+    p.start = static_cast<uint32_t>(start);
+    p.len = static_cast<uint32_t>(len);
+    p.stride = static_cast<uint32_t>(stride);
+    p.k = static_cast<uint32_t>(k);
+    p.ntau = static_cast<uint32_t>(n);
+    dispatch(std::string("bidiag_") + dtype_label(t), {}, p, static_cast<uint32_t>(B));
+  };
+  for (int64_t k = 0; k < n; ++k) {
+    // H_k: column k from the diagonal down; A[k:, k+1:] <- H_k^H A[k:, k+1:]
+    reflect(tauq, d, k * ld + k, m - k, ld, k);
+    if (k + 1 < n) {
+      at::Tensor v = a3.narrow(1, k, m - k).narrow(2, k, 1);
+      at::Tensor c = a3.narrow(1, k, m - k).narrow(2, k + 1, n - k - 1);
+      at::Tensor w = at::bmm(adj(c), v);  // C^H v
+      at::Tensor tk = tauq.narrow(1, k, 1).unsqueeze(2);  // [B, 1, 1]
+      c.baddbmm_(v, adj(w) * at::conj(tk), 1.0, -1.0);
+      // G_k: row k right of the diagonal (conjugated, as zgebd2's zlacgv);
+      // A[k+1:, k+1:] <- A[k+1:, k+1:] G_k
+      at::Tensor row = a3.narrow(1, k, 1).narrow(2, k + 1, n - k - 1);
+      if (complex) row.copy_(at::conj_physical(row));
+      reflect(taup, e, k * ld + k + 1, n - k - 1, 1, k);
+      if (k + 1 < m) {
+        at::Tensor uk = row;  // [B, 1, n - k - 1]
+        at::Tensor dmat = a3.narrow(1, k + 1, m - k - 1).narrow(2, k + 1, n - k - 1);
+        at::Tensor wr = at::bmm(dmat, uk.transpose(1, 2));  // D u
+        at::Tensor tp = taup.narrow(1, k, 1).unsqueeze(2);
+        dmat.baddbmm_(wr * tp, at::conj(uk), 1.0, -1.0);
+      }
+      if (complex) row.copy_(at::conj_physical(row));
+    }
+  }
+  // B's SVD from its Golub-Kahan tridiagonal (size 2n)
+  at::Tensor tgk_d = at::zeros({B, 2 * n}, real), tgk_e = at::zeros({B, 2 * n}, real);
+  tgk_e.view({B, n, 2}).select(2, 0).copy_(d);
+  if (n > 1) tgk_e.view({B, n, 2}).select(2, 1).narrow(1, 0, n - 1).copy_(e.narrow(1, 0, n - 1));
+  at::Tensor lam, z;
+  if (!tridiagonal_eigen(tgk_d, tgk_e, B, 2 * n, lam, z)) {
+    return false;
+  }
+  // the n largest eigenvalues, descending
+  at::Tensor top = lam.narrow(1, n, n).flip({1});
+  sigma = at::clamp_min(top, 0);
+  at::Tensor x = z.narrow(2, n, n).flip({2});  // [B, 2n, n]
+  at::Tensor xv = x.view({B, n, 2, n});
+  // An eigenvector's halves are v / sqrt 2 and u / sqrt 2 while sigma is
+  // clear of the other singular values' -sigma (mixing with its own -sigma
+  // only rescales them). Small singular values close to others' negatives mix
+  // the halves of several (by eps |B| / (sigma_i + sigma_j)), and at 0 they
+  // are any mix of v's and u's directions: the halves' polar factor (or QR
+  // for dependent ones) makes them orthonormal again, at the cost of a few
+  // GEMMs (QR, a second at n = 1024 on an H100, only when needed).
+  double r2 = std::sqrt(2.0);
+  at::Tensor vb = polar_orthonormalize(xv.select(2, 0) * r2).to(t);
+  at::Tensor ub = polar_orthonormalize(xv.select(2, 1) * r2).to(t);
+  int64_t ucols = full ? m : n;
+  u = at::zeros({B, m, ucols}, a3.options());
+  u.narrow(1, 0, n).narrow(2, 0, n).copy_(ub);
+  if (full && m > n) u.narrow(1, n, m - n).narrow(2, n, m - n).diagonal(0, 1, 2).fill_(1);
+  apply_q(a3, tauq, u, /*left=*/true, /*transpose=*/false);
+  v = vb.contiguous();
+  if (n > 1) {
+    // P = G_0 ... G_{n-2}: G_k's u is the conjugate of row k right of the
+    // diagonal, a column of A^H below its first subdiagonal
+    at::Tensor pr = adj(a3).narrow(1, 1, n - 1).narrow(2, 0, n - 1).contiguous();
+    at::Tensor vrows = v.narrow(1, 1, n - 1);
+    apply_q(pr, taup.narrow(1, 0, n - 1), vrows, /*left=*/true, /*transpose=*/false);
   }
   return true;
 }
@@ -1226,15 +1559,27 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
   bool wide = m < n;  // work with A^H (tall): A = U S V^H  <=>  A^H = V S U^H
   at::Tensor a3 = batched(wide ? adj(a) : a);
   int64_t tm = a3.size(1), tn = a3.size(2);  // tm >= tn = k
-  auto [sigma, w, v] = jacobi_svd(a3);
   auto bs = batch_shape(a);
+  at::Tensor sigma, left, v;
+  bool done = false;
+  if (tn >= kSvdBidiagMin && std::getenv("TORCH_VK_SVD_JACOBI") == nullptr) {
+    // (a3 is a fresh copy: batched() of a view, or of adj(a), copies)
+    at::Tensor work = a3.contiguous().clone();
+    done = bidiag_svd(work, compute_uv && full_matrices, sigma, left, v);
+  }
+  if (!done) {
+    at::Tensor w;
+    std::tie(sigma, w, v) = jacobi_svd(a3);
+    if (compute_uv) {
+      left = left_vectors(w, sigma, full_matrices ? tm : tn);  // [B, tm, tm or k]
+    }
+  }
   assign(S, sigma.view(with_tail(bs, {k})));
   if (!compute_uv) {
     at::native::resize_output(U, {0});
     at::native::resize_output(Vh, {0});
     return {U, S, Vh};
   }
-  at::Tensor left = left_vectors(w, sigma, full_matrices ? tm : tn);  // [B, tm, tm or k]
   // For the tall problem: U_t = left, V_t = v (tn x tn).
   at::Tensor u_out = wide ? v : left;
   at::Tensor v_out = wide ? left : v;

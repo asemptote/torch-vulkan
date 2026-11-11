@@ -248,6 +248,11 @@ EXPECTED = [
     (r"test_modules\.py::.*::test_cpu_gpu_parity_nn_(CrossEntropyLoss_vk_float16|LinearCrossEntropyLoss_vk_bfloat16)$", r"",
      "an expected failure on CUDA and XPU as well (the ModuleInfo marks it so for those devices only): accelerators "
      "compute the 16-bit loss in float32 and round once, the CPU in steps"),
+    (r"test_decomp\.py::.*::test_comprehensive_nn_functional_nll_loss_vk_float16$",
+     r"larger with decomposition nll_loss_forward\.default than original",
+     "as CUDA's, vk's 16-bit nll_loss_forward sums in float32 and rounds once (the CPU sums in float16, in its "
+     "cascade); its decomposition, summing float16 terms, is then further from the float64 reference than the "
+     "original by more than the test's float16 allowance (0.021 against 0.0099 + 0.01)"),
     (r"test_modules\.py::.*::test_cpu_gpu_parity_nn_ConvTranspose[123]d_vk_complex32$", r"",
      "an expected failure on CUDA as well (the ModuleInfo marks it so for CUDA only: complex32 transposed "
      "convolution is not implemented on the CPU, which the parity test compares against)"),
@@ -295,6 +300,21 @@ EXPECTED = [
     (r"test_index_put_large_indices_|test_index_reduce_reduce_(mean|prod)_vk_(bfloat16|float16)", r"Tensor-likes are not close",
      "vk accumulates 16-bit floats in float32 and rounds once; the CPU (the test's reference) rounds its running "
      "sum or product to 16 bits at every step (for bfloat16 index_put_: error ~1 on vk, ~230 on the CPU)"),
+    (r"test_autodiff__foreach_(ceil|clamp_max|clamp_min|erf|erfc|floor|frac|lgamma|maximum|minimum|round|sign|trunc)_"
+     r"(in|out)place_vk_complex128", r"",
+     "these foreach ops have no complex kernels on any device (the CPU's error, raised on vk); the OpInfo lists "
+     "complex128 anyway and marks the test an expected failure on CUDA and XPU only"),
+    (r"test_foreach_reduce_large_input__foreach_norm_w_empty_(True|False)_vk_(bool|u?int\d+)",
+     r"linalg.vector_norm: Expected a floating point or complex tensor",
+     "the test's reference (linalg.vector_norm) refuses integer and bool tensors on every device; PyTorch marks it an "
+     "expected failure for those dtypes on CUDA and XPU"),
+    (r"test_unary_op_tensors_on_different_devices__foreach_neg_vk_bool", r"does not match",
+     "the test matches the error's own text as a regex, whose \"logical_not()\" does not match itself; any device "
+     "that raises the CPU's bool-negation error fails it"),
+    (r"test_consumer_to_single_producer_case_2_correctness_vk|test_warn_on_accumulate_grad_stream_mismatch_flag_vk",
+     r"has no attribute 'default_stream'|Backend doesn't support create a new Stream",
+     "vk runs everything on one queue and has no stream objects; PyTorch expects these to fail on MPS for the same "
+     "reason"),
     (r"test_transformerencoderlayer_vk_", r"False is not true",
      "TransformerEncoderLayer takes its fast path on PrivateUse1 devices too (torch.nn's _supported_device_type), "
      "which gives NaN for fully masked rows; the test expects the fast path only on the CPU and CUDA"),
@@ -367,8 +387,12 @@ EXPECTED = [
      "division rounds as the CPU's (lavapipe), not on NVIDIA or Intel"),
     (r"", r"^KeyError: 'vk(\W|$)",
      "the test looks up per-device settings (drivers, tolerances) that have no entry for vk"),
-    (r"_int4|int4pack|_dyn_quant_|_weight_int4", r"",
+    (r"_int4|int4pack|_weight_int4", r"",
      "int4 packed-weight matmuls: packed layouts specific to x86/ARM CPUs and CUDA (out of scope)"),
+    (r"test__dyn_quant_matmul_4bit_", r"Some elements have error >= 0\.06",
+     "a bound on the int4 / int8 quantisation error that holds for the CPU's random draws only: vk's generator "
+     "(Philox) draws other numbers for the seed, and on them one output of 352,256 is 0.061 off a float32 mm, "
+     "with the CPU's kernels too; vk's kernel gives the CPU's results bit for bit on the same inputs"),
     (r"", r"InductorError: KeyError: 'vk'",
      "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
 ]

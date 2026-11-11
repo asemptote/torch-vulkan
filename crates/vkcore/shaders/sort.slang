@@ -10,6 +10,8 @@
 //                     shared memory
 // `total` (all rows) is a multiple of 1024; each pair sorts ascending when
 // bit k of its position in the row is 0 (stage k merges runs of length k).
+// The local passes take blocks gid, gid + groups, ...: more than 65535
+// blocks (2^26 entries) would pass the dispatch limit.
 
 #include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 struct Params
@@ -20,7 +22,7 @@ struct Params
     uint P;
     uint j;
     uint k;
-    uint stride;  // grid stride (SORT_GLOBAL)
+    uint stride;  // grid stride: 512 x the workgroups dispatched
     uint _pad;
 };
 
@@ -90,25 +92,29 @@ void main(uint3 gid: SV_GroupID, uint3 lid: SV_GroupThreadID, uint3 id: SV_Dispa
         }
         return;
     }
-    uint base = gid.x * BLOCK;
     uint t = lid.x;
-    skey[t] = p.keys[base + t];
-    sidx[t] = p.idx[base + t];
-    skey[t + 512u] = p.keys[base + t + 512u];
-    sidx[t + 512u] = p.idx[base + t + 512u];
-    GroupMemoryBarrierWithGroupSync();
-    if (OP == SORT_LOCAL_FULL)
+    for (uint blk = gid.x; blk < p.total / uint(BLOCK); blk += p.stride / 512u)
     {
-        uint kmax = min(p.P, uint(BLOCK));
-        for (uint k = 2u; k <= kmax; k <<= 1)
-            local_steps(base, t, k, k >> 1);
+        uint base = blk * BLOCK;
+        skey[t] = p.keys[base + t];
+        sidx[t] = p.idx[base + t];
+        skey[t + 512u] = p.keys[base + t + 512u];
+        sidx[t + 512u] = p.idx[base + t + 512u];
+        GroupMemoryBarrierWithGroupSync();
+        if (OP == SORT_LOCAL_FULL)
+        {
+            uint kmax = min(p.P, uint(BLOCK));
+            for (uint k = 2u; k <= kmax; k <<= 1)
+                local_steps(base, t, k, k >> 1);
+        }
+        else
+        {
+            local_steps(base, t, p.k, uint(BLOCK) >> 1);
+        }
+        p.keys[base + t] = skey[t];
+        p.idx[base + t] = sidx[t];
+        p.keys[base + t + 512u] = skey[t + 512u];
+        p.idx[base + t + 512u] = sidx[t + 512u];
+        GroupMemoryBarrierWithGroupSync();
     }
-    else
-    {
-        local_steps(base, t, p.k, uint(BLOCK) >> 1);
-    }
-    p.keys[base + t] = skey[t];
-    p.idx[base + t] = sidx[t];
-    p.keys[base + t + 512u] = skey[t + 512u];
-    p.idx[base + t + 512u] = sidx[t + 512u];
 }

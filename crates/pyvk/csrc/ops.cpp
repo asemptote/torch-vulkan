@@ -615,10 +615,12 @@ template <bool Tanh>
 at::Tensor& sig_tanh_backward_out(const at::Tensor& grad, const at::Tensor& y, at::Tensor& out) {
   const char* name = Tanh ? "aten::tanh_backward" : "aten::sigmoid_backward";
   if (is_vk(grad) && is_vk(y) && is_vk(out) && at::isComplexType(at::result_type(grad, y))) {
-    // (as the CPU: grad * conj(1 - y^2), grad * conj((1 - y) y))
+    // (as the CPU: grad * conj(1 - y^2), grad * conj((1 - y) y); conjugated
+    // physically: inside a TorchDispatchMode the Conjugate key is excluded,
+    // and mul would read a lazy conjugate's raw data)
     at::Tensor d = Tanh ? at::rsub(y * y, 1) : at::rsub(y, 1) * y;
     at::native::resize_output(out, at::infer_size(grad.sizes(), y.sizes()));
-    out.copy_(grad * d.conj());
+    out.copy_(grad * at::conj_physical(d));
     return out;
   }
   if (!act_gpu(Tanh ? op::BINARY_TANH_BACKWARD : op::BINARY_SIGMOID_BACKWARD, grad, y, out)) {
@@ -635,6 +637,22 @@ at::Tensor sig_tanh_backward(const at::Tensor& grad, const at::Tensor& y) {
 
 at::Tensor& log_sigmoid_backward_out(const at::Tensor& grad, const at::Tensor& self, const at::Tensor& buffer,
                                      at::Tensor& grad_input) {
+  at::ScalarType t = at::result_type(grad, self);
+  if (buffer.defined() && buffer.numel() > 0 && buffer.sizes() == self.sizes() && is_vk(buffer) && is_vk(grad) &&
+      is_vk(self) && is_vk(grad_input) && at::isFloatingType(t)) {
+    // As the CPU's kernel, from the forward's buffer z = e^-|x| (rounded to
+    // the dtype): grad (max_deriv - sign z / (1 + z)), with max_deriv and
+    // sign 1 for x < 0, else 0 and -1; 16-bit values computed in float32.
+    // (Without a buffer, as CUDA's, the kernel below recomputes z.)
+    at::ScalarType ct = t == at::kHalf || t == at::kBFloat16 ? at::kFloat : t;
+    at::Tensor x = self.to(ct), z = buffer.to(ct), g = grad.to(ct);
+    at::Tensor neg = at::lt(x, 0);
+    at::Tensor sign = at::where(neg, at::scalar_tensor(1.0, x.options()), at::scalar_tensor(-1.0, x.options()));
+    at::Tensor r = g * (neg.to(ct) - sign * (z / (z + 1)));
+    at::native::resize_output(grad_input, r.sizes());
+    grad_input.copy_(r);
+    return grad_input;
+  }
   if (!act_gpu(op::BINARY_LOG_SIGMOID_BACKWARD, grad, self, grad_input)) {
     on_cpu("aten::log_sigmoid_backward", "grad_input", grad, self, buffer, grad_input);
   }
@@ -833,6 +851,10 @@ at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, a
     at::native::resize_output(out, r.sizes());
     out.copy_(r);
     return out;
+  }
+  if (at::isFloatingType(self.scalar_type()) && !exponent.isComplex() && exponent.toDouble() == 0.5 &&
+      out.scalar_type() == self.scalar_type() && is_vk(self) && is_vk(out)) {
+    return at::sqrt_out(out, self);  // (the CPU's x ** 0.5 is its sqrt)
   }
   if (!binary_gpu(kBinary[kPow], self, nullptr, &exponent, 1, out)) {
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);

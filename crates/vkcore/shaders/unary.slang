@@ -41,8 +41,8 @@ T apply(T x)
     case UNARY_SIGN: return T(sign(x));
 #ifdef IS_FLOAT
     case UNARY_RECIPROCAL: return m_div(T(1), x);  // (correctly rounded, as the CPU's)
-    case UNARY_SQRT: return sqrt(x);  // correctly rounded in SPIR-V
-    case UNARY_RSQRT: return T(1) / sqrt(x);
+    case UNARY_SQRT: return m_sqrt(x);  // (correctly rounded, as the CPU's)
+    case UNARY_RSQRT: return m_div(T(1), m_sqrt(x));  // (as the CPU's 1 / sqrt(x))
     case UNARY_FLOOR: return floor(x);
     case UNARY_CEIL: return ceil(x);
     case UNARY_TRUNC: return trunc(x);

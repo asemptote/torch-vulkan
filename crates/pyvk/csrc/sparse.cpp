@@ -35,6 +35,13 @@
 namespace vk {
 namespace {
 
+// The sum of a sparse tensor's entries (its values along dim 0) in their own
+// dtype, as coalescing and sparse addition combine them (bools: any).
+at::Tensor sum_entries(const at::Tensor& values, bool keepdim) {
+  if (values.scalar_type() == at::kBool) return values.any(0, keepdim);
+  return values.sum(0, keepdim, values.scalar_type());
+}
+
 // `t` with row-major strides, every one canonical (PyTorch's compressed
 // layouts check stride(-1) == 1, which contiguous() does not give a
 // one-element or empty tensor).
@@ -82,7 +89,7 @@ at::Tensor coalesce(const at::Tensor& self) {
     return make_sparse(self, sd, dd, self.sizes(), indices.clone(), values.clone(), true);
   }
   if (sd == 0) {
-    return make_sparse(self, sd, dd, self.sizes(), at::empty({0, 1}, indices.options()), values.sum(0, true), true);
+    return make_sparse(self, sd, dd, self.sizes(), at::empty({0, 1}, indices.options()), sum_entries(values, true), true);
   }
   at::Tensor key = linear_keys(indices, self.sizes(), sd);
   // (already in order without repeats, as most tensors built by these ops:
@@ -123,7 +130,7 @@ at::Tensor& add_out(const at::Tensor& self, const at::Tensor& other, const at::S
     if (other._nnz() == 0) return out;
     at::Tensor values = other._values().to(out.scalar_type());
     if (!(alpha.isIntegral(true) && alpha.toLong() == 1)) values = values * alpha;
-    if (other.sparse_dim() == 0) return out.add_(values.sum(0));  // (every entry is the whole tensor)
+    if (other.sparse_dim() == 0) return out.add_(sum_entries(values, false));  // (every entry is the whole tensor)
     at::Tensor idx = other._indices();
     c10::List<std::optional<at::Tensor>> rows;
     for (int64_t d = 0; d < other.sparse_dim(); ++d) rows.push_back(idx.select(0, d));
@@ -278,7 +285,7 @@ at::Tensor& mul_out(const at::Tensor& self, const at::Tensor& other, at::Tensor&
       const at::Tensor& z = z_is_other ? other : self;
       const at::Tensor& s = z_is_other ? self : other;
       at::Tensor c = z.coalesce();
-      at::Tensor scalar = c._nnz() == 0 ? at::zeros({}, c._values().options()) : c._values().sum(0);
+      at::Tensor scalar = c._nnz() == 0 ? at::zeros({}, c._values().options()) : sum_entries(c._values(), false);
       r = mul_sparse_dense(s, scalar, t, false);
     } else {
       r = mul_sparse_sparse(self, other);

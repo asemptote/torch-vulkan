@@ -81,14 +81,14 @@ at::Tensor sort_rows(const at::Tensor& x, bool descending) {
   uint32_t blocks = static_cast<uint32_t>(total / kSortBlock);
   uint32_t global_groups = std::min<uint32_t>(blocks, 65535);
   p.stride = global_groups * 512;
-  dispatch(kernel, {kSortLocalFull}, p, blocks);
+  dispatch(kernel, {kSortLocalFull}, p, global_groups);
   for (int64_t k = 2 * kSortBlock; k <= P; k <<= 1) {
     p.k = static_cast<uint32_t>(k);
     for (int64_t j = k / 2; j >= kSortBlock; j >>= 1) {
       p.j = static_cast<uint32_t>(j);
       dispatch(kernel, {kSortGlobal}, p, global_groups);
     }
-    dispatch(kernel, {kSortLocalMerge}, p, blocks);
+    dispatch(kernel, {kSortLocalMerge}, p, global_groups);
   }
   return idx.narrow(0, 0, rows * P).view({rows, P}).narrow(1, 0, n).contiguous();
 }

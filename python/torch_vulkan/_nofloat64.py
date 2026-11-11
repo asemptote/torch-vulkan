@@ -12,7 +12,12 @@ tolerance; without float64 the tolerance is float32 (a different decision
 only for a singular value within an ulp of it).
 
 Registered on the AutogradPrivateUse1 key (these are composite ops, so
-autograd differentiates the ops they call)."""
+autograd differentiates the ops they call), except linalg_pinv.atol_rtol_tensor:
+it has its own derivative (pinv_backward), so its kernel is a backend
+(PrivateUse1) one, and pinv's other overloads call it with their tolerances
+as tensors of the right dtype. (Differentiating through the SVD instead hits
+svd_backward's check, an allclose, which vmap has no batching rule for, and
+the SVD's forward-mode derivative, which fails on a view.)"""
 
 import torch
 
@@ -208,13 +213,23 @@ def _overloads(fn_name, impl, original_packet):
         return kernel
 
     if fn_name == "linalg_pinv":
+        def via_tensor(input, atol, rtol, hermitian):
+            # (pinv.atol_rtol_tensor, whose derivative autograd knows, with
+            # numbers as tensors of the tolerance's dtype)
+            real = input.real.dtype if input.is_complex() else input.dtype
+            real = torch.float64 if _has_float64() else real
+            as_t = lambda v: v if v is None or isinstance(v, torch.Tensor) else torch.full(
+                (), v, dtype=real, device=input.device)
+            return aten.linalg_pinv.atol_rtol_tensor(input, atol=as_t(atol), rtol=as_t(rtol), hermitian=hermitian)
+
+        def pick_composite(convert):
+            return lambda *args, **kwargs: via_tensor(*convert(*args, **kwargs))
+
         return {
-            "linalg_pinv.atol_rtol_tensor": pick("atol_rtol_tensor", lambda x, *, atol=None, rtol=None, hermitian=False:
-                                                 (x, atol, rtol, hermitian)),
-            "linalg_pinv.atol_rtol_float": pick("atol_rtol_float", lambda x, *, atol=None, rtol=None, hermitian=False:
-                                                (x, atol, rtol, hermitian)),
-            "linalg_pinv": pick("default", lambda x, rcond, hermitian=False: (x, 0.0, rcond, hermitian)),
-            "linalg_pinv.rcond_tensor": pick("rcond_tensor", lambda x, rcond, hermitian=False: (
+            "linalg_pinv.atol_rtol_float": pick_composite(lambda x, *, atol=None, rtol=None, hermitian=False:
+                                                          (x, atol, rtol, hermitian)),
+            "linalg_pinv": pick_composite(lambda x, rcond, hermitian=False: (x, 0.0, rcond, hermitian)),
+            "linalg_pinv.rcond_tensor": pick_composite(lambda x, rcond, hermitian=False: (
                 _check_real(rcond, "torch.linalg.pinv", "rcond"), (x, 0.0, rcond, hermitian))[1]),
         }
     return {
@@ -279,7 +294,10 @@ def register():
     }
     for name, fn in kernels.items():
         _lib.impl(name, fn, "AutogradPrivateUse1")
+    _lib.impl("linalg_pinv.atol_rtol_tensor", lambda x, *, atol=None, rtol=None, hermitian=False:
+              _pinv_impl(x, atol, rtol, hermitian), "PrivateUse1")
     # (CompositeExplicitAutograd ops: a backend kernel; zeta has no gradient)
     _lib.impl("special_zeta.other_scalar", _zeta_other_scalar, "PrivateUse1")
     _lib.impl("special_zeta.self_scalar", _zeta_self_scalar, "PrivateUse1")
-    return ["aten::" + n for n in kernels] + ["aten::special_zeta.other_scalar", "aten::special_zeta.self_scalar"]
+    return ["aten::" + n for n in kernels] + ["aten::linalg_pinv.atol_rtol_tensor", "aten::special_zeta.other_scalar",
+                                              "aten::special_zeta.self_scalar"]
