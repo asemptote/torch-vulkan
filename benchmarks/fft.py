@@ -28,6 +28,7 @@ def main():
         ("fft 1000003 (Bluestein)", (1_000_003,), lambda t: torch.fft.fft(t), True),
         ("fft2 1024x1024", (1024, 1024), lambda t: torch.fft.fft2(t), True),
         ("rfft 2^22", (1 << 22,), lambda t: torch.fft.rfft(t), False),
+        ("irfft 2^20", ((1 << 19) + 1,), lambda t: torch.fft.irfft(t), True),
     ]
     for dtype in (torch.complex64, torch.complex128):
         real = torch.float32 if dtype == torch.complex64 else torch.float64
