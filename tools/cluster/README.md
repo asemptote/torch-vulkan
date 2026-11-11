@@ -1,5 +1,10 @@
 # Running PyTorch's test suites on "vk" on a cluster
 
+> Maintainer tooling for one PBS cluster setup (and the workstations beside
+> it). Site details (hosts, queues, paths) live in the untracked
+> `cluster.env`; see `cluster.env.example`. Nothing else in the repository
+> depends on these scripts.
+
 `tools/pytorch_tests.py` runs PyTorch's own device-generic tests (`test_ops.py`,
 `test_torch.py`, ...) on device `"vk"`. A full `test_ops.py` is ~33,000 tests
 (~1 s each, mostly harness overhead), so it is split into shards and run in
