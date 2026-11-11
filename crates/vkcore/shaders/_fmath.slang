@@ -347,14 +347,32 @@ float m_div32(float a, float b)
     return bit_cast<float>(sign | keep);
 }
 
+// a * b as a 64-bit (hi, lo) pair from 32-bit products of 16-bit halves,
+// for a, b < 2^26 (no 64-bit integers: not every GPU has them).
+uint2 sqrt32_mul(uint a, uint b)
+{
+    uint a1 = a >> 16, a0 = a & 0xffffu, b1 = b >> 16, b0 = b & 0xffffu;
+    uint low = a0 * b0, mid = a1 * b0 + a0 * b1;  // (mid < 2^27)
+    uint lo = low + (mid << 16);
+    uint hi = a1 * b1 + (mid >> 16) + (lo < low ? 1u : 0u);
+    return uint2(hi, lo);
+}
+
+bool sqrt32_greater(uint2 a, uint2 b)
+{
+    return a.x > b.x || (a.x == b.x && a.y > b.y);
+}
+
 // sqrt(x) correctly rounded, as the CPU's: Vulkan's Sqrt is only as accurate
 // as 1 / inversesqrt (ANV's float32 roots differed from the CPU's in 8% of
-// cases). The GPU's root c of the significand M (x scaled by an even power
-// of two into [1, 4)) is moved to a neighbour while the root lies beyond the
-// midpoint on that side: with u = ulp(c), (c + u/2)^2 = c (c + u) + u^2 / 4
-// and M - c (c + u) is a multiple of u^2, so sqrt(M) > c + u/2 exactly when
-// M - c next(c) > 0, an exact residual (Dekker's product) whose sign the
-// rounding keeps. Zeros (with their sign), +inf and NaNs as the CPU's.
+// cases), and corrections in floating point depend on the driver neither
+// fusing nor approximating (CI's lavapipe still had 481 of 65547 off). So in
+// integers: x = m' 2^t with t even and m' < 2^25, R = m' 2^S (47 or 48 bits,
+// S = 22 or 24), and the 24-bit root c = floor(sqrt(R)) is found from the
+// GPU's float root by exact comparisons of c^2 with R (products of 16-bit
+// halves); the result rounds up iff R > c (c + 1), as (c + 1/2)^2 =
+// c (c + 1) + 1/4 and R is an integer. Zeros (with their sign), +inf and
+// NaNs as the CPU's.
 float m_sqrt(float x)
 {
     uint b = bit_cast<uint>(x);
@@ -363,30 +381,32 @@ float m_sqrt(float x)
     if (b > 0x7f800000u)
         return f32_nan();  // (negative or NaN)
     int e;
-    uint m = div32_unpack(x, e);  // (subnormals included, on the bits)
-    float M = bit_cast<float>(0x3f800000u | (m & 0x7fffffu));
-    if ((e & 1) != 0)
+    uint m = div32_unpack(x, e);  // |x| = m 2^(e - 23), m in [2^23, 2^24) (subnormals included)
+    int t = e - 23;
+    if ((t & 1) != 0)
     {
-        M *= 2.0f;
-        e -= 1;
+        m <<= 1;
+        t -= 1;
     }
-    // (one Newton step on the exact residual M - c^2 first: a driver's Sqrt
-    // may be an approximation good to a few thousand ulp, and the
-    // neighbour steps below move one ulp each)
-    float c = sqrt(M);
-    c += div32_residual(M, c, c) * (0.5f / c);
-    [ForceUnroll]
-    for (int i = 0; i < 3; i++)
+    uint S = m >= (1u << 24) ? 22u : 24u;
+    uint2 R = uint2(m >> (32u - S), m << S);
+    // the float root of R (= sqrt(m) 2^(S/2)), one Newton step, then exact steps
+    float f = sqrt(float(m)) * (S == 24u ? 4096.0f : 2048.0f);
+    f = 0.5f * (f + (float(m) * (S == 24u ? 16777216.0f : 4194304.0f)) / f);
+    uint c = clamp(uint(f), 1u << 23, (1u << 24) - 1u);
+    for (int i = 0; i < 64 && sqrt32_greater(sqrt32_mul(c, c), R); i++)
+        c--;
+    for (int i = 0; i < 64 && !sqrt32_greater(sqrt32_mul(c + 1u, c + 1u), R); i++)
+        c++;
+    if (sqrt32_greater(R, sqrt32_mul(c, c + 1u)))
+        c++;
+    int E = (t - int(S)) / 2 + 23;  // the result: c 2^((t - S) / 2), c in [2^23, 2^24]
+    if (c == (1u << 24))
     {
-        uint cb = bit_cast<uint>(c);
-        float up = bit_cast<float>(cb + 1u), dn = bit_cast<float>(cb - 1u);
-        if (div32_residual(M, c, up) > 0.0f)
-            c = up;
-        else if (div32_residual(M, dn, c) <= 0.0f)
-            c = dn;
+        c >>= 1;
+        E += 1;
     }
-    // (c in [1, 2): the root of M < 4 rounds below 2)
-    return bit_cast<float>((uint(e / 2 + 127) << 23) | (bit_cast<uint>(c) & 0x7fffffu));
+    return bit_cast<float>((uint(E + 127) << 23) | (c & 0x7fffffu));
 }
 
 #elif defined(T_f64) || defined(FMATH_F64)
