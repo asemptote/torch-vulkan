@@ -422,13 +422,19 @@ bool where_gpu(const at::Tensor& cond, const at::Tensor* a, const std::optional<
   std::vector<int64_t> shape = cond.sizes().vec();
   if (a) shape = at::infer_size(shape, a->sizes());
   if (b) shape = at::infer_size(shape, b->sizes());
-  // (a resized output in the dim order of the first operand of its shape,
-  // as TensorIterator: condition, self, other)
-  const at::Tensor* like = cond.sizes().equals(shape) ? &cond
-                           : (a && a->sizes().equals(shape)) ? a
-                           : (b && b->sizes().equals(shape)) ? b
-                                                              : nullptr;
-  resize_elementwise_output(out, shape, like, /*check_aliasing=*/false);
+  if (!out.sizes().equals(shape)) {
+    // (a resized output in the layout PyTorch's meta kernel gives it, as
+    // TensorIterator orders dims over all the operands' strides)
+    auto meta = [](const at::Tensor& t) { return at::empty_strided(t.sizes(), t.strides(), t.options().device(at::kMeta)); };
+    at::Tensor m = a && b             ? at::where(meta(cond), meta(*a), meta(*b))
+                   : a                ? at::where(meta(cond), meta(*a), *b_scalar)
+                   : b                ? at::where(meta(cond), *a_scalar, meta(*b))
+                                      : at::where(meta(cond), *a_scalar, *b_scalar);
+    at::native::resize_output(out, shape);
+    if (m.sizes().equals(shape) && m.is_non_overlapping_and_dense() && !out.strides().equals(m.strides())) {
+      out.as_strided_(shape, m.strides());
+    }
+  }
   const char* label = dtype_label(dtype);
   bool scalars_ok = !((a_scalar || b_scalar) && at::isComplexType(dtype));
   if (!is_vk(cond) || !is_vk(out) || (a && !is_vk(*a)) || (b && !is_vk(*b)) || label == nullptr || !scalars_ok) {

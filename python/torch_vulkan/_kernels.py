@@ -507,6 +507,17 @@ def _replication_pad_backward(dims):
     name = f"replication_pad{dims}d_backward"
 
     def kernel(grad_output, x, padding):
+        if len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1:
+            # (the CPU's shape checks, in its order and words)
+            c = x.dim() - dims - 1
+            torch._check(grad_output.shape[c] == x.shape[c], lambda: f"gradOutput channel unexpected. Expected: "
+                                                                     f"{x.shape[c]}, Got: {grad_output.shape[c]}")
+            for i, what in zip(range(dims), ("width", "height", "depth")):
+                d = x.dim() - 1 - i
+                want = x.shape[d] + padding[2 * i] + padding[2 * i + 1]
+                sep = "" if dims == 1 else ","
+                torch._check(grad_output.shape[d] == want, lambda: f"gradOutput {what} unexpected. Expected: "
+                                                                   f"{want}{sep} Got: {grad_output.shape[d]}")
         ok = len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1
         for i in range(dims if ok else 0):
             d = x.dim() - 1 - i
@@ -549,6 +560,8 @@ def _multi_margin_loss_backward(grad_output, x, target, p, margin, weight=None, 
         return _on_cpu("multi_margin_loss_backward", *args)
     xs = x.reshape(-1, x.shape[-1] if x.dim() else 1)  # (a 0-d input: one sample of one class)
     n, c = xs.shape
+    if n == 0:
+        return torch.zeros_like(x)  # (no samples: no gradient, as the CPU)
     t = target.reshape(-1)
     if t.numel() != n or c == 0 or not _targets_in_range(t, 0, c):
         return _on_cpu("multi_margin_loss_backward", *args)
@@ -575,6 +588,8 @@ def _multilabel_margin_loss_backward(grad_output, x, target, reduction, is_targe
         return _on_cpu("multilabel_margin_loss_backward", *args)
     xs = x.reshape(-1, x.shape[-1] if x.dim() else 1)  # (a 0-d input: one sample of one class)
     n, c = xs.shape
+    if n == 0:
+        return torch.zeros_like(x)  # (no samples: no gradient, as the CPU)
     tg = target.reshape(n, c)
     if c == 0 or not _targets_in_range(tg, -1, c):
         return _on_cpu("multilabel_margin_loss_backward", *args)

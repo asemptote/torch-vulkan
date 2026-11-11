@@ -124,7 +124,8 @@ at::Tensor as_dtype(const at::Tensor& self, std::optional<at::ScalarType> dtype)
   return at::_to_copy(self, self.options().dtype(*dtype));
 }
 
-bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keepdim, Plan& plan) {
+bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keepdim, Plan& plan,
+                 bool memory_order = true) {
   int64_t ndim = self.dim();
   std::vector<bool> reduced(ndim, !dims.has_value() || dims->empty());
   if (dims.has_value()) {
@@ -165,8 +166,10 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
   // contiguous one's.
   std::vector<size_t> order(red_size.size());
   for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-  std::stable_sort(order.begin(), order.end(),
-                   [&](size_t x, size_t y) { return std::abs(red_stride[x]) > std::abs(red_stride[y]); });
+  if (memory_order) {  // (not for argmax and friends: their index counts in the tensor's order)
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t x, size_t y) { return std::abs(red_stride[x]) > std::abs(red_stride[y]); });
+  }
   std::vector<int64_t> rs, rt;
   for (size_t i : order) {
     rs.push_back(red_size[i]);
@@ -622,7 +625,7 @@ std::tuple<at::Tensor&, at::Tensor&> max_min_dim_out(const at::Tensor& self, int
   }
   at::Tensor src = widen_half(self);
   if (!arg_reducible(src) || !is_vk(values) || !is_vk(indices) || self.dim() == 0 ||
-      !plan_reduce(src, dims, keepdim, plan)) {
+      !plan_reduce(src, dims, keepdim, plan, /*memory_order=*/false)) {
     on_cpu(Op == 0 ? "aten::max" : "aten::min", Op == 0 ? "dim_max" : "dim_min", self, dim, keepdim, values, indices);
     return {values, indices};
   }
@@ -649,7 +652,8 @@ at::Tensor& argmax_argmin_out(const at::Tensor& self, std::optional<int64_t> dim
   }
   at::Tensor src = widen_half(self);
   bool ok = arg_reducible(src) && is_vk(out) &&
-            plan_reduce(src, dim.has_value() ? at::OptionalIntArrayRef(dims) : std::nullopt, keepdim, plan);
+            plan_reduce(src, dim.has_value() ? at::OptionalIntArrayRef(dims) : std::nullopt, keepdim, plan,
+                        /*memory_order=*/false);
   if (ok && !dim.has_value() && keepdim && self.numel() > 0) {
     // (no dim, keepdim: the flat index, in a tensor of self's dims, all 1)
     at::Tensor flat = Op == 0 ? at::argmax(self.reshape({-1}), 0) : at::argmin(self.reshape({-1}), 0);

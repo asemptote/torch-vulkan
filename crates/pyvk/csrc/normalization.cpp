@@ -108,9 +108,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
   }
   at::Tensor out = kernels ? slice_affine(x3, scale, shift).view(x.sizes()).to(x.scalar_type())
                            : (xf * scale.view(shape) + shift.view(shape)).to(x.scalar_type());
-  // (saved statistics in the input's dtype, or float32 for a 16-bit input
-  // with float32 parameters, as on the CPU)
-  at::ScalarType stat = params == at::ScalarType::Undefined || params == x.scalar_type() ? x.scalar_type() : at::kFloat;
+  // (saved statistics in float32 for 16-bit inputs, as PyTorch's meta kernel
+  // says and CUDA gives them: FakeTensor and torch.compile go by the meta
+  // kernel; the CPU keeps them in the input's dtype unless the parameters
+  // are float32)
+  at::ScalarType stat = at::isReducedFloatingType(x.scalar_type()) ? at::kFloat : x.scalar_type();
+  (void)params;
   return {out, save_mean.to(stat), save_invstd.to(stat)};
 }
 

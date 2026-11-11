@@ -225,8 +225,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm(const at::Tenso
                 param_ok(weight) && param_ok(bias);
   if (!kernel && N == 0 && is_vk(input) && t != at::ScalarType::Undefined && group > 0 && C > 0 && HxW > 0 &&
       C % group == 0 && input.numel() == 0 && param_ok(weight) && param_ok(bias)) {
-    // (no samples: empty results, as the CPU's)
-    at::Tensor stats = at::empty({0, group}, input.options().dtype(t));
+    // (no samples: empty results, as the CPU's, its statistics in float32 only
+    // for 16-bit inputs with float32 weight or bias)
+    bool f32 = (defined(weight) && weight->scalar_type() == at::kFloat) || (defined(bias) && bias->scalar_type() == at::kFloat);
+    at::Tensor stats = at::empty({0, group}, input.options().dtype(reduced && !f32 ? input.scalar_type() : t));
     return {at::empty(input.sizes(), input.options()), stats, stats.clone()};
   }
   if (!kernel && is_vk(input) && !at::isFloatingType(input.scalar_type())) {
