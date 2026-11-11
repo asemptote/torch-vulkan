@@ -27,7 +27,7 @@ def test_weight_int8pack_mm(dtype, m, k, n):
     s = (torch.rand(n, generator=gen(3)) / 50).to(dtype)
     # (the reference without the CPU's kernel: its AVX2 / AVX-512 bfloat16
     # path reads 16 values of k at a time and crashes for k not a multiple of
-    # 16, as on the CI's runners)
+    # 16, as on the CI's runners: pytorch/pytorch#204474)
     want = (a.float() @ (b.float() * s.float()[:, None]).t()).to(dtype)
     with on_gpu():
         got = torch._weight_int8pack_mm(a.to("vk"), b.to("vk"), s.to("vk"))

@@ -17,6 +17,8 @@ import torch
 
 import torch_vulkan as tv
 
+SMALL = os.environ.get("TORCH_VK_BENCH_SMALL") == "1"  # (benchmarks/integrated.py --small: a quick check)
+
 
 def gflops(fn, flops, sync, reps=5):
     fn()
@@ -34,7 +36,7 @@ def main():
           f"torch {torch.__version__}")
     args = sys.argv[1:]
     dtypes = [getattr(torch, a) for a in args if not a.isdigit()] or [torch.float32, torch.float64, torch.float16]
-    sizes = [int(a) for a in args if a.isdigit()] or [256, 1024, 2048]
+    sizes = [int(a) for a in args if a.isdigit()] or ([128] if SMALL else [256, 1024, 2048])
     for dtype in dtypes:
         for n in sizes:
             a, b = torch.randn(n, n, dtype=dtype), torch.randn(n, n, dtype=dtype)

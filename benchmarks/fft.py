@@ -3,11 +3,14 @@
     python benchmarks/fft.py
 """
 
+import os
 import time
 
 import torch
 
 import torch_vulkan as tv
+
+SMALL = os.environ.get("TORCH_VK_BENCH_SMALL") == "1"  # (benchmarks/integrated.py --small: a quick check)
 
 
 def timed(fn, sync, reps=5):
@@ -30,6 +33,8 @@ def main():
         ("rfft 2^22", (1 << 22,), lambda t: torch.fft.rfft(t), False),
         ("irfft 2^20", ((1 << 19) + 1,), lambda t: torch.fft.irfft(t), True),
     ]
+    if SMALL:
+        cases = [(label, tuple(max(2, d // 256) for d in shape), f, c) for label, shape, f, c in cases]
     for dtype in (torch.complex64, torch.complex128):
         real = torch.float32 if dtype == torch.complex64 else torch.float64
         for label, shape, f, complex_input in cases:
