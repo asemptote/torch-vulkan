@@ -9,11 +9,18 @@ import torch.nn.functional as F
 
 from _util import ARM32, check, make, on_gpu
 
-# (On the Mali phone, Termux's armv7 torch computed CPU convolutions wrong in
-# about 1 of 50 float32 and 5 of 50 float64 calls, against a pure-Python
-# convolution, while vk's matched that reference throughout: the CPU is no
-# reference for these tests there.)
-UNRELIABLE_CPU_CONV = pytest.mark.skipif(ARM32, reason="a 32-bit Arm CPU's convolutions are intermittently wrong")
+# On the Mali phone, Termux's armv7 torch computed CPU convolutions wrong in
+# about 1 of 50 float32 and 5 of 50 float64 calls (against a pure-Python
+# convolution, which vk's matched throughout). There the CPU references are
+# taken three times and their elementwise median compared with (one wrong
+# call of three cannot move it).
+CPU_RUNS = 3 if ARM32 else 1
+
+
+def cpu_median(compute):
+    """compute() (a list of tensors) on the CPU, CPU_RUNS times: the elementwise median."""
+    runs = [compute() for _ in range(CPU_RUNS)]
+    return [torch.stack(ts).median(0).values if CPU_RUNS > 1 else ts[0] for ts in zip(*runs)]
 
 TOL = dict(rtol=2e-4, atol=2e-4)
 
@@ -28,7 +35,7 @@ def grads(fn, *tensors):
 
 
 def compare_with_cpu(fn, *tensors, tol=TOL):
-    want = grads(fn, *tensors)
+    want = cpu_median(lambda: grads(fn, *tensors))
     with on_gpu():
         got = grads(fn, *(t.to("vk") for t in tensors))
     for g, w in zip(got, want):
@@ -47,7 +54,6 @@ CONV_CASES = [
 
 
 @pytest.mark.parametrize("dims,cin,cout,k,stride,pad,dil,groups", CONV_CASES)
-@UNRELIABLE_CPU_CONV
 def test_conv(dims, cin, cout, k, stride, pad, dil, groups):
     spatial = (11, 9, 7)[:dims]
     x = make((2, cin) + spatial, torch.float32)
@@ -64,7 +70,6 @@ def test_conv(dims, cin, cout, k, stride, pad, dil, groups):
     (2, 3, 4, (2, 4), (3, 1), (0, 2), (2, 1), 1, (2, 0)),
     (3, 2, 2, 3, 1, 0, 1, 2, 0),
 ])
-@UNRELIABLE_CPU_CONV
 def test_conv_transpose(dims, cin, cout, k, stride, pad, dil, groups, outpad):
     spatial = (6, 5, 4)[:dims]
     x = make((2, cin) + spatial, torch.float32)
@@ -147,24 +152,30 @@ def test_upsample_and_grid_sample():
                          x, grid.clone(), tol=dict(rtol=1e-4, atol=1e-4))
 
 
-@UNRELIABLE_CPU_CONV
+@pytest.mark.skipif(ARM32, reason="a 32-bit Arm CPU trained this model wrongly after other tests (the same in all "
+                                   "three runs, so no median helps); run alone, its parameters equal vk's")
 def test_embedding_and_small_model_training():
+    import copy
+
     torch.manual_seed(0)
     model = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
                                 torch.nn.MaxPool2d(2), torch.nn.Flatten(), torch.nn.Linear(8 * 4 * 4, 10))
     x = make((4, 3, 8, 8), torch.float32)
     y = torch.randint(0, 10, (4,))
-    vk_model = torch.nn.Sequential(*[m for m in model])
-    import copy
-    vk_model = copy.deepcopy(model).to("vk")
-    for m, xs, ys in [(model, x, y), (vk_model, x.to("vk"), y.to("vk"))]:
+
+    def train(m, xs, ys):
         opt = torch.optim.SGD(m.parameters(), lr=0.1, momentum=0.9)
         for _ in range(3):
             opt.zero_grad()
             F.cross_entropy(m(xs), ys).backward()
             opt.step()
-    for a, b in zip(vk_model.parameters(), model.parameters()):
-        check(a.detach(), b.detach(), rtol=1e-3, atol=1e-3)
+        return [p.detach() for p in m.parameters()]
+
+    vk_model = copy.deepcopy(model).to("vk")
+    got = train(vk_model, x.to("vk"), y.to("vk"))
+    want = cpu_median(lambda: train(copy.deepcopy(model), x, y))
+    for a, b in zip(got, want):
+        check(a, b, rtol=1e-3, atol=1e-3)
     emb = make((10, 4), torch.float32)
     idx = torch.tensor([[1, 3, 3], [9, 0, 1]])
     compare_with_cpu(lambda w: F.embedding(idx.to(w.device), w), emb)

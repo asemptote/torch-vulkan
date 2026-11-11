@@ -6,7 +6,15 @@ import pytest
 import torch
 import torch_vulkan
 
-from _util import make, make_complex
+from _util import ARM32, make, make_complex
+
+# A 32-bit Arm CPU converts NaN, infinities and values past int32 to integers
+# by saturating (its quantize kernels use that, and NEON's magic-number
+# rounding): it quantizes them to other values than x86's FBGEMM or
+# quantize_val, which vk follows. Those inputs are left out of the
+# quantization comparisons there.
+def arm_finite(x, scale):
+    return torch.where(x.isfinite() & (x.abs() / scale < 2**22), x, 0.0) if ARM32 else x
 
 
 def no_fallback(f):
@@ -926,7 +934,7 @@ def test_fused_moving_avg_obs_fake_quant(per_row, symmetric, qrange):
 
 
 def test_fake_quantize_cachemask_ops():
-    x = torch.tensor([[-1.3, 0.0, 0.26, 4.0], [float("nan"), float("inf"), -0.5, 1e-3]])
+    x = arm_finite(torch.tensor([[-1.3, 0.0, 0.26, 4.0], [float("nan"), float("inf"), -0.5, 1e-3]]), 0.05)
     v = lambda t: t.to("vk")
     sc, zp = torch.tensor([0.05]), torch.tensor([3], dtype=torch.int32)
     on = torch.ones(1, dtype=torch.long)
@@ -946,6 +954,7 @@ def test_quantized_per_tensor(qdtype):
     g = torch.Generator().manual_seed(0)
     x = torch.cat([torch.randn(40, generator=g) * 20,
                    torch.tensor([float("nan"), float("inf"), -float("inf"), 0.05, 0.15, -0.05, 1e30, 3e9])]).view(6, 8)
+    x = arm_finite(x, 0.1)
     c = torch.quantize_per_tensor(x, 0.1, 5, qdtype)
     v = no_fallback(lambda: torch.quantize_per_tensor(x.to("vk"), 0.1, 5, qdtype))
     assert v.is_quantized and v.device.type == "vk" and v.dtype == qdtype
