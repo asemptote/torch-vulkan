@@ -5,7 +5,14 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE*", "NOTICE"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE*", "NOTICE"]
+
+# A newer push to the same branch or PR supersedes a running check.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   SLANG_VERSION: "2026.20"
@@ -66,6 +73,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      # Compiled dependencies and the workspace crates' build outputs: the
+      # build scripts keep SPIR-V and the C++ objects in OUT_DIR, keyed by
+      # content hash, so an unchanged kernel or .cpp file is not rebuilt.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: "true"
 
       - uses: actions/setup-python@v5
         with:
