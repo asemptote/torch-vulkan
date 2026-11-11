@@ -9,9 +9,12 @@
 //     u[q] = in[j + q n/r] * w^(k q (n / (r ns))),  q < r
 //     out[(j / ns) r ns + k + q ns] = sum_q' u[q'] W_r^(q' q)
 //
-// with w = exp(-+2 pi i / n) from `table`, which holds w^t for t < n/2 in
-// float64 accuracy (computed on the host; GPU sin/cos are far too
-// inaccurate), so w^(t + n/2) = -w^t. INVERSE conjugates every twiddle.
+// with w = exp(-+2 pi i / n) from `table`, two levels computed on the host in
+// float64 (GPU sin/cos are far too inaccurate): w^e = lo[e mod 2^L] hi[e >> L]
+// with L = ceil(log2(n) / 2), lo = table[0, 2^L), hi = table[2^L, ...). (A
+// table of every w^t was up to n/2 entries, 64 MiB at n = 2^24 complex64,
+// read at scattered places; these two stay in cache.) INVERSE conjugates
+// every twiddle.
 //
 // A workgroup takes g consecutive groups (r g = BUDGET; with r = n, g rows):
 // it multiplies by the twiddles while loading them into shared memory (group
@@ -20,8 +23,12 @@
 // r-point DFTs as radix-4 Stockham stages (one butterfly per thread, in
 // place: each thread reads its four values, a barrier, then writes them),
 // with a last radix-2 stage when log2(r) is odd, and stores the results
-// (group fastest once ns >= g, else q fastest). Every size is a power of
-// two, so indices take shifts and masks (integer division is slow on GPUs).
+// (group fastest once ns >= g, else q fastest). A workgroup loops over
+// blocks of g groups (ngroups workgroups in all) and loads the next block's
+// values and twiddles into registers before it transforms the current one,
+// so that those loads are in flight meanwhile. The first pass (ns = 1) has
+// no twiddles. Every size is a power of two, so indices take shifts and
+// masks (integer division is slow on GPUs).
 // Shared memory: 8 KiB of complex64 or complex128 values plus up to 8 KiB of
 // roots, Vulkan's guaranteed 16 KiB.
 
@@ -56,11 +63,11 @@ struct Params
 groupshared T buf[BUDGET];
 groupshared T roots[RMAX];
 
-// w^e for e < n, from the half table.
+// w^e for e < n, from the two-level table.
 T twiddle(uint e)
 {
-    uint h = p.n / 2;
-    T w = e < h ? p.table[min(e, h - 1)] : -p.table[min(e - h, h - 1)];
+    uint ln = firstbithigh(p.n), L = (ln + 1) >> 1;
+    T w = cmul(p.table[e & ((1u << L) - 1)], p.table[(1u << L) + min(e >> L, (p.n >> L) - 1)]);
     return INVERSE != 0 ? cconj(w) : w;
 }
 
@@ -68,6 +75,22 @@ T twiddle(uint e)
 T times_w4(T z)
 {
     return INVERSE != 0 ? T(-z.y, z.x) : T(z.y, -z.x);
+}
+
+// Block w's values for this thread (group fastest while a row has g groups,
+// else, r = n, q fastest, so the loads are contiguous) and their twiddles.
+void load_block(uint t, uint w, uint r, uint g, uint lr, uint lg, uint lnr, uint lns, uint ln, uint lstep,
+                uint groups, bool load_q_fast, out T v[BUDGET / WG], out T tw[BUDGET / WG])
+{
+    [ForceUnroll]
+    for (uint s = 0; s < BUDGET / WG; s++)
+    {
+        uint e = t + s * WG;
+        uint q = load_q_fast ? e & (r - 1) : e >> lg, c = load_q_fast ? e >> lr : e & (g - 1);
+        uint G = min((w << lg) + c, groups - 1), j = G & ((1u << lnr) - 1);  // (a partial last block repeats the last group)
+        v[s] = p.in[((G >> lnr) << ln) + j + (q << lnr)];
+        tw[s] = p.ns == 1 ? T(S(1), S(0)) : twiddle(((j & (p.ns - 1)) * q) << lstep);  // (none in the first pass)
+    }
 }
 
 [shader("compute")]
@@ -84,21 +107,26 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     for (uint i = t; i < r; i += WG)
         roots[i] = twiddle(i << lnr);  // W_r^i
     bool load_q_fast = nr < g, store_q_fast = p.ns < g;
-    for (uint w = gid.x; w < blocks; w += p.ngroups)  // uniform per workgroup
+    // A workgroup takes blocks w, w + ngroups, ...: the next block's values
+    // and twiddles are loaded into registers before the current block's DFTs,
+    // so that its loads are in flight while they run (the twiddles are
+    // applied once they have arrived, when the values go to shared memory).
+    T nv[BUDGET / WG], nw[BUDGET / WG];
+    uint w = gid.x;
+    if (w < blocks)  // (uniform per workgroup)
+        load_block(t, w, r, g, lr, lg, lnr, lns, ln, lstep, groups, load_q_fast, nv, nw);
+    for (; w < blocks; w += p.ngroups)
     {
         [ForceUnroll]
         for (uint s = 0; s < BUDGET / WG; s++)
         {
-            // group fastest while a row has g groups, else (r = n) q fastest
             uint e = t + s * WG;
             uint q = load_q_fast ? e & (r - 1) : e >> lg, c = load_q_fast ? e >> lr : e & (g - 1);
-            uint G = min((w << lg) + c, groups - 1), j = G & (nr - 1);  // (a partial last block repeats the last group)
-            T v = p.in[((G >> lnr) << ln) + j + (q << lnr)];
-            if (q != 0)
-                v = cmul(v, twiddle(((j & (p.ns - 1)) * q) << lstep));
-            buf[(q << lg) + c] = v;  // column c, element q
+            buf[(q << lg) + c] = q != 0 && p.ns != 1 ? cmul(nv[s], nw[s]) : nv[s];  // column c, element q
         }
         GroupMemoryBarrierWithGroupSync();
+        if (w + p.ngroups < blocks)
+            load_block(t, w + p.ngroups, r, g, lr, lg, lnr, lns, ln, lstep, groups, load_q_fast, nv, nw);
         uint m = 1, lm = 0;
         for (; m * 4 <= r; m *= 4, lm += 2)
         {
