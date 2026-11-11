@@ -195,9 +195,10 @@ SCAN SUM 0
 SCAN PROD 1
 
 # shaders/fft.slang phases, rows.slang modes
-FFT STOCKHAM 0
 FFT HERMITIAN 1
 FFT LOCAL 2
+FFT R2C 3
+FFT C2R 4
 ROWS GATHER 0
 ROWS SCATTER 1
 

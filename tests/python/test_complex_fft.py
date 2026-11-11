@@ -88,6 +88,70 @@ def test_fftn_dims_and_norms(norm):
     check(got, r, **fft_tol(torch.complex128, 960))
 
 
+@pytest.mark.parametrize("dtype", COMPLEX)
+@pytest.mark.parametrize("n", [1 << 11, 1 << 12, 1 << 13, 1 << 15, 1 << 17, 3 << 11])
+def test_fft_radix_passes(dtype, n):
+    # rows longer than fft.slang's LOCAL_MAX: radix-r passes (fft_radix.slang),
+    # log2(n) odd and even (a last radix-2 stage or not), and Bluestein over them
+    x = make_complex((2, n), dtype, 3)
+    with on_gpu():
+        got = torch.fft.fft(x.to("vk"))
+        back = torch.fft.ifft(got)
+    check(got, torch.fft.fft(x), **fft_tol(dtype, n))
+    check(back, x, **fft_tol(dtype, n))
+
+
+@pytest.mark.parametrize("dtype", COMPLEX)
+@pytest.mark.parametrize("shape", [(1000, 2), (333, 16), (7, 5, 64), (129, 512), (3, 1024), (70000, 4)])
+def test_fft_short_rows(dtype, shape):
+    # rows up to fft_radix.slang's BUDGET: one radix-n pass, several rows per
+    # workgroup, a partial last block, and more blocks than workgroups
+    x = make_complex(shape, dtype, 7)
+    n = shape[-1]
+    with on_gpu():
+        got = torch.fft.fft(x.to("vk"))
+        back = torch.fft.ifft(got)
+        cols = torch.fft.fft(x.to("vk"), dim=0)
+    check(got, torch.fft.fft(x), **fft_tol(dtype, n))
+    check(back, x, **fft_tol(dtype, n))
+    check(cols, torch.fft.fft(x, dim=0), **fft_tol(dtype, shape[0] * 4))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("n", [2, 4, 6, 30, 2048, 1 << 13, 1 << 15 | 2, 5, 9])
+def test_real_transforms_half_length(dtype, n):
+    # even lengths: fft.slang's FFT_R2C / FFT_C2R around a half-length FFT
+    # (odd ones the full-length path); onesided and full spectra, an input at
+    # an odd storage offset, and irfft ignoring X[0]'s and X[n/2]'s imaginary
+    # parts as the CPU does
+    cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+    x = make((3, n + 1), dtype, 4)
+    spec_in = make_complex((3, n // 2 + 1), cdtype, 5)
+    v, s = x.to("vk"), spec_in.to("vk")
+    with on_gpu():
+        got = [torch.fft.rfft(v[:, 1:]), torch.fft.fft(v[:, 1:]), torch.fft.irfft(s, n=n),
+               torch.fft.hfft(s, n=n), torch.fft.ihfft(v[:, 1:])]
+    want = [torch.fft.rfft(x[:, 1:]), torch.fft.fft(x[:, 1:]), torch.fft.irfft(spec_in, n=n),
+            torch.fft.hfft(spec_in, n=n), torch.fft.ihfft(x[:, 1:])]
+    for g, w in zip(got, want):
+        check(g, w, **fft_tol(cdtype, n * 4))
+
+
+@pytest.mark.float64
+def test_real_transforms_nd():
+    # rfftn / irfftn over dims in any order: the last dim's half-length real
+    # transform, then the others' complex ones
+    r = make((6, 8, 10), torch.float64, 6)
+    v = r.to("vk")
+    with on_gpu():
+        got = [torch.fft.rfftn(v, dim=(0, 2)), torch.fft.rfftn(v, dim=(2, 0)), torch.fft.rfft2(v, norm="ortho"),
+               torch.fft.irfftn(torch.fft.rfftn(v, dim=(1, 2)), s=(8, 10), dim=(1, 2))]
+    want = [torch.fft.rfftn(r, dim=(0, 2)), torch.fft.rfftn(r, dim=(2, 0)), torch.fft.rfft2(r, norm="ortho"),
+            torch.fft.irfftn(torch.fft.rfftn(r, dim=(1, 2)), s=(8, 10), dim=(1, 2))]
+    for g, w in zip(got, want):
+        check(g, w, **fft_tol(torch.complex128, 480))
+
+
 @pytest.mark.float64
 def test_fft_large_float64_accuracy():
     x = make_complex((1 << 16,), torch.complex128)
