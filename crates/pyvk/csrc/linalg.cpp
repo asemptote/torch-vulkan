@@ -1,11 +1,13 @@
 // Matrix products for device "vk": mm, bmm, addmm, baddbmm, addmv, dot.
 //
-// All of them run shaders/gemm.slang on 3-D views [batch, rows, cols]:
-// operands are passed by strides, so transposed (e.g. from autograd) and
-// broadcast operands need no copies. float32 and float64; other dtypes and
-// shapes the kernel cannot address run on the CPU. Products with one output
-// column or one output row are matrix-vector products and run
-// shaders/gemv.slang instead.
+// All of them run a GEMM kernel on 3-D views [batch, rows, cols]: operands
+// are passed by strides, so transposed (e.g. from autograd) and broadcast
+// operands need no copies. float32 and float64 run shaders/gemmsg.slang
+// (register tiles and subgroup broadcasts) where the device can, gemm4.slang
+// on Arm GPUs, gemm.slang (shared-memory tiles, also the integer products)
+// otherwise; dtypes and shapes no kernel can address run on the CPU.
+// Products with one output column or one output row are matrix-vector
+// products and run shaders/gemv.slang.
 
 #include "vk.h"
 
@@ -45,20 +47,35 @@ static_assert(sizeof(GemvParams) == 96 && offsetof(GemvParams, m_sr) == 56 && of
 
 constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
 constexpr int64_t kGemvRows0 = 8, kGemvRows1 = 64;  // rows per workgroup in shaders/gemv.slang's modes
+constexpr int64_t kSgThreads = 128, kSgRows = 8;  // WG and MR in shaders/gemmsg.slang
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
 
-// Whether float32 and int32 products use shaders/gemm4.slang where they
-// can: on Arm GPUs (Mali), unless TORCH_VK_GEMM is "tiled" ("float4" forces
-// it).
-bool prefer_gemm4() {
-  static const bool prefer = [] {
+// TORCH_VK_GEMM: "tiled" (gemm.slang), "float4" (gemm4.slang where it can),
+// "subgroup" (gemmsg.slang where the device can run it), or unset.
+std::string gemm_choice() {
+  static const std::string choice = [] {
     const char* env = std::getenv("TORCH_VK_GEMM");
-    if (env != nullptr && std::string(env) == "tiled") return false;
-    if (env != nullptr && std::string(env) == "float4") return true;
-    return vkt_vendor_id() == 0x13B5;
+    return std::string(env != nullptr ? env : "");
   }();
+  return choice;
+}
+
+// Whether float32 and int32 products use shaders/gemm4.slang where they
+// can: on Arm GPUs (Mali) by default.
+bool prefer_gemm4() {
+  static const bool prefer = gemm_choice() == "float4" || (gemm_choice().empty() && vkt_vendor_id() == 0x13B5);
   return prefer;
+}
+
+// Lanes of shaders/gemmsg.slang for float32 or float64 products, 0 where it
+// is not used: it is the default wherever the device can run it (subgroup
+// size control, shuffles), except on Arm GPUs, which keep gemm4.
+uint32_t subgroup_lanes(at::ScalarType t) {
+  static const bool wanted = gemm_choice() == "subgroup" || (gemm_choice().empty() && vkt_vendor_id() != 0x13B5);
+  static const uint32_t f32 = wanted ? vkt_kernel_subgroup_size("gemmsg_f32") : 0;
+  static const uint32_t f64 = wanted && vkt_has_float64() ? vkt_kernel_subgroup_size("gemmsg_f64") : 0;
+  return t == at::kFloat ? f32 : t == at::kDouble ? f64 : 0;
 }
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
@@ -147,6 +164,38 @@ bool gemv(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   return true;
 }
 
+// gemm.slang's Params (gemm4.slang's and gemmsg.slang's too) for c = alpha
+// a @ b (+ beta cin): cin is read only when beta != 0 (p.cin = 0 otherwise).
+GemmParams gemm_params(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+                       double alpha, double beta) {
+  bool use_cin = cin != nullptr && beta != 0.0;
+  GemmParams p{};
+  p.a = gpu_address(a);
+  p.b = gpu_address(b);
+  p.c = gpu_address_out(c);
+  p.cin = use_cin ? gpu_address(*cin) : 0;
+  p.alpha = pack_param(alpha, c.scalar_type());
+  p.beta = pack_param(beta, c.scalar_type());
+  p.m = static_cast<uint32_t>(c.size(1));
+  p.n = static_cast<uint32_t>(c.size(2));
+  p.k = static_cast<uint32_t>(a.size(2));
+  p.a_sb = static_cast<int32_t>(a.stride(0));
+  p.a_sm = static_cast<int32_t>(a.stride(1));
+  p.a_sk = static_cast<int32_t>(a.stride(2));
+  p.b_sb = static_cast<int32_t>(b.stride(0));
+  p.b_sk = static_cast<int32_t>(b.stride(1));
+  p.b_sn = static_cast<int32_t>(b.stride(2));
+  p.c_sb = static_cast<int32_t>(c.stride(0));
+  p.c_sm = static_cast<int32_t>(c.stride(1));
+  p.c_sn = static_cast<int32_t>(c.stride(2));
+  if (use_cin) {
+    p.cin_sb = static_cast<int32_t>(cin->stride(0));
+    p.cin_sm = static_cast<int32_t>(cin->stride(1));
+    p.cin_sn = static_cast<int32_t>(cin->stride(2));
+  }
+  return p;
+}
+
 // c = alpha * a @ b (+ beta * cin), all 3-D views: a [B, M, K], b [B, K, N],
 // c and cin [B, M, N] (cin may broadcast through zero strides). Returns false
 // if the kernel cannot handle the case.
@@ -172,6 +221,18 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   if ((n == 1 || m == 1) && gemv(a, b, c, cin, alpha, beta)) {
     return true;
   }
+  if (uint32_t lanes = subgroup_lanes(c.scalar_type()); lanes != 0) {
+    // (WG / S) MR x S NR tiles; NR = 4, or 2 for float64 with 32 lanes
+    int64_t nr = c.scalar_type() == at::kDouble && lanes == 32 ? 2 : 4;
+    int64_t tile_m = kSgThreads / lanes * kSgRows, tile_n = lanes * nr;
+    int64_t sx = (n + tile_n - 1) / tile_n, sy = (m + tile_m - 1) / tile_m;
+    if (sx <= kMaxGroups && sy <= kMaxGroups) {
+      GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
+      dispatch(std::string("gemmsg_") + dtype_label(c.scalar_type()), {p.cin != 0 ? 1u : 0u}, p,
+               static_cast<uint32_t>(sx), static_cast<uint32_t>(sy), static_cast<uint32_t>(batch));
+      return true;
+    }
+  }
   bool gemm4_type = c.scalar_type() == at::kFloat || c.scalar_type() == at::kInt;
   if (gemm4_type && prefer_gemm4() && !gemm4_layout(a, b, n, k)) {
     // Another layout (as x @ W.t()'s column-major W.t()), or K or N not
@@ -187,31 +248,8 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
       if (gemm4_layout(a2, b2, n, k4)) return gemm(a2, b2, c, cin, alpha, beta);
     }
   }
-  bool use_cin = cin != nullptr && beta != 0.0;
-  GemmParams p{};
-  p.a = gpu_address(a);
-  p.b = gpu_address(b);
-  p.c = gpu_address_out(c);
-  p.cin = use_cin ? gpu_address(*cin) : 0;
-  p.alpha = pack_param(alpha, c.scalar_type());
-  p.beta = pack_param(beta, c.scalar_type());
-  p.m = static_cast<uint32_t>(m);
-  p.n = static_cast<uint32_t>(n);
-  p.k = static_cast<uint32_t>(k);
-  p.a_sb = static_cast<int32_t>(a.stride(0));
-  p.a_sm = static_cast<int32_t>(a.stride(1));
-  p.a_sk = static_cast<int32_t>(a.stride(2));
-  p.b_sb = static_cast<int32_t>(b.stride(0));
-  p.b_sk = static_cast<int32_t>(b.stride(1));
-  p.b_sn = static_cast<int32_t>(b.stride(2));
-  p.c_sb = static_cast<int32_t>(c.stride(0));
-  p.c_sm = static_cast<int32_t>(c.stride(1));
-  p.c_sn = static_cast<int32_t>(c.stride(2));
-  if (use_cin) {
-    p.cin_sb = static_cast<int32_t>(cin->stride(0));
-    p.cin_sm = static_cast<int32_t>(cin->stride(1));
-    p.cin_sn = static_cast<int32_t>(cin->stride(2));
-  }
+  GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
+  bool use_cin = p.cin != 0;
   if (gemm4_type && prefer_gemm4() && gemm4_layout(a, b, n, k) && (m + kTile4M - 1) / kTile4M <= kMaxGroups) {
     dispatch(std::string("gemm4_") + dtype_label(c.scalar_type()), {use_cin ? 1u : 0u}, p, static_cast<uint32_t>((n + kTile4N - 1) / kTile4N),
              static_cast<uint32_t>((m + kTile4M - 1) / kTile4M), static_cast<uint32_t>(batch));

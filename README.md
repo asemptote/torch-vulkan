@@ -207,18 +207,19 @@ interface) and `Tensor.vk()`; `torch.manual_seed` seeds the GPU generator.
 | `TORCH_VK_STRICT=1` | Raise instead of running an op on the CPU. |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted, and the tests fail on any. |
 | `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU, as a reference for testing and comparison. |
-| `TORCH_VK_GEMM=tiled` or `float4` | Choose the matrix-multiply kernel (`float4` is the default on Arm GPUs, `tiled` elsewhere). |
+| `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | Choose the matrix-multiply kernel (`float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere). |
+| `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size of the `subgroup` kernels (by default 16 for float32 and 8 for float64), within the device's range. |
 | `TORCH_VK_API=1.1` | Use the Vulkan 1.1 code path on a newer driver. |
-| `TORCH_VK_DISABLE=int64,float64,int16,float16,int8,storage16,storage8,denorm` | Hide device features, to test a small GPU's code paths on a bigger one. |
+| `TORCH_VK_DISABLE=int64,float64,int16,float16,int8,storage16,storage8,denorm,subgroups` | Hide device features, to test a small GPU's code paths on a bigger one. |
 | `TORCH_VK_CACHE_DIR` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, or `$XDG_CACHE_HOME/torch-vulkan`, or `~/.cache/torch-vulkan`). |
 
 ## Limitations
 
 - **Performance is not the focus yet.** Kernels favour correctness and
-  portability. On the Intel UHD 620, matrix products reach about 20% of the
-  GPU's float32 peak and are slower than MKL on the CPU; per-op overhead is
-  about 9 µs, close to the CPU's. Faster GEMM (subgroup and
-  cooperative-matrix kernels) and FFT kernels are future work.
+  portability. On the Intel UHD 620, float32 matrix products reach about
+  35% of the GPU's peak (about 148 GFLOP/s at 2048^3, ahead of MKL on the
+  CPU) and float64 about 30 GFLOP/s; per-op overhead is about 9 µs, close to
+  the CPU's. Cooperative-matrix GEMM and faster FFT kernels are future work.
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.

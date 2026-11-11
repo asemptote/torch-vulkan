@@ -145,6 +145,19 @@ pub extern "C" fn vkt_vendor_id() -> u32 {
     runtime().map(|rt| rt.ctx.vendor_id).unwrap_or(0)
 }
 
+/// The subgroup size kernel `name` runs with (vkcore's SUBGROUP_KERNELS,
+/// e.g. "gemmsg_f32"): 0 for other kernels, and where the device cannot run it.
+///
+/// # Safety
+///
+/// `name` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn vkt_kernel_subgroup_size(name: *const c_char) -> u32 {
+    let Ok(rt) = runtime() else { return 0 };
+    let Ok(name) = CStr::from_ptr(name).to_str() else { return 0 };
+    vkcore::kernel_subgroup_size(&rt.ctx.caps, name)
+}
+
 /// Optional device features as bits (csrc/vk.h `Feature`): 1 float64,
 /// 2 int16 (with 16-bit storage), 4 float16 (with 16-bit storage), 8 int8
 /// (with 8-bit storage).

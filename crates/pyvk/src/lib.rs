@@ -66,6 +66,13 @@ fn capabilities() -> u32 {
     ffi::vkt_capabilities()
 }
 
+/// The subgroup size kernel `name` runs with (e.g. "gemmsg_f32"): 0 for
+/// kernels not written for subgroups and where the device cannot run it.
+#[pyfunction]
+fn kernel_subgroup_size(name: &str) -> u32 {
+    runtime().map(|rt| vkcore::kernel_subgroup_size(&rt.ctx.caps, name)).unwrap_or(0)
+}
+
 /// Seeds the default random generator (offset back to 0).
 #[pyfunction]
 fn manual_seed(seed: u64) {
@@ -178,6 +185,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dispatch_count, m)?)?;
     m.add_function(wrap_pyfunction!(record_fallback, m)?)?;
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel_subgroup_size, m)?)?;
     m.add_function(wrap_pyfunction!(manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(seed, m)?)?;

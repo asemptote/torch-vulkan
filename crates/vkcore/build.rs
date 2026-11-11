@@ -55,7 +55,7 @@ const SLANGC_FLAGS: &[&str] = &[
 /// (x - k c1) - k c2 into x - k (c1 + c2), and error-free transformations
 /// into nothing). Matrix products keep the default: their inner loops want
 /// fused multiply-adds, which only make them more accurate.
-const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemv"];
+const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemmsg", "gemv"];
 
 fn slangc() -> PathBuf {
     if let Ok(p) = env::var("SLANGC") {
