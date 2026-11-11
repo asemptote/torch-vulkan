@@ -25,7 +25,6 @@
 
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
-#include <cstdio>
 
 #include <algorithm>
 #include <cmath>
@@ -710,6 +709,167 @@ bool tridiag_eigh(const at::Tensor& a3, bool want_vectors, at::Tensor& values, a
   return true;
 }
 
+// Eigenvalues (ascending) and eigenvectors (columns, real) of B real
+// symmetric tridiagonals d, e [B, n] (e[n - 1] = 0; both overwritten):
+// divide and conquer from kStedcMin up, QL below. False if QL did not converge.
+bool tridiagonal_eigen(at::Tensor d, at::Tensor e, int64_t B, int64_t n, at::Tensor& values, at::Tensor& vectors) {
+  if (n >= kStedcMin) {
+    return stedc(d, e, B, n, values, vectors);
+  }
+  at::Tensor zt;
+  if (!ql_tridiagonal(d, e, B, n, &zt, d.scalar_type())) {
+    return false;
+  }
+  auto [sorted, order] = at::sort(d, /*stable=*/true, 1, false);
+  values = sorted;
+  vectors = at::gather(zt.transpose(1, 2), 2, order.unsqueeze(1).expand({B, n, n}));
+  return true;
+}
+
+struct BidiagParams {
+  uint64_t a, tau, beta;
+  uint32_t sa, start, len, stride, k, ntau;
+};
+static_assert(sizeof(BidiagParams) == 48, "must match shaders/bidiag.slang");
+
+// Q of a QR of q3 [B, n, n] (Householder), its columns' phases matched to q3's:
+// q3's columns made orthonormal, in order, with an orthonormal completion
+// where they are (numerically) dependent.
+at::Tensor orthonormalize(const at::Tensor& q3) {
+  int64_t n = q3.size(2);
+  at::Tensor qr = q3.contiguous().clone();
+  at::Tensor tau = geqrf_inplace(qr);
+  at::Tensor q = form_q(qr, tau, n);
+  at::Tensor r = qr.diagonal(0, 1, 2);  // [B, n]
+  at::Tensor mag = at::abs(r);
+  at::Tensor phase = at::where(mag > 0, r / mag.to(r.scalar_type()), at::ones_like(r));
+  return q * phase.unsqueeze(1);
+}
+
+// x3 [B, n, n] (columns nearly orthonormal) made orthonormal with the least
+// change: its polar factor, by Newton-Schulz iterations X <- X (3 I - X^H X) / 2
+// (two GEMMs each; the error squares each time). Columns too far from
+// orthonormal for that (|X^H X - I| > 1/2: dependent ones, where singular
+// values at 0 leave them in any mix) take orthonormalize()'s QR instead.
+at::Tensor polar_orthonormalize(const at::Tensor& x3) {
+  int64_t n = x3.size(2);
+  double eps = epsilon(x3.scalar_type());
+  at::Tensor x = x3.contiguous();
+  at::Tensor eye = at::eye(n, x.options());
+  for (int it = 0; it < 8; ++it) {
+    at::Tensor e = at::bmm(adj(x), x) - eye;
+    double d = at::abs(e).amax().item<double>();
+    if (d <= 64 * eps) {
+      break;
+    }
+    if (d > 0.5) {
+      return orthonormalize(x3);
+    }
+    x = x - 0.5 * at::bmm(x, e);
+  }
+  return x;
+}
+
+constexpr int64_t kSvdBidiagMin = 32;  // the bidiagonal route from this many columns up (Jacobi below)
+
+// SVD of a3 [B, m, n], m >= n (overwritten) as LAPACK's gesdd does it, on the
+// GPU: Householder reduction to a real upper bidiagonal B = Q^H A P (zgebd2:
+// a column reflector, then a row reflector per step; each reflector by
+// shaders/bidiag.slang, the updates as matrix-vector products and rank-one
+// updates), B's SVD through the eigendecomposition of its Golub-Kahan
+// tridiagonal (zero diagonal, off-diagonal d_1, e_1, d_2, ..., d_n; its
+// eigenvalues are +-sigma, an eigenvector of sigma interleaves v and u:
+// (v_1, u_1, v_2, u_2, ...) / sqrt 2) by divide and conquer (stedc), then U =
+// Q U_B and V = P V_B (apply_q). U_B's and V_B's halves of the eigenvectors
+// are made orthonormal by a QR, which also completes them where singular
+// values near 0 leave the +-sigma pairs mixed. Returns (sigma descending
+// [B, n], U [B, m, ucols], V [B, n, n]) (ucols = m with full matrices, n
+// otherwise); false (with nothing returned) if the eigensolver failed.
+bool bidiag_svd(const at::Tensor& a3, bool full, at::Tensor& sigma, at::Tensor& u, at::Tensor& v) {
+  int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2);
+  at::ScalarType t = a3.scalar_type();
+  at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
+  bool complex = at::isComplexType(t);
+  at::Tensor tauq = at::zeros({B, n}, a3.options()), taup = at::zeros({B, n}, a3.options());
+  at::Tensor d = at::zeros({B, n}, real), e = at::zeros({B, n}, real);
+  int64_t ld = a3.stride(1), sa = a3.stride(0);
+  auto reflect = [&](const at::Tensor& tau, const at::Tensor& beta, int64_t start, int64_t len, int64_t stride,
+                     int64_t k) {
+    BidiagParams p{};
+    p.a = gpu_address(a3);
+    p.tau = gpu_address(tau);
+    p.beta = gpu_address(beta);
+    p.sa = static_cast<uint32_t>(sa);
+    p.start = static_cast<uint32_t>(start);
+    p.len = static_cast<uint32_t>(len);
+    p.stride = static_cast<uint32_t>(stride);
+    p.k = static_cast<uint32_t>(k);
+    p.ntau = static_cast<uint32_t>(n);
+    dispatch(std::string("bidiag_") + dtype_label(t), {}, p, static_cast<uint32_t>(B));
+  };
+  for (int64_t k = 0; k < n; ++k) {
+    // H_k: column k from the diagonal down; A[k:, k+1:] <- H_k^H A[k:, k+1:]
+    reflect(tauq, d, k * ld + k, m - k, ld, k);
+    if (k + 1 < n) {
+      at::Tensor v = a3.narrow(1, k, m - k).narrow(2, k, 1);
+      at::Tensor c = a3.narrow(1, k, m - k).narrow(2, k + 1, n - k - 1);
+      at::Tensor w = at::bmm(adj(c), v);  // C^H v
+      at::Tensor tk = tauq.narrow(1, k, 1).unsqueeze(2);  // [B, 1, 1]
+      c.baddbmm_(v, adj(w) * at::conj(tk), 1.0, -1.0);
+      // G_k: row k right of the diagonal (conjugated, as zgebd2's zlacgv);
+      // A[k+1:, k+1:] <- A[k+1:, k+1:] G_k
+      at::Tensor row = a3.narrow(1, k, 1).narrow(2, k + 1, n - k - 1);
+      if (complex) row.copy_(at::conj_physical(row));
+      reflect(taup, e, k * ld + k + 1, n - k - 1, 1, k);
+      if (k + 1 < m) {
+        at::Tensor uk = row;  // [B, 1, n - k - 1]
+        at::Tensor dmat = a3.narrow(1, k + 1, m - k - 1).narrow(2, k + 1, n - k - 1);
+        at::Tensor wr = at::bmm(dmat, uk.transpose(1, 2));  // D u
+        at::Tensor tp = taup.narrow(1, k, 1).unsqueeze(2);
+        dmat.baddbmm_(wr * tp, at::conj(uk), 1.0, -1.0);
+      }
+      if (complex) row.copy_(at::conj_physical(row));
+    }
+  }
+  // B's SVD from its Golub-Kahan tridiagonal (size 2n)
+  at::Tensor tgk_d = at::zeros({B, 2 * n}, real), tgk_e = at::zeros({B, 2 * n}, real);
+  tgk_e.view({B, n, 2}).select(2, 0).copy_(d);
+  if (n > 1) tgk_e.view({B, n, 2}).select(2, 1).narrow(1, 0, n - 1).copy_(e.narrow(1, 0, n - 1));
+  at::Tensor lam, z;
+  if (!tridiagonal_eigen(tgk_d, tgk_e, B, 2 * n, lam, z)) {
+    return false;
+  }
+  // the n largest eigenvalues, descending
+  at::Tensor top = lam.narrow(1, n, n).flip({1});
+  sigma = at::clamp_min(top, 0);
+  at::Tensor x = z.narrow(2, n, n).flip({2});  // [B, 2n, n]
+  at::Tensor xv = x.view({B, n, 2, n});
+  // An eigenvector's halves are v / sqrt 2 and u / sqrt 2 while sigma is
+  // clear of the other singular values' -sigma (mixing with its own -sigma
+  // only rescales them). Small singular values close to others' negatives mix
+  // the halves of several (by eps |B| / (sigma_i + sigma_j)), and at 0 they
+  // are any mix of v's and u's directions: the halves' polar factor (or QR
+  // for dependent ones) makes them orthonormal again, at the cost of a few
+  // GEMMs (QR, a second at n = 1024 on an H100, only when needed).
+  double r2 = std::sqrt(2.0);
+  at::Tensor vb = polar_orthonormalize(xv.select(2, 0) * r2).to(t);
+  at::Tensor ub = polar_orthonormalize(xv.select(2, 1) * r2).to(t);
+  int64_t ucols = full ? m : n;
+  u = at::zeros({B, m, ucols}, a3.options());
+  u.narrow(1, 0, n).narrow(2, 0, n).copy_(ub);
+  if (full && m > n) u.narrow(1, n, m - n).narrow(2, n, m - n).diagonal(0, 1, 2).fill_(1);
+  apply_q(a3, tauq, u, /*left=*/true, /*transpose=*/false);
+  v = vb.contiguous();
+  if (n > 1) {
+    // P = G_0 ... G_{n-2}: G_k's u is the conjugate of row k right of the
+    // diagonal, a column of A^H below its first subdiagonal
+    at::Tensor pr = adj(a3).narrow(1, 1, n - 1).narrow(2, 0, n - 1).contiguous();
+    at::Tensor vrows = v.narrow(1, 1, n - 1);
+    apply_q(pr, taup.narrow(1, 0, n - 1), vrows, /*left=*/true, /*transpose=*/false);
+  }
+  return true;
+}
+
 // One-sided Jacobi SVD of a3 [B, m, n], m >= n (overwritten):
 // (singular values descending [B, n], W = U S unnormalized [B, m, n], V [B, n, n]).
 std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(const at::Tensor& a3_in) {
@@ -1351,15 +1511,27 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
   bool wide = m < n;  // work with A^H (tall): A = U S V^H  <=>  A^H = V S U^H
   at::Tensor a3 = batched(wide ? adj(a) : a);
   int64_t tm = a3.size(1), tn = a3.size(2);  // tm >= tn = k
-  auto [sigma, w, v] = jacobi_svd(a3);
   auto bs = batch_shape(a);
+  at::Tensor sigma, left, v;
+  bool done = false;
+  if (tn >= kSvdBidiagMin && std::getenv("TORCH_VK_SVD_JACOBI") == nullptr) {
+    // (a3 is a fresh copy: batched() of a view, or of adj(a), copies)
+    at::Tensor work = a3.contiguous().clone();
+    done = bidiag_svd(work, compute_uv && full_matrices, sigma, left, v);
+  }
+  if (!done) {
+    at::Tensor w;
+    std::tie(sigma, w, v) = jacobi_svd(a3);
+    if (compute_uv) {
+      left = left_vectors(w, sigma, full_matrices ? tm : tn);  // [B, tm, tm or k]
+    }
+  }
   assign(S, sigma.view(with_tail(bs, {k})));
   if (!compute_uv) {
     at::native::resize_output(U, {0});
     at::native::resize_output(Vh, {0});
     return {U, S, Vh};
   }
-  at::Tensor left = left_vectors(w, sigma, full_matrices ? tm : tn);  // [B, tm, tm or k]
   // For the tall problem: U_t = left, V_t = v (tn x tn).
   at::Tensor u_out = wide ? v : left;
   at::Tensor v_out = wide ? left : v;
