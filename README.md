@@ -77,7 +77,7 @@ in PyTorch's own tests**: across 36 of PyTorch's device-generic test files
 `test_autograd.py`, `test_optim.py`, `test_sparse.py`, `test_nestedtensor.py`
 and others; about 160,000 tests each on lavapipe and an NVIDIA GPU, run by
 `tools/pytorch_tests.py` with every CPU call recorded), no op computes on the
-CPU or calls it to raise an error. <!-- FINAL: confirm with #7's rerun --> Every remaining failure also fails on
+CPU or calls it to raise an error. Every remaining failure also fails on
 the CPU or has a written reason in that script's `EXPECTED` table. In the
 OpInfo sweep (`tools/opinfo_coverage.py --strict`, PyTorch's sample inputs for
 every op compared against the CPU) every op runs on the GPU and matches the
