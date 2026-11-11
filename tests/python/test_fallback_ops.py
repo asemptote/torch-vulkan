@@ -446,3 +446,12 @@ def test_out_on_another_device_raises_without_cpu():
         with pytest.raises(RuntimeError, match="same device"):
             f()
         assert torch_vulkan.fallback_counts() == before
+
+
+def test_where_keeps_operand_layout():
+    # (as TensorIterator: a fresh output in the first full-shape operand's dim
+    # order; compiled graphs view it with the strides FakeTensor predicted)
+    x = make((2, 3, 4), torch.float32).transpose(0, 1)
+    y = make((4,), torch.float32, seed=1)
+    for f in (lambda a, b: torch.where(a > 0, a, b), lambda a, b: torch.where(a > 0, a, 0.0)):
+        assert f(x.to("vk"), y.to("vk")).stride() == f(x, y).stride()

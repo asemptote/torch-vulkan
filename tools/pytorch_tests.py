@@ -245,6 +245,12 @@ FAILING = ("failed", "crashed", "xpassed", "validation")
 # pattern, reason); counted as "expected", not as failures. Every entry needs
 # a reason a reader can check.
 EXPECTED = [
+    (r"test_modules\.py::.*::test_cpu_gpu_parity_nn_(CrossEntropyLoss_vk_float16|LinearCrossEntropyLoss_vk_bfloat16)$", r"",
+     "an expected failure on CUDA and XPU as well (the ModuleInfo marks it so for those devices only): accelerators "
+     "compute the 16-bit loss in float32 and round once, the CPU in steps"),
+    (r"test_modules\.py::.*::test_cpu_gpu_parity_nn_ConvTranspose[123]d_vk_complex32$", r"",
+     "an expected failure on CUDA as well (the ModuleInfo marks it so for CUDA only: complex32 transposed "
+     "convolution is not implemented on the CPU, which the parity test compares against)"),
     (r"^test_spectral_ops\.py::.*_vk_float16$", r"Unsupported dtype Half",
      "PyTorch's torch.fft functions take float16 only on CUDA, XPU and meta devices (promote_type_fft) and raise "
      "the CPU's error elsewhere, before any kernel; complex32 transforms run on vk"),
