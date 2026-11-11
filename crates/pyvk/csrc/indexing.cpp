@@ -966,6 +966,12 @@ at::Tensor& index_reduce_out(const at::Tensor& self, int64_t dim, const at::Tens
               "index_reduce(): Expected reduce to be one of prod, mean, amax or amin but got ", reduce, ".");
   reject_dtype("index_reduce", self.scalar_type(), self.scalar_type() == at::kBool);
   if (copy_self_if_no_index(self, source, out)) return out;
+  if (reduce == "prod" && at::isComplexType(self.scalar_type()) && self.dim() == 0 && is_vk(self)) {
+    // (0-d complex: the CPU's kernels raise, its exclude-self initialisation first)
+    TORCH_CHECK_NOT_IMPLEMENTED(include_self, "\"index_reduce_func_exclude_input_init\" not implemented for '",
+                                self.scalar_type(), "'");
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "\"index_func_\" not implemented for '", self.scalar_type(), "'");
+  }
   if (reduce == "prod" && at::isComplexType(self.scalar_type()) && index.dim() <= 1 && source.dim() == self.dim() &&
       source.dim() > 0 && is_vk(index)) {
     // (as a scatter: index along dim, expanded to source's shape; the CPU's

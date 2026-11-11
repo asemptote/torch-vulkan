@@ -75,9 +75,15 @@ std::tuple<at::Tensor, at::Tensor> nll_loss_forward(const at::Tensor& self, cons
                                                     const std::optional<at::Tensor>& weight, int64_t reduction,
                                                     int64_t ignore_index) {
   if (!kernel_ok(self, target, weight)) {
-    if (is_vk(self) && self.dim() >= 1 && self.dim() <= 2 && target.dim() <= 1) {
+    if (is_vk(self)) {
+      // (the CPU's checks, in its order: shapes, weight, target dtype)
+      check_shapes(self, target, true);
+      int64_t classes = self.size(-1);
+      const at::Tensor w = weight.has_value() ? *weight : at::Tensor();
+      TORCH_CHECK(!w.defined() || (w.dim() == 1 && w.numel() == classes), "weight tensor should be defined either for all ",
+                  classes, " classes or no classes but got weight tensor of shape: ", w.defined() ? w.sizes() : at::IntArrayRef{});
       TORCH_CHECK(target.scalar_type() == at::kLong || target.scalar_type() == at::kByte,
-                  "expected target dtype to be Long or Byte, but got ", target.scalar_type());  // (the CPU's check)
+                  "expected target dtype to be Long or Byte, but got ", target.scalar_type());
     }
     auto s = on_cpu("aten::nll_loss_forward", "", self, target, weight, reduction, ignore_index);
     return {s[0].toTensor(), s[1].toTensor()};

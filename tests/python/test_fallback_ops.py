@@ -651,6 +651,11 @@ ERROR_CASES = {
     "min_empty": lambda d: torch.min(torch.empty(0, dtype=torch.long, device=d)),
     "slow_conv3d_weight": lambda d: torch.ops.aten.slow_conv3d_forward(
         torch.empty(1, 1, 1, 0, device=d), torch.empty(1, 0, 1, device=d), [1, 1, 1], None, [1, 1, 1], [0, 0, 0]),
+    "nll_half_weight_shape": lambda d: torch.ops.aten.nll_loss_forward(
+        torch.randn(2, 3, device=d).half(), torch.tensor([0, 1], device=d), torch.ones(2, device=d).half(), 1, -100),
+    "index_reduce_0d_complex": lambda d: torch.index_reduce(torch.tensor(1 + 1j, device=d), 0,
+                                                            torch.tensor([0], device=d), torch.tensor(2 + 0j, device=d),
+                                                            "prod"),
     "linear_combination_empty": lambda d: torch.ops.aten._compute_linear_combination(torch.ones((), device=d),
                                                                                      torch.ones(2, 2, device=d)),
 }
