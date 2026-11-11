@@ -40,7 +40,7 @@
 // Work arrays (per merge g, offsets in units of G m): rw (real): z, dlam,
 // tau, zhat, vals, then the rotations' (c, s) (2 G m), then rho [G]; iw
 // (int): col, org, the rotations' column pairs (2 G m), then info [4 G]
-// (k, number of rotations).
+// (k, number of rotations, whether a rotation mixed the two halves).
 
 #include "opcodes.slang"
 
@@ -168,7 +168,7 @@ void prep(uint t, uint g)
         zmax = max(zmax, abs(p.rw[RTAU(g, pick)]));
     }
     R tol = R(8) * EPS * max(dmax, zmax);
-    uint k = 0, ndef = 0, nrot = 0;
+    uint k = 0, ndef = 0, nrot = 0, cross = 0;
     int pj = -1;
     for (uint o = 0; o < m; o++)
     {
@@ -202,6 +202,8 @@ void prep(uint t, uint g)
             p.rw[RCS(g, nrot)] = c;
             p.rw[RCS(g, nrot) + 1] = s;
             nrot++;
+            if ((i < h) != (j < h))
+                cross = 1;  // (QM no longer block diagonal)
             R di = p.rw[RVALS(g, i)], dj = p.rw[RVALS(g, j)];
             p.rw[RVALS(g, i)] = di * c * c + dj * s * s;
             p.rw[RVALS(g, j)] = di * s * s + dj * c * c;
@@ -228,6 +230,7 @@ void prep(uint t, uint g)
     }
     p.iw[IINFO(g)] = int(k);
     p.iw[IINFO(g) + 1] = int(nrot);
+    p.iw[IINFO(g) + 2] = int(cross);
 }
 
 void rot(uint r, uint g)
@@ -247,139 +250,202 @@ void rot(uint r, uint g)
     }
 }
 
-// Root j of the secular equation: origin pole o, offset tau.
-void secular(uint j, uint g)
+// Roots j of the secular equation: SEC_LANES lanes per root sum the poles'
+// terms (dlam_i, z_i) between them, added up in shared memory, and the
+// root's first lane updates it; a workgroup's SEC_ROOTS roots iterate
+// together until all have converged. (A thread per root summed k terms one
+// after another each iteration: latency-bound, and too few threads to fill
+// a large GPU.) Per root: origin pole o and offset tau.
+#define SEC_LANES 32
+#define SEC_ROOTS (WG / SEC_LANES)
+groupshared R sec_sum[5][WG];
+groupshared R sec_tau[SEC_ROOTS];
+groupshared R sec_dorg[SEC_ROOTS];
+groupshared uint sec_done[SEC_ROOTS];
+groupshared uint sec_any;
+
+void secular(uint t, uint gx, uint g)
 {
     uint k = uint(p.iw[IINFO(g)]);
-    if (j >= k)
-        return;
+    uint r = t / SEC_LANES, lane = t % SEC_LANES;
+    uint j = gx * SEC_ROOTS + r;
+    if (gx * SEC_ROOTS >= k)
+        return;  // (uniform: the whole workgroup)
+    bool mine = j < k;
+    uint jj = min(j, k - 1);
     R rho = p.rw[RRHO(g)];
     R rhoinv = R(1) / rho;
-    R dj = p.rw[RDLAM(g, j)];
-    uint o;
-    R lo, hi;
-    if (j + 1 == k)
+    R dj = p.rw[RDLAM(g, jj)];
+    bool last = jj + 1 == k;
+    R gap = last ? R(0) : p.rw[RDLAM(g, jj + 1)] - dj;
+    R mid = gap * R(0.5);
+    // (the root's state, kept by its first lane)
+    uint o = jj;
+    R lo = R(0), hi = R(0);
+    bool choosing = true;
+    if (lane == 0)
     {
-        // the largest root: in (dlam_j, dlam_j + rho |z|^2]
-        R zz = R(0);
-        for (uint i = 0; i < k; i++)
-            zz += p.rw[RZ(g, i)] * p.rw[RZ(g, i)];
-        o = j;
-        lo = R(0);
-        hi = rho * zz * (R(1) + R(4) * EPS);
+        sec_tau[r] = last ? R(0) : mid;  // pass 0 picks the origin
+        sec_dorg[r] = dj;
+        sec_done[r] = mine ? 0u : 1u;
     }
-    else
+    GroupMemoryBarrierWithGroupSync();
+    for (uint it = 0; it < 101; it++)
     {
-        R gap = p.rw[RDLAM(g, j + 1)] - dj;
-        R mid = gap * R(0.5);
-        R f = rhoinv;
-        for (uint i = 0; i < k; i++)
+        R tau = sec_tau[r], dorg = sec_dorg[r];
+        bool done = sec_done[r] != 0u;
+        R psi = R(0), dpsi = R(0), phi = R(0), dphi = R(0), zz = R(0);
+        if (!done)
         {
-            R zi = p.rw[RZ(g, i)];
-            f += zi * zi / ((p.rw[RDLAM(g, i)] - dj) - mid);
-        }
-        if (f >= R(0))
-        {
-            o = j;
-            lo = R(0);
-            hi = mid;
-        }
-        else
-        {
-            o = j + 1;
-            lo = -(gap - mid);
-            hi = R(0);
-        }
-    }
-    R dorg = p.rw[RDLAM(g, o)];
-    R tau = (lo + hi) * R(0.5);
-    for (uint it = 0; it < 100; it++)
-    {
-        // psi: the poles at or below dlam_j, phi: those above (and derivatives)
-        R psi = R(0), dpsi = R(0), phi = R(0), dphi = R(0);
-        for (uint i = 0; i < k; i++)
-        {
-            R zi = p.rw[RZ(g, i)];
-            R del = (p.rw[RDLAM(g, i)] - dorg) - tau;
-            R tmp = zi / del;
-            if (i <= j)
+            for (uint i = lane; i < k; i += SEC_LANES)
             {
-                psi += zi * tmp;
-                dpsi += tmp * tmp;
-            }
-            else
-            {
-                phi += zi * tmp;
-                dphi += tmp * tmp;
-            }
-        }
-        R f = rhoinv + psi + phi;
-        if (f == R(0))
-            break;
-        if (f < R(0))
-            lo = tau;
-        else
-            hi = tau;
-        R d1 = (dj - dorg) - tau;  // dlam_j - lambda (< 0)
-        R eta;
-        bool ok = true;
-        if (j + 1 == k)
-        {
-            // one pole: c + b1 / (d1 - eta) = 0
-            R c = f - d1 * dpsi;
-            R b1 = d1 * d1 * dpsi;
-            if (c == R(0))
-                ok = false;
-            else
-                eta = d1 + b1 / c;
-        }
-        else
-        {
-            R d2 = (p.rw[RDLAM(g, j + 1)] - dorg) - tau;  // > 0
-            R b1 = d1 * d1 * dpsi, b2 = d2 * d2 * dphi;
-            R c = f - d1 * dpsi - d2 * dphi;
-            R bq = c * (d1 + d2) + b1 + b2;
-            R cq = c * d1 * d2 + b1 * d2 + b2 * d1;
-            if (c == R(0))
-            {
-                if (b1 + b2 == R(0))
-                    ok = false;
-                else
-                    eta = cq / bq;
-            }
-            else
-            {
-                R disc = bq * bq - R(4) * c * cq;
-                if (disc < R(0))
-                    ok = false;
+                R zi = p.rw[RZ(g, i)];
+                R del = (p.rw[RDLAM(g, i)] - dorg) - tau;
+                R tmp = zi / del;
+                zz += zi * zi;
+                if (i <= jj)
+                {
+                    psi += zi * tmp;
+                    dpsi += tmp * tmp;
+                }
                 else
                 {
-                    R sq = sqrt(disc);
-                    // the two roots, stably; the one between the poles (d1, d2)
-                    R r1 = bq >= R(0) ? (bq + sq) / (R(2) * c) : (R(2) * cq) / (bq - sq);
-                    R r2 = bq >= R(0) ? (R(2) * cq) / (bq + sq) : (bq - sq) / (R(2) * c);
-                    bool in1 = r1 > d1 && r1 < d2, in2 = r2 > d1 && r2 < d2;
-                    if (in1 && in2)
-                        eta = abs(r1) < abs(r2) ? r1 : r2;
-                    else if (in1)
-                        eta = r1;
-                    else if (in2)
-                        eta = r2;
-                    else
-                        ok = false;
+                    phi += zi * tmp;
+                    dphi += tmp * tmp;
                 }
             }
         }
-        R tnew = tau + eta;
-        if (!ok || !(tnew > lo && tnew < hi) || isnan(tnew))
-            tnew = (lo + hi) * R(0.5);
-        R step = abs(tnew - tau);
-        tau = tnew;
-        if (step <= R(2) * EPS * abs(tau) || hi - lo <= R(2) * EPS * max(abs(lo), abs(hi)))
+        sec_sum[0][t] = psi;
+        sec_sum[1][t] = dpsi;
+        sec_sum[2][t] = phi;
+        sec_sum[3][t] = dphi;
+        sec_sum[4][t] = zz;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint w = SEC_LANES / 2; w > 0; w >>= 1)
+        {
+            if (lane < w)
+            {
+                [ForceUnroll]
+                for (uint q = 0; q < 5; q++)
+                    sec_sum[q][t] += sec_sum[q][t + w];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (lane == 0 && !done)
+        {
+            psi = sec_sum[0][t];
+            dpsi = sec_sum[1][t];
+            phi = sec_sum[2][t];
+            dphi = sec_sum[3][t];
+            zz = sec_sum[4][t];
+            R f = rhoinv + psi + phi;
+            if (choosing)
+            {
+                choosing = false;
+                if (last)
+                {
+                    // the largest root: in (dlam_j, dlam_j + rho |z|^2]
+                    lo = R(0);
+                    hi = rho * zz * (R(1) + R(4) * EPS);
+                }
+                else if (f >= R(0))
+                {
+                    lo = R(0);
+                    hi = mid;
+                }
+                else
+                {
+                    o = jj + 1;
+                    dorg = p.rw[RDLAM(g, o)];
+                    lo = -(gap - mid);
+                    hi = R(0);
+                }
+                tau = (lo + hi) * R(0.5);
+            }
+            else if (f == R(0))
+                done = true;
+            else
+            {
+                if (f < R(0))
+                    lo = tau;
+                else
+                    hi = tau;
+                R d1 = (dj - dorg) - tau;  // dlam_j - lambda (< 0)
+                R eta = R(0);
+                bool ok = true;
+                if (last)
+                {
+                    // one pole: c + b1 / (d1 - eta) = 0
+                    R c = f - d1 * dpsi;
+                    R b1 = d1 * d1 * dpsi;
+                    if (c == R(0))
+                        ok = false;
+                    else
+                        eta = d1 + b1 / c;
+                }
+                else
+                {
+                    R d2 = (p.rw[RDLAM(g, jj + 1)] - dorg) - tau;  // > 0
+                    R b1 = d1 * d1 * dpsi, b2 = d2 * d2 * dphi;
+                    R c = f - d1 * dpsi - d2 * dphi;
+                    R bq = c * (d1 + d2) + b1 + b2;
+                    R cq = c * d1 * d2 + b1 * d2 + b2 * d1;
+                    if (c == R(0))
+                    {
+                        if (b1 + b2 == R(0))
+                            ok = false;
+                        else
+                            eta = cq / bq;
+                    }
+                    else
+                    {
+                        R disc = bq * bq - R(4) * c * cq;
+                        if (disc < R(0))
+                            ok = false;
+                        else
+                        {
+                            R sq = sqrt(disc);
+                            // the two roots, stably; the one between the poles (d1, d2)
+                            R r1 = bq >= R(0) ? (bq + sq) / (R(2) * c) : (R(2) * cq) / (bq - sq);
+                            R r2 = bq >= R(0) ? (R(2) * cq) / (bq + sq) : (bq - sq) / (R(2) * c);
+                            bool in1 = r1 > d1 && r1 < d2, in2 = r2 > d1 && r2 < d2;
+                            if (in1 && in2)
+                                eta = abs(r1) < abs(r2) ? r1 : r2;
+                            else if (in1)
+                                eta = r1;
+                            else if (in2)
+                                eta = r2;
+                            else
+                                ok = false;
+                        }
+                    }
+                }
+                R tnew = tau + eta;
+                if (!ok || !(tnew > lo && tnew < hi) || isnan(tnew))
+                    tnew = (lo + hi) * R(0.5);
+                R step = abs(tnew - tau);
+                tau = tnew;
+                if (step <= R(2) * EPS * abs(tau) || hi - lo <= R(2) * EPS * max(abs(lo), abs(hi)))
+                    done = true;
+            }
+            sec_tau[r] = tau;
+            sec_dorg[r] = dorg;
+            sec_done[r] = done ? 1u : 0u;
+        }
+        if (t == 0)
+            sec_any = 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0 && sec_done[r] == 0u)
+            sec_any = 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (sec_any == 0)
             break;
     }
-    p.rw[RTAU(g, j)] = tau;
-    p.iw[IORG(g, j)] = int(o);
+    if (mine && lane == 0)
+    {
+        p.rw[RTAU(g, j)] = sec_tau[r];
+        p.iw[IORG(g, j)] = int(o);
+    }
 }
 
 // dlam_i - lambda_j, accurately
@@ -446,7 +512,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID, uint3 dtid: SV_Dis
     else if (OP == STEDC_ROT)
         rot(dtid.x, gid.y);
     else if (OP == STEDC_SECULAR)
-        secular(dtid.x, gid.y);
+        secular(tid.x, gid.x, gid.y);
     else if (OP == STEDC_ZHAT)
         zhat(dtid.x, gid.y);
     else
