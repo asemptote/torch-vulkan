@@ -142,8 +142,9 @@ def hermitian(a, upper):
 @pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
 @pytest.mark.parametrize("shape", [(4, 4), (33, 33), (3, 40, 40), (130, 130)])
 def test_eigh_tridiagonal(dtype, shape):
-    # n >= 4: Householder reduction (shaders/tridiag.slang, gemv.slang) and
-    # implicit QL with its rotations logged and applied to Z^T, then Q Z
+    # n >= 4: Householder reduction (shaders/latrd.slang) and implicit QL
+    # with its rotations logged and applied to Z^T (divide and conquer from
+    # 64 up), then Q Z
     a = make_complex(shape, dtype, 1) if dtype.is_complex else make(shape, dtype, 1)
     real = torch.float32 if dtype in (torch.float32, torch.complex64) else torch.float64
     n = shape[-1]
@@ -197,6 +198,28 @@ def test_eigh_tridiagonal_degenerate(dtype):
         w, v = w.cpu(), v.cpu()
         check_close(v.mT @ v, torch.eye(n, dtype=dtype), dtype, n)
         check_close(a @ v, v * w.unsqueeze(-2), dtype, n * scale)
+
+
+@pytest.mark.parametrize("dtype", FLOATS + COMPLEX)
+@pytest.mark.parametrize("shape,magnitude", [((2, 97, 97), 0), ((65, 65), 0), ((70, 70), -1), ((70, 70), 1)])
+def test_eigh_blocked_scaled(dtype, shape, magnitude):
+    # the blocked reduction's panel boundaries (shaders/latrd.slang, 32
+    # columns: 97 ends on a full panel and a 1 x 1 trailing update), and
+    # matrices far from unit size (1e-200 / 1e200; 1e-30 / 1e30 in single
+    # precision) through divide and conquer, which pads 70 to 72
+    real = torch.float32 if dtype in (torch.float32, torch.complex64) else torch.float64
+    a = make_complex(shape, dtype, 4) if dtype.is_complex else make(shape, dtype, 4)
+    a = (a + a.mH) * (10.0 ** (magnitude * (30 if real == torch.float32 else 200)))
+    n = shape[-1]
+    with on_gpu():
+        w, v = torch.linalg.eigh(a.to("vk"))
+    want = torch.linalg.eigvalsh(a)
+    size = float(want.abs().max())
+    check(w / size, want / size, **tol(real, n))
+    w, v = w.cpu(), v.cpu()
+    eye = torch.eye(n, dtype=dtype).expand_as(a)
+    check_close(v.mH @ v, eye, real, n)
+    check_close((a @ v) / size, (v * w.unsqueeze(-2).to(dtype)) / size, real, n)
 
 
 def check_close(x, y, dtype, scale=10.0):
