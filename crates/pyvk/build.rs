@@ -93,6 +93,7 @@ fn main() {
             "csrc/normalization.cpp",
             "csrc/reduce.cpp",
             "csrc/linalg.cpp",
+            "csrc/quant.cpp",
             "csrc/fft.cpp",
             "csrc/dense.cpp",
             "csrc/special.cpp",
