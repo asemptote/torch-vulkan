@@ -107,6 +107,11 @@ jobs:
       - name: Python tests
         run: python -m pytest -q
 
+      # vk raises the CPU's dtype errors itself, from a generated table; this
+      # fails if the installed PyTorch's CPU no longer gives those errors.
+      - name: The CPU dtype-error table still matches the CPU
+        run: python tools/dev/cpu_dtype_errors.py --check
+
       - name: Op coverage sweep
         run: |
           set -o pipefail
