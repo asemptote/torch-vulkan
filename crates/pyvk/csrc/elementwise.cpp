@@ -121,6 +121,16 @@ double round_to(double v, at::ScalarType t) {
 
 at::Tensor& softshrink_out(const at::Tensor& self, const at::Scalar& lambd, at::Tensor& out) {
   double l = lambd.toDouble();
+  if (is_vk(self) && at::isFloatingType(self.scalar_type())) {
+    // (the CPU's checks: lambda within the dtype's range, then out='s dtype)
+    at::ScalarType st = self.scalar_type();
+    double top = st == at::kDouble   ? std::numeric_limits<double>::max()
+                 : st == at::kHalf   ? 65504.0
+                 : st == at::kBFloat16 ? static_cast<double>(std::numeric_limits<c10::BFloat16>::max())
+                                       : static_cast<double>(std::numeric_limits<float>::max());
+    TORCH_CHECK(l >= 0 && l <= top, "lambda must be in range [0, ", top, "] for input dtype ", st, ", but found ", lambd);
+    TORCH_CHECK(at::canCast(st, out.scalar_type()), "Found dtype ", out.scalar_type(), " but expected ", st);
+  }
   if (half_unary(self, out, [&](const at::Tensor& x) { return at::softshrink(x, round_to(l, self.scalar_type())); })) {
     return out;
   }

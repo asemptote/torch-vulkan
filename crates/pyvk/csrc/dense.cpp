@@ -871,7 +871,8 @@ at::Tensor& solve_triangular_out(const at::Tensor& a, const at::Tensor& b, bool 
                                  at::Tensor& out) {
   at::ScalarType st = a.scalar_type();
   // (16-bit floats: no kernel on the CPU, as on CUDA, even with nothing to solve)
-  TORCH_CHECK_NOT_IMPLEMENTED(!is_vk(a) || (st != at::kHalf && st != at::kBFloat16),
+  TORCH_CHECK_NOT_IMPLEMENTED(!is_vk(a) || ((at::isFloatingType(st) || at::isComplexType(st)) && st != at::kHalf &&
+                                               st != at::kBFloat16 && st != at::kComplexHalf),
                               "\"triangular_solve_cpu\" not implemented for '", st, "'");
   if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || b.dim() < 2 ||
       !is_vk(out)) {

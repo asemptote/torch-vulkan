@@ -1547,6 +1547,16 @@ def _transformer_encoder_layer_fwd(src, embed_dim, num_heads, qkv_weight, qkv_bi
     return norm2(x + feed_forward(x))
 
 
+def _slow_conv3d_forward(x, weight, kernel_size, bias, stride, padding):
+    """The CPU's unfold-based conv3d (which convolution routes some shapes to):
+    its weight check, then conv3d (a 2-D weight is [out, in * kT * kH * kW])."""
+    torch._check(weight.numel() > 0 and weight.dim() in (2, 5),
+                 lambda: f"non-empty 2D or 5D weight tensor expected, but got: {list(weight.shape)}")
+    if weight.dim() == 2:
+        weight = weight.view(weight.shape[0], -1, *kernel_size)
+    return torch.nn.functional.conv3d(x, weight, bias, stride, padding)
+
+
 def _masked_softmax(x, mask, dim=None, mask_type=None):
     """The CPU's masked softmax: masked positions excluded (0), a row with
     every position masked all NaN; mask_type 0 is an (L, L) attention mask and
@@ -1912,6 +1922,7 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "slow_conv3d_forward": _slow_conv3d_forward,
         "_transformer_encoder_layer_fwd": _transformer_encoder_layer_fwd,
         "_compute_linear_combination": _compute_linear_combination,
         "_compute_linear_combination.out": _compute_linear_combination_out,

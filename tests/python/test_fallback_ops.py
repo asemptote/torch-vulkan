@@ -642,6 +642,15 @@ ERROR_CASES = {
     "eigvals_1d": lambda d: torch.linalg.eigvals(torch.ones(3, device=d)),
     "cholesky_inverse_nonsquare": lambda d: torch.cholesky_inverse(torch.ones(2, 3, device=d)),
     "sum_complex32": lambda d: torch.ones(3, dtype=torch.complex32, device=d).sum(),
+    "fft_r2c_complex": lambda d: torch.ops.aten._fft_r2c(torch.ones(2, 2, dtype=torch.cfloat, device=d), [0, 1], 0, True),
+    "solve_triangular_int": lambda d: torch.linalg.solve_triangular(torch.eye(2, dtype=torch.int, device=d),
+                                                                    torch.ones(2, 2, dtype=torch.int, device=d), upper=True),
+    "softshrink_negative": lambda d: torch.nn.functional.softshrink(torch.ones(2, device=d), -1.0),
+    "softshrink_out_dtype": lambda d: torch._C._nn.softshrink(torch.ones(2, device=d), 0.5,
+                                                              out=torch.empty(2, dtype=torch.long, device=d)),
+    "min_empty": lambda d: torch.min(torch.empty(0, dtype=torch.long, device=d)),
+    "slow_conv3d_weight": lambda d: torch.ops.aten.slow_conv3d_forward(
+        torch.empty(1, 1, 1, 0, device=d), torch.empty(1, 0, 1, device=d), [1, 1, 1], None, [1, 1, 1], [0, 0, 0]),
     "linear_combination_empty": lambda d: torch.ops.aten._compute_linear_combination(torch.ones((), device=d),
                                                                                      torch.ones(2, 2, device=d)),
 }

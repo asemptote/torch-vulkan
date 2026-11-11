@@ -532,6 +532,9 @@ at::Tensor& amax_amin_out(const at::Tensor& self, at::IntArrayRef dim, bool keep
 
 template <ROp Op>
 at::Tensor full_max_min(const at::Tensor& self) {
+  TORCH_CHECK(self.numel() > 0 || !is_vk(self), Op == kMax ? "max" : "min",
+              "(): Expected reduction dim to be specified for input.numel() == 0. Specify the reduction dim with the "
+              "'dim' argument.");  // (first, as the CPU's)
   at::Tensor src = widen_half(self);
   Plan plan;
   if (!reducible(src) || !plan_reduce(src, std::nullopt, false, plan)) {

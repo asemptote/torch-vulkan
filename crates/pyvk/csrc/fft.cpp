@@ -335,6 +335,8 @@ at::Tensor fft_c2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
 }
 
 at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool onesided) {
+  TORCH_CHECK_TYPE(!self.is_complex() || !is_vk(self), "Only supports floating-point dtypes, but found: ",
+                   self.scalar_type());  // (the CPU's error, a TypeError)
   at::Tensor result = fft_r2c_compute(self, dim, normalization, onesided);
   if (dim.empty() || !is_vk(result)) {
     return result;
