@@ -25,7 +25,10 @@ def test_weight_int8pack_mm(dtype, m, k, n):
     a = torch.randn(m, k, generator=gen(1)).to(dtype)
     b = torch.randint(-128, 128, (n, k), dtype=torch.int8, generator=gen(2))
     s = (torch.rand(n, generator=gen(3)) / 50).to(dtype)
-    want = torch._weight_int8pack_mm(a, b, s)
+    # (the reference without the CPU's kernel: its AVX2 / AVX-512 bfloat16
+    # path reads 16 values of k at a time and crashes for k not a multiple of
+    # 16, as on the CI's runners)
+    want = (a.float() @ (b.float() * s.float()[:, None]).t()).to(dtype)
     with on_gpu():
         got = torch._weight_int8pack_mm(a.to("vk"), b.to("vk"), s.to("vk"))
         # a row slice (A's rows strided), as LLaMA's LM head passes it
@@ -99,8 +102,10 @@ def test_dyn_quant_errors():
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32, torch.float16, torch.float8_e4m3fn, None])
 @pytest.mark.parametrize("rowwise", [False, True])
 def test_scaled_mm(fa, fb, out_dtype, rowwise):
-    # the CPU's emulated path on the GPU: exact upcasts and scales, a float32
-    # product (here of float8 values: few enough bits to be exact), bias
+    # the CPU's emulated path on the GPU: exact upcasts, scales, a float32
+    # product, bias, the cast; equal to the CPU's where the scaled values'
+    # products are exact (tensor-wise scales of few bits), else within the
+    # float32 sums' order (the CPU's BLAS adds in another), then one rounding
     a = torch.randn(16, 32, generator=gen(1)).to(fa)
     b = torch.randn(48, 32, generator=gen(2)).to(fb).t()
     sa = torch.rand(16, 1, generator=gen(3)) + 0.5 if rowwise else torch.tensor(1.25)
@@ -115,8 +120,11 @@ def test_scaled_mm(fa, fb, out_dtype, rowwise):
         out = torch.empty(0, dtype=want.dtype, device="vk")
         torch._scaled_mm(a.to("vk"), b.to("vk"), sa.to("vk"), sb.to("vk"), **vkw, out=out)
     assert got.dtype == want.dtype and got.shape == want.shape
-    assert torch.equal(got.cpu().float(), want.float())
-    assert torch.equal(out.cpu().float(), want.float())
+    mag = (a.float() * sa).abs() @ (b.float() * sb).abs() / (2.0 if scale_result is not None else 1.0)
+    eps = torch.finfo(want.dtype).eps
+    tol = 0 if not rowwise else eps * want.float().abs() + 2**-20 * mag
+    for res in (got, out):
+        assert ((res.cpu().float() - want.float()).abs() <= tol).all()
 
 
 def test_scaled_mm_errors():

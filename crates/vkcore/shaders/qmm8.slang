@@ -89,8 +89,13 @@ void small_m(uint t, uint g)
         float w = float(int(p.b[nn * p.k + k])) * scale;
         [ForceUnroll]
         for (uint r = 0; r < 8; r++)
+        {
+            // (the row clamped: lavapipe may perform the load of a row past
+            // ROWS before the test, and A has only ROWS rows)
+            float v = ld(p.a[int(min(r, uint(max(ROWS, 1)) - 1u)) * p.a_sm + int(k) * p.a_sk]);
             if (r < ROWS)
-                acc[r] += ld(p.a[int(r) * p.a_sm + int(k) * p.a_sk]) * w;
+                acc[r] += v * w;
+        }
     }
     [ForceUnroll]
     for (uint r = 0; r < 8; r++)
