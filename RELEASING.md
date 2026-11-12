@@ -36,7 +36,8 @@ Record anything new in the README's hardware table or limitations.
 
 ## 4. Version and tag
 
-1. Set `version` in `pyproject.toml` and merge that to `main`.
+1. Set `version` in `pyproject.toml`, and `version` and `date-released` in
+   `CITATION.cff`, and merge that to `main`.
 2. Tag the merge: `git tag -a vX.Y.Z -m "torch-vulkan X.Y.Z"` and push the
    tag. The release workflow builds the Windows and Linux wheels and the
    SPIR-V bundle for Termux, tests the Linux wheel on lavapipe outside the
