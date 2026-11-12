@@ -63,20 +63,27 @@ static const uint LOCAL_MAX = 1024;
 #endif
 groupshared T sbuf[2][LOCAL_MAX];
 
-// X[k] = (A + B) / 2 + w^k (A - B) / (2i), w^h = -1 (FFT_R2C).
-T r2c_point(T a, T c, uint k, uint h)
+// X[k] = (A + B) / 2 + w (A - B) / (2i), w = w^k (FFT_R2C).
+T r2c_point(T a, T c, T w)
 {
-    T w = k == h ? T(S(-1), S(0)) : p.table[min(k, h - 1)];
     T e = (a + c) * S(0.5), d = (a - c) * S(0.5);
     T o = T(d.y, -d.x);  // (A - B) / (2i)
     return e + cmul(w, o);
 }
 
-// Z'[k] = (A + B) + i conj(w^k) (A - B), k < h (FFT_C2R).
-T c2r_point(T a, T c, uint k, uint h)
+// Z'[k] = (A + B) + i cw (A - B), cw = conj(w^k), k < h (FFT_C2R).
+T c2r_point(T a, T c, T cw)
 {
-    T d = cmul(cconj(p.table[min(k, max(h, 1u) - 1)]), a - c);
+    T d = cmul(cw, a - c);
     return (a + c) + T(-d.y, d.x);  // + i d
+}
+
+// w^k for k <= h/2 from the table (w^h = -1); the pair's other twiddle is
+// w^(h - k) = w^h conj(w^k) = -conj(w^k), so each pair reads one entry and
+// the passes read only the first half of the table.
+T pair_twiddle(uint k, uint h)
+{
+    return k == h ? T(S(-1), S(0)) : p.table[min(k, max(h, 1u) - 1)];
 }
 
 [shader("compute")]
@@ -126,10 +133,11 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         {
             uint b = t / pairs, k = t - b * pairs, km = k == 0 ? 0 : h - k;
             T zk = p.in[b * h + k], zm = p.in[b * h + km];
+            T w = pair_twiddle(k, h);
             uint row = b * (h + 1);
-            p.out[row + k] = r2c_point(zk, cconj(zm), k, h);
+            p.out[row + k] = r2c_point(zk, cconj(zm), w);
             if (h - k != k)
-                p.out[row + h - k] = r2c_point(zm, cconj(zk), h - k, h);
+                p.out[row + h - k] = r2c_point(zm, cconj(zk), -cconj(w));
         }
     }
     else if (PHASE == FFT_C2R)
@@ -150,9 +158,10 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                 xk.y = S(0);
                 xm.y = S(0);
             }
-            p.out[b * h + k] = c2r_point(xk, cconj(xm), k, h);
+            T w = pair_twiddle(k, h);
+            p.out[b * h + k] = c2r_point(xk, cconj(xm), cconj(w));
             if (k != 0 && h - k != k)
-                p.out[b * h + h - k] = c2r_point(xm, cconj(xk), h - k, h);
+                p.out[b * h + h - k] = c2r_point(xm, cconj(xk), -w);  // (conj(w^(h - k)) = -w^k)
         }
     }
     else
