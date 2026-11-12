@@ -233,11 +233,15 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 ## Limitations
 
 - **Performance** comes after correctness and portability, and varies by
-  operation. On an Intel UHD 620, float32 matrix products reach about 148
-  GFLOP/s at 2048^3 (ahead of MKL on the CPU) and float64 about 30 GFLOP/s; a
-  2^20-point complex64 FFT takes about 12 ms (the CPU about 6 ms), and long
-  real and prime-length transforms are ahead of the CPU.
-  <!-- FINAL (#36): the UHD 620 and HD 530 figures above, from the final runs -->
+  operation. On integrated Intel GPUs (against their own CPUs:
+  [HD 530](benchmarks/results/hd530-mesa.md),
+  [UHD 620](benchmarks/results/uhd620-windows.md)), float32 matrix products
+  reach about 95-110 GFLOP/s at 2048^3 (on the UHD 620, level with MKL on its
+  4-core CPU) and float64 about 26 GFLOP/s; prime-length FFTs are 3.6-4x
+  faster than the CPU and long real FFTs 1.2-2.5x faster, and a 2^20-point
+  complex64 FFT takes 5 ms on the HD 530 (CPU 7.7 ms); dense linear algebra
+  is 5-10x slower than the CPU's LAPACK on these small GPUs.
+  <!-- FINAL (#36): the UHD 620's 2^20 FFT, after the A/B against the previous wheel -->
   Against CUDA on the same GPUs ([tables](benchmarks/results/)), as vk's time
   over CUDA's:
   - float16 and bfloat16 matrix products run on tensor cores at 155-165
