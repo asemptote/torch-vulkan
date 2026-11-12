@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -170,8 +171,19 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
   // 2^20 (4 columns per workgroup at R = 1024: 32-byte runs), 8 beyond and
   // for complex128.
   std::string variant = c64 && bits <= 20 ? "e16" : "e8";
-  bool fits = has_feature(kFeatureShared32K) || (c64 && variant == "e8");  // (16 KiB for complex64 with 8)
   int64_t reg_passes = bits <= 20 ? 2 : 3;
+  // (TEMP experiment: TORCH_VK_FFT_PLAN = 2e16 or 2e8: two passes for 2^21 to 2^24,
+  // R up to the workgroup's WG E values, 4096 or 2048)
+  static const std::string plan = [] {
+    const char* v = std::getenv("TORCH_VK_FFT_PLAN");
+    return std::string(v != nullptr ? v : "");
+  }();
+  if (bits > 20 && (plan == "2e16" || plan == "2e8")) {
+    variant = plan.substr(1);
+    int64_t maxbits = (variant == "e16" && c64) ? 12 : 11;
+    if (bits <= 2 * maxbits) reg_passes = 2;
+  }
+  bool fits = has_feature(kFeatureShared32K) || (c64 && variant == "e8");  // (16 KiB for complex64 with 8)
   if (fits && bits >= 14 && bits <= 30) {
     std::string reg = std::string("fft_reg_") + dtype_label(x.scalar_type()) + "_" + variant;
     at::Tensor table2 = twiddles_2level(n, x.scalar_type());

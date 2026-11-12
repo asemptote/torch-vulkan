@@ -1,7 +1,7 @@
 // axis T: c64=float2 c128=double2
 // axis V: e16=uint e8=uint
 //
-// One radix-R Stockham pass of a power-of-two FFT, R = 128 to 1024, with the
+// One radix-R Stockham pass of a power-of-two FFT, R = 128 to 4096, with the
 // values in registers: csrc/fft.cpp's fft_pow2 takes longer rows in two or
 // three such passes (fft_radix.slang's, r <= 128, need one more). The pass is
 // fft_radix.slang's; for each group j < n/R (k = j % ns):
@@ -339,8 +339,12 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         run<1, 16, 2, 2>(tid.x, gid.x);
     else if (R == 512)
         run<2, 16, 2, 2>(tid.x, gid.x);
-    else
+    else if (R == 1024)
         run<2, 16, 4, 2>(tid.x, gid.x);
+    else if (R == 2048)
+        run<2, 16, 8, 2>(tid.x, gid.x);
+    else
+        run<2, 16, 16, 2>(tid.x, gid.x);  // (R = 4096: complex64)
 #else
     if (R == 128)
         run<2, 8, 2, 2>(tid.x, gid.x);
@@ -348,7 +352,9 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         run<2, 8, 4, 2>(tid.x, gid.x);
     else if (R == 512)
         run<2, 8, 8, 2>(tid.x, gid.x);
-    else
+    else if (R == 1024)
         run<3, 8, 8, 2>(tid.x, gid.x);
+    else
+        run<3, 8, 8, 4>(tid.x, gid.x);  // (R = 2048)
 #endif
 }
