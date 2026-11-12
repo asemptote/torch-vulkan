@@ -30,3 +30,13 @@ Medians of synchronised, warm calls; the last column is vk's time over CUDA's (h
 | svd float64 n=4096 | ms | 1518 | 2254 | 0.67 |
 | elementwise chain 2^26 float32 (x * y + z).relu() | GB/s | 2489 | 3313 | 1.3 |
 | per-op overhead: 1000 additions of 1024 floats | us/op | 4.88 | 5.45 | 0.9 |
+| rnn trajectory float32 N=1000, 1000 steps | ms | 21 | 28.8 | 0.73 |
+| rnn trajectory float32 N=4000, 1000 steps | ms | 36.5 | 34.6 | 1.1 |
+| rnn batch of 256 float32 N=4000, 200 steps | ms | 132 | 48.2 | 2.7 |
+| rnn Lyapunov exponents k=64 float32 N=1000, 500 steps | ms | 1025 | 49.6 | 21 |
+| rnn trajectory float64 N=1000, 1000 steps | ms | 21.4 | 28.9 | 0.74 |
+| rnn trajectory float64 N=4000, 1000 steps | ms | 52.9 | 54.3 | 0.97 |
+| rnn batch of 256 float64 N=4000, 200 steps | ms | 313 | 51.5 | 6.1 |
+| rnn Lyapunov exponents k=64 float64 N=1000, 500 steps | ms | 1056 | 50.2 | 21 |
+
+The rnn rows (benchmarks/rnn.py, a chaotic rate RNN after Sompolinsky, Crisanti and Sommers, whole runs) are from main d1c2e24 with this file. Its Lyapunov exponents agree between the two devices: max |difference| over the 64 leading exponents 1.7e-16 in float64 and 1.6e-7 in float32. The Lyapunov rows' time is mostly torch.linalg.qr of a 1000 x 64 matrix every 10 steps, a known gap (#62).
