@@ -189,7 +189,8 @@ pub unsafe extern "C" fn vkt_kernel_subgroup_size(name: *const c_char) -> u32 {
 /// Optional device features as bits (csrc/vk.h `Feature`): 1 float64,
 /// 2 int16 (with 16-bit storage), 4 float16 (with 16-bit storage), 8 int8
 /// (with 8-bit storage), 16 float16 and 32 bfloat16 cooperative matrices
-/// (gemmcm.slang).
+/// (gemmcm.slang), 64 at least 32 KiB of shared memory per workgroup
+/// (fft_reg.slang).
 #[no_mangle]
 pub extern "C" fn vkt_capabilities() -> u32 {
     let Ok(rt) = runtime() else { return 0 };
@@ -200,4 +201,5 @@ pub extern "C" fn vkt_capabilities() -> u32 {
         | (((c.shader_int8 && c.storage_buffer_8bit) as u32) << 3)
         | ((c.cooperative_matrix_f16 as u32) << 4)
         | ((c.cooperative_matrix_bf16 as u32) << 5)
+        | (((c.max_shared_memory >= 32 * 1024) as u32) << 6)
 }

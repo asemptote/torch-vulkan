@@ -96,6 +96,7 @@ enum Feature : uint32_t {
   kFeatureInt8 = 8,
   kFeatureCoopMatF16 = 16,   // float16 cooperative matrices (shaders/gemmcm.slang)
   kFeatureCoopMatBf16 = 32,  // bfloat16 cooperative matrices (shaders/gemmcm.slang)
+  kFeatureShared32K = 64,    // >= 32 KiB of shared memory per workgroup (shaders/fft_reg.slang)
 };
 
 inline bool has_feature(Feature f) {

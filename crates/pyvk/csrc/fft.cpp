@@ -42,6 +42,12 @@ struct RadixParams {
 };
 static_assert(sizeof(RadixParams) == 48, "must match shaders/fft_radix.slang");
 
+struct RegParams {
+  uint64_t in, out, table, rtab;
+  uint32_t n, ns, batch, r, ngroups, pad;
+};
+static_assert(sizeof(RegParams) == 56, "must match shaders/fft_reg.slang");
+
 constexpr double kPi = 3.14159265358979323846;
 
 bool is_pow2(int64_t n) {
@@ -106,6 +112,26 @@ at::Tensor twiddles_2level(int64_t n, at::ScalarType dtype) {
   return table;
 }
 
+// W_r^t = exp(-2 pi i t / r) for t < r (fft_reg.slang's rtab).
+at::Tensor roots_full(int64_t r, at::ScalarType dtype) {
+  static std::map<std::pair<int64_t, at::ScalarType>, at::Tensor> cache;
+  std::lock_guard<std::mutex> lock(g_cache_mutex);
+  auto key = std::make_pair(r, dtype);
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  at::Tensor host = at::empty({r}, at::kComplexDouble);
+  auto* w = host.data_ptr<c10::complex<double>>();
+  for (int64_t t = 0; t < r; ++t) {
+    double angle = -2.0 * kPi * static_cast<double>(t) / static_cast<double>(r);
+    w[t] = {std::cos(angle), std::sin(angle)};
+  }
+  at::Tensor table = to_device(host, dtype);
+  cache.emplace(key, table);
+  return table;
+}
+
 // Unnormalized FFT of contiguous rows x [batch, n], n a power of two.
 at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse) {
   if (n == 1) {
@@ -137,6 +163,41 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
   int64_t budget = rmax;
   int64_t bits = 0;
   while ((int64_t(1) << bits) < n) ++bits;
+  // Rows from 2^14: radix-R passes with the values in registers
+  // (fft_reg.slang), R = 128 to 1024: two up to 2^20, three up to 2^30
+  // (fft_radix.slang's passes, r <= 128, need one more). Its variant (values
+  // per thread) as measured on the H100 and L40S: 16 for complex64 up to
+  // 2^20 (4 columns per workgroup at R = 1024: 32-byte runs), 8 beyond and
+  // for complex128.
+  std::string variant = c64 && bits <= 20 ? "e16" : "e8";
+  bool fits = has_feature(kFeatureShared32K) || (c64 && variant == "e8");  // (16 KiB for complex64 with 8)
+  int64_t reg_passes = bits <= 20 ? 2 : 3;
+  if (fits && bits >= 14 && bits <= 30) {
+    std::string reg = std::string("fft_reg_") + dtype_label(x.scalar_type()) + "_" + variant;
+    at::Tensor table2 = twiddles_2level(n, x.scalar_type());
+    int64_t slots = variant == "e16" ? (c64 ? 4096 : 2048) : 2048;  // WG E values per workgroup
+    at::Tensor src = x;
+    for (int64_t pass = 0, ns = 1; pass < reg_passes; ++pass) {
+      int64_t r = int64_t(1) << (bits / reg_passes + (pass < bits % reg_passes ? 1 : 0));
+      at::Tensor table_r = roots_full(r, x.scalar_type());
+      at::Tensor dst = at::empty_like(x);
+      RegParams p{};
+      p.in = gpu_address(src);
+      p.out = gpu_address_out(dst);
+      p.table = gpu_address(table2);
+      p.rtab = gpu_address(table_r);
+      p.n = static_cast<uint32_t>(n);
+      p.ns = static_cast<uint32_t>(ns);
+      p.batch = static_cast<uint32_t>(batch);
+      p.r = static_cast<uint32_t>(r);
+      int64_t g = slots / r;
+      p.ngroups = static_cast<uint32_t>(std::min<int64_t>((batch * (n / r) + g - 1) / g, 65535));
+      dispatch(reg, {inverse ? 1u : 0u}, p, p.ngroups);
+      src = dst;
+      ns *= r;
+    }
+    return src;
+  }
   int64_t passes = n <= rmax ? 1 : (bits + 6) / 7;
   // A workgroup loops over blocks, loading the next while it transforms the
   // current one: at most kRadixGroups workgroups (4096 suited both the H100
