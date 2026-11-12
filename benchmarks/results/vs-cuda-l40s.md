@@ -1,4 +1,4 @@
-vk: NVIDIA L40S; CUDA: NVIDIA L40S; torch 2.14.1+cpu, 2.14.1+cu130
+vk: NVIDIA L40S; CUDA: NVIDIA L40S; torch 2.14.1+cpu, 2.14.1+cu130; NVIDIA driver 615.71.09 (Vulkan and CUDA 13.0)
 
 Medians of synchronised, warm calls; the last column is vk's time over CUDA's (how many times slower vk is; under 1: faster).
 
