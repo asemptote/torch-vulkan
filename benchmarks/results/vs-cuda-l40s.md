@@ -1,6 +1,6 @@
 vk: NVIDIA L40S; CUDA: NVIDIA L40S; torch 2.14.1+cpu, 2.14.1+cu130; NVIDIA driver 615.71.09 (Vulkan and CUDA 13.0)
 
-Medians of synchronised, warm calls; the last column is vk's time over CUDA's (how many times slower vk is; under 1: faster).
+Medians of synchronised, warm calls; the last column is vk's time over CUDA's (how many times slower vk is; under 1: faster). FFT rows from 96637d5, the others from db43372 (the same non-FFT code).
 
 | workload | unit | vk | CUDA | vk time / CUDA time |
 |---|---|---|---|---|
@@ -14,14 +14,14 @@ Medians of synchronised, warm calls; the last column is vk's time over CUDA's (h
 | matmul float64 8192^3 | TFLOP/s | 1.39 | 1.25 | 0.9 |
 | matmul float32 2048^3, TF32 on (CUDA) | TFLOP/s |  | 111 |  |
 | matmul float32 8192^3, TF32 on (CUDA) | TFLOP/s |  | 96.8 |  |
-| fft 2^20 complex64 | ms | 0.0539 | 0.0258 | 2.1 |
-| rfft 2^20 float32 | ms | 0.0439 | 0.0247 | 1.8 |
-| fft 2^20 complex128 | ms | 0.247 | 0.202 | 1.2 |
-| rfft 2^20 float64 | ms | 0.154 | 0.159 | 0.97 |
-| fft 2^24 complex64 | ms | 1.83 | 1.49 | 1.2 |
-| rfft 2^24 float32 | ms | 0.955 | 0.776 | 1.2 |
-| fft 2^24 complex128 | ms | 4.19 | 2.93 | 1.4 |
-| rfft 2^24 float64 | ms | 2.54 | 1.88 | 1.4 |
+| fft 2^20 complex64 | ms | 0.0482 | 0.0258 | 1.9 |
+| rfft 2^20 float32 | ms | 0.0428 | 0.0246 | 1.7 |
+| fft 2^20 complex128 | ms | 0.209 | 0.202 | 1 |
+| rfft 2^20 float64 | ms | 0.135 | 0.16 | 0.84 |
+| fft 2^24 complex64 | ms | 1.38 | 1.48 | 0.93 |
+| rfft 2^24 float32 | ms | 0.645 | 0.771 | 0.84 |
+| fft 2^24 complex128 | ms | 3.18 | 2.94 | 1.1 |
+| rfft 2^24 float64 | ms | 1.9 | 1.88 | 1 |
 | linalg.solve float64 n=1024 | ms | 13.8 | 6.72 | 2.1 |
 | eigh float64 n=1024 | ms | 48.8 | 25.9 | 1.9 |
 | svd float64 n=1024 | ms | 148 | 798 | 0.18 |
