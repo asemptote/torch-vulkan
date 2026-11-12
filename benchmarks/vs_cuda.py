@@ -14,7 +14,11 @@ Workloads: matrix products (float16, bfloat16, float32 with CUDA's TF32 off,
 and once with it on for reference, float64) at 2048^3 and 8192^3; FFTs and
 real FFTs of 2^20 and 2^24 points in complex64 / complex128; float64
 linalg.solve, eigh and svd at n = 1024 and 4096; an element-wise chain over
-2^26 float32 values (GB/s); the per-op overhead of small additions.
+2^26 float32 values (GB/s); the per-op overhead of small additions; and a
+chaotic rate RNN end to end (benchmarks/rnn.py, whole runs in ms): one
+trajectory (a matrix-vector product per step), a batch of 256 (a matrix
+product per step) and its leading Lyapunov exponents (with QR), in float32
+and float64.
 """
 
 import argparse
@@ -63,6 +67,19 @@ add("elementwise chain 2^26 float32 (x * y + z).relu()", "GB/s",
     "x, y, z = (torch.randn(1 << 26, device=dev) for _ in range(3))\n"
     "fn = lambda: (x * y + z).relu()\n"
     "amount = (3 + 3 + 2) * 4 * (1 << 26) / 1e9  # bytes read and written by mul, add, relu")
+# The chaotic rate RNN (benchmarks/rnn.py, embedded so that both devices run the same code)
+RNN = "_RNN_EMBEDDED = True\n" + open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "rnn.py"),
+                                       encoding="utf-8").read()
+for dt in ("float32", "float64"):
+    for n in (1000, 4000):
+        add(f"rnn trajectory {dt} N={n}, 1000 steps", "ms",
+            RNN + f"\nJ, x0 = network({n}, torch.{dt}, dev)\nfn = lambda: trajectory(J, x0, 1000)\namount = None")
+    add(f"rnn batch of 256 {dt} N=4000, 200 steps", "ms",
+        RNN + f"\nJ, x0 = network(4000, torch.{dt}, dev, batch=256)\nfn = lambda: trajectory(J, x0, 200)\n"
+        "amount = None")
+    add(f"rnn Lyapunov exponents k=64 {dt} N=1000, 500 steps", "ms",
+        RNN + f"\nJ, x0, q0 = network(1000, torch.{dt}, dev, k=64)\nfn = lambda: lyapunov(J, x0, q0, 500)\n"
+        "amount = None")
 add("per-op overhead: 1000 additions of 1024 floats", "us/op",
     "x = torch.randn(1024, device=dev)\n"
     "def fn():\n    y = x\n    for _ in range(1000):\n        y = y + 1.0\n    return y\n"
