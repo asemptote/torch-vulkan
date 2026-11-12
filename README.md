@@ -236,14 +236,22 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
   operation. On an Intel UHD 620, float32 matrix products reach about 148
   GFLOP/s at 2048^3 (ahead of MKL on the CPU) and float64 about 30 GFLOP/s; a
   2^20-point complex64 FFT takes about 12 ms (the CPU about 6 ms), and long
-  real and prime-length transforms are ahead of the CPU. Against CUDA on the
-  same GPUs ([tables](benchmarks/results/)): float16 and bfloat16 matrix
-  products on tensor cores reach about 160 TFLOP/s on an H100 NVL and an L40S
-  (CUDA: about 400 and 180-200), float32 products run at about 2.3x CUDA's
-  time, float64 `svd` at 0.3-1.1x (faster than CUDA in most cases), `eigh` at
-  1.6-3.5x, `solve` at 1.4-3.5x, FFTs at 1-4x, element-wise bandwidth at 1-1.3x, and per-op overhead
-  is slightly lower than CUDA's.
-<!-- FINAL (#36): replace with the final benchmarks (solve #34, FFT #35, the HD 530 and the UHD 620) -->
+  real and prime-length transforms are ahead of the CPU.
+  <!-- FINAL (#36): the UHD 620 and HD 530 figures above, from the final runs -->
+  Against CUDA on the same GPUs ([tables](benchmarks/results/)), as vk's time
+  over CUDA's:
+  - float16 and bfloat16 matrix products run on tensor cores at 155-165
+    TFLOP/s at 8192^3: 1.1-1.2x on an L40S and 2.5-2.6x on an H100 NVL, where
+    NVIDIA's own Vulkan cooperative-matrix sample tops out at about 170;
+  - float32 products 2.3-2.5x; float64 products 0.85-0.9x on the L40S and
+    about 5x on the H100, whose CUDA uses float64 tensor cores;
+  - float64 `svd` 0.2-0.8x (faster than CUDA), `eigh` 1.5-3.4x, `solve`
+    1.4-3.4x;
+  - FFTs within 2x, except transforms of 2^16-2^20 points, at up to about
+    2.3x: each call has about 40 us of fixed submission and synchronisation
+    cost; <!-- FINAL (#36): check against the FFT rerun -->
+  - element-wise bandwidth 1-1.3x, and per-op overhead 0.86-0.9x (slightly
+    lower than CUDA's).
 - **`torch.compile`**: the default Inductor backend has no code generator for
   `"vk"`. `backend="eager"` and `backend="aot_eager"` work (a forward and
   backward pass matches the CPU), without fusion.
