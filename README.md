@@ -247,9 +247,10 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
     about 5x on the H100, whose CUDA uses float64 tensor cores;
   - float64 `svd` 0.2-0.8x (faster than CUDA), `eigh` 1.5-3.4x, `solve`
     1.4-3.4x;
-  - FFTs within 2x, except transforms of 2^16-2^20 points, at up to about
-    2.3x: each call has about 40 us of fixed submission and synchronisation
-    cost; <!-- FINAL (#36): check against the FFT rerun -->
+  - FFTs and real FFTs at 0.84-1.9x on the L40S and 1.5-1.7x on the H100 at
+    2^24 points; smaller transforms (2^16-2^20 points) reach up to about 2.3x
+    on the H100, where each call's fixed submission and synchronisation cost
+    (about 40 us) dominates;
   - element-wise bandwidth 1-1.3x, and per-op overhead 0.86-0.9x (slightly
     lower than CUDA's).
 - **`torch.compile`**: the default Inductor backend has no code generator for
