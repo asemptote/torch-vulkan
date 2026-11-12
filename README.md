@@ -250,7 +250,8 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
   - float32 products 2.3-2.5x; float64 products 0.85-0.9x on the L40S and
     about 5x on the H100, whose CUDA uses float64 tensor cores;
   - float64 `svd` 0.2-0.8x (faster than CUDA), `eigh` 1.5-3.4x, `solve`
-    1.4-3.4x;
+    1.4-3.4x; `qr` of tall, skinny matrices is still 20-40x slower than CUDA
+    (1000x64 on an L40S), as its Householder panel runs on one workgroup;
   - FFTs and real FFTs at 0.84-1.9x on the L40S and 1.5-1.7x on the H100 at
     2^24 points; smaller transforms (2^16-2^20 points) reach up to about 2.3x
     on the H100, where each call's fixed submission and synchronisation cost
