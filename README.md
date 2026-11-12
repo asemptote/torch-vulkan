@@ -303,6 +303,13 @@ measurements, is in [docs/development-log.md](docs/development-log.md).
   inference on mobile GPUs.
 - [pytorch_dlprim](https://github.com/artyom-beilis/pytorch_dlprim): an
   OpenCL backend, and a Vulkan port of it in progress.
+- Two other projects share this name:
+  [yoshiyukiabe7688/torch-vulkan](https://github.com/yoshiyukiabe7688/torch-vulkan)
+  (training, GLSL kernels) and
+  [Peterc3-dev/torch-vulkan](https://github.com/Peterc3-dev/torch-vulkan)
+  (quantised LLM inference through Kompute). This one is
+  [asemptote/torch-vulkan](https://github.com/asemptote/torch-vulkan), imported
+  as `torch_vulkan`; avoid installing more than one into the same environment.
 - Discussion of an official Vulkan backend:
   [pytorch/pytorch#160230](https://github.com/pytorch/pytorch/issues/160230).
 
