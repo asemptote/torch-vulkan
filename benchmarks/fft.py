@@ -4,6 +4,7 @@
 """
 
 import os
+import statistics
 import time
 
 import torch
@@ -13,14 +14,20 @@ import torch_vulkan as tv
 SMALL = os.environ.get("TORCH_VK_BENCH_SMALL") == "1"  # (benchmarks/integrated.py --small: a quick check)
 
 
-def timed(fn, sync, reps=5):
+def timed(fn, sync, reps=5, blocks=7):
+    """The median over `blocks` of the mean time of `reps` calls: some
+    drivers (Intel's on Windows, 2^20 complex64) switch between a fast and a
+    slow mode for a whole block, which a single mean would land on by chance."""
     fn()
     sync()
-    start = time.perf_counter()
-    for _ in range(reps):
-        fn()
-    sync()
-    return (time.perf_counter() - start) / reps
+    times = []
+    for _ in range(blocks):
+        start = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        sync()
+        times.append((time.perf_counter() - start) / reps)
+    return statistics.median(times)
 
 
 def main():

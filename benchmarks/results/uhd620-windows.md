@@ -3,8 +3,10 @@
 - GPU: Intel(R) UHD Graphics 620, Vulkan driver Intel Corporation, Intel driver, version 101.2134
 - CPU baseline: Intel(R) Core(TM) i5-8350U CPU @ 1.70GHz, 4 threads, PyTorch 2.14.1+cpu
 - OS: Windows 11
-- torch-vulkan commit 96637d5, 2026-11-11
-- `python benchmarks/integrated.py uhd620-windows matmul fft division`
+- torch-vulkan commit 96637d5, 2026-11-11 (fft: commit 93d188a, 2026-11-11, from its
+  release dry-run's wheel)
+- `python benchmarks/integrated.py uhd620-windows matmul fft division`; fft:
+  `python benchmarks/fft.py`, each time the median over 7 blocks of 5 calls
 
 ## matmul
 
@@ -31,20 +33,23 @@ Intel(R) UHD Graphics 620 (TORCH_VK_GEMM=default) vs CPU (4 threads), torch 2.14
 
 ```
 Intel(R) UHD Graphics 620 vs CPU (4 threads), torch 2.14.1+cpu
-  fft 2^20                 complex64  vk     17.7 ms   cpu      7.2 ms
-  fft 64 x 2^14            complex64  vk      5.4 ms   cpu      2.4 ms
-  fft 1000003 (Bluestein)  complex64  vk     47.9 ms   cpu    120.9 ms
-  fft2 1024x1024           complex64  vk     23.8 ms   cpu      3.1 ms
-  rfft 2^22                complex64  vk     22.2 ms   cpu     34.4 ms
-  irfft 2^20               complex64  vk      6.5 ms   cpu      8.1 ms
-  fft 2^20                 complex128 vk     31.1 ms   cpu     15.9 ms
-  fft 64 x 2^14            complex128 vk     13.7 ms   cpu      4.7 ms
-  fft 1000003 (Bluestein)  complex128 vk     89.0 ms   cpu    238.7 ms
-  fft2 1024x1024           complex128 vk     29.1 ms   cpu      8.4 ms
-  rfft 2^22                complex128 vk     58.8 ms   cpu     69.5 ms
-  irfft 2^20               complex128 vk     11.0 ms   cpu     18.8 ms
+  fft 2^20                 complex64  vk     12.2 ms   cpu     12.7 ms
+  fft 64 x 2^14            complex64  vk      5.0 ms   cpu      3.8 ms
+  fft 1000003 (Bluestein)  complex64  vk     39.2 ms   cpu    221.3 ms
+  fft2 1024x1024           complex64  vk     14.6 ms   cpu      3.5 ms
+  rfft 2^22                complex64  vk     17.0 ms   cpu     36.3 ms
+  irfft 2^20               complex64  vk      4.8 ms   cpu      8.9 ms
+  fft 2^20                 complex128 vk     14.2 ms   cpu     15.5 ms
+  fft 64 x 2^14            complex128 vk      9.5 ms   cpu      4.5 ms
+  fft 1000003 (Bluestein)  complex128 vk     69.5 ms   cpu    164.4 ms
+  fft2 1024x1024           complex128 vk     26.8 ms   cpu      7.6 ms
+  rfft 2^22                complex128 vk     36.7 ms   cpu     72.0 ms
+  irfft 2^20               complex128 vk     10.9 ms   cpu     19.8 ms
   CPU fallbacks: none
 ```
+
+This laptop's CPU times vary up to 2x from run to run (a 15 W part, with turbo and
+thermal limits); the GPU times mostly within 15% (Bluestein complex64: 27 to 39 ms).
 
 
 ## division

@@ -13,10 +13,16 @@ a one-time warning (see `fallback_counts()`).
 """
 
 import atexit
+import importlib.metadata
 import sys
 import types
 
 import torch
+
+try:
+    __version__ = importlib.metadata.version("torch-vulkan")
+except importlib.metadata.PackageNotFoundError:  # a source tree on the path, not installed
+    __version__ = "unknown"
 
 # "vk" rather than "vulkan": PyTorch's built-in "vulkan" device type belongs
 # to its old, unmaintained mobile backend.

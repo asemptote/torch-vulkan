@@ -12,6 +12,12 @@ import torch_vulkan as tv
 from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
+def test_version_matches_the_installed_package():
+    import importlib.metadata
+
+    assert tv.__version__ == importlib.metadata.version("torch-vulkan")
+
+
 @pytest.mark.parametrize("dtype", ALL + [torch.float16, torch.uint8, torch.complex64])
 def test_roundtrip(dtype):
     x = torch.arange(24).reshape(4, 6).to(dtype)

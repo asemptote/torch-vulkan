@@ -233,7 +233,6 @@ RNG LOG_NORMAL 6
 # shaders/factor.slang
 FACTOR TRI_INV 1
 FACTOR CHOL_BLOCK 2
-FACTOR QR_PANEL 3
 FACTOR LARFT 4
 FACTOR SVD_ROUND 5
 FACTOR EIG_COLS 6
@@ -246,6 +245,10 @@ FACTOR LDL_SOLVE 10
 GETRF START 0
 GETRF STEP 1
 GETRF SWAP 2
+
+# shaders/geqrf.slang
+GEQRF DOT 0
+GEQRF UPD 1
 
 # shaders/special.slang (unary first; ZETA and later take a second operand)
 SPECIAL I0 0
