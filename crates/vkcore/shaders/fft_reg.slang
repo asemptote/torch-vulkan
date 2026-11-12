@@ -36,7 +36,19 @@
 // last pass has ns = n / R), so a workgroup takes g / 2 columns k and their
 // mirrors ns - k (columns 0 and ns / 2 are their own: their second copy is
 // computed, not stored), its last stage writes shared memory, and the
-// epilogue reads each value and its mirror from there.
+// epilogue reads each value and its mirror from there. (The pairing halves
+// the contiguous runs of the pass's loads and stores: g / 2 columns
+// ascending and g / 2 descending.)
+//
+// EPILOGUE = 2 (the first pass of an inverse real FFT's half-length
+// transform, irfft: csrc/fft.cpp's fft_c2r_compute): the input rows are the
+// onesided spectrum X of the real row of 2n values (rows of `pad` >= n + 1
+// values), folded on load as fft.slang's FFT_C2R folds it:
+//     Z'[k] = (A + B) + i conj(w^k) (A - B),  A = X[k], B = conj(X[n - k]),
+// with X[0]'s and X[n]'s imaginary parts dropped. In the first pass (ns = 1)
+// Z'[j + q nr]'s mirror is at column nr - j, element R - 1 - q, so the
+// columns are paired as for EPILOGUE = 1: a workgroup loads both columns'
+// X into shared memory, and each thread folds its values from there.
 
 #if defined(T_c64)
 typedef float S;
@@ -262,7 +274,7 @@ void stage<let RHO : uint>(Block k, uint m, uint lm, inout T v[E], T tw[E], bool
         v[u] = a == 0 ? x : cmul(x, tw[u]);
     }
     dfts<RHO>(v);
-    if (!last || EPILOGUE != 0)  // (uniform)
+    if (!last || EPILOGUE == 1)  // (uniform)
         GroupMemoryBarrierWithGroupSync();
     [ForceUnroll]
     for (uint u = 0; u < E; u++)
@@ -270,7 +282,7 @@ void stage<let RHO : uint>(Block k, uint m, uint lm, inout T v[E], T tw[E], bool
         uint ib = k.i + ((u / RHO) << k.lT), b = u % RHO, kk = ib & (m - 1);
         uint pos = ((ib >> lm) << (lm + lrho)) + kk + (b << lm);
         T x = v[(u / RHO) * RHO + at(RHO, b)];
-        if (last && EPILOGUE == 0)
+        if (last && EPILOGUE != 1)
         {
             if (k.store)
                 p.out[k.rowout + (pos << k.lns)] = x;
@@ -314,12 +326,46 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
             uint pi = w * hg + (c & (hg - 1)), pic = min(pi, npairs - 1);
             uint b = pic / pairs, kk = pic - b * pairs;
             Gc = (b << lnr) + (c < hg ? kk : (nr - kk) & (nr - 1));
-            G = pi < npairs ? Gc : groups;
+            // (a self-mirrored column's second copy is computed, not stored)
+            G = pi < npairs && (EPILOGUE == 1 || c < hg || (Gc & (nr - 1)) != kk) ? Gc : groups;
         }
         uint j = Gc & (nr - 1);
         uint rowin = (Gc >> lnr) << ln;
         uint rowout = rowin + ((j >> lns) << (lr + lns)) + (j & (p.ns - 1));
         T v[E];
+        if (EPILOGUE == 2)
+        {
+            // both columns of each pair into shared memory, then each value folded with its mirror
+            uint rowx = (Gc >> lnr) * p.pad;  // (this thread's row of X, rows of pad)
+            [ForceUnroll]
+            for (uint s = 0; s < E; s++)
+            {
+                uint e = t + s * WG, cs = e & (g - 1), pos = e >> lg;
+                uint pi = min(w * hg + (cs & (hg - 1)), npairs - 1);
+                uint b = pi / pairs, kk = pi - b * pairs;
+                uint jj = cs < hg ? kk : (nr - kk) & (nr - 1);
+                buf[slot(pos, lg, cs)] = p.in[b * p.pad + jj + (pos << lnr)];
+            }
+            GroupMemoryBarrierWithGroupSync();
+            [ForceUnroll]
+            for (uint a = 0; a < E; a++)
+            {
+                uint q = i + (a << lT), idx = j + (q << lnr);
+                T xa = buf[slot(q, lg, c)];
+                T xb = j != 0 ? buf[slot(R - 1 - q, lg, c ^ hg)] : q != 0 ? buf[slot(R - q, lg, c)] : p.in[rowx + p.n];
+                if (idx == 0)
+                {
+                    xa.y = S(0);  // (X[0] and X[n] count as real, as the full-length inverse's real part has them)
+                    xb.y = S(0);
+                }
+                T bb = cconj(xb);
+                T d = cmul(cconj(tw_2n(idx)), xa - bb);
+                v[a] = (xa + bb) + T(-d.y, d.x);
+            }
+            GroupMemoryBarrierWithGroupSync();  // (the stages write buf next)
+        }
+        else
+        {
         // the first stage: radix E from global memory (m = 1, a butterfly per thread)
         [ForceUnroll]
         for (uint a = 0; a < E; a++)
@@ -327,6 +373,7 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
             uint q = i + (a << lT);
             T x = p.in[rowin + j + (q << lnr)];
             v[a] = p.ns == 1 || q == 0 ? x : cmul(x, tw_n(((j & (p.ns - 1)) * q) << lstep));
+        }
         }
         dfts<E>(v);
         Block k = { i, c, lg, lT, lr, lns, rowout, G < groups };
@@ -361,7 +408,7 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
                 stage_tw<S3>(i, lT, lr, m3, firstbithigh(m3), tw1);
             stage<S3>(k, m3, firstbithigh(m3), v, PRE != 0 ? tw3 : tw1, true);
         }
-        if (EPILOGUE != 0)
+        if (EPILOGUE == 1)
         {
             GroupMemoryBarrierWithGroupSync();
             [ForceUnroll]
