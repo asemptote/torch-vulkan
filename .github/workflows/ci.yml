@@ -27,6 +27,11 @@ env:
   TORCH_VK_VALIDATE: "1"
   # lavapipe's LLVM JIT emits AVX-512 code that faults on some runner CPUs.
   LP_NATIVE_VECTOR_WIDTH: "256"
+  # The CPU reference the tests compare with: PyTorch's AVX2 kernels and MKL's
+  # AVX2 code path on every runner, as on the development machines, instead of
+  # whatever an AVX-512 runner picks (MKL's float32 sqrt differed there).
+  ATEN_CPU_CAPABILITY: "avx2"
+  MKL_CBWR: "AVX2"
 
 jobs:
   test:
