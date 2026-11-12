@@ -175,8 +175,19 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse,
   // per thread) as measured on the H100 and L40S: 16 for complex64 up to
   // 2^20 (4 columns per workgroup at R = 1024: 32-byte runs), 8 beyond and
   // for complex128.
+  // complex128 keeps fft_radix.slang's passes on integrated Intel GPUs under
+  // Windows: there (UHD 620, driver 101.2134) fft_reg made fft 2^20 complex128
+  // about 1.5x slower and rfft 2^22 float64 1.3x, while complex64 gained.
+  // Under Mesa (HD 530) fft_reg is as fast or faster for both, so the rule is
+  // the driver's, not the GPU's.
+#ifdef _WIN32
+  static const bool intel_windows = has_feature(kFeatureIntegrated) && vkt_vendor_id() == 0x8086;
+#else
+  static const bool intel_windows = false;
+#endif
   std::string variant = c64 && bits <= 20 ? "e16" : "e8";
-  bool fits = has_feature(kFeatureShared32K) || (c64 && variant == "e8");  // (16 KiB for complex64 with 8)
+  bool fits = (has_feature(kFeatureShared32K) || (c64 && variant == "e8")) &&  // (16 KiB for complex64 with 8)
+              (c64 || !intel_windows);
   int64_t reg_passes = bits <= 20 ? 2 : 3;
   if (fits && bits >= 14 && bits <= 30) {
     std::string reg = std::string("fft_reg_") + dtype_label(x.scalar_type()) + "_" + variant;
