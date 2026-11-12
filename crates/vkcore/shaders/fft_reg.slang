@@ -25,6 +25,18 @@
 //
 // Shared memory: WG E values (32 KiB, or 16 KiB for complex64 with E = 8);
 // the host checks that the device has it.
+//
+// EPILOGUE = 1 (the last pass of a real FFT's half-length transform, rfft:
+// csrc/fft.cpp's rfft_last_even): the output is the onesided spectrum of
+// the real row of 2n values whose complex pairs this row is, as fft.slang's
+// FFT_R2C computes it from the complex FFT Z:
+//     X[k] = (A + B) / 2 + w^k (A - B) / (2i),  A = Z[k], B = conj(Z[n - k]),
+// w = exp(-2 pi i / 2n) (`etab`, the two-level table for 2n), k <= n, rows
+// of n + 1. Z[k + q ns]'s mirror Z[n - k - q ns] is in column ns - k (the
+// last pass has ns = n / R), so a workgroup takes g / 2 columns k and their
+// mirrors ns - k (columns 0 and ns / 2 are their own: their second copy is
+// computed, not stored), its last stage writes shared memory, and the
+// epilogue reads each value and its mirror from there.
 
 #if defined(T_c64)
 typedef float S;
@@ -65,11 +77,13 @@ struct Params
     uint r;
     uint ngroups;
     uint pad;
+    T* etab;   // EPILOGUE: the two-level table for 2n
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
 [vk::constant_id(0)] const int INVERSE = 0;
+[vk::constant_id(1)] const int EPILOGUE = 0;
 
 groupshared T buf[BUF];
 
@@ -93,6 +107,20 @@ T tw_n(uint e)
 {
     uint ln = firstbithigh(p.n), L = (ln + 1) >> 1;
     return fwd(cmul(p.table[e & ((1u << L) - 1)], p.table[(1u << L) + min(e >> L, (p.n >> L) - 1)]));
+}
+
+// exp(-2 pi i e / 2n) for e <= n, from the two-level table for 2n (EPILOGUE).
+T tw_2n(uint e)
+{
+    uint ln2 = firstbithigh(p.n) + 1, L = (ln2 + 1) >> 1;
+    return cmul(p.etab[e & ((1u << L) - 1)], p.etab[(1u << L) + min(e >> L, ((2 * p.n) >> L) - 1)]);
+}
+
+// X[k] = (A + B) / 2 + w (A - B) / (2i) (EPILOGUE; fft.slang's FFT_R2C).
+T r2c_point(T a, T c, T w)
+{
+    T e = (a + c) * S(0.5), d = (a - c) * S(0.5);
+    return e + cmul(w, T(d.y, -d.x));
 }
 
 // W_R^e.
@@ -234,7 +262,7 @@ void stage<let RHO : uint>(Block k, uint m, uint lm, inout T v[E], T tw[E], bool
         v[u] = a == 0 ? x : cmul(x, tw[u]);
     }
     dfts<RHO>(v);
-    if (!last)  // (uniform)
+    if (!last || EPILOGUE != 0)  // (uniform)
         GroupMemoryBarrierWithGroupSync();
     [ForceUnroll]
     for (uint u = 0; u < E; u++)
@@ -242,13 +270,13 @@ void stage<let RHO : uint>(Block k, uint m, uint lm, inout T v[E], T tw[E], bool
         uint ib = k.i + ((u / RHO) << k.lT), b = u % RHO, kk = ib & (m - 1);
         uint pos = ((ib >> lm) << (lm + lrho)) + kk + (b << lm);
         T x = v[(u / RHO) * RHO + at(RHO, b)];
-        if (last)
+        if (last && EPILOGUE == 0)
         {
             if (k.store)
                 p.out[k.rowout + (pos << k.lns)] = x;
         }
         else
-            buf[slot(pos, k.lg, k.c)] = x;
+            buf[slot(pos, k.lg, k.c)] = x;  // (EPILOGUE: read back by the epilogue)
     }
 }
 
@@ -263,6 +291,10 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
     uint lstep = ln - lr - lns;  // the outer twiddle's exponent unit, n / (R ns)
     uint groups = p.batch << lnr, blocks = (groups + g - 1) >> lg;
     uint c = t & (g - 1), i = t >> lg;  // this thread's column and index in it
+    // EPILOGUE: pairs of mirrored columns (k, nr - k), k <= nr / 2, g / 2 a block
+    uint hg = g >> 1, pairs = (nr >> 1) + 1, npairs = p.batch * pairs;
+    if (EPILOGUE != 0)
+        blocks = (npairs + hg - 1) / hg;
     uint m1 = E, m2 = E * S1, m3 = E * S1 * S2;
     T tw1[E], tw2[E], tw3[E];
     if (PRE != 0)
@@ -277,6 +309,13 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
     for (uint w = gx; w < blocks; w += p.ngroups)  // (uniform per workgroup)
     {
         uint G = (w << lg) + c, Gc = min(G, groups - 1);  // (a partial last block repeats the last group)
+        if (EPILOGUE != 0)
+        {
+            uint pi = w * hg + (c & (hg - 1)), pic = min(pi, npairs - 1);
+            uint b = pic / pairs, kk = pic - b * pairs;
+            Gc = (b << lnr) + (c < hg ? kk : (nr - kk) & (nr - 1));
+            G = pi < npairs ? Gc : groups;
+        }
         uint j = Gc & (nr - 1);
         uint rowin = (Gc >> lnr) << ln;
         uint rowout = rowin + ((j >> lns) << (lr + lns)) + (j & (p.ns - 1));
@@ -321,6 +360,27 @@ void run<let N : uint, let S1 : uint, let S2 : uint, let S3 : uint>(uint t, uint
             if (PRE == 0)
                 stage_tw<S3>(i, lT, lr, m3, firstbithigh(m3), tw1);
             stage<S3>(k, m3, firstbithigh(m3), v, PRE != 0 ? tw3 : tw1, true);
+        }
+        if (EPILOGUE != 0)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            [ForceUnroll]
+            for (uint s = 0; s < E; s++)
+            {
+                // element (column slot cs, frequency pos) and its mirror's slot
+                uint e = t + s * WG, cs = e & (g - 1), pos = e >> lg;
+                uint pi = w * hg + (cs & (hg - 1));
+                uint b = min(pi, npairs - 1) / pairs, kk = min(pi, npairs - 1) - b * pairs;
+                uint jj = cs < hg ? kk : (nr - kk) & (nr - 1);
+                if (pi >= npairs || (cs >= hg && jj == kk))
+                    continue;  // (past the end, or a self-mirrored column's copy)
+                uint posm = jj == 0 ? (R - pos) & (R - 1) : R - 1 - pos;
+                T z = buf[slot(pos, lg, cs)], zm = buf[slot(posm, lg, cs ^ hg)];
+                uint idx = jj + (pos << lnr), row = b * (p.n + 1);
+                p.out[row + idx] = r2c_point(z, cconj(zm), tw_2n(idx));
+                if (idx == 0)
+                    p.out[row + p.n] = r2c_point(z, cconj(zm), T(S(-1), S(0)));
+            }
         }
         GroupMemoryBarrierWithGroupSync();  // (buf is reused by the next block)
     }
