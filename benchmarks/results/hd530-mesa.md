@@ -3,8 +3,9 @@
 - GPU: Intel(R) HD Graphics 530 (SKL GT2), Vulkan driver Intel open-source Mesa driver, Mesa 26.0.8-1ubuntu0.3, version 26.0.8
 - CPU baseline: Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz, 4 threads, PyTorch 2.14.1+cpu
 - OS: Linux 7.0.0-43-generic
-- torch-vulkan commit cccade8, 2026-11-11
-- `python benchmarks/integrated.py hd530-mesa matmul linalg eigh elementwise`
+- torch-vulkan commit cccade8, 2026-11-11 (fft: commit 96637d5, 2026-11-11)
+- `python benchmarks/integrated.py hd530-mesa matmul linalg eigh elementwise`;
+  fft: `python benchmarks/integrated.py hd530-mesa-fft fft`
 
 ## matmul
 
@@ -21,6 +22,28 @@ Intel(R) HD Graphics 530 (SKL GT2) (TORCH_VK_GEMM=default) vs CPU (4 threads), t
   float16    256^3   vk    37.5   vk a@b.T    37.4   cpu     1.6 GFLOP/s
   float16   1024^3   vk    83.3   vk a@b.T    65.7   cpu     1.1 GFLOP/s
   float16   2048^3   vk    88.9   vk a@b.T    73.1   cpu     0.3 GFLOP/s
+  CPU fallbacks: none
+```
+
+
+## fft
+
+`fft.py`:
+
+```
+Intel(R) HD Graphics 530 (SKL GT2) vs CPU (4 threads), torch 2.14.1+cpu
+  fft 2^20                 complex64  vk      5.0 ms   cpu      7.7 ms
+  fft 64 x 2^14            complex64  vk      2.9 ms   cpu      1.3 ms
+  fft 1000003 (Bluestein)  complex64  vk     28.2 ms   cpu    101.5 ms
+  fft2 1024x1024           complex64  vk     10.2 ms   cpu      1.8 ms
+  rfft 2^22                complex64  vk     12.0 ms   cpu     29.4 ms
+  irfft 2^20               complex64  vk      3.5 ms   cpu      4.0 ms
+  fft 2^20                 complex128 vk      9.9 ms   cpu      8.3 ms
+  fft 64 x 2^14            complex128 vk      5.9 ms   cpu      3.1 ms
+  fft 1000003 (Bluestein)  complex128 vk     46.0 ms   cpu    189.3 ms
+  fft2 1024x1024           complex128 vk     16.6 ms   cpu      4.1 ms
+  rfft 2^22                complex128 vk     20.5 ms   cpu     39.2 ms
+  irfft 2^20               complex128 vk      5.8 ms   cpu      6.7 ms
   CPU fallbacks: none
 ```
 
