@@ -105,6 +105,9 @@ pub struct Context {
     pub vendor_id: u32,
     /// A discrete GPU (its own memory and power budget).
     pub discrete: bool,
+    /// An integrated GPU (sharing the CPU's memory; not a CPU implementation
+    /// such as lavapipe).
+    pub integrated: bool,
     pub caps: Capabilities,
     memory: vk::PhysicalDeviceMemoryProperties,
     /// On Vulkan 1.1 devices, the extension entry points of the 1.2 core
@@ -326,7 +329,7 @@ impl Context {
                 (ash::khr::buffer_device_address::Device::new(&instance, &device),
                  ash::khr::timeline_semaphore::Device::new(&instance, &device))
             });
-            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, caps, memory, khr })
+            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr })
         }
     }
 
