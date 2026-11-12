@@ -391,21 +391,48 @@ at::Tensor block_t_gemm(const at::Tensor& v_in, const at::Tensor& tau_panel) {
   return t - at::diag_embed(zero.to(t.scalar_type()));
 }
 
-// In-place geqrf of a3 [B, m, n]; returns tau [B, min(m, n)].
+struct GeqrfParams {
+  uint64_t a, tau, part, refl;
+  uint32_t rows, ld, sa, k, b, j, groups, ntau;
+};
+static_assert(sizeof(GeqrfParams) == 64, "must match shaders/geqrf.slang");
+constexpr int64_t kGeqrfRows = 256;  // RW in shaders/geqrf.slang
+
+// In-place geqrf of a3 [B, m, n]; returns tau [B, min(m, n)]. Each panel is
+// factored over many workgroups, two dispatches per column
+// (shaders/geqrf.slang); the rest of the matrix is updated by block
+// reflectors and GEMMs.
 at::Tensor geqrf_inplace(const at::Tensor& a3) {
   int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2), kmax = std::min(m, n);
   at::Tensor tau = at::zeros({B, kmax}, a3.options());
   if (B == 0 || kmax == 0) {
     return tau;
   }
-  FactorParams p = params_for(a3);
-  p.aux = gpu_address(tau);
-  p.saux = static_cast<uint32_t>(kmax);
+  int64_t groups = (m + kGeqrfRows - 1) / kGeqrfRows;
+  at::Tensor part = at::empty({B, groups, kBlock}, a3.options());
+  at::Tensor refl = at::empty({B, 4}, a3.options());
+  GeqrfParams g{};
+  g.a = gpu_address(a3);
+  g.tau = gpu_address(tau);
+  g.part = gpu_address(part);
+  g.refl = gpu_address(refl);
+  g.rows = static_cast<uint32_t>(m);
+  g.ld = static_cast<uint32_t>(a3.stride(1));
+  g.sa = static_cast<uint32_t>(a3.stride(0));
+  g.groups = static_cast<uint32_t>(groups);
+  g.ntau = static_cast<uint32_t>(kmax);
+  std::string kernel = std::string("geqrf_") + dtype_label(a3.scalar_type());
+  uint32_t bz = static_cast<uint32_t>(B);
   for (int64_t k = 0; k < kmax; k += kBlock) {
     int64_t b = std::min(kBlock, kmax - k);
-    p.k = static_cast<uint32_t>(k);
-    p.b = static_cast<uint32_t>(b);
-    factor(op::FACTOR_QR_PANEL, p, B, a3.scalar_type());
+    g.k = static_cast<uint32_t>(k);
+    g.b = static_cast<uint32_t>(b);
+    for (int64_t j = k; j < k + b; ++j) {
+      g.j = static_cast<uint32_t>(j);
+      uint32_t gx = static_cast<uint32_t>((m - j + kGeqrfRows - 1) / kGeqrfRows);
+      dispatch(kernel, {op::GEQRF_DOT}, g, gx, bz);
+      dispatch(kernel, {op::GEQRF_UPD}, g, gx, bz);
+    }
     if (k + b < n) {
       // A2 <- H^H A2 = A2 - V T^H (V^H A2)
       at::Tensor v = reflectors(a3, k, b);

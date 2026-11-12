@@ -1,9 +1,9 @@
 // axis T: f32=float f64=double c64=float2 c128=double2
 //
 // Small dense factorization steps for csrc/dense.cpp (M13), the parts of
-// blocked LU (its panels are getrf.slang), Cholesky, QR and Jacobi eigen/SVD
-// that LAPACK would do on the CPU. Matrices are row-major and batched: matrix
-// z starts at a + z * sa
+// blocked LU and QR (their panels are getrf.slang and geqrf.slang), Cholesky
+// and Jacobi eigen/SVD that LAPACK would do on the CPU. Matrices are
+// row-major and batched: matrix z starts at a + z * sa
 // (row i, column j at [i * ld + j]). One workgroup works on one matrix (or
 // one Jacobi pair of one matrix), so steps that depend on each other are
 // separated by workgroup barriers; global memory is used throughout.
@@ -15,9 +15,6 @@
 //               upper per UPPER, unit diagonal per UNIT) into aux (b x b)
 //   CHOL_BLOCK  in-place lower Cholesky of the b x b block at (k, k); a
 //               non-positive pivot sets info (once) to its 1-based index
-//   QR_PANEL    Householder QR of columns [k, k + b) over rows [k, rows)
-//               (LAPACK's dlarfg/dlarf: beta = -sign(alpha) |x|, v(0) = 1
-//               implicit, stored below the diagonal), tau into aux[k + j]
 //   LARFT       the b x b upper-triangular T of the panel's block reflector
 //               H = I - V T V^H (forward, columnwise) into aux2
 //   SVD_ROUND   one-sided Jacobi: for column pair `pairs[gid.x]` of the
@@ -294,72 +291,6 @@ void chol_block(uint t, uint z)
 }
 
 // ---------------------------------------------------------------- QR
-
-void qr_panel(uint t, uint z)
-{
-    T* a = p.a + z * p.sa;
-    T* tau = p.aux + z * p.saux;
-    uint m = p.rows, ld = p.ld;
-    for (uint j = p.k; j < p.k + p.b; j++)
-    {
-        // dlarfg / zlarfg on x = a[j:m, j]. The norms are scaled by the
-        // largest |part| (as dlapy3/dznrm2), or squares of tiny entries
-        // underflow (flushed on GPUs) and beta becomes 0: tau NaN; a column
-        // whose largest part is subnormal counts as zero (H = I).
-        T alpha = a[j * ld + j];
-        R amax = R(0);
-        for (uint i = j + 1 + t; i < m; i += WG)
-            amax = max(amax, mag1(a[i * ld + j]));
-        amax = max(reduce_max_real(t, amax), mag1(alpha));
-        R part = R(0);
-        if (amax >= min_normal())
-        {
-            for (uint i = j + 1 + t; i < m; i += WG)
-                part += norm2(a[i * ld + j] / amax);
-        }
-        R xnorm2 = reduce_sum_real(t, part);  // (|x|^2 / amax^2)
-        R alphr = re(alpha);
-        T tj = ZERO;
-        if (amax >= min_normal() && (xnorm2 != R(0) || !is_zero(alpha - fromr(alphr))))
-        {
-            R beta = -sign_of(alphr) * amax * sqrt(norm2(alpha / amax) + xnorm2);
-#ifdef IS_COMPLEX
-            tj = T((beta - alphr) / beta, -alpha.y / beta);
-#else
-            tj = (beta - alpha) / beta;
-#endif
-            T scale = dv(ONE, alpha - fromr(beta));
-            for (uint i = j + 1 + t; i < m; i += WG)
-                a[i * ld + j] = mul(a[i * ld + j], scale);
-            barrier();
-            if (t == 0)
-                a[j * ld + j] = fromr(beta);
-        }
-        if (t == 0)
-            tau[j] = tj;
-        barrier();
-        if (is_zero(tj))
-            continue;
-        // Apply H^H = I - conj(tau) v v^H to the panel's later columns.
-        T ctj = cj(tj);
-        for (uint c = j + 1; c < p.k + p.b; c++)
-        {
-            T dot = ZERO;
-            for (uint i = j + t; i < m; i += WG)
-            {
-                T v = i == j ? ONE : a[i * ld + j];
-                dot += mul(cj(v), a[i * ld + c]);
-            }
-            T w = mul(reduce_sum(t, dot), ctj);
-            for (uint i = j + t; i < m; i += WG)
-            {
-                T v = i == j ? ONE : a[i * ld + j];
-                a[i * ld + c] = a[i * ld + c] - mul(v, w);
-            }
-            barrier();
-        }
-    }
-}
 
 // T (b x b, upper) with H_k ... H_{k+b-1} = I - V T V^H: T[j, j] = tau_j,
 // T[0:j, j] = -tau_j T[0:j, 0:j] (V[:, 0:j]^H v_j).
@@ -859,7 +790,6 @@ void main(uint3 gid: SV_GroupID, uint3 lid: SV_GroupThreadID)
     case FACTOR_LASWP: laswp(t, gid.x); break;
     case FACTOR_TRI_INV: tri_inv(t, gid.x); break;
     case FACTOR_CHOL_BLOCK: chol_block(t, gid.x); break;
-    case FACTOR_QR_PANEL: qr_panel(t, gid.x); break;
     case FACTOR_LARFT: larft(t, gid.x); break;
     case FACTOR_SVD_ROUND: svd_round(t, gid.x, gid.y); break;
     case FACTOR_EIG_COLS: eig_cols(t, gid.x, gid.y); break;
