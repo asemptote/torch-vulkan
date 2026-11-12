@@ -197,7 +197,7 @@ def test_irfft_long_rows(dtype):
     # (rows the register passes take: fft_reg.slang's first pass folds the
     # half spectrum itself; with extra values past n + 1, which irfft ignores,
     # the input rows are longer than the transform's)
-    for bits, extra in ((15, 0), (18, 0), (18, 5), (21, 0), (22, 3)):
+    for bits, extra in ((15, 0), (18, 0), (18, 5), (20, 0), (21, 0), (22, 3)):
         n = 1 << (bits + 1)
         x = make_complex((2, n // 2 + 1 + extra), dtype, bits)
         with on_gpu():

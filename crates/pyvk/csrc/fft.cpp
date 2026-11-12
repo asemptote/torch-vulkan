@@ -189,9 +189,14 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse,
   bool fits = has_feature(kFeatureShared32K) || (c64 && variant == "e8");  // (16 KiB for complex64 with 8)
   int64_t reg_passes = bits <= 20 ? 2 : 3;
   bool c2r = c2r_m > 0 && inverse;
-  if (c2r && !(fits && bits >= 14 && bits <= 30 &&
-               (variant == "e16" ? (c64 ? 4096 : 2048) : 2048) / (int64_t(1) << (bits / reg_passes + 1)) >= 2)) {
-    return at::Tensor();  // (the folding first pass pairs columns: g >= 2 of them)
+  if (c2r) {
+    // (the folding first pass pairs columns: g = slots / r >= 2 of them, r
+    // the first pass's radix, the largest)
+    int64_t slots = variant == "e16" && c64 ? 4096 : 2048;
+    int64_t r0 = int64_t(1) << (bits / reg_passes + (bits % reg_passes ? 1 : 0));
+    if (!(fits && bits >= 14 && bits <= 30 && slots / r0 >= 2)) {
+      return at::Tensor();
+    }
   }
   if (fits && bits >= 14 && bits <= 30) {
     std::string reg = std::string("fft_reg_") + dtype_label(x.scalar_type()) + "_" + variant;
