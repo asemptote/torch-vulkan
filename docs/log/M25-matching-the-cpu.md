@@ -141,3 +141,22 @@ round as the CPU does, step by step.
     another dim. The slices' destinations are disjoint, so the order of
     accumulation is unchanged. This keeps each slice's per-element offsets
     and sort keys well inside a buffer's 4 GiB.
+
+## rfft: the half-spectrum split in the last register pass (#35)
+
+- rfft of 2n real values is an n-point complex FFT of their pairs followed by
+  FFT_R2C, X[k] = (Z[k] + conj(Z[n - k])) / 2 + w^k (Z[k] - conj(Z[n - k])) / (2i).
+  Where fft_pow2 takes the row in fft_reg.slang's register passes, the last
+  pass computes X itself (`EPILOGUE = 1`). In that pass (ns = n / R), Z[k +
+  q ns]'s mirror Z[n - k - q ns] is in column ns - k, so a workgroup takes g /
+  2 columns k and their mirrors. Its last stage writes shared memory, and the
+  epilogue reads each value and its mirror there and writes X, in rows of n +
+  1. w^k comes from the two-level table for 2n.
+- With `EPILOGUE = 0` the kernel is unchanged. Rows the register passes do
+  not take keep the separate FFT_R2C pass, which reads each mirrored pair and
+  one twiddle once (db43372).
+- H100 NVL, synchronised calls against CUDA: rfft of 2^24 float32 points went
+  from 2.6x to 1.6x CUDA's time (0.543 -> 0.324 ms), and 2^20 from 2.1x to
+  1.8x. On the L40S, 2^24 float32 takes 0.642 ms, against CUDA's 0.777.
+  Accuracy is the CPU's: relative errors of 1.9-2.8e-7 (float32) and
+  6-9.6e-16 (float64) against a float64 reference, from 2^15 to 2^23 points.

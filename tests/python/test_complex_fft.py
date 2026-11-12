@@ -177,3 +177,16 @@ def test_complex_views_alias():
     with on_gpu():
         w = u.to("vk").unfold(0, 4, 2) * 1
     check(w, u.unfold(0, 4, 2))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_rfft_long_rows(dtype):
+    # (rows the register passes take: fft_reg.slang's last pass writes the
+    # half spectrum itself, columns paired with their mirrors)
+    for bits in (15, 18, 21, 22):
+        x = make((2, 1 << bits), dtype, bits)
+        with on_gpu():
+            got = torch.fft.rfft(x.to("vk"))
+        want = torch.fft.rfft(x.double()).to(got.dtype)
+        tol = 2e-6 if dtype == torch.float32 else 1e-13
+        check(got, want, rtol=0, atol=tol * want.abs().max().item())

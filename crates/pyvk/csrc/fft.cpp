@@ -45,8 +45,9 @@ static_assert(sizeof(RadixParams) == 48, "must match shaders/fft_radix.slang");
 struct RegParams {
   uint64_t in, out, table, rtab;
   uint32_t n, ns, batch, r, ngroups, pad;
+  uint64_t etab;  // (EPILOGUE only)
 };
-static_assert(sizeof(RegParams) == 56, "must match shaders/fft_reg.slang");
+static_assert(sizeof(RegParams) == 64, "must match shaders/fft_reg.slang");
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -133,7 +134,12 @@ at::Tensor roots_full(int64_t r, at::ScalarType dtype) {
 }
 
 // Unnormalized FFT of contiguous rows x [batch, n], n a power of two.
-at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse) {
+//
+// r2c (forward only): where the register passes take the row, their last
+// pass writes the onesided spectrum of the real rows whose complex pairs x
+// holds ([batch, n + 1], as fft.slang's FFT_R2C: fft_reg.slang's EPILOGUE)
+// into *r2c, and that is returned; otherwise the complex FFT, as without it.
+at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse, const at::Tensor* r2c = nullptr) {
   if (n == 1) {
     return x.clone();
   }
@@ -177,13 +183,17 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
     at::Tensor table2 = twiddles_2level(n, x.scalar_type());
     int64_t slots = variant == "e16" ? (c64 ? 4096 : 2048) : 2048;  // WG E values per workgroup
     at::Tensor src = x;
+    bool epilogue = r2c != nullptr && !inverse;
     for (int64_t pass = 0, ns = 1; pass < reg_passes; ++pass) {
       int64_t r = int64_t(1) << (bits / reg_passes + (pass < bits % reg_passes ? 1 : 0));
+      // (the epilogue pairs columns: g = slots / r >= 2 of them in the last pass)
+      bool fused = epilogue && pass == reg_passes - 1 && slots / r >= 2;
       at::Tensor table_r = roots_full(r, x.scalar_type());
-      at::Tensor dst = at::empty_like(x);
+      at::Tensor dst = fused ? *r2c : at::empty_like(x);
       RegParams p{};
       p.in = gpu_address(src);
       p.out = gpu_address_out(dst);
+      p.etab = fused ? gpu_address(twiddles_2level(2 * n, x.scalar_type())) : 0;
       p.table = gpu_address(table2);
       p.rtab = gpu_address(table_r);
       p.n = static_cast<uint32_t>(n);
@@ -192,7 +202,12 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse)
       p.r = static_cast<uint32_t>(r);
       int64_t g = slots / r;
       p.ngroups = static_cast<uint32_t>(std::min<int64_t>((batch * (n / r) + g - 1) / g, 65535));
-      dispatch(reg, {inverse ? 1u : 0u}, p, p.ngroups);
+      if (fused) {
+        // (blocks of g / 2 mirrored column pairs: (n / r) / 2 + 1 a row)
+        int64_t pairs = batch * ((n / r) / 2 + 1);
+        p.ngroups = static_cast<uint32_t>(std::min<int64_t>((pairs + g / 2 - 1) / (g / 2), 65535));
+      }
+      dispatch(reg, {inverse ? 1u : 0u, fused ? 1u : 0u}, p, p.ngroups);
       src = dst;
       ns *= r;
     }
@@ -348,9 +363,13 @@ at::Tensor rfft_last_even(const at::Tensor& x) {
   }
   int64_t n = moved.size(-1), h = n / 2, batch = moved.numel() / std::max<int64_t>(n, 1);
   at::Tensor z = at::view_as_complex(moved.view({batch, h, 2}));
-  at::Tensor spectrum = fft_rows(z, false);
-  at::Tensor out = at::empty({batch, h + 1}, spectrum.options());
-  fft_phase(op::FFT_R2C, spectrum, out, n, h, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
+  at::Tensor out = at::empty({batch, h + 1}, z.options());
+  // (where the register passes take the row, their last pass writes the
+  // spectrum: fft_reg.slang's EPILOGUE)
+  at::Tensor spectrum = is_pow2(h) ? fft_pow2(z, batch, h, false, &out) : fft_rows(z, false);
+  if (!spectrum.is_same(out)) {
+    fft_phase(op::FFT_R2C, spectrum, out, n, h, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
+  }
   std::vector<int64_t> shape = moved.sizes().vec();
   shape.back() = h + 1;
   return out.view(shape);
