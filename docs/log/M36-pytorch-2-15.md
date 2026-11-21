@@ -62,6 +62,65 @@ like `_philox_uniform_` before it), `_scaled_addmm` (CUDA only) and
 kernel; the rest is MPS and XPU dispatch entries. `Math.h`, which
 `_special.slang` is ported from, did not change.
 
+## What 2.15's own tests found
+
+A lavapipe run of the 36 test files on 2.15 (before the fixes below) had
+414 vk-only failures that the last 2.14 run did not have, and new CPU
+fallbacks. Most came from three changes on PyTorch's side:
+
+- **Custom-op and FakeTensor alias checks.** 2.15's `torch._refs.fft`
+  goes through a custom op whose output may not alias its input, and the
+  FakeTensor cross-checks compare aliasing. vk's `_fft_c2c` (and r2c, c2r)
+  returned the input itself where a transform does nothing (an empty or
+  length-1 dimension). They now return a copy (222 failures).
+- **Bicubic `grid_sample` of 5-D input** (pytorch/pytorch#194787), new on
+  the CPU, CUDA and MPS. vk computes it from gathers
+  (`_bicubic_grid_sample_3d` in `_kernels.py`): 2.15's `resolve_cubic_taps`
+  on tensors (Keys coefficients, the four taps per axis around the
+  unclipped index, padding, a dropped tap reading nothing), 64 taps
+  accumulated z, y, x in the CPU's order, in float32 or float64, indexing
+  through the input's strides (an expanded input is not copied). Its
+  backward is autograd of the same composite, as for 2-D bicubic.
+  PyTorch's meta function refuses 5-D bicubic on devices other than the CPU
+  and CUDA, so `_layout.py` no longer runs FakeTensor for `grid_sampler_3d`
+  (it logged an error on every first call) and the two FakeTensor tests are
+  in the runner's `EXPECTED` list.
+- **Tests that used to be CUDA-only** now run on every accelerator
+  (`@onlyAccelerator`). Most exposed differences in vk worth fixing:
+  `zero_` writes zero bits, as the CPU's memset, so dtypes with no fill
+  kernel (`bits8`, `float4_e2m1fn_x2`) can be zeroed; float to int32 casts
+  give int32 min for NaN, infinities and out-of-range values, as x86 does
+  (the GPU saturated), and float64 to int8/int16/uint8 their low bits;
+  `exponential_` never returns 0 (CUDA keeps -log(1 - u) at least half the
+  dtype's epsilon); `multinomial` checks devices first; `randperm` with n =
+  0 or a generator of another device type; `cat` gives a resized `out=` the
+  inputs' memory format; complex `x ** 2`, `** 3` and `** -2` are products,
+  as the CPU computes them (`(-1 + inf i) ** 2` is `-inf - inf i`). Some
+  are CUDA-only by nature (CUDA graphs, peak-memory statistics, streams,
+  DataParallel, SyncBatchNorm's CUDA-only ops) and are in `EXPECTED`.
+
+The rest were changes in the CPU's behaviour:
+
+- `clamp` and `hardtanh` saturate integer scalar bounds outside the dtype's
+  range (pytorch/pytorch#193169): a bound that cannot change an element is
+  dropped, the opposite raises; `hardtanh` no longer rejects negative
+  bounds for unsigned types. vk follows (`clamp_bound` in elementwise.cpp),
+  and clamps uint16, uint32 and uint64 (new on the CPU, #189953) on the GPU
+  as the signed type that orders them the same way (uint16 and uint32
+  widened, uint64 with its top bit flipped). This turned up an older bug:
+  an int32 or 8/16-bit `clamp` with only one bound used int64's extremes for
+  the missing one, whose low words the 32-bit kernel read as 0 and -1, so
+  `torch.clamp(int32_tensor, min=10)` gave -1 everywhere.
+- Padding and pooling checks moved to shared headers with new messages
+  (`Padding.h`, `PoolingChecks.h`); vk's checks follow them, and the
+  reflection and replication pad backwards check `grad_output`'s channels.
+- `aminmax` raises `ValueError` for overlapping `min` and `max` outputs;
+  `histc`'s dtype error names `torch.histogram`; `i0` and the other special
+  functions now refuse a partially overlapping `out=`, as every CPU unary op
+  does (2.15's test lists `i0`).
+- `torch.equal` of uint16/32/64 and `addmv` with an empty matrix (any dtype)
+  ran on the CPU; they run on the GPU now.
+
 ## Tooling
 
 `tools/cluster/setup.sh` installed torch 2.14.1 and checked out PyTorch's
