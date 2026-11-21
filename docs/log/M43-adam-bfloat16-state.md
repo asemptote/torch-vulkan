@@ -1,4 +1,4 @@
-# Fused Adam with bfloat16 state (M42)
+# Fused Adam with bfloat16 state (M43)
 
 Issue #90. PyTorch 2.15's CUDA kernels for `_fused_adam_` and
 `_fused_adamw_` take float32 parameters and gradients with bfloat16
