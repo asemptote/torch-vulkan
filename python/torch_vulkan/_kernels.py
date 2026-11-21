@@ -459,61 +459,81 @@ def _clip_coordinates(x, size):
     return torch.where(torch.isnan(x), float(size - 1), x.clamp(0, size - 1))
 
 
-def _bicubic_grid_sample_3d(input, grid, padding_mode, align_corners):
-    """grid_sampler_3d's bicubic mode (PyTorch 2.15's CPU kernel) from gathers:
-    64 taps per output point, each term formed as the CPU's (sample * (z y) * x)
-    in input's dtype (float32 or float64, the CPU's opmath type), then summed.
-    Differentiable: autograd gives grid_sampler_3d's backward, through the
-    coefficients and the sampled values."""
-    n, c, d_in, h_in, w_in = input.shape
+def _bicubic_grid_sample(input, grid, padding_mode, align_corners):
+    """grid_sampler_{2,3}d's bicubic mode from gathers, as PyTorch 2.15's CPU
+    kernels: resolve_cubic_taps per axis (a dropped tap reads nothing, so a
+    non-finite voxel beside it does not reach the result), in input's dtype
+    (float32 or float64, the CPU's opmath type). 3-D: 64 terms per output
+    point, each sample * (z y) * x, summed; 2-D: the CPU's order, four
+    values along x per row, then the rows along y. Differentiable: autograd
+    gives grid_sampler's backward, through the coefficients and the sampled
+    values."""
+    k = input.dim() - 2
+    n, c = input.shape[:2]
+    spatial = input.shape[2:]
     points = grid.shape[1:-1]
     p = math.prod(points)
-    g = grid.reshape(n, p, 3)
+    g = grid.reshape(n, p, k)
 
     def unnormalize(v, size):
         return (v + 1) / 2 * (size - 1) if align_corners else ((v + 1) * size - 1) / 2
 
-    xc, xt = _cubic_taps(unnormalize(g[..., 0], w_in), w_in, padding_mode, align_corners)
-    yc, yt = _cubic_taps(unnormalize(g[..., 1], h_in), h_in, padding_mode, align_corners)
-    zc, zt = _cubic_taps(unnormalize(g[..., 2], d_in), d_in, padding_mode, align_corners)
-    # All 64 taps in one gather (indexed through input's strides: an expanded
-    # input is not copied); each term as the CPU's, sample * (z y) * x, summed.
-    zt, yt, xt = (torch.stack(t, -1) for t in (zt, yt, xt))  # [n, P, 4]
-    zc, yc, xc = (torch.stack(t, -1) for t in (zc, yc, xc))
-    zi, yi, xi = zt[..., :, None, None], yt[..., None, :, None], xt[..., None, None, :]
-    reads = (zi >= 0) & (yi >= 0) & (xi >= 0)  # [n, P, 4, 4, 4]
-    zi, yi, xi = (torch.where(reads, t, 0) for t in (zi, yi, xi))
-    batch = torch.arange(n, device=input.device).view(n, 1, 1, 1, 1)
-    sample = input[batch, :, zi, yi, xi]  # [n, P, 4, 4, 4, c]
+    coeffs, taps = [], []  # by input dim (D, H, W order)
+    for d in range(k):
+        size = spatial[d]
+        cd, td = _cubic_taps(unnormalize(g[..., k - 1 - d], size), size, padding_mode, align_corners)
+        td = torch.stack(td, -1)  # [n, P, 4]
+        if input.stride(2 + d) == 0:
+            # (an expanded dim: every tap reads its one element, whatever its
+            # index, which may lie past what the indexing kernels address)
+            td = torch.where(td >= 0, 0, -1)
+        coeffs.append(torch.stack(cd, -1))
+        taps.append(td)
+    # All taps in one gather (indexed through input's strides: an expanded
+    # input is not copied); a dropped tap reads element 0 and is zeroed.
+    view = [(slice(None),) * 2 + tuple(slice(None) if e == d else None for e in range(k)) for d in range(k)]
+    idx = [t[v] for t, v in zip(taps, view)]  # each [n, P, 4 (at its dim), 1, ...]
+    reads = functools.reduce(torch.logical_and, (i >= 0 for i in idx))  # [n, P, 4, ..., 4]
+    idx = [torch.where(reads, i, 0) for i in idx]
+    batch = torch.arange(n, device=input.device).view(n, *[1] * (k + 1))
+    sample = input[(batch, slice(None), *idx)]  # [n, P, 4, ..., 4, c]
     sample = torch.where(reads.unsqueeze(-1), sample, 0)
-    weight_zy = (zc[..., :, None, None] * yc[..., None, :, None]).unsqueeze(-1)
-    term = sample * weight_zy * xc[..., None, None, :].unsqueeze(-1)
-    value = term.flatten(2, 4).sum(2).transpose(1, 2)  # [n, c, P]
-    return value.reshape(n, c, *points)
+    cf = [cd[v].unsqueeze(-1) for cd, v in zip(coeffs, view)]
+    if k == 3:
+        term = sample * (cf[0] * cf[1]) * cf[2]
+        value = term.flatten(2, 4).sum(2)  # [n, P, c]
+    else:
+        rows = sample * cf[1]  # [n, P, 4 (y), 4 (x), c]
+        row = ((rows[:, :, :, 0] + rows[:, :, :, 1]) + rows[:, :, :, 2]) + rows[:, :, :, 3]
+        cols = row * cf[0].squeeze(3)  # [n, P, 4 (y), c]
+        value = ((cols[:, :, 0] + cols[:, :, 1]) + cols[:, :, 2]) + cols[:, :, 3]
+    return value.transpose(1, 2).reshape(n, c, *points)
 
 
-def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
-    _checks.grid_sampler(input, grid, mode, 3)
-    dt = _grid_dtype(input.dtype)
-    if mode not in (0, 1):  # bicubic
-        return _bicubic_grid_sample_3d(input.to(dt), grid.to(dt), padding_mode, align_corners).to(input.dtype)
-    out = torch.ops.torch_vulkan.grid_sampler(input.to(dt), grid.to(dt), mode, padding_mode, align_corners)
-    return out.to(input.dtype)
+def _make_grid_sampler_forward(k):
+    def forward(input, grid, mode, padding_mode, align_corners):
+        _checks.grid_sampler(input, grid, mode, k)
+        dt = _grid_dtype(input.dtype)
+        if mode not in (0, 1):  # bicubic
+            return _bicubic_grid_sample(input.to(dt), grid.to(dt), padding_mode, align_corners).to(input.dtype)
+        # (shaders/gridsample.slang: the CPU's arithmetic, the same at both ranks)
+        out = torch.ops.torch_vulkan.grid_sampler(input.to(dt), grid.to(dt), mode, padding_mode, align_corners)
+        return out.to(input.dtype)
+
+    return forward
 
 
 def _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask):
-    """grid_sampler_{2,3}d's bicubic backward as autograd of a decomposition
-    (PyTorch's for 2-D, _bicubic_grid_sample_3d for 3-D; Vulkan gathers forward,
-    scatter-adds backward): the gradients flow through the cubic coefficients
-    and the sampled values, as the CPU's (none through the tap indices).
-    Autograd is re-enabled here, since an op's backward kernel runs below it."""
-    if input.dim() == 5:
-        dt = _grid_dtype(input.dtype)
+    """grid_sampler_{2,3}d's bicubic backward as autograd of _bicubic_grid_sample
+    (Vulkan gathers forward, scatter-adds backward): the gradients flow through
+    the cubic coefficients and the sampled values, as the CPU's (none through
+    the tap indices). Autograd is re-enabled here, since an op's backward
+    kernel runs below it."""
+    dt = _grid_dtype(input.dtype)
 
-        def decomp(x, g, mode, padding, align):
-            return _bicubic_grid_sample_3d(x.to(dt), g.to(dt), padding, align).to(x.dtype)
-    else:
-        decomp = decomposition_table[torch.ops.aten.grid_sampler_2d.default]
+    def decomp(x, g, padding, align):
+        return _bicubic_grid_sample(x.to(dt), g.to(dt), padding, align).to(x.dtype)
+
     tls_exclude = torch._C._dispatch_tls_local_exclude_set()
     for key in (torch._C.DispatchKey.AutogradPrivateUse1, torch._C.DispatchKey.ADInplaceOrView):
         tls_exclude = tls_exclude.remove(key)
@@ -523,7 +543,7 @@ def _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align
         wrt = [t for t in (x, g) if t.requires_grad]
         if not wrt:
             return None, None
-        out = decomp(x, g, 2, padding_mode, align_corners)
+        out = decomp(x, g, padding_mode, align_corners)
         grads = list(torch.autograd.grad(out, wrt, grad_output, allow_unused=True))
     gi = grads.pop(0) if output_mask[0] else None
     gg = grads.pop(0) if output_mask[1] else None
@@ -1888,6 +1908,22 @@ def _masked_softmax(x, mask, dim=None, mask_type=None):
     return torch.softmax(x.masked_fill(m, -math.inf), d if x.dim() else 0)
 
 
+def _masked_softmax_backward(grad_output, output, mask, dim=None):
+    """The CPU's masked softmax backward (host_softmax_backward with a mask):
+    along `dim`, s = the sum of grad * out over unmasked positions, and the
+    gradient out * (grad - s) there, 0 where masked (so a NaN output of a
+    fully masked row gives 0, not NaN)."""
+    torch._check(grad_output.shape == mask.shape, lambda: "Mask shape should match grad shape")
+    torch._check(mask.dtype == torch.bool, lambda: "Mask should be a boolean tensor")
+    g, out, m = grad_output, output, mask
+    if g.dim() == 0:
+        g, out, m = g.view(1), out.view(1), m.view(1)
+    d = (g.dim() - 1 if dim is None else dim) if grad_output.dim() else 0
+    zero = torch.zeros((), dtype=g.dtype, device=g.device)
+    s = torch.where(m, zero, g * out).sum(d, keepdim=True)
+    return torch.where(m, zero, out * (g - s)).reshape(grad_output.shape)
+
+
 def _embedding_renorm_(weight, indices, max_norm, norm_type):
     """The CPU's: each distinct indexed row with a norm above max_norm scaled
     by max_norm / (norm + 1e-7) (the norm in the weight's dtype, the scale in
@@ -2187,7 +2223,8 @@ def _kernels():
         "max_pool3d_with_indices_backward": _make_max_pool_backward(3),
         "adaptive_max_pool2d": _make_adaptive_max(2),
         "adaptive_max_pool3d": _make_adaptive_max(3),
-        "grid_sampler_3d": _grid_sampler_forward,
+        "grid_sampler_2d": _make_grid_sampler_forward(2),
+        "grid_sampler_3d": _make_grid_sampler_forward(3),
         "grid_sampler_2d_backward": _make_grid_sampler_backward("grid_sampler_2d_backward"),
         "grid_sampler_3d_backward": _make_grid_sampler_backward("grid_sampler_3d_backward"),
         "ldexp.Tensor": _ldexp,
@@ -2232,6 +2269,7 @@ def _kernels():
         "_segment_reduce_backward": _segment_reduce_backward,
         "_transform_bias_rescale_qkv": _transform_bias_rescale_qkv,
         "_masked_softmax": _masked_softmax,
+        "_masked_softmax_backward": _masked_softmax_backward,
         "_fake_quantize_per_tensor_affine_cachemask_tensor_qparams":
             _fake_quantize_per_tensor_affine_cachemask_tensor_qparams,
         "fake_quantize_per_channel_affine_cachemask": _fake_quantize_per_channel_affine_cachemask,

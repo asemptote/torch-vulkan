@@ -107,6 +107,7 @@ fn main() {
             "csrc/optim.cpp",
             "csrc/nested.cpp",
             "csrc/quantized.cpp",
+            "csrc/autocast.cpp",
     ];
     let mut build = cc::Build::new();
     build

@@ -71,7 +71,7 @@ torch_vulkan.fallback_counts()  # ops that ran on the CPU instead, if any: {}
   included), grid sampling, embeddings, attention and `nn.MultiheadAttention`'s
   fast path, nested tensors, `segment_reduce`.
 - **Training**: the optimisers' fused (`fused=True`) and foreach updates for
-  Adam, AdamW, SGD and Adagrad, and `torch.amp.GradScaler`.
+  Adam, AdamW, SGD and Adagrad, `torch.autocast` and `torch.amp.GradScaler`.
 
 All numerical work runs on the GPU (see the design principles in
 [CONTRIBUTING.md](CONTRIBUTING.md#design-principles)). **No op runs on the CPU

@@ -74,8 +74,12 @@ at::Tensor index_offsets(at::IntArrayRef shape, const std::vector<IndexTerm>& te
     TORCH_CHECK_INDEX(t.size > 0, "index is out of bounds for dimension with size 0");
     at::Tensor index = index_dtype_ok(t.index) ? t.index : t.index.to(at::kLong);
     std::string kernel = index.scalar_type() == at::kLong ? "index_i64" : "index_i32";
+    // (the kernel bounds indices in int32: a dim beyond that, which only an
+    // expanded tensor has, is bounded at int32's top, so the indices it can
+    // address are in range rather than its size wrapping)
+    int64_t size = std::min<int64_t>(t.size, std::numeric_limits<int32_t>::max());
     launch_strided(kernel.c_str(), {k == 0 ? 0u : 1u, wrap ? 1u : 0u}, offsets, k == 0 ? nullptr : &offsets, &index,
-                   {t.stride, t.size, error});
+                   {t.stride, size, error});
   }
   return offsets;
 }

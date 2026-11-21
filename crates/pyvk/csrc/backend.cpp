@@ -475,7 +475,8 @@ const at::Tensor& resize_(const at::Tensor& self, at::IntArrayRef size, std::opt
 // ---------------------------------------------------------------- float8
 
 bool is_float8(at::ScalarType s) {
-  return s == at::kFloat8_e4m3fn || s == at::kFloat8_e5m2 || s == at::kFloat8_e4m3fnuz || s == at::kFloat8_e5m2fnuz;
+  return s == at::kFloat8_e4m3fn || s == at::kFloat8_e5m2 || s == at::kFloat8_e4m3fnuz || s == at::kFloat8_e5m2fnuz ||
+         s == at::kFloat8_e8m0fnu;
 }
 
 bool fnuz(at::ScalarType s) {
@@ -488,7 +489,9 @@ bool fnuz(at::ScalarType s) {
 // [K] uint8: a float32 of magnitude bits m (sign cleared, NaN included)
 // converts to codes[k] for the last k with thresholds[k] <= m (the
 // conversion's magnitude code is monotone in m), the sign then set as c10
-// does (fnuz formats: none on zero, NaN 0x80).
+// does (fnuz formats: none on zero, NaN 0x80). float8_e8m0fnu (a power of
+// two, or NaN 0xff) has no sign bit: its code is all 8 bits, and c10's
+// conversion ignores the float's sign.
 struct Float8Tables {
   at::Tensor values, thresholds, codes;
 };
@@ -506,6 +509,7 @@ const Float8Tables& float8_tables(at::ScalarType t) {
   // 0x80 for an fnuz NaN (above every other code)
   auto code_of = [&](const at::Tensor& m) {
     at::Tensor c = m.to(at::kInt).view(at::kFloat).to(t).view(at::kByte).to(at::kInt);
+    if (t == at::kFloat8_e8m0fnu) return c;
     return fnuz(t) ? at::where(at::eq(c, 0x80), 0x80, at::bitwise_and(c, 0x7f)) : at::bitwise_and(c, 0x7f);
   };
   // each code's first magnitude, by bisection over [0, 2^31)
@@ -581,7 +585,9 @@ bool copy_float8(const at::Tensor& dst, const at::Tensor& src) {
   at::Tensor mag = at::bitwise_and(bits, 0x7fffffff);
   at::Tensor k = at::searchsorted(tb.thresholds, mag.reshape({-1}), false, true) - 1;
   at::Tensor code = tb.codes.index_select(0, k).view(f.sizes());
-  if (fnuz(dt)) {
+  if (dt == at::kFloat8_e8m0fnu) {
+    // (no sign)
+  } else if (fnuz(dt)) {
     code = at::where(at::logical_and(negative, at::logical_and(at::ne(code, 0), at::ne(code, 0x80))),
                      at::bitwise_or(code, 0x80), code);
   } else {
@@ -1995,8 +2001,4 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&vk::cpu_fallback>());
 }
 
-// Autocast on "vk" changes no dtypes (no lower-precision policy for this
-// backend yet): every op passes straight through the AutocastPrivateUse1 key.
-TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
-  m.fallback(torch::CppFunction::makeFallthrough());
-}
+// (autocast: autocast.cpp)
