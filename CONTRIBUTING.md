@@ -95,8 +95,11 @@ a new release:
 2. Regenerate the files derived from PyTorch's own code:
    `python tools/port_special.py` (`shaders/_special.slang`, from ATen's
    `Math.h`) and `python tools/dev/cpu_dtype_errors.py` (the CPU's dtype
-   errors that vk raises itself, from a fallback-detail run). Review their
-   diffs.
+   errors that vk raises itself: the table's signatures probed again on the
+   new CPU, plus any new ones from a fallback-detail run given as
+   arguments). Review their diffs, and the release notes for checks whose
+   exception type changed (2.15 made many `TypeError` or
+   `NotImplementedError`): vk's kernels repeat some of those checks.
 3. Run `tests/python`, the strict OpInfo sweep and PyTorch's test files
    (`tools/pytorch_tests.py`); differences in the CPU's results between
    releases (2.15's float16 `linspace`, for example) show up here.

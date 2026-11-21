@@ -80,6 +80,11 @@ def _relayout(t, layout):
 # input (by argument index) where the meta kernels say contiguous: the
 # padding backwards (grad_input as the input).
 FOLLOW_INPUT = {f"{kind}_pad{d}d_backward": 1 for kind in ("reflection", "replication") for d in (1, 2, 3)}
+# Ops whose kernels lay their results out contiguously, as their meta kernels
+# say, and whose meta kernels refuse some arguments vk computes (PyTorch 2.15's
+# grid_sampler_3d refuses 5-D bicubic off the CPU and CUDA, logging an error
+# from FakeTensor): no FakeTensor run for them.
+CONTIGUOUS = {"grid_sampler_3d"}
 
 
 def with_layout(op, kernel):
@@ -94,11 +99,14 @@ def with_layout(op, kernel):
             return _laid_out(*args, **kwargs)
 
     follow = FOLLOW_INPUT.get(op._schema.name.split("::", 1)[1])
+    contiguous = op._schema.name.split("::", 1)[1] in CONTIGUOUS
 
     def _laid_out(*args, **kwargs):
         result = kernel(*args, **kwargs)
         if getattr(_local, "busy", False) or op._schema.is_mutable:
             return result  # (in-place and out= kernels write into given tensors)
+        if contiguous and isinstance(result, torch.Tensor):
+            return result.contiguous()
         if follow is not None and isinstance(result, torch.Tensor) and isinstance(args[follow], torch.Tensor):
             from torch._prims_common import suggest_memory_format
 

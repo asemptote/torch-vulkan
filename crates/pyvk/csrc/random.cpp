@@ -215,7 +215,11 @@ at::Tensor& exponential_(at::Tensor& self, double lambd, std::optional<at::Gener
     return self;
   }
   TORCH_CHECK(lambd > 0.0, "exponential_ expects lambda > 0.0, but found lambda=", lambd);
-  return float_fill(self, op::RNG_EXPONENTIAL, lambd, 0, gen);
+  // (never 0, as CUDA's: -log(1 - u) is at least half the dtype's epsilon, so
+  // that it does not round to 0 in a 16-bit dtype either)
+  at::ScalarType t = self.scalar_type();
+  double least = t == at::kHalf ? 0x1p-11 : t == at::kBFloat16 ? 0x1p-8 : t == at::kDouble ? 0x1p-53 : 0x1p-24;
+  return float_fill(self, op::RNG_EXPONENTIAL, lambd, least, gen);
 }
 
 at::Tensor& cauchy_(at::Tensor& self, double median, double sigma, std::optional<at::Generator> gen) {
@@ -479,6 +483,9 @@ at::Tensor& normal_ft_out(double mean, const at::Tensor& std, std::optional<at::
 // Without: Gumbel-top-k (the num_samples largest log p - log(-log u)).
 at::Tensor& multinomial_out(const at::Tensor& self, int64_t n, bool replacement, std::optional<at::Generator> gen,
                             at::Tensor& out) {
+  // (first, as CUDA's: the input and out on one device)
+  TORCH_CHECK(self.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", out.device(), " and ", self.device(), "!");
   TORCH_CHECK(self.dim() == 1 || self.dim() == 2, "prob_dist must be 1 or 2 dim");
   TORCH_CHECK(at::isFloatingType(self.scalar_type()), "multinomial only supports floating-point dtypes for input");
   TORCH_CHECK(n > 0, "cannot sample n_sample <= 0 samples");
@@ -541,6 +548,14 @@ at::Tensor& randperm_out(int64_t n, std::optional<at::Generator> gen, at::Tensor
   TORCH_CHECK(t != at::kHalf || n <= (int64_t(1) << 11) + 1, "n cannot be greater than 2049 for Half type.");
   TORCH_CHECK(t != at::kFloat || n <= (int64_t(1) << 24) + 1, "n cannot be greater than 2^24+1 for Float type.");
   TORCH_CHECK(t != at::kDouble || n <= (int64_t(1) << 53) + 1, "n cannot be greater than 2^53+1 for Double type.");
+  // (a vk generator routes randperm here whatever out's device, as CUDA's
+  // does: n = 0 needs no generator; otherwise its device type must be out's)
+  if (n == 0) {
+    at::native::resize_output(out, {0});
+    return out;
+  }
+  TORCH_CHECK(!gen.has_value() || !gen->defined() || gen->device().type() == out.device().type(), "Expected a '",
+              out.device().type(), "' device type for generator but found '", gen->device().type(), "'");
   if (!is_vk(out) || storage_label(out.scalar_type()) == nullptr || at::isComplexType(out.scalar_type())) {
     on_cpu("aten::randperm", "generator_out", n, gen, out);
     return out;

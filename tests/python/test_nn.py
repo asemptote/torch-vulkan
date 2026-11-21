@@ -139,6 +139,17 @@ def test_upsample_and_grid_sample():
                          x, grid.clone(), tol=dict(rtol=1e-4, atol=1e-4))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_grid_sample_3d_bicubic(dtype):
+    # (PyTorch 2.15 on: bicubic 5-D grid_sample, 64 taps; grad_input and grad_grid)
+    x = make((2, 3, 4, 5, 6), dtype)
+    grid = (torch.rand(2, 3, 4, 2, 3, generator=torch.Generator().manual_seed(4)) * 2.4 - 1.2).to(dtype)
+    tol = dict(rtol=1e-4, atol=1e-4) if dtype == torch.float32 else dict(rtol=1e-10, atol=1e-10)
+    for pad, ac in itertools.product(["zeros", "border", "reflection"], [False, True]):
+        compare_with_cpu(lambda x, g: F.grid_sample(x, g, mode="bicubic", padding_mode=pad, align_corners=ac),
+                         x, grid.clone(), tol=tol)
+
+
 def test_embedding_and_small_model_training():
     import copy
 

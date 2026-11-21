@@ -213,7 +213,8 @@ def _raise_cpu_dtype_error(op, name, args, kwargs):
 
     hit = TABLE.get(_dtype_signature(name, op, args, kwargs))
     if hit is not None:
-        raise (NotImplementedError if hit[0] else RuntimeError)(_render_type_names(hit[1]))
+        kind = {"NotImplementedError": NotImplementedError, "TypeError": TypeError}.get(hit[0], RuntimeError)
+        raise kind(_render_type_names(hit[1]))
 
 
 _TYPE_NAMES = {}

@@ -776,6 +776,17 @@ at::Tensor& addmv_out(const at::Tensor& self, const at::Tensor& mat, const at::T
                       const at::Scalar& alpha, at::Tensor& out) {
   int64_t m = mat.size(0);
   at::native::resize_output(out, {m});
+  if (is_vk(out) && is_vk(self) && mat.numel() == 0 && self.dim() <= 1 && mat.dim() == 2 && vec.dim() == 1 &&
+      mat.size(1) == vec.size(0) && (self.numel() == m || self.numel() == 1)) {
+    // (an empty matrix, any dtype, as the CPU: beta * self, or zeros where beta
+    // is 0, so self's NaNs do not propagate)
+    if (beta.toComplexDouble() == 0.0) {
+      out.zero_();
+    } else if (m > 0) {
+      at::mul_out(out, self.expand({m}), at::scalar_tensor(beta, self.options()));
+    }
+    return out;
+  }
   bool done = false;
   if (self.dim() <= 1 && is_vk(self)) {
     // A matrix-vector product is a GEMM with one column.

@@ -268,3 +268,34 @@ def test_float32_division_correctly_rounded():
         for g_, w in zip(got, [x / y, torch.reciprocal(x)]):
             same = (g_.view(torch.int32) == w.view(torch.int32)) | (g_.isnan() & w.isnan())
             assert same.all(), (g_[~same][:4], w[~same][:4])
+
+
+INTEGERS = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.uint16, torch.uint32, torch.uint64]
+
+
+@pytest.mark.parametrize("dtype", INTEGERS)
+def test_integer_clamp_bounds(dtype):
+    # One-sided bounds, and bounds outside the dtype's range (PyTorch 2.15 on:
+    # a bound that cannot change an element is dropped, the opposite raises).
+    info = torch.iinfo(dtype)
+    x = torch.tensor([0, 1, 7, 100, min(info.max, 2 ** 40)], dtype=torch.int64)
+    if info.min < 0:
+        x = torch.cat([x, torch.tensor([-1, -100, max(info.min, -2 ** 40)])])
+    x = x.to(dtype)
+    bounds = [(3, None), (None, 50), (3, 50), (info.min - 1, None), (None, info.max + 1),
+              (info.min - 1, info.max + 1), (-1, 60)]
+    for lo, hi in bounds:
+        try:
+            want = torch.clamp(x, lo, hi)
+        except Exception as e:  # (the CPU's error, the same on vk)
+            with pytest.raises(type(e)) as got_error:
+                torch.clamp(x.to("vk"), lo, hi)
+            assert str(got_error.value).splitlines()[0] == str(e).splitlines()[0]
+            continue
+        with on_gpu():
+            got = torch.clamp(x.to("vk"), lo, hi)
+        assert torch.equal(got.cpu(), want), (lo, hi)
+        if lo is not None and hi is not None:
+            with on_gpu():
+                got = torch.nn.functional.hardtanh(x.to("vk"), lo, hi)
+            assert torch.equal(got.cpu(), torch.nn.functional.hardtanh(x, lo, hi)), (lo, hi)

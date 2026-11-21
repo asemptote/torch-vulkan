@@ -413,22 +413,107 @@ def _grid_dtype(t):
     return torch.float64 if t == torch.float64 else torch.float32
 
 
+def _cubic_taps(coord, size, padding_mode, align_corners):
+    """GridSampler.cpp's resolve_cubic_taps (PyTorch 2.15), on tensors: the Keys
+    coefficients of coord's fractional part and the four taps' indices (int64,
+    -1 where zeros padding drops the tap), around the unclipped index."""
+    base = torch.floor(coord)
+    t = coord - base
+    a = -0.75
+
+    def conv1(x):  # (UpSample.h's cubic_convolution1 and 2)
+        return ((a + 2) * x - (a + 3)) * x * x + 1
+
+    def conv2(x):
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+
+    coeffs = [conv2(t + 1.0), conv1(t), conv1(1.0 - t), conv2((1.0 - t) + 1.0)]
+    base = base.detach()
+    taps = []
+    for i in range(4):
+        tap = base + (i - 1)
+        if padding_mode == 1:  # border
+            tap = _clip_coordinates(tap, size)
+        elif padding_mode == 2:  # reflection (compute_coordinates_sized: the parity by fmod)
+            low = 0.0 if align_corners else -0.5
+            span = float(size - 1 if align_corners else size)
+            if span == 0:
+                tap = torch.zeros_like(tap)
+            else:
+                dist = (tap - low).abs()
+                extra = torch.fmod(dist, span)
+                odd = torch.fmod(torch.floor(dist / span), 2.0) != 0
+                tap = torch.where(odd, span - extra + low, extra + low)
+            tap = _clip_coordinates(tap, size)
+        # (a tap that is negative, not finite or past the input is dropped; the
+        # bound compared in int64, as a float may not hold the size exactly)
+        ok = (tap >= 0) & (tap < 9.223372036854775807e18)
+        index = torch.where(ok, tap, 0.0).to(torch.int64)
+        taps.append(torch.where(ok & (index < size), index, -1))
+    return coeffs, taps
+
+
+def _clip_coordinates(x, size):
+    """GridSampler.h's clip_coordinates: min(size - 1, max(x, 0)), whose std::min
+    and std::max make NaN size - 1."""
+    return torch.where(torch.isnan(x), float(size - 1), x.clamp(0, size - 1))
+
+
+def _bicubic_grid_sample_3d(input, grid, padding_mode, align_corners):
+    """grid_sampler_3d's bicubic mode (PyTorch 2.15's CPU kernel) from gathers:
+    64 taps per output point, each term formed as the CPU's (sample * (z y) * x)
+    in input's dtype (float32 or float64, the CPU's opmath type), then summed.
+    Differentiable: autograd gives grid_sampler_3d's backward, through the
+    coefficients and the sampled values."""
+    n, c, d_in, h_in, w_in = input.shape
+    points = grid.shape[1:-1]
+    p = math.prod(points)
+    g = grid.reshape(n, p, 3)
+
+    def unnormalize(v, size):
+        return (v + 1) / 2 * (size - 1) if align_corners else ((v + 1) * size - 1) / 2
+
+    xc, xt = _cubic_taps(unnormalize(g[..., 0], w_in), w_in, padding_mode, align_corners)
+    yc, yt = _cubic_taps(unnormalize(g[..., 1], h_in), h_in, padding_mode, align_corners)
+    zc, zt = _cubic_taps(unnormalize(g[..., 2], d_in), d_in, padding_mode, align_corners)
+    # All 64 taps in one gather (indexed through input's strides: an expanded
+    # input is not copied); each term as the CPU's, sample * (z y) * x, summed.
+    zt, yt, xt = (torch.stack(t, -1) for t in (zt, yt, xt))  # [n, P, 4]
+    zc, yc, xc = (torch.stack(t, -1) for t in (zc, yc, xc))
+    zi, yi, xi = zt[..., :, None, None], yt[..., None, :, None], xt[..., None, None, :]
+    reads = (zi >= 0) & (yi >= 0) & (xi >= 0)  # [n, P, 4, 4, 4]
+    zi, yi, xi = (torch.where(reads, t, 0) for t in (zi, yi, xi))
+    batch = torch.arange(n, device=input.device).view(n, 1, 1, 1, 1)
+    sample = input[batch, :, zi, yi, xi]  # [n, P, 4, 4, 4, c]
+    sample = torch.where(reads.unsqueeze(-1), sample, 0)
+    weight_zy = (zc[..., :, None, None] * yc[..., None, :, None]).unsqueeze(-1)
+    term = sample * weight_zy * xc[..., None, None, :].unsqueeze(-1)
+    value = term.flatten(2, 4).sum(2).transpose(1, 2)  # [n, c, P]
+    return value.reshape(n, c, *points)
+
+
 def _grid_sampler_forward(input, grid, mode, padding_mode, align_corners):
     _checks.grid_sampler(input, grid, mode, 3)
-    if mode not in (0, 1):  # bicubic
-        return _on_cpu("grid_sampler_3d", input, grid, mode, padding_mode, align_corners)
     dt = _grid_dtype(input.dtype)
+    if mode not in (0, 1):  # bicubic
+        return _bicubic_grid_sample_3d(input.to(dt), grid.to(dt), padding_mode, align_corners).to(input.dtype)
     out = torch.ops.torch_vulkan.grid_sampler(input.to(dt), grid.to(dt), mode, padding_mode, align_corners)
     return out.to(input.dtype)
 
 
 def _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask):
-    """grid_sampler_2d's bicubic backward as autograd of its decomposition (Vulkan
-    gathers forward, scatter-adds backward): the gradients flow through the
-    cubic coefficients and the sampled values, as the CPU's (none through the
-    tap indices). Autograd is re-enabled here, since an op's backward kernel
-    runs below it."""
-    decomp = decomposition_table[torch.ops.aten.grid_sampler_2d.default]
+    """grid_sampler_{2,3}d's bicubic backward as autograd of a decomposition
+    (PyTorch's for 2-D, _bicubic_grid_sample_3d for 3-D; Vulkan gathers forward,
+    scatter-adds backward): the gradients flow through the cubic coefficients
+    and the sampled values, as the CPU's (none through the tap indices).
+    Autograd is re-enabled here, since an op's backward kernel runs below it."""
+    if input.dim() == 5:
+        dt = _grid_dtype(input.dtype)
+
+        def decomp(x, g, mode, padding, align):
+            return _bicubic_grid_sample_3d(x.to(dt), g.to(dt), padding, align).to(x.dtype)
+    else:
+        decomp = decomposition_table[torch.ops.aten.grid_sampler_2d.default]
     tls_exclude = torch._C._dispatch_tls_local_exclude_set()
     for key in (torch._C.DispatchKey.AutogradPrivateUse1, torch._C.DispatchKey.ADInplaceOrView):
         tls_exclude = tls_exclude.remove(key)
@@ -456,7 +541,7 @@ def _make_grid_sampler_backward(name):
         if list(grad_output.shape) != expected:
             raise ValueError(f"{name}(): expected grad_output to have sizes {expected}, but got grad_output with "
                              f"sizes {list(grad_output.shape)}")
-        if mode not in (0, 1):  # bicubic (2-D only): differentiate PyTorch's decomposition
+        if mode not in (0, 1):  # bicubic: differentiate a decomposition
             return _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask)
         # (shaders/gridsample.slang: grad_grid, and each output point's corners
         # with their weights, which one scatter-add turns into grad_input)
@@ -502,23 +587,39 @@ def _shrink_backward(name):
     return kernel
 
 
+def _pad_backward_shape_check(grad_output, x, padding, dims):
+    """Padding.h's pad_backward_shape_check (PyTorch 2.15, reflection and
+    replication alike), in its order and words."""
+    if len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1:
+        c = x.dim() - dims - 1
+        torch._check(grad_output.shape[c] == x.shape[c], lambda: f"grad_output channel unexpected. Expected: "
+                                                                 f"{x.shape[c]}, Got: {grad_output.shape[c]}")
+        for i, what in zip(range(dims), ("width", "height", "depth")):
+            d = x.dim() - 1 - i
+            want = x.shape[d] + padding[2 * i] + padding[2 * i + 1]
+            torch._check(grad_output.shape[d] == want, lambda: f"grad_output {what} unexpected. Expected: "
+                                                               f"{want}, Got: {grad_output.shape[d]}")
+
+
+def _reflection_pad_backward(dims):
+    """reflection_pad{1,2,3}d_backward: the CPU's checks, then PyTorch's
+    decomposition (gathers and index_add on vk)."""
+    decomp = decomposition_table[getattr(torch.ops.aten, f"reflection_pad{dims}d_backward").default]
+
+    def kernel(grad_output, x, padding):
+        _pad_backward_shape_check(grad_output, x, padding, dims)
+        return decomp(grad_output, x, padding)
+
+    return kernel
+
+
 def _replication_pad_backward(dims):
     """replication_pad{1,2,3}d_backward: each padded dim's gradient summed into
     the input position it replicates (the clamped index), a dim at a time."""
     name = f"replication_pad{dims}d_backward"
 
     def kernel(grad_output, x, padding):
-        if len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1:
-            # (the CPU's shape checks, in its order and words)
-            c = x.dim() - dims - 1
-            torch._check(grad_output.shape[c] == x.shape[c], lambda: f"gradOutput channel unexpected. Expected: "
-                                                                     f"{x.shape[c]}, Got: {grad_output.shape[c]}")
-            for i, what in zip(range(dims), ("width", "height", "depth")):
-                d = x.dim() - 1 - i
-                want = x.shape[d] + padding[2 * i] + padding[2 * i + 1]
-                sep = "" if dims == 1 else ","
-                torch._check(grad_output.shape[d] == want, lambda: f"gradOutput {what} unexpected. Expected: "
-                                                                   f"{want}{sep} Got: {grad_output.shape[d]}")
+        _pad_backward_shape_check(grad_output, x, padding, dims)
         ok = len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims + 1
         for i in range(dims if ok else 0):
             d = x.dim() - 1 - i
@@ -2156,6 +2257,9 @@ def _kernels():
         "_thnn_fused_gru_cell_backward": _thnn_fused_gru_cell_backward,
         "softshrink_backward": _shrink_backward("softshrink_backward"),
         "hardshrink_backward": _shrink_backward("hardshrink_backward"),
+        "reflection_pad1d_backward": _reflection_pad_backward(1),
+        "reflection_pad2d_backward": _reflection_pad_backward(2),
+        "reflection_pad3d_backward": _reflection_pad_backward(3),
         "replication_pad1d_backward": _replication_pad_backward(1),
         "replication_pad2d_backward": _replication_pad_backward(2),
         "replication_pad3d_backward": _replication_pad_backward(3),

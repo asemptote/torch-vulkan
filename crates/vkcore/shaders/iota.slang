@@ -4,8 +4,8 @@
 //   IOTA_ARANGE    out = alpha + i * beta
 //   IOTA_LINSPACE  out = alpha + i * gamma for i < n / 2, else
 //                  beta - (n - 1 - i) * gamma (PyTorch's symmetric formula;
-//                  float types only). float16 rounds the product and the
-//                  sum to half separately, as PyTorch's c10::Half does.
+//                  float types only). float16 computes in float32 and
+//                  rounds once, as PyTorch's CPU kernel (its opmath type).
 
 #include "_int64.slang"  // (the i64 variant's T: _int64.slang)
 #define OUT_T T
@@ -30,9 +30,9 @@ void main(uint3 id: SV_DispatchThreadID)
         if (OP == IOTA_ARANGE)
             v = fma(float(i), beta(), alpha());
         else if (i < p.n / 2)
-            v = alpha() + float(to_half(gamma() * float(i)));
+            v = alpha() + gamma() * float(i);
         else
-            v = beta() - float(to_half(gamma() * float(p.n - 1 - i)));
+            v = beta() - gamma() * float(p.n - 1 - i);
         p.out[o.o] = to_half(v);
 #elif defined(T_f32) || defined(T_f64)
         T v;

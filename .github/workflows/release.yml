@@ -181,7 +181,7 @@ jobs:
         run: |
           tar -czf "dist/torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz" -C spirv .
           cat > notes.md <<EOF
-          Wheels for Windows and Linux (x86_64), for Python 3.10 or newer and PyTorch ${TORCH_VERSION%.*}:
+          Wheels for Windows and Linux (x86_64), for Python 3.11 or newer and PyTorch ${TORCH_VERSION%.*}:
 
               pip install "torch==${TORCH_VERSION%.*}.*"
               pip install <wheel URL from the assets below>

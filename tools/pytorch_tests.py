@@ -291,9 +291,6 @@ EXPECTED = [
     (r"test_trivial_fancy_out_of_bounds_", r"",
      "out-of-range indices are flagged by the kernel and raised at the next synchronization, as CUDA's "
      "device asserts (CUDA skips this test)"),
-    (r"test_pow_cuda_complex_extremal_passing_", r"Scalars are not close",
-     "(-1 + inf i)^2: the CPU's complex pow gives inf + nan i from its special-value path; vk squares exactly "
-     "(-inf - inf i)"),
     (r"test_eig(vals)?_numpy_", r"Tensor-likes are not close",
      "for batched inputs the test applies one batch's eigenvalue sort to another ([::-1] reverses the batch "
      "axis), so it requires LAPACK's eigenvalue order; eigenvalues come in no particular order"),
@@ -369,7 +366,8 @@ EXPECTED = [
      "expects that)"),
     (r"test_out_(cholesky_inverse|geqrf|ormqr|triangular_solve)_", r"Unexpected success",
      "vk passes an out= test PyTorch marks as failing for these ops (their CPU kernels change out='s strides)"),
-    (r"test_linear_cross_entropy_loss_with_acc_dtype_bias_True_b?float16_", r"not less than or equal to",
+    (r"test_linear_cross_entropy_loss_(with_acc_dtype_bias_True_b?float16|prob_target_none_reduction_bias_False_"
+     r"acc_policy_\w+_vk_float32)", r"not less than or equal to",
      "ULP trip-wires calibrated for one seed on the CPU, CUDA and MPS (the CPU misses them for most other seeds; "
      "a device that is none of these gets CUDA's caps); vk's random weights differ from the CPU's at that seed, "
      "and every op of the chunked path gives the CPU's result exactly"),
@@ -393,8 +391,32 @@ EXPECTED = [
      "a bound on the int4 / int8 quantisation error that holds for the CPU's random draws only: vk's generator "
      "(Philox) draws other numbers for the seed, and on them one output of 352,256 is 0.061 off a float32 mm, "
      "with the CPU's kernels too; vk's kernel gives the CPU's results bit for bit on the same inputs"),
-    (r"", r"InductorError: KeyError: 'vk'",
+    (r"", r"InductorError: (KeyError: 'vk'|.*no scheduling registered for device vk)",
      "torch.compile: inductor has no code generator for vk (out of scope; eager mode only)"),
+    # (PyTorch 2.15 runs many CUDA tests on any accelerator, vk included)
+    (r"_use_accelerator_graph_True_", r"Tried to instantiate dummy base class CUDAGraph",
+     "the test captures a CUDA graph on any accelerator; vk has no graph capture"),
+    (r"test_peak_memory_foreach_", r"no attribute '_cuda_resetPeakMemoryStats'",
+     "the test reads CUDA's peak-memory statistics on any accelerator"),
+    (r"TestInputGradBuffersVK::test_(different_stream_errors|later_producer_on_different_stream_errors|"
+     r"user_stream_switch_does_not_change_execution_stream)_vk", r"Backend doesn't support create a new Stream",
+     "the test needs a second stream; vk runs everything in order on one queue"),
+    (r"test_index_add_smem_stage_alignment_regression_", r"has no attribute 'get_device_properties'",
+     "the test sizes its input from CUDA's per-block shared memory (torch.<device>.get_device_properties)"),
+    (r"test_checkpointing_without_reentrant_dataparallel_", r"no attribute '_scatter'",
+     "torch.nn.DataParallel scatters with CUDA's communication ops"),
+    (r"test_sync_batchnorm_(accuracy|backward_elemt)_vk", r"aten::batch_norm_(stats|backward_elemt)",
+     "SyncBatchNorm's ops (batch_norm_stats, batch_norm_backward_elemt, ...) exist for CUDA only, with no CPU "
+     "kernel to compare against"),
+    (r"TestFakeTensorVK::test_fake_(crossref_backward_(no_)?amp_|autocast_)?nn_functional_grid_sample_vk",
+     r"bicubic interpolation with 5D input is not supported on vk",
+     "PyTorch 2.15's meta function for grid_sampler_3d refuses 5-D bicubic on devices other than the CPU and "
+     "CUDA (the trace mirrors eager there); vk computes it, so the FakeTensor run and the real one disagree"),
+    (r"test_scatter_reduce_multiply_unsupported_dtypes_vk_complex", r"RuntimeError not raised",
+     "complex scatter with reduce='multiply': vk computes it, as the CPU does; the test expects CUDA's refusal"),
+    (r"test_upsamplingNearest2d_launch_fail_vk", r"Unexpected success",
+     "a CUDA launch-configuration limit (grid size) the test expects every accelerator to hit; vk's kernels "
+     "loop over the elements and have no such limit"),
 ]
 
 

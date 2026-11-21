@@ -187,6 +187,21 @@ def test_sequences(dtype):
         check(got[1], torch.logspace(-2, 2, 9, dtype=dtype), **tol)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linspace_16_bit(dtype):
+    # Bit for bit as the CPU (PyTorch 2.15 on: float32 step and arithmetic,
+    # one rounding), over ranges whose elements land between 16-bit values.
+    if ARM32:
+        pytest.skip("not yet compared with a 32-bit Arm CPU's PyTorch 2.15")
+    cases = [(-3, 40, 37), (0, 1, 1000), (-1, 1, 257), (0.1, 0.7, 333), (1000, -999, 4097),
+             (-65504 if dtype == torch.float16 else -3e38, 7, 101), (2.5, 2.5, 9)]
+    for start, end, steps in cases:
+        with on_gpu():
+            got = torch.linspace(start, end, steps, dtype=dtype, device="vk")
+        want = torch.linspace(start, end, steps, dtype=dtype)
+        assert torch.equal(got.cpu(), want), (start, end, steps)
+
+
 def test_equal_isin():
     a = make((5, 4), torch.int64)
     b = a.clone()
@@ -199,6 +214,18 @@ def test_equal_isin():
     assert results == [True, False, False]
     check(isin[0], torch.isin(a, test))
     check(isin[1], torch.isin(a, test, invert=True))
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+def test_equal_unsigned(dtype):
+    a = torch.tensor([[0, 1, 2 ** 15, 7], [3, 9, 65535, 2]]).to(dtype)
+    b = a.clone()
+    b[1, 2] = 4
+    va, vb = a.to("vk"), b.to("vk")
+    with on_gpu():
+        results = [torch.equal(va, va.clone()), torch.equal(va, vb), torch.equal(va, va[:1]),
+                   torch.equal(va[0, 0], va[0, 0].clone()), torch.equal(va.t(), va.t().contiguous())]
+    assert results == [True, False, False, True, True]
 
 
 def test_out_of_range_index_raises_on_sync():

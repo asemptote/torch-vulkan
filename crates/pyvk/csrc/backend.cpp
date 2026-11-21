@@ -822,7 +822,14 @@ at::Tensor& fill_tensor(at::Tensor& self, const at::Tensor& value) {
 }
 
 at::Tensor& zero_(at::Tensor& self) {
-  return fill_scalar(self, 0);
+  // All-zero bits, as the CPU's memset and CUDA's zero_ (PyTorch 2.15): zero in
+  // every dtype, including those with no fill kernel (bits8, float4_e2m1fn_x2).
+  std::string kernel = move_kernel(self.itemsize());
+  if (kernel.empty()) {
+    return fill_scalar(self, 0);
+  }
+  launch_strided_bits(kernel.c_str(), {op::MOVE_FILL}, self, nullptr, nullptr, std::array<uint64_t, 2>{0, 0});
+  return self;
 }
 
 // ---------------------------------------------------------------- CPU fallback
@@ -1302,7 +1309,7 @@ std::string dtype_signature(const std::string& op, const c10::FunctionSchema& sc
 
 struct CpuDtypeError {
   const char* signature;
-  bool not_implemented;  // NotImplementedError, else RuntimeError
+  char kind;  // 'N': NotImplementedError, 'T': TypeError, 'R': RuntimeError
   const char* message;
 };
 
@@ -1312,7 +1319,7 @@ struct CpuDtypeError {
 void raise_cpu_dtype_error(const std::string& signature) {
   static const CpuDtypeError table[] = {
 #include "cpu_dtype_errors.inc"
-      {nullptr, false, nullptr}};
+      {nullptr, 'R', nullptr}};
   static const std::map<std::string, const CpuDtypeError*> index = [] {
     std::map<std::string, const CpuDtypeError*> m;
     for (const CpuDtypeError& e : table) {
@@ -1340,7 +1347,8 @@ void raise_cpu_dtype_error(const std::string& signature) {
     msg.replace(at, end - at + 1, cpp);
     at += cpp.size();
   }
-  TORCH_CHECK_NOT_IMPLEMENTED(!it->second->not_implemented, msg);
+  TORCH_CHECK_NOT_IMPLEMENTED(it->second->kind != 'N', msg);
+  TORCH_CHECK_TYPE(it->second->kind != 'T', msg);
   TORCH_CHECK(false, msg);
 }
 
