@@ -150,13 +150,13 @@ PyTorch 2.14, which they are compiled against, and a Vulkan driver:
 ```sh
 pip install "torch==2.14.*"
 # Windows
-pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.0/torch_vulkan-0.2.0-cp310-abi3-win_amd64.whl
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.1/torch_vulkan-0.2.1-cp310-abi3-win_amd64.whl
 # Linux
-pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.0/torch_vulkan-0.2.0-cp310-abi3-manylinux_2_28_x86_64.whl
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.1/torch_vulkan-0.2.1-cp310-abi3-manylinux_2_28_x86_64.whl
 ```
 
 On Android (Termux), build from source with the release's prebuilt kernels:
-extract `torch-vulkan-spirv-v0.2.0.tar.gz` and run `tools/build-termux.sh`
+extract `torch-vulkan-spirv-v0.2.1.tar.gz` and run `tools/build-termux.sh`
 with that directory (the script describes the setup). Other platforms build
 from source as below.
 
