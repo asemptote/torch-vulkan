@@ -3,7 +3,9 @@
 // All of them run a GEMM kernel on 3-D views [batch, rows, cols]: operands
 // are passed by strides, so transposed (e.g. from autograd) and broadcast
 // operands need no copies. float32 and float64 run shaders/gemmsg.slang
-// (register tiles and subgroup broadcasts) where the device can; on Arm GPUs
+// (register tiles and subgroup broadcasts) where the device can (float32 on
+// bfloat16 cooperative matrices instead when torch.set_float32_matmul_precision
+// allows it: float32_parts); on Arm GPUs
 // gemm4s.slang (16-lane subgroups, also float16 and bfloat16 in float32) or
 // gemm4.slang; gemm.slang (shared-memory tiles, also the integer products)
 // otherwise; dtypes and shapes no kernel can address run on the CPU.
@@ -17,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -152,6 +155,28 @@ bool use_coopmat(at::ScalarType t) {
   static const bool bf16 = gemm_choice().empty() && has_feature(kFeatureCoopMatBf16) &&
                            vkt_kernel_subgroup_size("gemmcm_bf16") == 32;
   return t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
+}
+
+// The bfloat16 parts each float32 operand of a product is taken as, at the
+// precision torch.set_float32_matmul_precision sets (docs/log/M41): 1 for
+// "medium" (rounded to bfloat16), 3 for "high" (split into two bfloat16
+// parts, the products of three pairs of them summed), where the device has
+// bfloat16 cooperative matrices; 0 (float32 products, as before) for
+// "highest", PyTorch's default, elsewhere, and under an at::NoTF32Guard,
+// which keeps the products inside convolutions, factorisations and other
+// ops in float32 (as PyTorch keeps them on CUDA).
+int64_t float32_parts() {
+  if (!use_coopmat(at::kBFloat16) || at::NoTF32Guard::should_disable_fp32_reduced_precision()) {
+    return 0;
+  }
+  at::Float32MatmulPrecision precision = at::Float32MatmulPrecision::HIGHEST;
+  try {
+    precision = at::globalContext().float32MatmulPrecision();
+  } catch (const c10::Error&) {
+    // (PyTorch refuses to say when the per-backend fp32_precision settings
+    // contradict the legacy one; products then stay in float32)
+  }
+  return precision == at::Float32MatmulPrecision::MEDIUM ? 1 : precision == at::Float32MatmulPrecision::HIGH ? 3 : 0;
 }
 
 // gemm4's layout: row-major A and B (unit k and n strides) whose rows and
@@ -474,6 +499,57 @@ uint32_t coop_mode(const at::Tensor& t) {
   return 0;
 }
 
+struct Bf16PartsParams {
+  uint64_t x, y;
+  uint32_t rows, k, kp, parts, kinds, stride;
+  int32_t sb, sr, sk;
+  int32_t yb, yr, yk;
+};
+static_assert(sizeof(Bf16PartsParams) == 64, "must match shaders/bf16parts.slang");
+
+// shaders/bf16parts.slang: float32 x [B, R, k] (k along dim 2, or along dim
+// 1 when `k_rows`, as B's) as bfloat16 [B, R, parts kp] (k along dim 1 again
+// when `k_rows`), k padded with zeros to kp, a multiple of 8, part q's kind
+// in bits 2q of `kinds` (0 hi, 1 lo, 2 hi where finite, else 0). The parts
+// are contiguous along R where x is, else along k (gemmcm.slang stages
+// either in 16-byte pieces); a broadcast batch (stride 0) is computed once.
+// Undefined where the parts would be too many to address.
+at::Tensor bf16_parts(const at::Tensor& x, bool k_rows, int64_t parts, uint32_t kinds) {
+  at::Tensor v = k_rows ? x.transpose(1, 2) : x;  // [B, R, k]
+  int64_t batch = v.stride(0) == 0 ? 1 : v.size(0), rows = v.size(1), k = v.size(2), kp = ceil_div(k, 8) * 8;
+  int64_t rp = ceil_div(rows, 8) * 8;
+  bool r_fast = v.stride(1) == 1 && v.stride(2) != 1;
+  if (batch * rp * parts * kp >= (int64_t(1) << 31) || batch > kMaxGroups) {
+    return at::Tensor();
+  }
+  // y: [B, R, parts kp] as [B, parts kp, R (rp)] when r_fast
+  at::Tensor y = r_fast ? at::empty({batch, parts * kp, rp}, x.options().dtype(at::kBFloat16))
+                              .narrow(2, 0, rows)
+                              .transpose(1, 2)
+                        : at::empty({batch, rows, parts * kp}, x.options().dtype(at::kBFloat16));
+  Bf16PartsParams p{};
+  p.x = gpu_address(v);
+  p.y = gpu_address_out(y);
+  p.rows = static_cast<uint32_t>(rows);
+  p.k = static_cast<uint32_t>(k);
+  p.kp = static_cast<uint32_t>(kp);
+  p.parts = static_cast<uint32_t>(parts);
+  p.kinds = kinds;
+  p.sb = static_cast<int32_t>(v.stride(0));
+  p.sr = static_cast<int32_t>(v.stride(1));
+  p.sk = static_cast<int32_t>(v.stride(2));
+  p.yb = static_cast<int32_t>(y.stride(0));
+  p.yr = static_cast<int32_t>(y.stride(1));
+  p.yk = static_cast<int32_t>(y.stride(2));
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(rows * kp), &groups, &p.stride));
+  dispatch("bf16parts", {r_fast ? 1u : 0u}, p, groups, static_cast<uint32_t>(batch));
+  if (batch != v.size(0)) {
+    y = y.expand({v.size(0), rows, parts * kp});
+  }
+  return k_rows ? y.transpose(1, 2) : y;
+}
+
 
 // How many pieces of k would let `groups` workgroups fill `slots` (the
 // workgroups the GPU runs at once, about), as llama.cpp's Vulkan backend
@@ -588,22 +664,39 @@ CoopPlan coop_plan(int64_t m, int64_t n, int64_t k, int64_t batch) {
   return {&small, 1};
 }
 
-// gemm() for float16 and bfloat16: shaders/gemmcm.slang on cooperative
-// matrices, products accumulated in float32 and rounded once. Returns false
-// where it does not run (no cooperative matrices of the type, matrix-vector
-// products: those take the float32 route of other 16-bit products).
-bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
-                  double alpha, double beta) {
-  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
+// gemm() on shaders/gemmcm.slang's cooperative matrices: float16 and
+// bfloat16 products accumulated in float32 and rounded once, and float32
+// products at a reduced precision where torch.set_float32_matmul_precision
+// asks for one (float32_parts): bfloat16 products of the operands' bfloat16
+// parts (bf16_parts), summed in float32 and stored unrounded. At "high"
+// those are A's (lo, hi, hi) times B's (hi, lo, hi) over 3 k. Returns false
+// where it does not run (no cooperative matrices of the type, float32 at
+// "highest", matrix-vector products: those take the float32 route of other
+// 16-bit products).
+bool coop_gemm(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& c, const at::Tensor* cin,
+               double alpha, double beta) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a_in.size(2);
   at::ScalarType t = c.scalar_type();
-  if (!use_coopmat(t) || a.scalar_type() != t || b.scalar_type() != t || (cin != nullptr && cin->scalar_type() != t) ||
-      m == 1 || n == 1 || k == 0) {
+  int64_t parts = t == at::kFloat ? float32_parts() : 0;
+  if ((t == at::kFloat ? parts == 0 : !use_coopmat(t)) || a_in.scalar_type() != t || b_in.scalar_type() != t ||
+      (cin != nullptr && cin->scalar_type() != t) || m == 1 || n == 1 || k == 0) {
     return false;  // (k = 0 too: gemmcm.slang's pipelined k loop needs one tile; it hung on NVIDIA)
   }
-  for (const at::Tensor* t : {&a, &b, &c, cin}) {
-    if (t != nullptr && (!is_vk(*t) || max_offset(*t) < 0 || max_offset(*t) >= (int64_t(1) << 31))) {
+  for (const at::Tensor* x : {&a_in, &b_in, &c, cin}) {
+    if (x != nullptr && (!is_vk(*x) || max_offset(*x) < 0 || max_offset(*x) >= (int64_t(1) << 31))) {
       return false;
     }
+  }
+  at::Tensor a = a_in, b = b_in;
+  if (parts > 0 && c.numel() > 0) {
+    // (two bits per part: 0 hi, 1 lo, 2 hi where finite, else 0: the hi
+    // that meets the other's lo, so that an infinity does not meet a lo of 0)
+    a = bf16_parts(a_in, false, parts, parts == 1 ? 0u : (1u | 2u << 2 | 0u << 4));
+    b = bf16_parts(b_in, true, parts, parts == 1 ? 0u : (2u | 1u << 2 | 0u << 4));
+    if (!a.defined() || !b.defined()) {
+      return false;
+    }
+    k = a.size(2);
   }
   CoopPlan plan = coop_plan(m, n, k, batch);
   const CoopTile& tile = *plan.tile;
@@ -619,7 +712,8 @@ bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
   p.beta = pack_param(beta, at::kFloat);
   std::string kernel = std::string(t == at::kHalf ? "gemmcm_f16_" : "gemmcm_bf16_") + tile.label;
   int64_t group = gemm_group() >= 0 ? gemm_group() : 0;
-  std::vector<uint32_t> spec = {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b), 0u, static_cast<uint32_t>(group)};
+  std::vector<uint32_t> spec = {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b), 0u, static_cast<uint32_t>(group),
+                                t == at::kFloat ? 1u : 0u};  // (C_F32)
   int64_t kc = 0, splits = split_pieces(plan.splits, k, kc);
   if (splits > 1 && split_k_gemm(kernel, spec, 3, p, gx, gy, splits, kc, c, cin, alpha, beta, at::kFloat)) {
     return true;
@@ -704,7 +798,10 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     return true;
   }
   if (c.scalar_type() == at::kHalf || c.scalar_type() == at::kBFloat16) {
-    return coop_gemm_16(a, b, c, cin, alpha, beta) || gemm4s(a, b, c, cin, alpha, beta);
+    return coop_gemm(a, b, c, cin, alpha, beta) || gemm4s(a, b, c, cin, alpha, beta);
+  }
+  if (c.scalar_type() == at::kFloat && coop_gemm(a, b, c, cin, alpha, beta)) {
+    return true;  // (at torch.set_float32_matmul_precision's "high" or "medium")
   }
   if (!gemm_dtype(c.scalar_type()) || a.scalar_type() != c.scalar_type() || b.scalar_type() != c.scalar_type() ||
       (cin != nullptr && cin->scalar_type() != c.scalar_type())) {
@@ -1121,6 +1218,20 @@ at::Tensor dot(const at::Tensor& self, const at::Tensor& other) {
 
 }  // namespace
 }  // namespace vk
+
+// torch_vulkan._kernels' exact_products(): float32 matrix products in its
+// scope (this thread's) stay in float32 at any
+// torch.set_float32_matmul_precision, as under an at::NoTF32Guard: the
+// products that pooling and interpolation are written as. 1 enters a
+// scope, 0 leaves the innermost.
+extern "C" void vkt_exact_float32_products(int enter) {
+  thread_local std::vector<std::unique_ptr<at::NoTF32Guard>> scopes;
+  if (enter != 0) {
+    scopes.push_back(std::make_unique<at::NoTF32Guard>());
+  } else if (!scopes.empty()) {
+    scopes.pop_back();
+  }
+}
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   using namespace vk;
