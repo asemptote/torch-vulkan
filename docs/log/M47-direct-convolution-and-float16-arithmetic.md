@@ -1,7 +1,7 @@
-# Direct convolution and float16 arithmetic (M42)
+# Direct convolution and float16 arithmetic (M47)
 
 Part of issue #75 (items 1, 2 and 4: a direct convolution kernel, vectorised
-float16 kernels, an opt-in flag for float16 arithmetic). After M39 and M41,
+float16 kernels, an opt-in flag for float16 arithmetic). After M39 and M46,
 convolutions were still most of Kokoro's vocoder time on the Mali-G57: an
 im2col copy of the input (K times its size: 164 MB for a k = 11
 convolution over 29,041 samples) and a product that streamed those columns
@@ -41,9 +41,9 @@ input in place:
   half_via_float did).
 - It runs wherever the GPU runs 16-lane subgroups with shuffles (Mali's
   Valhall GPUs, Intel's), for stride-1 convolutions with at most 16 inner
-  taps that are not depthwise (M41's multiply-adds do those):
+  taps that are not depthwise (M46's multiply-adds do those):
   convolutions with a stride keep im2col, and transposed convolutions
-  reach it through M41's phases (stride 1). `TORCH_VK_CONV=im2col` restores
+  reach it through M46's phases (stride 1). `TORCH_VK_CONV=im2col` restores
   the columns and product for comparison.
 
 ## float16 arithmetic (opt-in)
@@ -82,7 +82,7 @@ other work: about 10% noise):
 | conv1d 256 -> 256, k 11, 4,840 samples | 90 | 55 | 52 | 46 |
 | conv1d 256 -> 256, k 3 | 26 | 14 | 15 | 9.2 |
 | conv1d 1024 -> 1024, k 3, 242 frames | 19 | 17 | 18 | 13 |
-| conv_transpose1d 512 -> 256, k 20, s 10 (M41's phases) | 333 | 34 | 33 | 27 |
+| conv_transpose1d 512 -> 256, k 20, s 10 (M46's phases) | 333 | 34 | 33 | 27 |
 | conv_transpose1d 256 -> 128, k 12, s 6 | 347 | 38 | 37 | 27 |
 | conv2d 64 -> 64, k 3, 56 x 56, batch 8 | 64 | 14 | 15 | 10 |
 
@@ -95,12 +95,12 @@ Mali-G57 (Galaxy A13): to follow (tile sweep, Kokoro end to end).
 
 - tests/python/test_nn.py `test_direct_conv` (through `TORCH_VK_CONV`, in a
   subprocess): 1-3 dims, every inner tap count to 16, dilations 1-5,
-  groups, batches, bias, K = 1, asymmetric and cropped inputs (M41's
+  groups, batches, bias, K = 1, asymmetric and cropped inputs (M46's
   phases), float32, float16 and bfloat16, against float64 references with
   the float32 sums' bound; `test_fp16_arithmetic.py`.
 - The HD 530 now runs every stride-1 convolution through conv4s by
   default: tests/python (1920 passed), PyTorch's `nn/test_convolution.py`,
-  `test_nn.py -k onv` and `test_ops.py -k conv` as M41, the strict OpInfo
+  `test_nn.py -k onv` and `test_ops.py -k conv` as M46, the strict OpInfo
   sweep's convolutions; lavapipe (which cannot run conv4s) tests/python
   test_nn, test_matmul, test_fp16_arithmetic.
 
