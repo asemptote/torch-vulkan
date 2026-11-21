@@ -190,3 +190,18 @@ def test_rfft_long_rows(dtype):
         want = torch.fft.rfft(x.double()).to(got.dtype)
         tol = 2e-6 if dtype == torch.float32 else 1e-13
         check(got, want, rtol=0, atol=tol * want.abs().max().item())
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_irfft_long_rows(dtype):
+    # (rows the register passes take: fft_reg.slang's first pass folds the
+    # half spectrum itself; with extra values past n + 1, which irfft ignores,
+    # the input rows are longer than the transform's)
+    for bits, extra in ((15, 0), (18, 0), (18, 5), (20, 0), (21, 0), (22, 3)):
+        n = 1 << (bits + 1)
+        x = make_complex((2, n // 2 + 1 + extra), dtype, bits)
+        with on_gpu():
+            got = torch.fft.irfft(x.to("vk"), n=n)
+        want = torch.fft.irfft(x.to(torch.complex128), n=n).to(got.dtype)
+        tol = 2e-6 if dtype == torch.complex64 else 1e-13
+        check(got, want, rtol=0, atol=tol * want.abs().max().item())
