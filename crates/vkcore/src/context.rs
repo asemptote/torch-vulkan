@@ -54,6 +54,13 @@ pub struct Capabilities {
     /// The same for bfloat16 A and B (VK_KHR_shader_bfloat16's
     /// shaderBFloat16Type and shaderBFloat16CooperativeMatrix).
     pub cooperative_matrix_bf16: bool,
+    /// The GPU's streaming multiprocessors or compute units (NVIDIA SMs, AMD
+    /// CUs, Arm shader cores, Intel Xe cores), 0 where unknown: matrix
+    /// products choose their tile shape and split k by it
+    /// (csrc/linalg.cpp). From VK_NV_shader_sm_builtins,
+    /// VK_AMD_shader_core_properties(2) or VK_ARM_shader_core_builtins, else
+    /// a table of Intel device IDs; `TORCH_VK_COMPUTE_UNITS` overrides it.
+    pub compute_units: u32,
     pub max_shared_memory: u32,
     pub max_workgroup_count_x: u32,
     pub max_push_constants: u32,
@@ -113,6 +120,10 @@ pub struct Context {
     /// On Vulkan 1.1 devices, the extension entry points of the 1.2 core
     /// functions used (buffer device addresses, timeline semaphores).
     khr: Option<(ash::khr::buffer_device_address::Device, ash::khr::timeline_semaphore::Device)>,
+    /// VK_KHR_external_fence_fd, on Intel GPUs under Linux only: the stream
+    /// exports each submission's fence as a sync_file to read the kernel's
+    /// status for it (see [`crate::stream::intel_linux`]).
+    pub fence_fd: Option<ash::khr::external_fence_fd::Device>,
 }
 
 static VALIDATION_ISSUES: AtomicUsize = AtomicUsize::new(0);
@@ -284,6 +295,15 @@ impl Context {
             if caps.cooperative_matrix_bf16 {
                 names.push(SHADER_BFLOAT16_NAME.as_ptr());
             }
+            let fence_fd = crate::stream::intel_linux(props.vendor_id) && has(ash::khr::external_fence_fd::NAME) && {
+                let info = vk::PhysicalDeviceExternalFenceInfo::default().handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+                let mut ext = vk::ExternalFenceProperties::default();
+                instance.get_physical_device_external_fence_properties(physical_device, &info, &mut ext);
+                ext.external_fence_features.contains(vk::ExternalFenceFeatureFlags::EXPORTABLE)
+            };
+            if fence_fd {
+                names.push(ash::khr::external_fence_fd::NAME.as_ptr());
+            }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
             let mut device_info = vk::DeviceCreateInfo::default()
@@ -329,7 +349,8 @@ impl Context {
                 (ash::khr::buffer_device_address::Device::new(&instance, &device),
                  ash::khr::timeline_semaphore::Device::new(&instance, &device))
             });
-            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr })
+            let fence_fd = fence_fd.then(|| ash::khr::external_fence_fd::Device::new(&instance, &device));
+            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr, fence_fd })
         }
     }
 
@@ -515,7 +536,27 @@ unsafe fn query_capabilities(
     let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
     let mut m4 = vk::PhysicalDeviceMaintenance4Properties::default();
     let mut sscp = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+    let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+    let mut amd = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+    let mut amd2 = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
+    let mut arm = vk::PhysicalDeviceShaderCoreBuiltinsPropertiesARM::default();
     let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut sub).push_next(&mut m3);
+    let has_sm = has(ash::nv::shader_sm_builtins::NAME);
+    let has_amd = has(ash::amd::shader_core_properties::NAME);
+    let has_amd2 = has(ash::amd::shader_core_properties2::NAME);
+    let has_arm = has(ash::arm::shader_core_builtins::NAME);
+    if has_sm {
+        properties = properties.push_next(&mut sm);
+    }
+    if has_amd {
+        properties = properties.push_next(&mut amd);
+    }
+    if has_amd2 {
+        properties = properties.push_next(&mut amd2);
+    }
+    if has_arm {
+        properties = properties.push_next(&mut arm);
+    }
     if float_controls {
         properties = properties.push_next(&mut fc);
     }
@@ -560,6 +601,19 @@ unsafe fn query_capabilities(
     };
     let coop_f16_shape = shapes.contains(&vk::ComponentTypeKHR::FLOAT16);
     let coop_bf16_shape = shapes.contains(&COMPONENT_TYPE_BFLOAT16);
+    let compute_units = std::env::var("TORCH_VK_COMPUTE_UNITS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(
+        if has_sm && sm.shader_sm_count > 0 {
+            sm.shader_sm_count
+        } else if has_amd2 && amd2.active_compute_unit_count > 0 {
+            amd2.active_compute_unit_count
+        } else if has_amd && amd.compute_units_per_shader_array > 0 {
+            amd.shader_engine_count * amd.shader_arrays_per_engine_count * amd.compute_units_per_shader_array
+        } else if has_arm && arm.shader_core_count > 0 {
+            arm.shader_core_count
+        } else {
+            intel_xe_cores(props.vendor_id, props.device_id)
+        },
+    );
 
 
     let memory = instance.get_physical_device_memory_properties(pd);
@@ -606,6 +660,7 @@ unsafe fn query_capabilities(
             && b(bf16.shader_bfloat16_type)
             && b(bf16.shader_bfloat16_cooperative_matrix)
             && !disabled("bfloat16"),
+        compute_units,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
         max_push_constants: props.limits.max_push_constants_size,
@@ -613,6 +668,28 @@ unsafe fn query_capabilities(
         // (without maintenance4: no stated limit beyond one allocation's)
         max_buffer_size: if maintenance4 { m4.max_buffer_size } else { m3.max_memory_allocation_size },
         unified_memory_type,
+    }
+}
+
+/// Xe cores of Intel's discrete GPUs by PCI device ID (their drivers report
+/// no core count), 0 for other devices: Arc A-series and B-series, from
+/// Intel's specifications.
+fn intel_xe_cores(vendor: u32, device: u32) -> u32 {
+    if vendor != 0x8086 {
+        return 0;
+    }
+    match device {
+        0x56A6 => 6,                   // A310
+        0x5693 | 0x56A5 | 0x56B1 => 8, // A370M, A380, Pro A40/A50
+        0x5697 => 12,                  // A530M
+        0x5692 | 0x56B3 => 16,         // A550M, Pro A60
+        0x56A2 => 24,                  // A580
+        0x5691 | 0x56A1 => 28,         // A730M, A750
+        0x56A0 | 0x5690 => 32,         // A770, A770M
+        0xE212 => 16,                  // Pro B50
+        0xE20C => 18,                  // B570
+        0xE20B | 0xE211 => 20,         // B580, Pro B60
+        _ => 0,
     }
 }
 

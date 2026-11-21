@@ -173,6 +173,13 @@ pub extern "C" fn vkt_vendor_id() -> u32 {
     runtime().map(|rt| rt.ctx.vendor_id).unwrap_or(0)
 }
 
+/// The device's SMs or compute units (vkcore `Capabilities::compute_units`),
+/// 0 where unknown.
+#[no_mangle]
+pub extern "C" fn vkt_compute_units() -> u32 {
+    runtime().map(|rt| rt.ctx.caps.compute_units).unwrap_or(0)
+}
+
 /// The subgroup size kernel `name` runs with (vkcore's SUBGROUP_KERNELS,
 /// e.g. "gemmsg_f32"): 0 for other kernels, and where the device cannot run it.
 ///

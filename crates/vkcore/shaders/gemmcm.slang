@@ -1,4 +1,5 @@
 // axis T: f16=half bf16=uint16_t
+// axis TILE: l=0 m=1 s=2
 //
 // Batched float16 or bfloat16 GEMM on cooperative matrices
 // (VK_KHR_cooperative_matrix; bfloat16 fragments with VK_KHR_shader_bfloat16):
@@ -11,8 +12,11 @@
 // storage type: bfloat16 is stored as uint16_t); E is the fragments' type.
 //
 // A workgroup of WG threads (subgroups of 32 lanes: vkcore requires that
-// size) computes a BM x BN tile of C, its 8 subgroups in a 2 x 4 grid, each
-// WM x WN fragments of 16 x 16 (64 x 64 values). Per block of BK values of k it stages A's
+// size) computes a BM x BN tile of C, its subgroups in a grid, each WM x WN
+// fragments of 16 x 16. TILE picks the tile (csrc/linalg.cpp chooses it by
+// the problem's size and the GPU's SM count): l 128 x 256 in 8 subgroups of
+// 64 x 64, m 128 x 128 in 4 subgroups of 64 x 64, s 64 x 128 in 4 subgroups
+// of 32 x 64. Per block of BK values of k it stages A's
 // BM x BK and B's BK x BN blocks in shared memory as float16, in 16-byte
 // pieces of 8 values (zeros past the edges): one 16-byte load each where an
 // operand is contiguous along k, m or n (A_MODE, B_MODE; csrc/linalg.cpp
@@ -23,31 +27,28 @@
 // subgroup at a time, to be scaled, added to Cin and stored with bounds
 // checks.
 //
+// Split k (SPLIT = 1): workgroup z = batch * splits + s sums only k in
+// [s kc, (s + 1) kc) (p.kc, a multiple of BK) and stores its float32 sums,
+// unscaled, to a workspace (p.c as float*, with p.c's strides) that
+// splitk.slang then adds up in a fixed order, scales, adds to Cin and
+// rounds: results are the same from run to run.
+//
+// GROUP > 0 launches the tiles in bands of GROUP rows of tiles, column by
+// column within a band, instead of row by row, so that the workgroups
+// running at once share their A and B panels in L2.
+//
 // Shared memory: the A and B blocks with 8 values of padding per row (rows
 // stay 16-byte aligned, as cooperative-matrix loads need, and start in
-// different banks), plus one float32 fragment per subgroup: 38 KiB
-// (vkcore requires that much for this kernel).
+// different banks), plus one float32 fragment per subgroup: 38 KiB for the
+// l tile (vkcore requires that much for this kernel), less for the others.
 
 #include "_slot.slang"
-#include "_half.slang"
+#include "_gemm16.slang"
 
 #if defined(T_bf16)
 typealias E = BFloat16;
-uint bits_of(T x) { return uint(x); }
-float to_f(T x) { return bit_cast<float>(uint(x) << 16); }
-T from_f(float f)
-{
-    if (isnan(f))
-        return uint16_t(0x7fc0);
-    uint u = bit_cast<uint>(f);
-    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even
-    return uint16_t(u >> 16);
-}
 #else
 typealias E = half;
-uint bits_of(T x) { return uint(bit_cast<uint16_t>(x)); }
-float to_f(T x) { return float(x); }
-T from_f(float f) { return to_half(f); }
 #endif
 
 using namespace linalg;
@@ -63,7 +64,7 @@ struct Params
     uint m;
     uint n;
     uint k;
-    uint _pad;
+    uint kc;  // k per split (SPLIT)
     int a_sm, a_sk, a_sb;
     int b_sk, b_sn, b_sb;
     int c_sm, c_sn, c_sb;
@@ -79,16 +80,32 @@ struct Params
 [vk::constant_id(1)] const int A_MODE = 0;
 [vk::constant_id(2)] const int B_MODE = 0;
 
-// Tile shape (csrc/linalg.cpp mirrors BM and BN). Measured at 2048^3 to
-// 8192^3 (TFLOP/s, H100 NVL / L40S): 128 x 256 x 32 with 4 x 4 fragments
-// per subgroup 145-149 / 147-157; 256 x 128 140-146 / 143-150; 128 x 128
-// 112-118 / 123-138, with BK 64 123-126 (H100); 64 x 128 100-109 (H100).
+[vk::constant_id(3)] const int SPLIT = 0;
+[vk::constant_id(4)] const int GROUP = 0;
+
+// Tile shapes (csrc/linalg.cpp mirrors BM and BN). Measured at 2048^3 to
+// 8192^3 (TFLOP/s, H100 NVL / L40S, M22): 128 x 256 x 32 with 4 x 4
+// fragments per subgroup 145-149 / 147-157; 256 x 128 140-146 / 143-150;
+// 128 x 128 in 8 subgroups 112-118 / 123-138, with BK 64 123-126 (H100);
+// 64 x 128 100-109 (H100). See docs/log/M35 for the choice between them.
 #define LANES 32
+#define BK 32
+#if defined(TILE_l)
 #define BM 128
 #define BN 256
-#define BK 32
 #define WM 4
 #define WN 4
+#elif defined(TILE_m)
+#define BM 128
+#define BN 128
+#define WM 4
+#define WN 4
+#else
+#define BM 64
+#define BN 128
+#define WM 2
+#define WN 4
+#endif
 // subgroups in a grid of BM / (16 WM) rows and BN / (16 WN) columns, each
 // WM x WN fragments of 16 x 16
 #define SG_COLS (BN / (16 * WN))
@@ -185,8 +202,23 @@ uint4 load_b_piece(int base, uint k0, uint col0, uint o, uint ii)
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
     uint t = tid.x, sg = t / LANES, lane = t % LANES;
-    uint row0 = gid.y * BM, col0 = gid.x * BN;
-    int batch = int(gid.z);
+    uint tm = gid.y, tn = gid.x;
+    if (GROUP > 0)
+    {
+        // tile (tm, tn) of the launch order's id: bands of GROUP tile rows,
+        // m fastest within a band
+        uint gx = (p.n + BN - 1) / BN, gy = (p.m + BM - 1) / BM;
+        uint id = gid.y * gx + gid.x, band = id / (GROUP * gx), first = band * GROUP;
+        uint rows = min(gy - first, uint(GROUP)), r = id - band * GROUP * gx;
+        tm = first + r % rows;
+        tn = r / rows;
+    }
+    uint row0 = tm * BM, col0 = tn * BN;
+    // split k: z = batch * splits + s sums k in [klo, khi)
+    uint splits = SPLIT != 0 ? (p.k + p.kc - 1) / p.kc : 1u;
+    int batch = int(gid.z / splits);
+    uint klo = SPLIT != 0 ? (gid.z % splits) * p.kc : 0u;
+    uint khi = SPLIT != 0 ? min(klo + p.kc, p.k) : p.k;
     int abase = batch * p.a_sb, bbase = batch * p.b_sb;
     uint wr = (sg / SG_COLS) * WM * 16, wc = (sg % SG_COLS) * WN * 16;  // the subgroup's block of the tile
     // shared layouts: A [m][k] unless A_MODE 2 ([k][m]); B [k][n] unless
@@ -204,25 +236,25 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     // the first block's pieces (none for k = 0: the loads clamp k to k - 1,
     // and empty operands may have no memory; csrc/linalg.cpp declines k = 0
     // too, which hung NVIDIA GPUs)
-    if (p.k != 0)
+    if (khi > klo)
     {
         [ForceUnroll]
         for (uint s = 0; s < PA; s++)
         {
             uint o, ii;
             piece_at(t + s * WG, a_row, o, ii);
-            ra[s] = load_a_piece(abase, row0, 0, o, ii);
+            ra[s] = load_a_piece(abase, row0, klo, o, ii);
         }
         [ForceUnroll]
         for (uint s = 0; s < PB; s++)
         {
             uint o, ii;
             piece_at(t + s * WG, b_row, o, ii);
-            rb[s] = load_b_piece(bbase, 0, col0, o, ii);
+            rb[s] = load_b_piece(bbase, klo, col0, o, ii);
         }
     }
 
-    for (uint k0 = 0; k0 < p.k; k0 += BK)
+    for (uint k0 = klo; k0 < khi; k0 += BK)
     {
         [ForceUnroll]
         for (uint s = 0; s < PA; s++)
@@ -240,7 +272,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         }
         GroupMemoryBarrierWithGroupSync();
         uint k1 = k0 + BK;
-        if (k1 < p.k)
+        if (k1 < khi)
         {
             // the next block's pieces, in flight during the products
             [ForceUnroll]
@@ -303,7 +335,12 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
             for (uint e = lane; e < 256; e += LANES)
             {
                 uint gm = row0 + wr + i * 16 + e / 16, gn = col0 + wc + j * 16 + e % 16;
-                if (gm < p.m && gn < p.n)
+                if (SPLIT != 0 && gm < p.m && gn < p.n)
+                {
+                    float* ws = (float*)p.c;  // (the sums, unscaled: splitk.slang finishes them)
+                    ws[int(gid.z) * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = Cs[sg * 256 + e];
+                }
+                else if (gm < p.m && gn < p.n)
                 {
                     float v = alpha * Cs[sg * 256 + e];
                     if (USE_CIN != 0)  // beta == 0 must ignore Cin entirely (it may hold NaN)

@@ -57,7 +57,8 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 |---|---|
 | `TORCH_VK_STRICT=1` | Raise `NotImplementedError` instead of running an op on the CPU. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
-| `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default limits batches on Intel GPUs only, where some drivers drop the results of very long submissions. |
+| `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
+| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
 | `TORCH_VK_BARRIERS=full` | Put a full compute + transfer memory barrier before every command, instead of one matched to the two commands' kinds. A debugging switch: it rules out the narrowed barriers when a race is suspected, at about 0.5 us per dispatch. |
 | `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500` on discrete GPUs, `0`, blocking at once, on integrated ones and lavapipe, which share the CPU's power or cores). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
 
@@ -67,6 +68,10 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 |---|---|
 | `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
 | `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size for the `subgroup` kernels (default 16 for float32, 8 for float64), within the device's range. |
+| `TORCH_VK_COMPUTE_UNITS=n` | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, `0`, unknown, elsewhere: then products are never split). |
+| `TORCH_VK_SPLIT_K=n` | Split every float matrix product's k into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size. The pieces' sums are added in a fixed order, so results are the same from run to run either way. For testing and tuning. |
+| `TORCH_VK_GEMM_TILE=l`, `m` or `s` | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every float16 and bfloat16 product, instead of choosing by the GPU's size. For testing and tuning. |
+| `TORCH_VK_GEMM_GROUP=g` | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). For testing and tuning. |
 | `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. |
 | `TORCH_VK_EIGH_QL=1` | `eigh`: use tridiagonal QL instead of divide and conquer for every size (comparison and debugging). |
 | `TORCH_VK_SVD_JACOBI=1` | `svd`: use one-sided Jacobi instead of bidiagonalisation for every size (comparison and debugging). |

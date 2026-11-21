@@ -270,9 +270,11 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 - **float32 subnormals** are flushed to zero on GPUs that flush them in
   shaders (e.g. the H100).
 - **Long float64 kernels** can trip the Windows GPU watchdog on small
-  integrated GPUs; on Linux's i915 (Intel Gen9), a single dispatch running
-  for a second or more can lose its results without a device-lost error
-  (the stream bounds batches on Intel GPUs, `TORCH_VK_MAX_BATCH_GROUPS`).
+  integrated GPUs; on Linux's i915 (Intel), a single kernel running for 20 s
+  or more is cancelled by the kernel driver. The stream keeps the work queued
+  on Intel GPUs under Linux short (`TORCH_VK_MAX_IN_FLIGHT`,
+  `TORCH_VK_MAX_BATCH_GROUPS`) and raises an error if work is cancelled
+  anyway, since Mesa's driver does not report it.
 
 ## How it works
 

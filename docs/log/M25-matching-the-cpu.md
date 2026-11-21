@@ -25,7 +25,7 @@ round as the CPU does, step by step.
     53 >= 2 * 24 + 2) for every non-negative float32 bit pattern on ANV: no
     differences.
   - float64 keeps the floating-point method: a Newton step on a Dekker
-    residual, then neighbour tests, without FMAs, after scaling x by 2^±600
+    residual, then neighbour tests, without FMAs, after scaling x by 2^Â±600
     into [2^-500, 2^500].
   - rsqrt is `m_div(1, m_sqrt(x))`, rounded twice, like the CPU's
     `1 / std::sqrt(x)`. pow(x, 0.5) is sqrt, as on the CPU.
@@ -121,14 +121,18 @@ round as the CPU does, step by step.
   dispatched one workgroup per 1024-entry block, and lavapipe and most
   drivers allow at most 65535 workgroups per dispatch. The local passes now
   loop over the blocks with a grid stride, as the global ones already did.
-- **Submissions on Intel GPUs** (`vkcore/src/stream.rs`): a submission that
-  kept a Gen9 GPU (HD 530, Mesa's ANV, Linux's i915) busy for a couple of
-  seconds came back with its later commands' results missing, and no lost
-  device was reported. A 2^27-entry sort was unsorted, and a scatter of
-  2^26 values wrote nothing. The stream now also submits once a batch holds
-  2^13 workgroups on Intel GPUs, so a big dispatch goes alone while small
-  ones still batch. `TORCH_VK_MAX_BATCH_GROUPS` overrides this, and 0 removes
-  the limit.
+- **Submissions on Intel GPUs** (`vkcore/src/stream.rs`): on a Gen9 GPU
+  (HD 530, Mesa's ANV, Linux's i915), long submissions came back with their
+  later commands' results missing, and no lost device was reported. A
+  2^27-entry float64 sort was unsorted, and a scatter of 2^26 values wrote
+  nothing. The stream now also submits once a batch holds 2^13 workgroups on
+  Intel GPUs, so a big dispatch goes alone while small ones still batch.
+  `TORCH_VK_MAX_BATCH_GROUPS` overrides this, and 0 removes the limit.
+  (Corrected in M34: the trigger is not a submission busy for "a couple of
+  seconds", as first written here, but i915 cancelling work still unfinished
+  20 s after it was submitted, queue time included. The cap helped only
+  because i915 also throttles a context with a few dozen submissions queued;
+  M34 bounds the submissions in flight as well, and reports a cancellation.)
 - **sum_rows_by_key** (embedding's and grid_sampler's backward): keys it
   skips (zero padding's corners) all went to one spare row. That made one
   run, which one thread folds serially, about 1.6 s per call in

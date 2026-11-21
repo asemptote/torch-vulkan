@@ -37,8 +37,16 @@ fn main() -> Result<()> {
     run(false)?; // warm-up: pipeline compile, command buffers
     println!("{} ({ops} fills of {n} float64 each)", rt.ctx.device_name);
     println!("  sync after every op: {:7.1} us/op", run(true)?);
-    let batch = rt.stream.lock().unwrap().max_batch;
+    let (batch, in_flight) = {
+        let s = rt.stream.lock().unwrap();
+        (s.max_batch, s.max_in_flight)
+    };
     println!("  batched ({batch}/submit): {:7.1} us/op", run(false)?);
+    // One submission per op, never waiting for one: with max_in_flight set
+    // (TORCH_VK_MAX_IN_FLIGHT), the stream waits for older submissions.
+    rt.stream.lock().unwrap().max_batch = 1;
+    println!("  one submit per op, max {in_flight} in flight (0: no limit): {:7.1} us/op", run(false)?);
+    rt.stream.lock().unwrap().max_batch = batch;
     assert_eq!(unsafe { y.as_slice_mut::<f64>() }[n as usize - 1], (ops - 1) as f64);
     rt.free(y);
     Ok(())
