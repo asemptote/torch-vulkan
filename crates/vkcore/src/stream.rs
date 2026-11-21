@@ -19,14 +19,48 @@ use crate::{Context, Result};
 pub const DEFAULT_MAX_BATCH: u32 = 256;
 
 /// Workgroups per batch before the stream submits on its own, on Intel GPUs
-/// (0: no limit, elsewhere). On Linux, a submission that kept a Gen9 GPU
-/// (HD 530, Mesa's ANV, i915) busy for a couple of seconds came back with
-/// its later commands' results missing, and no lost device reported: a
-/// 2^27-entry sort, whose bitonic passes of 65535 workgroups take about a
-/// second each there, was unsorted with two passes per submission and
-/// right with one. A big dispatch is then submitted alone (small ones still
-/// batch up to DEFAULT_MAX_BATCH), with a margin: 2^13 workgroups.
+/// (0: no limit, elsewhere; TORCH_VK_MAX_BATCH_GROUPS overrides). A big
+/// dispatch is then submitted alone, while small ones still batch up to
+/// DEFAULT_MAX_BATCH, so that one submission is a few bitonic passes of a
+/// huge sort rather than the whole sort.
+///
+/// Under Linux, i915 cancels GPU work still unfinished 20 s
+/// (`i915.request_timeout_ms`) after it was submitted, and Mesa's ANV reports
+/// VK_SUCCESS all the same (mesa#16166): the commands cut off simply leave
+/// their outputs unwritten. The 20 s count from submission, not from when the
+/// work starts, so they cover everything queued ahead of it as well. On the
+/// HD 530 a 2^27-entry float64 sort (~26 s of GPU work, 172 dispatches) in
+/// one submission came back unsorted. In one submission per dispatch it was
+/// right, but only because i915 also blocks a submission while the context's
+/// ring holds a few dozen unfinished ones (see [`default_max_in_flight`]),
+/// which kept ~10 s of its ~0.15 s passes queued at a time; with passes of
+/// ~0.4 s that is over 20 s again. Small batches therefore go with a bound on
+/// the submissions in flight.
 pub const INTEL_MAX_BATCH_GROUPS: u64 = 1 << 13;
+
+/// An Intel GPU under Linux, where the kernel driver (i915) silently cancels
+/// work still unfinished 20 s after it was submitted (see
+/// [`INTEL_MAX_BATCH_GROUPS`]). The stream then bounds the submissions in
+/// flight and checks each one's fence status as it retires.
+pub fn intel_linux(vendor_id: u32) -> bool {
+    cfg!(target_os = "linux") && vendor_id == 0x8086
+}
+
+/// Submissions the stream lets the GPU have queued or running at once
+/// (0: no limit): TORCH_VK_MAX_IN_FLIGHT, by default 2 on Intel GPUs under
+/// Linux ([`intel_linux`]) and 0 elsewhere. Before submitting a batch, the
+/// stream waits until fewer than this many earlier ones are unfinished. With
+/// 2, a batch waits behind at most the one before it, so each finishes within
+/// two batches' time of its submission, while the GPU still has the next
+/// batch queued whenever one finishes. (i915 itself blocks a submission only
+/// once the context's ring is nearly full, a few dozen submissions: on the
+/// HD 530 that let over 20 s of work queue up.)
+pub fn default_max_in_flight(vendor_id: u32) -> u32 {
+    std::env::var("TORCH_VK_MAX_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if intel_linux(vendor_id) { 2 } else { 0 })
+}
 
 /// Microseconds [`Stream::wait`] polls before blocking: TORCH_VK_SPIN_US, by
 /// default 500 on discrete GPUs and 0 (block at once) elsewhere. Integrated
@@ -47,6 +81,24 @@ pub fn full_barriers() -> bool {
     *FULL.get_or_init(|| std::env::var("TORCH_VK_BARRIERS").is_ok_and(|v| v == "full"))
 }
 
+/// How long a submission must have been in flight (submitted to seen
+/// finished) before its fence's status is read, on [`intel_linux`]
+/// platforms: i915 cancels a submission only once it is 20 s old
+/// (`i915.request_timeout_ms`; settable, but rarely below that). Reading the
+/// status costs about 12 us (exporting a sync_file), resetting the fence
+/// instead about 1.
+const CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A submitted batch not yet retired.
+struct Submission {
+    /// The timeline value it signals.
+    value: u64,
+    cb: vk::CommandBuffer,
+    /// The exportable fence it signals (null unless the context has `fence_fd`).
+    fence: vk::Fence,
+    at: std::time::Instant,
+}
+
 pub struct Stream {
     ctx: Arc<Context>,
     layout: vk::PipelineLayout,
@@ -57,9 +109,16 @@ pub struct Stream {
     bound: vk::Pipeline,
     /// Timeline value signaled by the most recent submission.
     submitted: u64,
-    in_flight: VecDeque<(u64, vk::CommandBuffer)>,
+    /// Submitted batches not yet retired.
+    in_flight: VecDeque<Submission>,
     spare: Vec<vk::CommandBuffer>,
+    spare_fences: Vec<vk::Fence>,
+    /// Set once a retired submission's fence carried an error (the kernel
+    /// cancelled it): from then on every call fails, as on a lost device.
+    cancelled: Option<i32>,
     pub max_batch: u32,
+    /// Submissions in flight at most (0: no limit; see [`default_max_in_flight`]).
+    pub max_in_flight: u32,
     /// Workgroups per batch before it is submitted (0: no limit; see
     /// INTEL_MAX_BATCH_GROUPS; TORCH_VK_MAX_BATCH_GROUPS overrides).
     pub max_batch_groups: u64,
@@ -90,6 +149,7 @@ impl Stream {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(if ctx.vendor_id == 0x8086 { INTEL_MAX_BATCH_GROUPS } else { 0 });
+            let max_in_flight = default_max_in_flight(ctx.vendor_id);
             Ok(Self {
                 ctx,
                 layout,
@@ -101,7 +161,10 @@ impl Stream {
                 submitted: 0,
                 in_flight: VecDeque::new(),
                 spare: Vec::new(),
+                spare_fences: Vec::new(),
+                cancelled: None,
                 max_batch: DEFAULT_MAX_BATCH,
+                max_in_flight,
                 max_batch_groups,
                 batch_groups: 0,
                 dispatches: 0,
@@ -234,6 +297,11 @@ impl Stream {
     /// Submits everything recorded so far. Returns the timeline value that
     /// will be signaled when it completes.
     pub fn flush(&mut self) -> Result<u64> {
+        if self.recording.is_none() {
+            return Ok(self.submitted);
+        }
+        self.limit_in_flight()?;
+        let fence = self.fence()?;
         let Some(cb) = self.recording.take() else { return Ok(self.submitted) };
         let d = &self.ctx.device;
         unsafe {
@@ -258,13 +326,68 @@ impl Stream {
             let buffers = [cb];
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
             let submit = vk::SubmitInfo::default().command_buffers(&buffers).signal_semaphores(&semaphores).push_next(&mut timeline);
-            d.queue_submit(self.ctx.queue, &[submit], vk::Fence::null())?;
+            let at = std::time::Instant::now();
+            d.queue_submit(self.ctx.queue, &[submit], fence)?;
             self.submitted = value;
-            self.in_flight.push_back((value, cb));
+            self.in_flight.push_back(Submission { value, cb, fence, at });
         }
         self.commands = 0;
         self.batch_groups = 0;
         Ok(self.submitted)
+    }
+
+    /// With [`Self::max_in_flight`] set, waits until fewer than that many
+    /// submissions are unfinished, so that the next one can go.
+    fn limit_in_flight(&mut self) -> Result<()> {
+        let max = self.max_in_flight as usize;
+        if max == 0 || self.in_flight.len() < max {
+            return Ok(());
+        }
+        self.recycle()?;
+        if self.in_flight.len() >= max {
+            let value = self.in_flight[self.in_flight.len() - max].value;
+            self.wait(value)?;
+            self.recycle()?;
+        }
+        Ok(())
+    }
+
+    /// A fence for the next submission: an unsignalled exportable one where
+    /// the context has `fence_fd`, else null.
+    fn fence(&mut self) -> Result<vk::Fence> {
+        if self.ctx.fence_fd.is_none() {
+            return Ok(vk::Fence::null());
+        }
+        if let Some(f) = self.spare_fences.pop() {
+            return Ok(f);
+        }
+        let mut export = vk::ExportFenceCreateInfo::default().handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        Ok(unsafe { self.ctx.device.create_fence(&vk::FenceCreateInfo::default().push_next(&mut export), None)? })
+    }
+
+    /// The error, if any, that the kernel recorded on a finished submission's
+    /// fence (ANV does not report it: mesa#16166), read if the submission
+    /// was in flight for [`CHECK_AFTER`] or more; the fence is reset for reuse.
+    fn fence_error(&self, s: &Submission) -> Result<Option<i32>> {
+        if s.at.elapsed() >= CHECK_AFTER {
+            if let Some(error) = exported_fence_error(&self.ctx, s.fence) {
+                return error;
+            }
+        }
+        // (the timeline semaphore may be seen signalled before the fence)
+        unsafe {
+            self.ctx.device.wait_for_fences(&[s.fence], true, u64::MAX)?;
+            self.ctx.device.reset_fences(&[s.fence])?;
+        }
+        Ok(None)
+    }
+
+    /// Once a submission was cancelled, every call fails with this.
+    fn check_cancelled(&self) -> Result<()> {
+        match self.cancelled {
+            None => Ok(()),
+            Some(status) => Err(cancelled_message(status).into()),
+        }
     }
 
     /// Timeline value of the newest finished batch.
@@ -278,6 +401,7 @@ impl Stream {
     /// H100 NVL, a tiny kernel followed by a synchronize took 43 us, most of
     /// it the wake-up; CUDA's synchronize spins likewise by default.)
     pub fn wait(&self, value: u64) -> Result<()> {
+        self.check_cancelled()?;
         let spin = spin_us(self.ctx.discrete);
         if spin > 0 {
             let start = std::time::Instant::now();
@@ -302,22 +426,39 @@ impl Stream {
         self.recycle()
     }
 
+    /// Number of submissions not yet finished.
+    pub fn unfinished(&self) -> Result<u64> {
+        Ok(self.submitted.saturating_sub(self.completed()?))
+    }
+
     /// Number of commands recorded but not yet submitted.
     pub fn pending(&self) -> u32 {
         self.commands
     }
 
+    /// Retires the finished submissions, reusing their command buffers and
+    /// fences, and fails if the kernel cancelled any of them.
     fn recycle(&mut self) -> Result<()> {
+        self.check_cancelled()?;
         let done = self.completed()?;
-        while let Some(&(value, cb)) = self.in_flight.front() {
-            if value > done {
-                break;
+        while self.in_flight.front().is_some_and(|s| s.value <= done) {
+            let s = self.in_flight.pop_front().unwrap();
+            unsafe { self.ctx.device.reset_command_buffer(s.cb, vk::CommandBufferResetFlags::empty())? };
+            self.spare.push(s.cb);
+            if s.fence != vk::Fence::null() {
+                match self.fence_error(&s) {
+                    Ok(error) => {
+                        self.spare_fences.push(s.fence);
+                        self.cancelled = self.cancelled.or(error);
+                    }
+                    Err(e) => {
+                        unsafe { self.ctx.device.destroy_fence(s.fence, None) };
+                        return Err(e);
+                    }
+                }
             }
-            unsafe { self.ctx.device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())? };
-            self.spare.push(cb);
-            self.in_flight.pop_front();
         }
-        Ok(())
+        self.check_cancelled()
     }
 }
 
@@ -325,9 +466,85 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let _ = self.synchronize();
         unsafe {
+            // (synchronize fails at once after a cancellation: still wait for
+            // everything submitted before destroying its command buffers)
+            let semaphores = [self.timeline];
+            let values = [self.submitted];
+            let _ = self.ctx.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values), u64::MAX);
             let d = &self.ctx.device;
+            for s in self.in_flight.drain(..) {
+                self.spare_fences.push(s.fence);
+            }
+            for f in self.spare_fences.drain(..).filter(|&f| f != vk::Fence::null()) {
+                d.destroy_fence(f, None);
+            }
             d.destroy_command_pool(self.pool, None);
             d.destroy_semaphore(self.timeline, None);
         }
     }
+}
+
+/// The error, if any, on a finished submission's fence, from its status as
+/// an exported sync_file (exporting also resets the fence); None where the
+/// context cannot export fences.
+#[cfg(target_os = "linux")]
+fn exported_fence_error(ctx: &Context, fence: vk::Fence) -> Option<Result<Option<i32>>> {
+    ctx.fence_fd.as_ref().map(|fence_fd| sync_file_error(fence_fd, fence))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exported_fence_error(_ctx: &Context, _fence: vk::Fence) -> Option<Result<Option<i32>>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sync_file_error(fence_fd: &ash::khr::external_fence_fd::Device, fence: vk::Fence) -> Result<Option<i32>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let info = vk::FenceGetFdInfoKHR::default().fence(fence).handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+    let fd = unsafe { fence_fd.get_fence_fd(&info)? };
+    if fd < 0 {
+        return Ok(None); // (allowed for a signalled fence: no status to read)
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut status = sync_file_status(fd.as_raw_fd())?;
+    if status == 0 {
+        // Still active (the timeline semaphore can signal first): wait.
+        let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut p, 1, -1) };
+        status = sync_file_status(fd.as_raw_fd())?;
+    }
+    Ok((status < 0).then_some(status))
+}
+
+/// The status `SYNC_IOC_FILE_INFO` reports for a sync_file: 1 signalled, 0
+/// still active, negative: signalled with that error (-errno).
+#[cfg(target_os = "linux")]
+fn sync_file_status(fd: std::os::fd::RawFd) -> Result<i32> {
+    #[repr(C)]
+    struct SyncFileInfo {
+        name: [u8; 32],
+        status: i32,
+        flags: u32,
+        num_fences: u32,
+        pad: u32,
+        sync_fence_info: u64,
+    }
+    // _IOWR('>', 4, struct sync_file_info), from linux/sync_file.h
+    const SYNC_IOC_FILE_INFO: u32 = (3 << 30) | ((std::mem::size_of::<SyncFileInfo>() as u32) << 16) | ((b'>' as u32) << 8) | 4;
+    let mut info = SyncFileInfo { name: [0; 32], status: 0, flags: 0, num_fences: 0, pad: 0, sync_fence_info: 0 };
+    if unsafe { libc::ioctl(fd, SYNC_IOC_FILE_INFO as _, &mut info) } < 0 {
+        return Err(format!("SYNC_IOC_FILE_INFO: {}", std::io::Error::last_os_error()).into());
+    }
+    Ok(info.status)
+}
+
+/// The error once the kernel cancelled a submission (fence status `status`).
+fn cancelled_message(status: i32) -> String {
+    let why = if status == -4 { "-4, EINTR: i915's request watchdog".to_string() } else { status.to_string() };
+    format!(
+        "GPU work was cancelled by the kernel driver while the Vulkan driver reported success (fence status {why}), \
+         so results computed on the device since then are invalid; restart the process. On Linux, i915 cancels work \
+         still unfinished 20 s (i915.request_timeout_ms) after it was submitted: keep less work queued at once \
+         (TORCH_VK_MAX_IN_FLIGHT, TORCH_VK_MAX_BATCH_GROUPS) or smaller single operations, or raise that timeout"
+    )
 }
