@@ -15,7 +15,7 @@ float64) at 2048^3, 4096^3 and 8192^3, and in weight gradients' shape
 (x.t() @ y: a 4096 x 4096 or 1024 x 1024 result summed over 65536 or 262144
 rows) in 16-bit and float32; float32 products at
 torch.set_float32_matmul_precision("high") and ("medium") (CUDA: TF32 for
-both; vk: three or one bfloat16 products, docs/log/M40); FFTs and
+both; vk: three or one bfloat16 products, docs/log/M41); FFTs and
 real FFTs of 2^20 and 2^24 points in complex64 / complex128; float64
 linalg.solve, eigh and svd at n = 1024 and 4096; an element-wise chain over
 2^26 float32 values (GB/s); the per-op overhead of small additions; and a

@@ -1,6 +1,6 @@
 // The bfloat16 parts of a float32 matrix product's operand, for float32
 // products at torch.set_float32_matmul_precision's "medium" and "high"
-// (csrc/linalg.cpp's bf16_parts; docs/log/M40), which then run as one
+// (csrc/linalg.cpp's bf16_parts; docs/log/M41), which then run as one
 // bfloat16 product on cooperative matrices (gemmcm.slang with C_F32):
 //
 //   y[b][r][q kp + j] = part q of x[b][r][j] for j < k, 0 for k <= j < kp,

@@ -1,4 +1,4 @@
-# float32 products at torch.set_float32_matmul_precision (M40)
+# float32 products at torch.set_float32_matmul_precision (M41)
 
 Issue #76. `torch.set_float32_matmul_precision("high")` or `("medium")`
 lets PyTorch compute float32 matrix products at lower precision; CUDA then

@@ -40,7 +40,7 @@
 // C_F32 = 1: C and Cin are float32, and C is stored unrounded: float32
 // products at torch.set_float32_matmul_precision's "medium" and "high",
 // which csrc/linalg.cpp runs as bfloat16 products of their operands'
-// bfloat16 parts (bf16parts.slang; docs/log/M40).
+// bfloat16 parts (bf16parts.slang; docs/log/M41).
 //
 // Shared memory: the A and B blocks with 8 values of padding per row (rows
 // stay 16-byte aligned, as cooperative-matrix loads need, and start in

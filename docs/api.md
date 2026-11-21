@@ -61,8 +61,8 @@ cooperative matrices):
 | Setting | float32 products on "vk" | Error of each product a b | L40S, 8192^3 |
 |---|---|---|---|
 | `"highest"` (default) | float32 | float32's | 17 TFLOP/s |
-| `"high"` | each operand split into two bfloat16 parts, hi + lo; hi hi + hi lo + lo hi, three bfloat16 products summed in float32 | under 2^-14 \|a b\| (about 16 bits) | see docs/log/M40 |
-| `"medium"` | operands rounded to bfloat16, one bfloat16 product summed in float32 | under 2^-7 \|a b\| (8 bits) | see docs/log/M40 |
+| `"high"` | each operand split into two bfloat16 parts, hi + lo; hi hi + hi lo + lo hi, three bfloat16 products summed in float32 | under 2^-14 \|a b\| (about 16 bits) | see docs/log/M41 |
+| `"medium"` | operands rounded to bfloat16, one bfloat16 product summed in float32 | under 2^-7 \|a b\| (8 bits) | see docs/log/M41 |
 
 - It applies to `mm`, `bmm`, `addmm`, `baddbmm`, `matmul`, `nn.Linear`,
   `einsum` and other ops made of those, forward and backward, and to the

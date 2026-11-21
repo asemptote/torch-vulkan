@@ -421,7 +421,7 @@ def test_coopmat_coverage():
             assert tv._native.kernel_subgroup_size(f"gemmcm_{label}") == 32
 
 
-# torch.set_float32_matmul_precision (docs/log/M40): where the device has
+# torch.set_float32_matmul_precision (docs/log/M41): where the device has
 # bfloat16 cooperative matrices, "medium" rounds float32 operands to bfloat16
 # and "high" splits each into two bfloat16 parts, multiplied three times.
 # Each product's error relative to |a b| is then at most 2^-8 + 2^-8 (+ their

@@ -158,7 +158,7 @@ bool use_coopmat(at::ScalarType t) {
 }
 
 // The bfloat16 parts each float32 operand of a product is taken as, at the
-// precision torch.set_float32_matmul_precision sets (docs/log/M40): 1 for
+// precision torch.set_float32_matmul_precision sets (docs/log/M41): 1 for
 // "medium" (rounded to bfloat16), 3 for "high" (split into two bfloat16
 // parts, the products of three pairs of them summed), where the device has
 // bfloat16 cooperative matrices; 0 (float32 products, as before) for
