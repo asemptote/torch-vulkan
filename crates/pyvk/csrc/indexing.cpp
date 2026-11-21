@@ -1615,13 +1615,17 @@ at::Tensor& linspace_out(const at::Scalar& start, const at::Scalar& end, int64_t
     s = at::scalar_tensor(start, at::TensorOptions().dtype(dtype)).item<double>();
     e = at::scalar_tensor(end, at::TensorOptions().dtype(dtype)).item<double>();
   }
-  if (compute == at::kHalf) {
-    // In c10::Half arithmetic, as PyTorch's CPU kernel.
-    c10::Half hs(static_cast<float>(s)), he(static_cast<float>(e));
-    c10::Half hstep = (he - hs) / c10::Half(static_cast<float>(steps - 1));
-    s = static_cast<float>(hs);
-    e = static_cast<float>(he);
-    step = static_cast<float>(hstep);
+  if (dtype == at::kHalf || dtype == at::kBFloat16) {
+    // As PyTorch's CPU kernel (2.15 on): the endpoints rounded to the dtype,
+    // the step and each element in float32, rounded to the dtype once.
+    auto round = [&](double x) {
+      return dtype == at::kHalf ? static_cast<float>(c10::Half(static_cast<float>(x)))
+                                : static_cast<float>(c10::BFloat16(static_cast<float>(x)));
+    };
+    float fs = round(s), fe = round(e);
+    s = fs;
+    e = fe;
+    step = (fe - fs) / static_cast<float>(steps - 1);
   } else if (compute == at::kFloat) {
     float fs = static_cast<float>(s), fe = static_cast<float>(e);
     step = (fe - fs) / static_cast<float>(steps - 1);

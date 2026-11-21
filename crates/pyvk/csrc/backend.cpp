@@ -1302,7 +1302,7 @@ std::string dtype_signature(const std::string& op, const c10::FunctionSchema& sc
 
 struct CpuDtypeError {
   const char* signature;
-  bool not_implemented;  // NotImplementedError, else RuntimeError
+  char kind;  // 'N': NotImplementedError, 'T': TypeError, 'R': RuntimeError
   const char* message;
 };
 
@@ -1312,7 +1312,7 @@ struct CpuDtypeError {
 void raise_cpu_dtype_error(const std::string& signature) {
   static const CpuDtypeError table[] = {
 #include "cpu_dtype_errors.inc"
-      {nullptr, false, nullptr}};
+      {nullptr, 'R', nullptr}};
   static const std::map<std::string, const CpuDtypeError*> index = [] {
     std::map<std::string, const CpuDtypeError*> m;
     for (const CpuDtypeError& e : table) {
@@ -1340,7 +1340,8 @@ void raise_cpu_dtype_error(const std::string& signature) {
     msg.replace(at, end - at + 1, cpp);
     at += cpp.size();
   }
-  TORCH_CHECK_NOT_IMPLEMENTED(!it->second->not_implemented, msg);
+  TORCH_CHECK_NOT_IMPLEMENTED(it->second->kind != 'N', msg);
+  TORCH_CHECK_TYPE(it->second->kind != 'T', msg);
   TORCH_CHECK(false, msg);
 }
 

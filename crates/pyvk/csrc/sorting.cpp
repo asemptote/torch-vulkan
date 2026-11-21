@@ -140,7 +140,7 @@ std::tuple<at::Tensor&, at::Tensor&> sort_out(const at::Tensor& self, std::optio
                                               bool descending, at::Tensor& values, at::Tensor& indices) {
   if (at::isComplexType(self.scalar_type()) && is_vk(self)) {
     at::maybe_wrap_dim(dim, self.dim());  // (as sort's meta function, first)
-    TORCH_CHECK(false, " Sort does not support complex dtypes on CPU");  // (the CPU's message)
+    TORCH_CHECK_TYPE(false, " Sort does not support complex dtypes on CPU");  // (the CPU's message)
   }
   if (!sortable(self) || !is_vk(values) || !is_vk(indices)) {
     on_cpu("aten::sort", "values_stable", self, stable, dim, descending, values, indices);
@@ -860,7 +860,8 @@ std::tuple<at::Tensor, at::Tensor> std_mean(const at::Tensor& self, at::Optional
 
 at::Tensor nansum_vk(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                   std::optional<at::ScalarType> dtype) {
-  reject_dtype("nansum", self.scalar_type(), at::isComplexType(self.scalar_type()));
+  // (the CPU's check and message; CUDA's nansum takes complex inputs)
+  TORCH_CHECK_NOT_IMPLEMENTED(!at::isComplexType(self.scalar_type()), "nansum on CPU does not support complex inputs");
   at::Tensor x = at::isFloatingType(self.scalar_type()) ? at::where(at::isnan(self), at::zeros_like(self), self) : self;
   return at::sum(x, dim, keepdim, dtype);
 }

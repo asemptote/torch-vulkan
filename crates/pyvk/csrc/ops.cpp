@@ -835,7 +835,7 @@ at::Tensor logit_backward(const at::Tensor& grad, const at::Tensor& self, std::o
 }
 
 at::Tensor& heaviside_out(const at::Tensor& self, const at::Tensor& values, at::Tensor& out) {
-  TORCH_CHECK(!self.is_complex() && !values.is_complex() && !out.is_complex(),
+  TORCH_CHECK_NOT_IMPLEMENTED(!self.is_complex() && !values.is_complex() && !out.is_complex(),
               "heaviside is not yet implemented for complex tensors.");
   TORCH_CHECK(self.scalar_type() == values.scalar_type(),
               "heaviside is not yet implemented for tensors with different dtypes.");
