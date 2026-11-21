@@ -66,7 +66,18 @@ shaderFloat64, a 32-bit Android userspace), with no CPU fallback on "vk":
   here reached Python as `RuntimeError`. On Android the typed checks
   (`TORCH_CHECK_TYPE`/`INDEX`/`VALUE`/`NOT_IMPLEMENTED`, `vk.h`) throw with
   the type_info libtorch_python's handlers use, found with `dlsym`.
-- Run the phone's tests with `OMP_NUM_THREADS=1`: Termux's multithreaded CPU
-  convolution, the tests' reference, gives a wrong result for about 2% of
-  small conv1d calls (repeated calls on the same input differ), which looked
-  like a GPU bug.
+- Termux's multithreaded CPU convolution, the tests' reference, gave a wrong
+  result for about 2% of small conv1d calls (repeated calls on the same input
+  differ), which looked like a GPU bug. The cause is Termux's OpenBLAS
+  (0.3.34), built single-threaded without `USE_LOCKING`: its buffers are
+  unsafe when PyTorch calls sgemm/dgemm from several OpenMP threads at once
+  (termux/termux-packages#33339). On Android or 32-bit Arm, the tests'
+  conftest.py therefore runs PyTorch's CPU with one thread
+  (`torch.set_num_threads(1)`, restored at the end), and their CPU
+  references are right without medians of repeated runs or skips (#71).
+- The OpInfo sweep compares `svd_lowrank` and `pca_lowrank` by absolute
+  value, as `svd`'s (#81). With the same random matrix, vk's steps (the
+  projections, the QRs, the small matrix B = Q^H A) match the phone's CPU
+  to float32 rounding, but the phone's CPU, through OpenBLAS's LAPACK, takes
+  the opposite sign for the first singular vectors of a wide B. MKL, on
+  x86, takes vk's, and the phone's own CPU agrees with vk when B is tall.
