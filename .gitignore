@@ -10,3 +10,6 @@ tools/opinfo_coverage.log
 tools/*.part*.jsonl
 # PyTorch's test suite (sparse checkout; tools/pytorch_tests.py says how)
 pytorch-src/
+dist/
+# Written by tools/build-termux.sh
+python/torch_vulkan/_build_info.py

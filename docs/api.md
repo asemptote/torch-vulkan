@@ -10,7 +10,10 @@ page lists what the package adds on top of that.
 Importing `torch_vulkan` registers the device. It also registers
 `torch.vk`, PyTorch's device-module interface for the backend (the same
 functions, reached as `torch.vk.synchronize()` and so on), and the
-`Tensor.vk()` method.
+`Tensor.vk()` method. A Termux build (a release's Android wheel, or
+`tools/build-termux.sh`) records the PyTorch it was compiled against, and
+importing it under any other PyTorch version raises an `ImportError` (after
+a `python-torch` upgrade, install the matching build or rebuild).
 
 | Function | Returns / does |
 |---|---|

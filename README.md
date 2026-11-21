@@ -155,10 +155,31 @@ pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.1/t
 pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.2.1/torch_vulkan-0.2.1-cp310-abi3-manylinux_2_28_x86_64.whl
 ```
 
-On Android (Termux), build from source with the release's prebuilt kernels:
-extract `torch-vulkan-spirv-v0.2.1.tar.gz` and run `tools/build-termux.sh`
-with that directory (the script describes the setup). Other platforms build
-from source as below.
+On Android, in [Termux](https://termux.dev), releases from 0.3.0 attach
+wheels for 64-bit (`arm64_v8a`) and 32-bit (`armeabi_v7a`) Termux, compiled
+against Termux's own `python-torch` package. `vulkan-loader-android` makes
+Termux's Vulkan loader Android's, which reaches the phone's GPU (Termux's
+default loader finds only Mesa's drivers):
+
+```sh
+pkg install python-torch vulkan-loader-android
+# 64-bit Termux (uname -m: aarch64)
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.3.0/torch_vulkan-0.3.0-cp311-abi3-android_24_arm64_v8a.whl
+# 32-bit Termux (uname -m: armv7l or armv8l)
+pip install https://github.com/asemptote/torch-vulkan/releases/download/v0.3.0/torch_vulkan-0.3.0-cp311-abi3-android_24_armeabi_v7a.whl
+```
+
+A wheel needs the exact `python-torch` version it was compiled against (the
+release notes name it): pip refuses it with any other torch, and after a
+`python-torch` upgrade `import torch_vulkan` raises an `ImportError` until
+the matching wheel is installed. If `vulkan-loader-android` would remove
+packages that need Mesa's loader (`vulkan-loader-generic`), keep that loader
+and put a directory holding `libvulkan.so -> /system/lib64/libvulkan.so`
+(`/system/lib` on 32-bit) first on `LD_LIBRARY_PATH` when running
+torch-vulkan. For another `python-torch`, build from source with the
+release's prebuilt kernels: extract `torch-vulkan-spirv-vX.Y.Z.tar.gz` and
+run `tools/build-termux.sh` with that directory (the script describes the
+setup; it also makes a wheel). Other platforms build from source as below.
 
 ## Building
 
@@ -198,8 +219,8 @@ uv pip install numpy pytest maturin expecttest hypothesis
 .\.venv\Scripts\python -m pytest -q
 ```
 
-Android (Termux, 32-bit ARM): see `tools/build-termux.sh`; Termux has no
-`slangc`, so it uses kernels compiled elsewhere, such as a release's
+Android (Termux, 64-bit or 32-bit ARM): see `tools/build-termux.sh`; Termux
+has no `slangc`, so it uses kernels compiled elsewhere, such as a release's
 `torch-vulkan-spirv-*.tar.gz`.
 
 ## Python API

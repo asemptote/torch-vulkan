@@ -24,6 +24,28 @@ try:
 except importlib.metadata.PackageNotFoundError:  # a source tree on the path, not installed
     __version__ = "unknown"
 
+
+def _check_torch_build():
+    """Termux builds (tools/build-termux.sh, and the releases' Android
+    wheels) record the torch they were compiled against in _build_info.py.
+    libtorch's C++ ABI changes between releases, so after a `pkg upgrade` of
+    python-torch the module could fail to load or crash; refuse it here
+    instead. (pip keeps the other wheels' torch within one minor release.)"""
+    try:
+        from ._build_info import TORCH_VERSION
+    except ImportError:
+        return
+    installed = torch.__version__.split("+")[0]
+    if installed != TORCH_VERSION:
+        raise ImportError(
+            f"torch_vulkan {__version__} was compiled against PyTorch {TORCH_VERSION}, but PyTorch "
+            f"{installed} is installed (on Termux, python-torch was upgraded?). Install the torch-vulkan "
+            f"build for PyTorch {installed} (see the README's 'Installing'), or rebuild with "
+            "tools/build-termux.sh.")
+
+
+_check_torch_build()
+
 # "vk" rather than "vulkan": PyTorch's built-in "vulkan" device type belongs
 # to its old, unmaintained mobile backend.
 torch.utils.rename_privateuse1_backend("vk")
@@ -94,9 +116,10 @@ def _warn_llvmpipe_on_android():
 
         warnings.warn(
             "torch_vulkan: Vulkan found only llvmpipe (Mesa's CPU driver), not the phone's GPU; on 32-bit "
-            "Android its shaders crash (SIGBUS) in reductions such as sum and softmax. Load Android's own "
-            "Vulkan loader (/system/lib/libvulkan.so) first for this process, e.g. through LD_LIBRARY_PATH "
-            "(see the README's 'Building on the phone').", RuntimeWarning, stacklevel=2)
+            "Android its shaders crash (SIGBUS) in reductions such as sum and softmax. Use Android's own "
+            "Vulkan loader: `pkg install vulkan-loader-android`, or put a libvulkan.so linked to "
+            "/system/lib64/libvulkan.so (/system/lib on 32-bit) first on LD_LIBRARY_PATH (see the README's "
+            "'Installing').", RuntimeWarning, stacklevel=2)
 
 
 _warn_llvmpipe_on_android()

@@ -21,8 +21,14 @@ installed) on each kind of device the README lists as tested:
 - lavapipe: CI;
 - an NVIDIA GPU (and one with cooperative matrices, for the float16 GEMM);
 - Intel under both Windows and Mesa (Linux);
-- an Arm Mali phone under Termux, built with `tools/build-termux.sh` from the
-  release candidate's SPIR-V, as a Termux user would.
+- an Arm Mali phone under Termux, with the release candidate's Termux wheel
+  for its userspace (the `wheel-termux-arm` or `wheel-termux-aarch64`
+  artifact of a release-workflow run by hand, `gh workflow run release.yml`)
+  installed with pip as a Termux user would, and the smoke test
+  (`TORCH_VK_STRICT=1 python tools/release_smoke.py`) on the GPU. The
+  workflow tests the aarch64 wheel only on lavapipe, and the arm wheel only
+  for importing (lavapipe's 32-bit ARM shaders fault), so this is their GPU
+  check.
 
 Record anything new in the README's hardware table or limitations.
 
@@ -39,12 +45,17 @@ Record anything new in the README's hardware table or limitations.
 1. Set `version` in `pyproject.toml`, and `version` and `date-released` in
    `CITATION.cff`, and merge that to `main`.
 2. Tag the merge: `git tag -a vX.Y.Z -m "torch-vulkan X.Y.Z"` and push the
-   tag. The release workflow builds the Windows and Linux wheels and the
-   SPIR-V bundle for Termux, tests the Linux wheel on lavapipe outside the
-   source tree, and creates a **draft** release. It fails if the tag doesn't
-   match `pyproject.toml`'s version.
-3. Check the draft: three assets (two wheels, `torch-vulkan-spirv-vX.Y.Z.tar.gz`),
-   and install a wheel on a real GPU.
+   tag. The release workflow builds the Windows and Linux wheels, the Termux
+   wheels (aarch64 and arm, in Termux's Docker image on arm64 runners,
+   against Termux's `python-torch`, which must be `tools/torch-version`'s
+   release) and the SPIR-V bundle for Termux builds from source, tests the
+   Linux and aarch64 Termux wheels on lavapipe outside the source tree, and
+   creates a **draft** release. It fails if the tag doesn't match
+   `pyproject.toml`'s version.
+3. Check the draft: five assets (the Windows, Linux, Termux aarch64 and
+   Termux arm wheels, `torch-vulkan-spirv-vX.Y.Z.tar.gz`), and install a
+   wheel on a real GPU. The release notes name the `python-torch` version the
+   Termux wheels need.
 
 ## 5. Publish
 

@@ -1,6 +1,7 @@
-# Builds wheels for Windows and Linux (x86_64) and the kernels' SPIR-V (for
-# Termux builds, which have no slangc), tests the Linux wheel on lavapipe
-# outside the source tree, and for a v* tag attaches everything to a draft
+# Builds wheels for Windows and Linux (x86_64), for Termux on Android (aarch64
+# and 32-bit arm) and the kernels' SPIR-V (for Termux builds from source,
+# which have no slangc), tests the Linux and aarch64 Termux wheels on
+# lavapipe outside the source tree, and for a v* tag attaches everything to a draft
 # GitHub release. Run it by hand (workflow_dispatch) to build without
 # releasing.
 name: release
@@ -155,9 +156,44 @@ jobs:
           assert not torch_vulkan.fallback_counts()
           EOF
 
+  # Wheels for Termux on Android, built in Termux itself: the official
+  # termux-docker image on GitHub's arm64 runners (whose Neoverse N2 cores
+  # also run 32-bit ARM, so the arm image runs natively too), against
+  # Termux's own python-torch, from the spirv job's kernels (Termux has no
+  # slangc). See docs/log/M40-termux-packages.md.
+  wheel-termux:
+    needs: spirv
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, arm]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: spirv
+          path: spirv
+      - name: Docker settings for Termux
+        run: |
+          # 32-bit bionic keeps thread IDs in 16 bits (termux-docker's README).
+          sudo sysctl -w kernel.pid_max=65535
+          mkdir -m 777 dist
+          docker pull -q "termux/termux-docker:${{ matrix.arch }}"
+          # (termux-docker needs the personality() syscall)
+          echo "TERMUX_RUN=docker run --rm --security-opt seccomp=unconfined -v $PWD:/src:ro -v $PWD/spirv:/spirv:ro -v $PWD/dist:/out termux/termux-docker:${{ matrix.arch }}" >> "$GITHUB_ENV"
+      - name: Build the wheel in Termux
+        run: $TERMUX_RUN bash /src/tools/termux_ci.sh build /spirv /out
+      - name: Test the wheel in a fresh Termux (lavapipe)
+        run: $TERMUX_RUN bash /src/tools/termux_ci.sh test /out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-termux-${{ matrix.arch }}
+          path: dist/*.whl
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [spirv, wheel-windows, wheel-linux, test-wheel-linux]
+    needs: [spirv, wheel-windows, wheel-linux, test-wheel-linux, wheel-termux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -190,8 +226,18 @@ jobs:
               pip install "torch==${TORCH_VERSION%.*}.*"
               pip install <wheel URL from the assets below>
 
-          On Android (Termux), build from source with the prebuilt kernels:
-          extract torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz and run
+          On Android (Termux), wheels for 64-bit (aarch64) and 32-bit (armeabi_v7a)
+          userspaces, compiled against Termux's python-torch ${TORCH_VERSION} (and
+          refusing to import under another torch, so reinstall after a python-torch
+          upgrade); \`pkg install vulkan-loader-android\` lets them reach the phone's GPU:
+
+              pkg install python-torch vulkan-loader-android
+              pip install <android_24_arm64_v8a or android_24_armeabi_v7a wheel URL from the assets below>
+
+          The aarch64 wheel is tested on lavapipe (Mesa's CPU Vulkan) in Termux's
+          Docker image, the arm wheel on an Arm Mali-G57 phone. With another
+          python-torch, build from source with the prebuilt kernels: extract
+          torch-vulkan-spirv-${GITHUB_REF_NAME}.tar.gz and run
           \`tools/build-termux.sh <that directory>\` (see the README).
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
