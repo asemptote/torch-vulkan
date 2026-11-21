@@ -74,6 +74,28 @@ fn many_batches_without_sync() -> Result<()> {
 }
 
 #[test]
+fn bounded_submissions_in_flight() -> Result<()> {
+    let rt = Runtime::new()?;
+    {
+        let mut s = rt.stream.lock().unwrap();
+        s.max_batch = 1; // one submission per command
+        s.max_in_flight = 2;
+    }
+    let n = 1 << 16;
+    let y = rt.alloc(n as u64 * 8)?;
+    for i in 0..200 {
+        fill(&rt, y.address, i as f64, n)?;
+        let unfinished = rt.stream.lock().unwrap().unfinished()?;
+        assert!(unfinished <= 2, "{unfinished} submissions in flight");
+    }
+    rt.synchronize()?;
+    assert!(unsafe { y.as_slice_mut::<f64>() }.iter().all(|&v| v == 199.0));
+    rt.free(y);
+    assert_clean();
+    Ok(())
+}
+
+#[test]
 fn specialization_constants() -> Result<()> {
     let rt = Runtime::new()?;
     let n = 1000;

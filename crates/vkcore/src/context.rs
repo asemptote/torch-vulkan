@@ -113,6 +113,10 @@ pub struct Context {
     /// On Vulkan 1.1 devices, the extension entry points of the 1.2 core
     /// functions used (buffer device addresses, timeline semaphores).
     khr: Option<(ash::khr::buffer_device_address::Device, ash::khr::timeline_semaphore::Device)>,
+    /// VK_KHR_external_fence_fd, on Intel GPUs under Linux only: the stream
+    /// exports each submission's fence as a sync_file to read the kernel's
+    /// status for it (see [`crate::stream::intel_linux`]).
+    pub fence_fd: Option<ash::khr::external_fence_fd::Device>,
 }
 
 static VALIDATION_ISSUES: AtomicUsize = AtomicUsize::new(0);
@@ -284,6 +288,15 @@ impl Context {
             if caps.cooperative_matrix_bf16 {
                 names.push(SHADER_BFLOAT16_NAME.as_ptr());
             }
+            let fence_fd = crate::stream::intel_linux(props.vendor_id) && has(ash::khr::external_fence_fd::NAME) && {
+                let info = vk::PhysicalDeviceExternalFenceInfo::default().handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+                let mut ext = vk::ExternalFenceProperties::default();
+                instance.get_physical_device_external_fence_properties(physical_device, &info, &mut ext);
+                ext.external_fence_features.contains(vk::ExternalFenceFeatureFlags::EXPORTABLE)
+            };
+            if fence_fd {
+                names.push(ash::khr::external_fence_fd::NAME.as_ptr());
+            }
             let priorities = [1.0];
             let queue_info = vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities);
             let mut device_info = vk::DeviceCreateInfo::default()
@@ -329,7 +342,8 @@ impl Context {
                 (ash::khr::buffer_device_address::Device::new(&instance, &device),
                  ash::khr::timeline_semaphore::Device::new(&instance, &device))
             });
-            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr })
+            let fence_fd = fence_fd.then(|| ash::khr::external_fence_fd::Device::new(&instance, &device));
+            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr, fence_fd })
         }
     }
 

@@ -12,6 +12,10 @@ test-kernels = []
 [dependencies]
 ash = "0.38"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# ioctl on sync_files (stream.rs: reading the kernel's status for a submission)
+libc = "0.2"
+
 [dev-dependencies]
 # Tests and examples see the test kernels.
 vkcore = { path = ".", features = ["test-kernels"] }
