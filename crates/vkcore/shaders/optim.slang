@@ -1,4 +1,5 @@
 // axis T: f32=float f64=double
+// axis S: t=T bf16=uint16_t
 //
 // Fused optimiser steps (torch.optim with fused=True), one launch per
 // parameter tensor, elementwise over its n contiguous elements, with the
@@ -15,6 +16,10 @@
 // FLAGS (bits): SCALED (grad /= gs, written back, as the CPU), MAXIMIZE,
 // DECAY (weight_decay != 0), AMSGRAD, MOMENTUM, FIRST (SGD's first step),
 // NESTEROV.
+// S is the type of buf1..3: T, or bfloat16 (stored as its 16 bits; with T =
+// float32 parameters and gradients, torch.optim's mixed precision as in
+// CUDA's fused Adam): read into T, the step computed in T, written back
+// rounded to nearest even, as cast.slang.
 
 #include "_slot.slang"
 #include "opcodes.slang"
@@ -23,9 +28,9 @@ struct Params
 {
     T* param;      // 0
     T* grad;       // 8
-    T* buf1;       // 16
-    T* buf2;       // 24
-    T* buf3;       // 32
+    S* buf1;       // 16
+    S* buf2;       // 24
+    S* buf3;       // 32
     uint n;        // 40
     uint stride;   // 44
     uint flags;    // 48
@@ -56,6 +61,22 @@ T coef(uint i)
 
 bool has(uint flag) { return (p.flags & flag) != 0; }
 
+#if defined(S_bf16)
+T load(S x) { return T(bit_cast<float>(uint(x) << 16)); }
+S store(T v)
+{
+    float f = float(v);
+    if (isnan(f))
+        return uint16_t(0x7fc0);
+    uint u = bit_cast<uint>(f);
+    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even
+    return uint16_t(u >> 16);
+}
+#else
+T load(S x) { return x; }
+S store(T v) { return v; }
+#endif
+
 [numthreads(64, 1, 1)]  // (vkt_grid_1d's workgroup size)
 void main(uint3 gid: SV_DispatchThreadID)
 {
@@ -81,16 +102,16 @@ void main(uint3 gid: SV_DispatchThreadID)
             }
             // exp_avg.lerp_(grad, 1 - beta1), as the CPU's vectorised lerp
             T w = coef(3);
-            T m = p.buf1[i];
+            T m = load(p.buf1[i]);
             bool small = abs(w) < T(0.5);
             m = fma(small ? w : w - T(1), grad - m, small ? m : grad);
-            T v = p.buf2[i] * coef(4) + coef(5) * grad * grad;
-            p.buf1[i] = m;
-            p.buf2[i] = v;
+            T v = load(p.buf2[i]) * coef(4) + coef(5) * grad * grad;
+            p.buf1[i] = store(m);
+            p.buf2[i] = store(v);
             if (has(AMSGRAD))
             {
-                v = max(p.buf3[i], v);
-                p.buf3[i] = v;
+                v = max(load(p.buf3[i]), v);
+                p.buf3[i] = store(v);
             }
             T denom = sqrt(v) / coef(6) + coef(7);
             p.param[i] = param + coef(8) * m / denom;
@@ -101,8 +122,8 @@ void main(uint3 gid: SV_DispatchThreadID)
                 grad = fma(param, coef(1), grad);
             if (has(MOMENTUM))
             {
-                T buf = has(FIRST) ? grad : fma(coef(3), grad, p.buf1[i] * coef(2));
-                p.buf1[i] = buf;
+                T buf = has(FIRST) ? grad : fma(coef(3), grad, load(p.buf1[i]) * coef(2));
+                p.buf1[i] = store(buf);
                 grad = has(NESTEROV) ? fma(buf, coef(2), grad) : buf;
             }
             p.param[i] = param + grad * coef(4);
@@ -111,8 +132,8 @@ void main(uint3 gid: SV_DispatchThreadID)
         {
             if (has(DECAY))
                 grad = grad + param * coef(1);
-            T sum = p.buf1[i] + grad * grad;
-            p.buf1[i] = sum;
+            T sum = load(p.buf1[i]) + grad * grad;
+            p.buf1[i] = store(sum);
             T std_ = sqrt(sum) + coef(2);
             p.param[i] = param - coef(3) * grad / std_;
         }

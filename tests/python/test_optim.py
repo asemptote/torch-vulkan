@@ -135,3 +135,52 @@ def test_grad_scaler_steps():
     assert torch_vulkan.fallback_counts() == before
     torch.testing.assert_close(p.detach().cpu(), torch.full((3,), 0.8))
     assert scaler.get_scale() == 8.0
+
+
+def bf16_state(o):
+    """Initialises Adam's state in bfloat16 before its first step (as PyTorch's
+    test_fused_mixed_precision tests do)."""
+    for group in o.param_groups:
+        for p in group["params"]:
+            st = o.state[p]
+            if not st:
+                st["step"] = torch.zeros((), dtype=torch.float32, device=p.device)
+                for k in ("exp_avg", "exp_avg_sq") + (("max_exp_avg_sq",) if group["amsgrad"] else ()):
+                    st[k] = torch.zeros_like(p, dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("opt,kwargs", [c for c in CASES if c[0] in (torch.optim.Adam, torch.optim.AdamW)])
+def test_fused_adam_bfloat16_state(opt, kwargs):
+    # float32 parameters and gradients with bfloat16 state, as CUDA's fused
+    # kernels: the same as float32 state rounded to bfloat16 after each step
+    shapes = ((5, 7), (33,), (2, 3, 4))
+    params = [torch.nn.Parameter(make(s, torch.float32, seed=i).to("vk")) for i, s in enumerate(shapes)]
+    ref = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    o, r = opt(params, fused=True, **kwargs), opt(ref, fused=True, **kwargs)
+    bf16_state(o)
+    before = torch_vulkan.fallback_counts()
+    for step in range(4):
+        for i, (p, q) in enumerate(zip(params, ref)):
+            p.grad = make(p.shape, torch.float32, seed=100 * step + i).to("vk")
+            q.grad = p.grad.clone()
+        o.step()
+        r.step()
+        for p, q in zip(params, ref):
+            assert torch.equal(p.detach().cpu(), q.detach().cpu())
+            for k, v in r.state[q].items():
+                if k == "step":
+                    continue
+                assert o.state[p][k].dtype == torch.bfloat16
+                assert torch.equal(o.state[p][k].cpu(), v.to(torch.bfloat16).cpu())
+                r.state[q][k] = v.to(torch.bfloat16).float()
+    assert torch_vulkan.fallback_counts() == before
+    # other mixed dtypes (bfloat16 parameters with float32 state): CUDA's error
+    p = torch.nn.Parameter(torch.ones(3, device="vk", dtype=torch.bfloat16))
+    p.grad = torch.ones(3, device="vk", dtype=torch.bfloat16)
+    o = opt([p], fused=True, **kwargs)
+    o.state[p].update(step=torch.zeros((), device="vk"), exp_avg=torch.zeros(3, device="vk"),
+                      exp_avg_sq=torch.zeros(3, device="vk"))
+    if kwargs.get("amsgrad"):
+        o.state[p]["max_exp_avg_sq"] = torch.zeros(3, device="vk")
+    with pytest.raises(RuntimeError, match="requires float32 params, got BFloat16"):
+        o.step()
