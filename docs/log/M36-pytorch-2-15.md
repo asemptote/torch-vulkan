@@ -134,4 +134,31 @@ checkout other than `~/torch-vulkan`, as `build.sh` does.
 
 ## Testing
 
-RESULTS
+- tests/python with `TORCH_VK_STRICT=1`: 1607 passed, 9 skipped on the Intel
+  HD 530 (Mesa ANV) and on lavapipe.
+- The strict OpInfo sweep: 689 ops, all on the GPU, none on the CPU, on both.
+- `tools/dev/cpu_dtype_errors.py --check --all`: 1419 signatures, none
+  mismatched.
+- PyTorch's 36 test files on lavapipe (121,587 tests collected): the full
+  run gave 107,003 passed and 418 vk-only failures before the fixes; the
+  439 failing or falling-back tests run again after them leave 61 vk-only
+  failures and 2 crashes.
+
+What is left:
+
+- Tests 2.15 runs on accelerators for the first time that show gaps older
+  than 2.15: sparse compressed tensors (`bmm`, `baddbmm`,
+  `_sparse_mm_reduce_impl`, `sampled_addmm`'s checks, `addmm` into a dense
+  result, the device-mismatch messages of the constructors; 37 tests), fused
+  Adam/AdamW with bfloat16 parameters and float32 state (9), 2-D bicubic
+  `grid_sample` with zeros padding beside a non-finite voxel (PyTorch's
+  decomposition multiplies it by a zero weight; 2-D and 3-D then differ),
+  nearest `grid_sample`'s rounding at half-way coordinates, a 2^53 + 1 wide
+  axis, autocast's dtype under checkpointing, a Python-dispatch deadlock
+  test, and a CPU-scalar `pow` case.
+- Fallbacks in those tests: `_masked_softmax_backward`, `abs` of
+  float8_e5m2 and `eq`/`copy_` of float8_e8m0fnu, and CPU errors for fused
+  Adam's mixed dtypes, `_validate_compressed_sparse_indices` and
+  `baddbmm`'s `out=` dtype.
+- The three `test_tensor_lr_*_LBFGS` failures and `grid_sampler_3d`'s
+  gradgrad crash were there with 2.14.

@@ -408,7 +408,7 @@ EXPECTED = [
     (r"test_sync_batchnorm_(accuracy|backward_elemt)_vk", r"aten::batch_norm_(stats|backward_elemt)",
      "SyncBatchNorm's ops (batch_norm_stats, batch_norm_backward_elemt, ...) exist for CUDA only, with no CPU "
      "kernel to compare against"),
-    (r"TestFakeTensorVK::test_fake_crossref_backward_(no_)?amp_nn_functional_grid_sample_vk",
+    (r"TestFakeTensorVK::test_fake_(crossref_backward_(no_)?amp_|autocast_)?nn_functional_grid_sample_vk",
      r"bicubic interpolation with 5D input is not supported on vk",
      "PyTorch 2.15's meta function for grid_sampler_3d refuses 5-D bicubic on devices other than the CPU and "
      "CUDA (the trace mirrors eager there); vk computes it, so the FakeTensor run and the real one disagree"),
