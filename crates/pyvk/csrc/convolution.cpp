@@ -7,16 +7,18 @@
 //  - forward: im2col as a strided view of the padded input (one copy kernel)
 //    and a batched GEMM against the weight (for one sample or one group,
 //    the weight times the columns laid out as rows, the bias added by it);
-//  - transposed: an ordinary convolution of the zero-inserted input with the
-//    flipped, transposed weight (no accumulation into overlapping windows);
+//  - depthwise (one input channel per group): one multiply-add per tap;
+//  - transposed, with a stride: one convolution of the input for all the
+//    stride's phases (sub-pixel convolution), interleaved into the output;
+//    without (or where the phases would not save work): an ordinary
+//    convolution of the (zero-inserted) input with the flipped, transposed
+//    weight (no accumulation into overlapping windows);
 //  - backward: grad_input is a transposed convolution, grad_weight a GEMM of
 //    grad_output against the same columns, grad_bias a sum.
 
 #include "vk.h"
 
 #include <torch/library.h>
-
-#include <cstdlib>
 
 namespace vk {
 
@@ -311,9 +313,8 @@ at::Tensor conv_transpose_phases(const at::Tensor& x, const at::Tensor& w, const
 at::Tensor conv_transpose_forward(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
                                   at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef output_padding,
                                   at::IntArrayRef dilation, int64_t groups) {
-  if (std::getenv("TORCH_VK_CONV_TRANSPOSE_ZEROS") == nullptr) {
-    at::Tensor y = conv_transpose_phases(x, w, bias, stride, padding, output_padding, dilation, groups);
-    if (y.defined()) return y;
+  if (at::Tensor y = conv_transpose_phases(x, w, bias, stride, padding, output_padding, dilation, groups); y.defined()) {
+    return y;
   }
   int64_t s = x.dim() - 2, N = x.size(0), Ci = x.size(1), Cog = w.size(1), Co = Cog * groups;
   // Insert stride - 1 zeros between input elements.
