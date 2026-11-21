@@ -65,6 +65,7 @@ int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
 int vkt_has_float64();
 uint32_t vkt_vendor_id();
 uint32_t vkt_capabilities();
+uint32_t vkt_compute_units();  // the device's SMs or compute units, 0 if unknown
 uint32_t vkt_kernel_subgroup_size(const char* name);  // lanes of a subgroup kernel (e.g. gemmsg_f32), 0 if unavailable
 }
 

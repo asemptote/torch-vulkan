@@ -3,7 +3,7 @@
 // Batched GEMM with register tiles and subgroup broadcasts, for GPUs with
 // subgroup size control, shuffles and broadcasts: C[b] = alpha * A[b] @ B[b]
 // (+ beta * Cin[b] when USE_CIN), operands addressed through element
-// strides as in gemm.slang (whose Params this is, its padding slot unused).
+// strides as in gemm.slang (whose Params this is).
 //
 // A workgroup of WG threads in subgroups of S lanes computes a
 // (WG / S) MR x S NR tile of C: subgroup g its rows g MR .., lane l the
@@ -20,6 +20,11 @@
 // have twice the registers), every subgroup full; the kernel is instantiated
 // for 8, 16 and 32 lanes and picks the size it runs with. On the UHD 620 at
 // n = 2048: float32 about 2.2x gemm.slang, float64 about 1.35x.
+//
+// Split k (SPLIT = 1): workgroup z = batch * splits + s sums only k in
+// [s kc, (s + 1) kc) (p.kc, a multiple of 32) and stores its sums, unscaled,
+// to a workspace (p.c, with p.c's strides) that splitk.slang then adds up in
+// a fixed order, scales and adds to Cin.
 
 #include "_slot.slang"
 
@@ -34,7 +39,7 @@ struct Params
     uint m;
     uint n;
     uint k;
-    uint _pad;
+    uint kc;  // k per split (SPLIT)
     int a_sm, a_sk, a_sb;
     int b_sk, b_sn, b_sb;
     int c_sm, c_sn, c_sb;
@@ -53,6 +58,7 @@ T param(slot64 bits)
 }
 
 [vk::constant_id(0)] const int USE_CIN = 0;
+[vk::constant_id(1)] const int SPLIT = 0;
 
 #define WG 128
 #define MR 8
@@ -65,8 +71,13 @@ T param(slot64 bits)
 #endif
 groupshared T Bs[BS_MAX];
 
-void run<let S : int, let NR : int>(uint t, uint lane, uint2 grp, int batch)
+void run<let S : int, let NR : int>(uint t, uint lane, uint2 grp, uint z)
 {
+    // split k: z = batch * splits + s sums k in [klo, khi)
+    uint splits = SPLIT != 0 ? (p.k + p.kc - 1) / p.kc : 1u;
+    int batch = int(z / splits);
+    uint klo = SPLIT != 0 ? (z % splits) * p.kc : 0u;
+    uint khi = SPLIT != 0 ? min(klo + p.kc, p.k) : p.k;
     const uint CN = S * NR;
     uint row0 = (grp.y * (WG / S) + t / S) * MR, col0 = grp.x * CN;
     int abase = batch * p.a_sb, bbase = batch * p.b_sb;
@@ -76,7 +87,7 @@ void run<let S : int, let NR : int>(uint t, uint lane, uint2 grp, int batch)
         [ForceUnroll]
         for (int j = 0; j < NR; j++)
             acc[i][j] = T(0);
-    for (uint k0 = 0; k0 < p.k; k0 += S)
+    for (uint k0 = klo; k0 < khi; k0 += S)
     {
         // B's block (zeros past k and n) and this lane's A values (zeros past
         // m and k), so the tail of k adds nothing.
@@ -129,6 +140,11 @@ void run<let S : int, let NR : int>(uint t, uint lane, uint2 grp, int batch)
             uint col = col0 + lane + uint(j * S);
             if (col >= p.n)
                 continue;
+            if (SPLIT != 0)
+            {
+                p.c[int(z) * p.c_sb + int(row) * p.c_sm + int(col) * p.c_sn] = acc[i][j];  // (unscaled)
+                continue;
+            }
             T v = alpha * acc[i][j];
             if (USE_CIN != 0)  // beta == 0 must ignore Cin entirely (it may hold NaN)
                 v += beta * p.cin[batch * p.cin_sb + int(row) * p.cin_sm + int(col) * p.cin_sn];
@@ -142,16 +158,16 @@ void run<let S : int, let NR : int>(uint t, uint lane, uint2 grp, int batch)
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
     uint S = WaveGetLaneCount(), lane = WaveGetLaneIndex();
-    int batch = int(gid.z);
+    uint z = gid.z;
     if (S == 8)
-        run<8, 4>(tid.x, lane, gid.xy, batch);
+        run<8, 4>(tid.x, lane, gid.xy, z);
     else if (S == 16)
-        run<16, 4>(tid.x, lane, gid.xy, batch);
+        run<16, 4>(tid.x, lane, gid.xy, z);
 #if defined(T_f64)
     else
-        run<32, 2>(tid.x, lane, gid.xy, batch);
+        run<32, 2>(tid.x, lane, gid.xy, z);
 #else
     else
-        run<32, 4>(tid.x, lane, gid.xy, batch);
+        run<32, 4>(tid.x, lane, gid.xy, z);
 #endif
 }
