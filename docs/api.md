@@ -58,11 +58,11 @@ Ampere on, with a driver that has `VK_KHR_shader_bfloat16`),
 on CUDA, but with bfloat16 where CUDA uses TF32 (Vulkan has no TF32
 cooperative matrices):
 
-| Setting | float32 products on "vk" | Error of each product | about 2^-7 |a b| (8 bits) | | L40S, 8192^3 |
+| Setting | float32 products on "vk" | Error of each product a b | L40S, 8192^3 |
 |---|---|---|---|
 | `"highest"` (default) | float32 | float32's | 17 TFLOP/s |
-| `"high"` | each operand split into two bfloat16 parts, hi + lo; hi hi + hi lo + lo hi, three bfloat16 products summed in float32 | under 2^-14 \|| about 2^-7 |a b| (8 bits) |\| (about 16 bits) | 49 TFLOP/s |
-| `"medium"` | operands rounded to bfloat16, one bfloat16 product summed in float32 | about 2^-7 |a b| (8 bits) |\|a b\| (8 bits) | 142 TFLOP/s |
+| `"high"` | each operand split into two bfloat16 parts, hi + lo; hi hi + hi lo + lo hi, three bfloat16 products summed in float32 | under 2^-14 \|a b\| (about 16 bits) | 49 TFLOP/s |
+| `"medium"` | operands rounded to bfloat16, one bfloat16 product summed in float32 | about 2^-7 \|a b\| (8 bits) | 142 TFLOP/s |
 
 - It applies to `mm`, `bmm`, `addmm`, `baddbmm`, `matmul`, `nn.Linear`,
   `einsum` and other ops made of those, forward and backward, and to the
@@ -93,9 +93,9 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 |---|---|
 | `TORCH_VK_STRICT=1` | Raise `NotImplementedError` instead of running an op on the CPU. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
-| `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit | about 2^-7 |a b| (8 bits) |atch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
-| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs | about 2^-7 |a b| (8 bits) |atch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
-| `TORCH_VK_BARRIERS=full` or `every` | Put | about 2^-7 |a b| (8 bits) |arrier before every command, instead of only where a command touches memory that one since the last barrier wrote, or writes memory one since then read (the default: kernels that touch disjoint memory then run concurrently; docs/log/M37). `every`: a barrier matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier. Debugging switches, to rule out a missed dependency when a race is suspected. |
+| `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
+| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
+| `TORCH_VK_BARRIERS=full` or `every` | Put a barrier before every command, instead of only where a command touches memory that one since the last barrier wrote, or writes memory one since then read (the default: kernels that touch disjoint memory then run concurrently; docs/log/M37). `every`: a barrier matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier. Debugging switches, to rule out a missed dependency when a race is suspected. |
 | `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500` on discrete GPUs, `0`, blocking at once, on integrated ones and lavapipe, which share the CPU's power or cores). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
 
 ### Choosing kernels
@@ -113,7 +113,7 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | `TORCH_VK_EIGH_QL=1` | `eigh`: use tridiagonal QL instead of divide and conquer for every size (comparison and debugging). |
 | `TORCH_VK_SVD_JACOBI=1` | `svd`: use one-sided Jacobi instead of bidiagonalisation for every size (comparison and debugging). |
 
-### Testing a smaller GPU's paths on | about 2^-7 |a b| (8 bits) |igger one
+### Testing a smaller GPU's paths on a bigger one
 
 | Variable | Effect |
 |---|---|
