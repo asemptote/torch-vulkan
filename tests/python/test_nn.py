@@ -7,20 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from _util import ARM32, check, make, on_gpu
-
-# On the Mali phone, Termux's armv7 torch computed CPU convolutions wrong in
-# about 1 of 50 float32 and 5 of 50 float64 calls (against a pure-Python
-# convolution, which vk's matched throughout). There the CPU references are
-# taken three times and their elementwise median compared with (one wrong
-# call of three cannot move it).
-CPU_RUNS = 3 if ARM32 else 1
-
-
-def cpu_median(compute):
-    """compute() (a list of tensors) on the CPU, CPU_RUNS times: the elementwise median."""
-    runs = [compute() for _ in range(CPU_RUNS)]
-    return [torch.stack(ts).median(0).values if CPU_RUNS > 1 else ts[0] for ts in zip(*runs)]
+from _util import check, make, on_gpu
 
 TOL = dict(rtol=2e-4, atol=2e-4)
 
@@ -35,7 +22,7 @@ def grads(fn, *tensors):
 
 
 def compare_with_cpu(fn, *tensors, tol=TOL):
-    want = cpu_median(lambda: grads(fn, *tensors))
+    want = grads(fn, *tensors)
     with on_gpu():
         got = grads(fn, *(t.to("vk") for t in tensors))
     for g, w in zip(got, want):
@@ -152,8 +139,6 @@ def test_upsample_and_grid_sample():
                          x, grid.clone(), tol=dict(rtol=1e-4, atol=1e-4))
 
 
-@pytest.mark.skipif(ARM32, reason="a 32-bit Arm CPU trained this model wrongly after other tests (the same in all "
-                                   "three runs, so no median helps); run alone, its parameters equal vk's")
 def test_embedding_and_small_model_training():
     import copy
 
@@ -173,7 +158,7 @@ def test_embedding_and_small_model_training():
 
     vk_model = copy.deepcopy(model).to("vk")
     got = train(vk_model, x.to("vk"), y.to("vk"))
-    want = cpu_median(lambda: train(copy.deepcopy(model), x, y))
+    want = train(copy.deepcopy(model), x, y)
     for a, b in zip(got, want):
         check(a, b, rtol=1e-3, atol=1e-3)
     emb = make((10, 4), torch.float32)
