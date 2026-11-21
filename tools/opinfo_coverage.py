@@ -63,8 +63,10 @@ TIED_INDICES = ("kthvalue", "median", "nanmedian", "mode", "topk", "sort")
 # values they select.
 TIED_ORDER = ("argsort",)
 # Ops whose vector outputs are unique only up to sign (eigenvectors,
-# singular vectors): compared by absolute value.
-SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd")
+# singular vectors): compared by absolute value. (svd_lowrank and
+# pca_lowrank end in an SVD: the CPU's signs there depend on its LAPACK, MKL's
+# on x86 and OpenBLAS's on Termux differing for wide matrices.)
+SIGN_AMBIGUOUS = ("linalg.eigh", "linalg.svd", "svd", "svd_lowrank", "pca_lowrank")
 # General eigendecompositions: eigenvalues in no particular order, vectors up
 # to a phase; compared as sorted eigenvalues and by A V = V diag(w).
 EIG = ("linalg.eig", "linalg.eigvals")

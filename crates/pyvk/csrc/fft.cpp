@@ -139,7 +139,17 @@ at::Tensor roots_full(int64_t r, at::ScalarType dtype) {
 // pass writes the onesided spectrum of the real rows whose complex pairs x
 // holds ([batch, n + 1], as fft.slang's FFT_R2C: fft_reg.slang's EPILOGUE)
 // into *r2c, and that is returned; otherwise the complex FFT, as without it.
-at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse, const at::Tensor* r2c = nullptr) {
+//
+// c2r_m > 0 (inverse only): x is the onesided spectrum [batch, c2r_m >= n + 1]
+// of real rows of 2n, and the first register pass folds it as fft.slang's
+// FFT_C2R does (fft_reg.slang's EPILOGUE = 2): the result is the inverse FFT
+// of the folded rows, [batch, n]. Where the register passes do not take the
+// row, an undefined tensor (the caller folds and transforms).
+at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse, const at::Tensor* r2c = nullptr,
+                    int64_t c2r_m = 0) {
+  if (c2r_m > 0 && (n < (int64_t(1) << 14) || !inverse)) {
+    return at::Tensor();  // (folding only in the register passes, which start at 2^14)
+  }
   if (n == 1) {
     return x.clone();
   }
@@ -189,6 +199,16 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse,
   bool fits = (has_feature(kFeatureShared32K) || (c64 && variant == "e8")) &&  // (16 KiB for complex64 with 8)
               (c64 || !intel_windows);
   int64_t reg_passes = bits <= 20 ? 2 : 3;
+  bool c2r = c2r_m > 0 && inverse;
+  if (c2r) {
+    // (the folding first pass pairs columns: g = slots / r >= 2 of them, r
+    // the first pass's radix, the largest)
+    int64_t slots = variant == "e16" && c64 ? 4096 : 2048;
+    int64_t r0 = int64_t(1) << (bits / reg_passes + (bits % reg_passes ? 1 : 0));
+    if (!(fits && bits >= 14 && bits <= 30 && slots / r0 >= 2)) {
+      return at::Tensor();
+    }
+  }
   if (fits && bits >= 14 && bits <= 30) {
     std::string reg = std::string("fft_reg_") + dtype_label(x.scalar_type()) + "_" + variant;
     at::Tensor table2 = twiddles_2level(n, x.scalar_type());
@@ -199,12 +219,14 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse,
       int64_t r = int64_t(1) << (bits / reg_passes + (pass < bits % reg_passes ? 1 : 0));
       // (the epilogue pairs columns: g = slots / r >= 2 of them in the last pass)
       bool fused = epilogue && pass == reg_passes - 1 && slots / r >= 2;
+      bool folded = c2r && pass == 0;  // (r = the largest radix: g >= 2 checked above)
       at::Tensor table_r = roots_full(r, x.scalar_type());
-      at::Tensor dst = fused ? *r2c : at::empty_like(x);
+      at::Tensor dst = fused ? *r2c : at::empty({batch, n}, x.options());  // (x may be the wider spectrum)
       RegParams p{};
       p.in = gpu_address(src);
       p.out = gpu_address_out(dst);
-      p.etab = fused ? gpu_address(twiddles_2level(2 * n, x.scalar_type())) : 0;
+      p.etab = fused || folded ? gpu_address(twiddles_2level(2 * n, x.scalar_type())) : 0;
+      p.pad = folded ? static_cast<uint32_t>(c2r_m) : 0;  // (the spectrum's row length)
       p.table = gpu_address(table2);
       p.rtab = gpu_address(table_r);
       p.n = static_cast<uint32_t>(n);
@@ -213,12 +235,12 @@ at::Tensor fft_pow2(const at::Tensor& x, int64_t batch, int64_t n, bool inverse,
       p.r = static_cast<uint32_t>(r);
       int64_t g = slots / r;
       p.ngroups = static_cast<uint32_t>(std::min<int64_t>((batch * (n / r) + g - 1) / g, 65535));
-      if (fused) {
+      if (fused || folded) {
         // (blocks of g / 2 mirrored column pairs: (n / r) / 2 + 1 a row)
         int64_t pairs = batch * ((n / r) / 2 + 1);
         p.ngroups = static_cast<uint32_t>(std::min<int64_t>((pairs + g / 2 - 1) / (g / 2), 65535));
       }
-      dispatch(reg, {inverse ? 1u : 0u, fused ? 1u : 0u}, p, p.ngroups);
+      dispatch(reg, {inverse ? 1u : 0u, fused ? 1u : folded ? 2u : 0u}, p, p.ngroups);
       src = dst;
       ns *= r;
     }
@@ -471,9 +493,14 @@ at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
     // Even length: fft.slang's FFT_C2R folds the half spectrum into one of
     // half length, whose inverse FFT, read as reals, is the output (times n).
     int64_t h = last_dim_size / 2;
-    at::Tensor folded = at::empty({batch, h}, rows.options());
-    fft_phase(op::FFT_C2R, rows, folded, last_dim_size, m, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
-    at::Tensor z = fft_rows(folded, true);
+    // (where the register passes take the row, their first pass folds it:
+    // fft_reg.slang's EPILOGUE = 2)
+    at::Tensor z = is_pow2(h) ? fft_pow2(rows, batch, h, true, nullptr, m) : at::Tensor();
+    if (!z.defined()) {
+      at::Tensor folded = at::empty({batch, h}, rows.options());
+      fft_phase(op::FFT_C2R, rows, folded, last_dim_size, m, batch, batch * (h / 2 + 1));  // (a thread per mirrored pair)
+      z = fft_rows(folded, true);
+    }
     out = at::view_as_real(z).view(shape).movedim(-1, last);
   } else {
     // Rebuild the full Hermitian spectrum along the last dim, then invert it.

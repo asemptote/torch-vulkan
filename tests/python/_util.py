@@ -23,6 +23,14 @@ WIDE = torch.float64 if HAS_FLOAT64 else torch.float32
 # A 32-bit Arm userspace (Termux on Android phones), whose CPU kernels differ
 # from x86's in a few results the tests compare against (see their uses).
 ARM32 = platform.machine().startswith("arm") and sys.maxsize < 2**32
+# Android (Termux): sys.platform is "android" from Python 3.13, and Android
+# builds of older versions have sys.getandroidapilevel.
+ANDROID = sys.platform == "android" or hasattr(sys, "getandroidapilevel")
+# Termux's OpenBLAS is built single-threaded without locking, so the CPU's
+# GEMMs (in convolutions and matmuls) can be wrong when PyTorch calls it from
+# several threads at once (termux/termux-packages#33339). There conftest.py
+# runs the CPU with one thread, so the tests' CPU references are right.
+SINGLE_THREADED_CPU = ARM32 or ANDROID
 
 
 @contextlib.contextmanager

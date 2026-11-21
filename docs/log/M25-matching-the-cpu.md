@@ -160,3 +160,29 @@ round as the CPU does, step by step.
   1.8x. On the L40S, 2^24 float32 takes 0.642 ms, against CUDA's 0.777.
   Accuracy is the CPU's: relative errors of 1.9-2.8e-7 (float32) and
   6-9.6e-16 (float64) against a float64 reference, from 2^15 to 2^23 points.
+
+## irfft: the half-spectrum fold in the first register pass (#35)
+
+- irfft of 2n real values folds the onesided spectrum X into n complex
+  values, Z'[k] = (A + B) + i conj(w^k) (A - B) with A = X[k] and B =
+  conj(X[n - k]) (FFT_C2R), then takes their inverse FFT. Where fft_pow2
+  takes the row in the register passes, the first pass folds X itself
+  (`EPILOGUE = 2`). In that pass (ns = 1), Z'[j + q nr]'s mirror is at
+  column nr - j, element R - 1 - q, so the columns pair up as for rfft's
+  epilogue. A workgroup loads both columns' X into shared memory, and each
+  thread folds its values from there. X[0]'s and X[n]'s imaginary parts are
+  dropped, as the CPU drops them. The input rows can be longer than n + 1
+  (irfft ignores the rest): the pass reads rows of `pad` values.
+- The pass needs g >= 2 columns a workgroup at the first pass's radix, the
+  largest. Rows without that, and rows the register passes do not take (and
+  complex128 on Intel's Windows driver, #60), keep the separate FFT_C2R pass.
+- H100 NVL, the median of 7 blocks of 5 synchronised calls, against main:
+  complex64 rows of 2^24 points went from 0.26 to 0.20 ms, and 8 of them
+  from 1.54 to 1.15 ms. Batches of 8 rows of 2^19-2^22 points take
+  0.88-0.96x the time. Single rows up to 2^22 points are unchanged, at that
+  resolution (0.01 ms). On the HD 530 (Mesa), the fold is neutral: within
+  ±6% of main from 2^16 to 2^24 points. Halving each load's contiguous runs
+  costs about what the pass saves there.
+- Accuracy, against a float64 reference from 2^16 to 2^24 points, padded
+  rows too: float32 errors are about the CPU's, and float64 errors are
+  6-9e-16 (tests/python/test_complex_fft.py's test_irfft_long_rows).

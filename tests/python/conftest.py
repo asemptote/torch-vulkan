@@ -19,8 +19,28 @@ def _has_float64():
     return bool(_native.capabilities() & 1)
 
 
+_cpu_threads = None
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "float64: needs a GPU with float64 arithmetic (shaderFloat64)")
+    # On Termux the CPU computes the references with one thread (_util.py's
+    # SINGLE_THREADED_CPU); vk's kernels don't use PyTorch's CPU threads.
+    from _util import SINGLE_THREADED_CPU
+
+    if SINGLE_THREADED_CPU:
+        import torch
+
+        global _cpu_threads
+        _cpu_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+
+
+def pytest_unconfigure(config):
+    if _cpu_threads is not None:
+        import torch
+
+        torch.set_num_threads(_cpu_threads)
 
 
 def pytest_collection_modifyitems(config, items):

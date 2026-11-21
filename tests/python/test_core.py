@@ -15,7 +15,14 @@ from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex
 def test_version_matches_the_installed_package():
     import importlib.metadata
 
-    assert tv.__version__ == importlib.metadata.version("torch-vulkan")
+    try:
+        installed = importlib.metadata.version("torch-vulkan")
+    except importlib.metadata.PackageNotFoundError:
+        # An in-tree build on the path, not installed (Termux's build-termux.sh):
+        # there is no metadata, and __version__ says so (#66).
+        assert tv.__version__ == "unknown"
+        return
+    assert tv.__version__ == installed
 
 
 @pytest.mark.parametrize("dtype", ALL + [torch.float16, torch.uint8, torch.complex64])
