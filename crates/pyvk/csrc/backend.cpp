@@ -611,7 +611,7 @@ bool copy_unsigned(const at::Tensor& dst, const at::Tensor& src) {
   // the source's values in a dtype that holds them (uint64: its int64 bits)
   at::Tensor v = src;
   if (st == at::kUInt16) v = at::bitwise_and(src.view(at::kShort).to(at::kInt), 0xFFFF);
-  if (st == at::kUInt32) v = at::bitwise_and(src.view(at::kInt).to(at::kLong), 0xFFFFFFFFLL);
+  if (st == at::kUInt32) v = at::bitwise_and(src.view(at::kInt).to(at::kLong), int64_t{0xFFFFFFFF});
   if (st == at::kUInt64) {
     at::Tensor bits = src.view(at::kLong);
     if (at::isFloatingType(dt) || at::isComplexType(dt)) {  // 2^63 and up: the sign bit as +2^63
