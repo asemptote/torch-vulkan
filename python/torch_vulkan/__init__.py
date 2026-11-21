@@ -8,8 +8,10 @@
 Importing this module registers a PyTorch backend on the PrivateUse1 key
 (implemented in C++, see crates/pyvk/csrc) and names it "vk". Element-wise
 op with a Vulkan kernel runs on the GPU, many others through PyTorch's
-decompositions into such ops (see _decomp.py); the rest run on the CPU with
-a one-time warning (see `fallback_counts()`).
+decompositions into such ops (see _decomp.py). An op with no Vulkan kernel
+for its arguments raises NotImplementedError, unless the CPU fallback is on
+(TORCH_VK_CPU_FALLBACK=1 or `set_cpu_fallback(True)`): then it runs on the
+CPU, with a one-time warning (see `fallback_counts()`).
 """
 
 import atexit
@@ -76,10 +78,12 @@ _python_kernels += _nofloat64.register()
 __all__ = [
     "device_count",
     "device_name",
+    "cpu_fallback_enabled",
     "empty_cache",
     "fallback_counts",
     "is_available",
     "memory_stats",
+    "set_cpu_fallback",
     "synchronize",
 ]
 
@@ -142,8 +146,25 @@ def empty_cache():
 
 def fallback_counts():
     """{op: count} of aten ops that ran on the CPU instead of the GPU (as
-    "op (raised)" where the CPU raised, a dtype or argument check, say)."""
+    "op (raised)" where the CPU only raised, a dtype or argument check, say,
+    and "op (refused)" where the CPU fallback was off and the op raised
+    NotImplementedError instead)."""
     return dict(_native.fallback_counts())
+
+
+def set_cpu_fallback(enabled):
+    """Lets ops with no Vulkan kernel for their arguments run on the CPU
+    (True), with a one-time warning per op and counted in fallback_counts(),
+    or makes them raise NotImplementedError (False, the default), for the
+    whole process. TORCH_VK_CPU_FALLBACK=1 in the environment turns it on at
+    start-up."""
+    _native.set_cpu_fallback(bool(enabled))
+
+
+def cpu_fallback_enabled():
+    """Whether ops with no Vulkan kernel for their arguments may run on the
+    CPU (see set_cpu_fallback)."""
+    return _native.cpu_fallback_enabled()
 
 
 def manual_seed(seed):

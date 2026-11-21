@@ -24,7 +24,9 @@ a `python-torch` upgrade, install the matching build or rebuild).
 | `synchronize(device=None)` | Waits until all queued GPU work has finished. Reading a value back (`.item()`, `.cpu()`) synchronises by itself. |
 | `memory_stats()` | `{"allocated_bytes", "reserved_bytes", "blocks"}`: memory held by live tensors, memory held by the caching allocator in total, and the number of device memory blocks. |
 | `empty_cache()` | Returns cached, unused device memory to the driver. |
-| `fallback_counts()` | `{op: count}` of aten ops that ran on the CPU instead of the GPU since the process started; an op whose CPU call only raised an error appears as `"op (raised)"`. Empty in normal use. |
+| `fallback_counts()` | `{op: count}` of aten ops that ran on the CPU instead of the GPU since the process started; an op whose CPU call only raised an error appears as `"op (raised)"`, and one refused with the CPU fallback off as `"op (refused)"`. Empty in normal use. |
+| `set_cpu_fallback(enabled)` | Lets ops with no Vulkan kernel for their arguments run on the CPU (`True`) or makes them raise `NotImplementedError` (`False`, the default), for the whole process. See [The CPU fallback](#the-cpu-fallback). |
+| `cpu_fallback_enabled()` | Whether the CPU fallback is on. |
 | `manual_seed(seed)` | Seeds the `"vk"` random generator. `torch.manual_seed` seeds it too. |
 | `seed()` | Seeds the `"vk"` generator nondeterministically and returns the seed. |
 | `initial_seed()` | The seed the generator started from. |
@@ -52,6 +54,34 @@ generator.
 - Per-tensor affine quantised tensors (`quantize_per_tensor`, `dequantize`,
   `int_repr` and views) are supported; per-channel quantisation is not.
 
+## The CPU fallback
+
+Every op exercised by PyTorch's own test suites runs on the GPU. An op that
+vk has no kernel for (with these arguments: a dtype or layout it does not
+support, say) raises `NotImplementedError` naming the op, as PyTorch's MPS
+backend does:
+
+    NotImplementedError: torch_vulkan: aten::sort.values_stable has no Vulkan kernel for these arguments, and
+    the CPU fallback is off. To run it on the CPU instead (slower), set TORCH_VK_CPU_FALLBACK=1 or call
+    torch_vulkan.set_cpu_fallback(True). ...
+
+With `TORCH_VK_CPU_FALLBACK=1` in the environment, or after
+`torch_vulkan.set_cpu_fallback(True)`, such an op runs on the CPU instead:
+its "vk" inputs are copied to the CPU and its results back, with a warning
+the first time each op does so, and each call is counted in
+`fallback_counts()`. Where the CPU would only raise an error for the
+arguments (a dtype check, say), that error is raised either way.
+
+`TORCH_VK_STRICT`, the switch before 0.3.0 (when the fallback was on by
+default), still works: `TORCH_VK_STRICT=1` is the default, and
+`TORCH_VK_STRICT=0` turns the fallback on. `TORCH_VK_CPU_FALLBACK` wins where
+both are set. `TORCH_VK_LINALG=cpu` (below) turns the fallback on too.
+
+Two uses of the CPU are not fallbacks and need no switch: an op's CPU call
+that only raises its error (above), and, on GPUs without float64,
+`torch.amp.GradScaler`'s unscaling, which takes the scale's reciprocal on a
+CPU copy of the one-element scale.
+
 ## Autocast
 
 `torch.autocast("vk", dtype=torch.float16)` (or `torch.bfloat16`; float16 is
@@ -73,7 +103,8 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 
 | Variable | Effect |
 |---|---|
-| `TORCH_VK_STRICT=1` | Raise `NotImplementedError` instead of running an op on the CPU. |
+| `TORCH_VK_CPU_FALLBACK=1` | Run an op that has no Vulkan kernel for its arguments on the CPU (with a one-time warning, counted in `fallback_counts()`) instead of raising `NotImplementedError`, the default. `0` keeps it off. See [The CPU fallback](#the-cpu-fallback). |
+| `TORCH_VK_STRICT=0` or `1` | The older switch: `0` turns the CPU fallback on, `1` (the default) leaves it off. `TORCH_VK_CPU_FALLBACK` wins where both are set. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
 | `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
 | `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
@@ -91,7 +122,7 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | `TORCH_VK_SPLIT_K=n` | Split every float matrix product's k into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size. The pieces' sums are added in a fixed order, so results are the same from run to run either way. For testing and tuning. |
 | `TORCH_VK_GEMM_TILE=l`, `m` or `s` | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every float16 and bfloat16 product, instead of choosing by the GPU's size. For testing and tuning. |
 | `TORCH_VK_GEMM_GROUP=g` | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). For testing and tuning. |
-| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. |
+| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. Turns the CPU fallback on (unless `TORCH_VK_CPU_FALLBACK=0`). |
 | `TORCH_VK_EIGH_QL=1` | `eigh`: use tridiagonal QL instead of divide and conquer for every size (comparison and debugging). |
 | `TORCH_VK_SVD_JACOBI=1` | `svd`: use one-sided Jacobi instead of bidiagonalisation for every size (comparison and debugging). |
 

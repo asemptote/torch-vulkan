@@ -158,7 +158,9 @@ def _half_via_float(op, args, kwargs):
     return spec.unflatten(cast)
 
 
-_STRICT = os.environ.get("TORCH_VK_STRICT", "0") not in ("", "0")
+REFUSED = ("torch_vulkan: {} has no Vulkan kernel for these arguments, and the CPU fallback is off. To run it on "
+           "the CPU instead (slower), set TORCH_VK_CPU_FALLBACK=1 or call torch_vulkan.set_cpu_fallback(True). "
+           "Please report the op: https://github.com/asemptote/torch-vulkan/issues")  # (as backend.cpp's)
 _DETAIL = os.environ.get("TORCH_VK_FALLBACK_DETAIL", "0") not in ("", "0")
 
 
@@ -271,7 +273,7 @@ def _cpu_fallback(op, name, args, kwargs):
     if result is not NotImplemented:
         return result
     key = name + (_describe(op, args, kwargs) if _DETAIL else "")
-    if _STRICT:
+    if not _native.cpu_fallback_enabled():
         # (as backend.cpp's strict_probe: the CPU on copies, so that its own
         # error reaches the caller; NotImplementedError only where it computes)
         def to_cpu(x):
@@ -282,7 +284,8 @@ def _cpu_fallback(op, name, args, kwargs):
         except Exception:
             _native.record_fallback(key + " (raised)")
             raise
-        raise NotImplementedError(f"torch_vulkan: {name} has no Vulkan kernel (TORCH_VK_STRICT forbids the CPU)")
+        _native.record_fallback(key + " (refused)")
+        raise NotImplementedError(REFUSED.format(name))
     if _TRACE:  # (as backend.cpp's TORCH_VK_FALLBACK_TRACE: the call and where it came from)
         import sys
         import traceback

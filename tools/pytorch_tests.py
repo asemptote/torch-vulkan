@@ -31,9 +31,13 @@ too are counted as "fails on CPU too", not as vk problems, and failures
 listed in EXPECTED (with the reason) are counted as "expected". A summary
 (outcome counts and the most common messages of the vk-only failures) is
 printed and the vk-only failures are listed in --out/<run>.failures.txt.
-The aten ops that ran on the CPU instead of the GPU (each test's fallbacks,
+The aten ops that called the CPU instead of the GPU (each test's fallbacks,
 whatever its outcome) are listed in --out/cpu_ops.txt: per op, the number of
-tests and calls, and an example test id.
+tests and calls, and an example test id. The CPU fallback is off, as by
+default for users, so an op without a Vulkan kernel fails its test with
+NotImplementedError and is listed as "op (refused)"; --cpu-fallback runs
+such ops on the CPU instead (listed as "op"), to see whether the rest of a
+test passes.
 --merge summarizes every run in --out (e.g. shards from several machines).
 """
 
@@ -508,7 +512,7 @@ def summarize(out, stems):
             fh.write(f"{op}\t{n}\t{calls[op]}\t{example[op]}\n")
     print("\ntotal:", describe(total))
     if tests:
-        print(f"\n{len(tests)} aten ops ran on the CPU (tests, calls, an example; all in cpu_ops.txt):")
+        print(f"\n{len(tests)} aten ops called the CPU or were refused it (tests, calls, an example; all in cpu_ops.txt):")
         for op, n in tests.most_common(40):
             print(f"{n:6d} {calls[op]:8d}  {op}  {example[op]}")
     if messages:
@@ -531,6 +535,8 @@ def main():
     parser.add_argument("--shard", default="", help="INDEX/COUNT: run every COUNT-th collected test, starting at INDEX")
     parser.add_argument("--timeout", type=int, default=6 * 3600, help="seconds per pytest process")
     parser.add_argument("--merge", action="store_true", help="summarize every run in --out")
+    parser.add_argument("--cpu-fallback", action="store_true",
+                        help="run ops without a Vulkan kernel on the CPU instead of failing the test")
     parser.add_argument("--ids", default="", help="run these test ids (one per line) instead of collecting a file's")
     parser.add_argument("--name", default="", help="run name for --ids (default: the ids file's name)")
     parser.add_argument("--collect", action="store_true",
@@ -546,6 +552,8 @@ def main():
     if not (tests / "test_ops.py").exists():
         sys.exit(f"{tests} is not PyTorch's test/ directory (set --tests or PYTORCH_TEST_DIR)")
     env = dict(os.environ, PYTORCH_TESTING_DEVICE_ONLY_FOR="vk", PYTHONUNBUFFERED="1")
+    if args.cpu_fallback:
+        env["TORCH_VK_CPU_FALLBACK"] = "1"
     # The -k / -m filters are applied when collecting the ids.
     run_extra = [arg for i, arg in enumerate(extra)
                  if arg not in ("-k", "-m") and (i == 0 or extra[i - 1] not in ("-k", "-m"))]

@@ -34,6 +34,8 @@ extern "C" {
     fn vkt_take_device_error() -> i32;
     fn vkt_read_log_mark(name: *const std::ffi::c_char);
     fn vkt_record_fallback(op: *const std::ffi::c_char) -> i32;
+    fn vkt_cpu_fallback_enabled() -> i32;
+    fn vkt_set_cpu_fallback(on: i32);
     fn vkt_manual_seed(seed: u64);
     fn vkt_initial_seed() -> u64;
     fn vkt_seed() -> u64;
@@ -53,12 +55,24 @@ fn synchronize() -> PyResult<()> {
     Ok(())
 }
 
-/// Counts (and warns about, once) an op that ran on the CPU; false in strict
-/// mode (TORCH_VK_STRICT), where the caller must raise instead.
+/// Counts (and warns about, once) an op that ran on the CPU; false with the
+/// CPU fallback off, where the caller must raise instead.
 #[pyfunction]
 fn record_fallback(op: &str) -> bool {
     let name = std::ffi::CString::new(op.replace('\0', " ")).unwrap_or_default();
     unsafe { vkt_record_fallback(name.as_ptr()) == 0 }
+}
+
+/// Whether ops without a Vulkan kernel may run on the CPU (off by default).
+#[pyfunction]
+fn cpu_fallback_enabled() -> bool {
+    unsafe { vkt_cpu_fallback_enabled() != 0 }
+}
+
+/// Turns the CPU fallback on or off for the process.
+#[pyfunction]
+fn set_cpu_fallback(on: bool) {
+    unsafe { vkt_set_cpu_fallback(i32::from(on)) }
 }
 
 /// The stream's counts since start-up, as (name, count) pairs: commands
@@ -242,6 +256,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
     m.add_function(wrap_pyfunction!(dispatch_count, m)?)?;
     m.add_function(wrap_pyfunction!(record_fallback, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_fallback_enabled, m)?)?;
+    m.add_function(wrap_pyfunction!(set_cpu_fallback, m)?)?;
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_subgroup_size, m)?)?;
     m.add_function(wrap_pyfunction!(compute_units, m)?)?;

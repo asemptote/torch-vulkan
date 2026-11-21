@@ -84,9 +84,11 @@ CPU or calls it to raise an error. Every remaining failure also fails on
 the CPU or has a written reason in that script's `EXPECTED` table. In the
 OpInfo sweep (`tools/opinfo_coverage.py --strict`, PyTorch's sample inputs for
 every op compared against the CPU) every op runs on the GPU and matches the
-CPU. PyTorch's CPU fallback remains as a safety net for anything the tests
-don't reach: it is counted in `torch_vulkan.fallback_counts()`, and
-`TORCH_VK_STRICT=1` turns it into an error.
+CPU. An op that the tests don't reach and vk has no kernel for raises
+`NotImplementedError` naming the op, as on Apple's MPS; with
+`TORCH_VK_CPU_FALLBACK=1` (or `torch_vulkan.set_cpu_fallback(True)`) it runs
+on the CPU instead, with a warning, counted in
+`torch_vulkan.fallback_counts()`.
 
 ## A scientific example
 
@@ -235,6 +237,7 @@ torch_vulkan.synchronize()      # wait for queued GPU work
 torch_vulkan.memory_stats()     # {"allocated_bytes", "reserved_bytes", "blocks"}
 torch_vulkan.empty_cache()      # return cached device memory to the driver
 torch_vulkan.fallback_counts()  # {op: count} of ops that ran on the CPU
+torch_vulkan.set_cpu_fallback(True)  # let ops without a Vulkan kernel run on the CPU (off by default)
 ```
 
 Importing `torch_vulkan` also registers `torch.vk` (PyTorch's device-module
@@ -248,7 +251,7 @@ The ones most often needed (all of them are in [docs/api.md](docs/api.md#environ
 
 | Variable | Effect |
 |---|---|
-| `TORCH_VK_STRICT=1` | Raise `NotImplementedError` where an op would compute on the CPU (an op whose CPU check only raises gives the CPU's error). |
+| `TORCH_VK_CPU_FALLBACK=1` | Run an op that has no Vulkan kernel for its arguments on the CPU, with a one-time warning, instead of raising `NotImplementedError` (the default). |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache. |
 | `TORCH_VK_DISABLE=a,b,...` | Hide device features (e.g. `float64`, `coopmat`), to test a small GPU's code paths on a bigger one. |

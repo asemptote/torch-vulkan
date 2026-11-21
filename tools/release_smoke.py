@@ -1,8 +1,8 @@
 """A release's smoke test, from its own artefacts (a wheel in a fresh venv,
-or a Termux build from the release's SPIR-V bundle), with TORCH_VK_STRICT=1
-so that any CPU fallback raises:
+or a Termux build from the release's SPIR-V bundle), with the CPU fallback
+off (the default) so that any CPU fallback raises:
 
-    TORCH_VK_STRICT=1 python tools/release_smoke.py
+    python tools/release_smoke.py
 
 matmul, fft / rfft / irfft, eigvalsh, solve, qr (and float64 qr where the
 GPU has float64), 20 Adam steps on a small MLP, and no fallbacks. It ends
@@ -15,7 +15,7 @@ import os
 import torch
 import torch_vulkan as tv
 
-assert os.environ.get("TORCH_VK_STRICT") == "1", "run with TORCH_VK_STRICT=1"
+assert not tv.cpu_fallback_enabled(), "run with the CPU fallback off (unset TORCH_VK_CPU_FALLBACK)"
 try:
     version = importlib.metadata.version("torch_vulkan")
 except importlib.metadata.PackageNotFoundError:  # (a source tree on PYTHONPATH)
