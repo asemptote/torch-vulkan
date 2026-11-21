@@ -77,9 +77,11 @@ fallbacks. Most came from three changes on PyTorch's side:
   the CPU, CUDA and MPS. vk computes it from gathers
   (`_bicubic_grid_sample_3d` in `_kernels.py`): 2.15's `resolve_cubic_taps`
   on tensors (Keys coefficients, the four taps per axis around the
-  unclipped index, padding, a dropped tap reading nothing), 64 taps
-  accumulated z, y, x in the CPU's order, in float32 or float64, indexing
-  through the input's strides (an expanded input is not copied). Its
+  unclipped index, padding, a dropped tap reading nothing), then the 64 taps
+  of every output point in one gather through the input's strides (an
+  expanded input is not copied), each term formed as the CPU's, in float32
+  or float64, and summed. (A first version, one gather per tap, made
+  PyTorch's gradgrad test of it run for over 20 minutes on lavapipe.) Its
   backward is autograd of the same composite, as for 2-D bicubic.
   PyTorch's meta function refuses 5-D bicubic on devices other than the CPU
   and CUDA, so `_layout.py` no longer runs FakeTensor for `grid_sampler_3d`

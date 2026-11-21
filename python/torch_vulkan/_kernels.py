@@ -461,8 +461,8 @@ def _clip_coordinates(x, size):
 
 def _bicubic_grid_sample_3d(input, grid, padding_mode, align_corners):
     """grid_sampler_3d's bicubic mode (PyTorch 2.15's CPU kernel) from gathers:
-    64 taps per output point, weighted z, y, x in the CPU's order and
-    accumulated in input's dtype (float32 or float64, the CPU's opmath type).
+    64 taps per output point, each term formed as the CPU's (sample * (z y) * x)
+    in input's dtype (float32 or float64, the CPU's opmath type), then summed.
     Differentiable: autograd gives grid_sampler_3d's backward, through the
     coefficients and the sampled values."""
     n, c, d_in, h_in, w_in = input.shape
@@ -476,20 +476,19 @@ def _bicubic_grid_sample_3d(input, grid, padding_mode, align_corners):
     xc, xt = _cubic_taps(unnormalize(g[..., 0], w_in), w_in, padding_mode, align_corners)
     yc, yt = _cubic_taps(unnormalize(g[..., 1], h_in), h_in, padding_mode, align_corners)
     zc, zt = _cubic_taps(unnormalize(g[..., 2], d_in), d_in, padding_mode, align_corners)
-    # (indexed through input's strides: an expanded input is not copied)
-    batch = torch.arange(n, device=input.device).view(n, 1).expand(n, p)
-    value = None
-    for k in range(4):
-        for j in range(4):
-            weight_zy = zc[k] * yc[j]  # [n, P]
-            plane = (zt[k] >= 0) & (yt[j] >= 0)
-            for i in range(4):
-                reads = plane & (xt[i] >= 0)
-                zi, yi, xi = (torch.where(reads, t, 0) for t in (zt[k], yt[j], xt[i]))
-                sample = input[batch, :, zi, yi, xi].transpose(1, 2)  # [n, c, P]
-                sample = torch.where(reads.unsqueeze(1), sample, 0)
-                term = sample * weight_zy.unsqueeze(1) * xc[i].unsqueeze(1)
-                value = term if value is None else value + term
+    # All 64 taps in one gather (indexed through input's strides: an expanded
+    # input is not copied); each term as the CPU's, sample * (z y) * x, summed.
+    zt, yt, xt = (torch.stack(t, -1) for t in (zt, yt, xt))  # [n, P, 4]
+    zc, yc, xc = (torch.stack(t, -1) for t in (zc, yc, xc))
+    zi, yi, xi = zt[..., :, None, None], yt[..., None, :, None], xt[..., None, None, :]
+    reads = (zi >= 0) & (yi >= 0) & (xi >= 0)  # [n, P, 4, 4, 4]
+    zi, yi, xi = (torch.where(reads, t, 0) for t in (zi, yi, xi))
+    batch = torch.arange(n, device=input.device).view(n, 1, 1, 1, 1)
+    sample = input[batch, :, zi, yi, xi]  # [n, P, 4, 4, 4, c]
+    sample = torch.where(reads.unsqueeze(-1), sample, 0)
+    weight_zy = (zc[..., :, None, None] * yc[..., None, :, None]).unsqueeze(-1)
+    term = sample * weight_zy * xc[..., None, None, :].unsqueeze(-1)
+    value = term.flatten(2, 4).sum(2).transpose(1, 2)  # [n, c, P]
     return value.reshape(n, c, *points)
 
 
