@@ -194,7 +194,7 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
 // every phase. So the s phases are one convolution with s Co output
 // channels, whose result is interleaved into the output: about K / T times
 // less work than convolving the zero-inserted input (s times for d = 1 and
-// K a multiple of s; docs/log/M40). Dims with stride 1 stay ordinary
+// K a multiple of s; docs/log/M46). Dims with stride 1 stay ordinary
 // (flipped kernel, dilation d). Returns an undefined tensor where this does
 // not save work (no stride, or a dilation large enough that T >= K) or the
 // input is empty.
