@@ -1,10 +1,12 @@
 //! An in-order command stream, like a CUDA stream.
 //!
 //! Commands are recorded into a command buffer and submitted in batches; a
-//! timeline semaphore counts finished batches. Consecutive commands are
-//! separated by a full compute/transfer memory barrier, so every command sees
-//! the results of the ones before it (simple and safe; finer-grained
-//! dependency tracking can come later).
+//! timeline semaphore counts finished batches. Each command declares the GPU
+//! memory it reads and writes ([`Access`]), and the stream puts a memory
+//! barrier before a command only when it conflicts with a command since the
+//! last barrier (read after write, write after read, write after write), as
+//! llama.cpp's Vulkan backend does. A command without a declaration is
+//! ordered against everything, before and after it. See docs/log/M37.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -73,12 +75,74 @@ pub fn spin_us(discrete: bool) -> u64 {
         .unwrap_or(if discrete { 500 } else { 0 })
 }
 
-/// TORCH_VK_BARRIERS=full: a full compute + transfer memory barrier before
-/// every command, instead of one from the previous command's kind to the
-/// next's (a debugging switch).
+/// Where the stream puts barriers (TORCH_VK_BARRIERS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierMode {
+    /// (default) Only before a command that conflicts with one since the
+    /// last barrier, or after an undeclared one.
+    Tracked,
+    /// `check`: as Tracked, and the runtime checks each declared dispatch's
+    /// writes against its declaration (see `Runtime::dispatch_declared`).
+    Check,
+    /// `every`: before every command, from the previous command's kind to
+    /// the next's (compute -> compute between dispatches): 0.2.0's barriers.
+    Every,
+    /// `full`: a full compute + transfer barrier before every command.
+    Full,
+}
+
+impl BarrierMode {
+    pub fn tracked(self) -> bool {
+        matches!(self, BarrierMode::Tracked | BarrierMode::Check)
+    }
+}
+
+/// TORCH_VK_BARRIERS: `full`, `every`, `check`, or anything else (unset) for
+/// [`BarrierMode::Tracked`].
+pub fn barrier_mode() -> BarrierMode {
+    static MODE: std::sync::OnceLock<BarrierMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TORCH_VK_BARRIERS").as_deref() {
+        Ok("full") => BarrierMode::Full,
+        Ok("every") => BarrierMode::Every,
+        Ok("check") => BarrierMode::Check,
+        _ => BarrierMode::Tracked,
+    })
+}
+
+/// TORCH_VK_BARRIERS=full (a debugging switch: see [`BarrierMode::Full`]).
 pub fn full_barriers() -> bool {
-    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FULL.get_or_init(|| std::env::var("TORCH_VK_BARRIERS").is_ok_and(|v| v == "full"))
+    barrier_mode() == BarrierMode::Full
+}
+
+/// GPU memory `[lo, hi)` (device addresses) that a command reads, or reads
+/// and writes (`write`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access {
+    pub lo: u64,
+    pub hi: u64,
+    pub write: bool,
+}
+
+impl Access {
+    /// Whether the two accesses touch common bytes and one of them writes.
+    pub fn conflicts(&self, other: &Access) -> bool {
+        (self.write || other.write) && self.lo < other.hi && other.lo < self.hi
+    }
+}
+
+/// Accesses kept since the last barrier before the stream puts in a barrier
+/// anyway, so that checking a command against them stays cheap.
+pub const MAX_UNSYNCED: usize = 128;
+
+/// Barrier counts since the stream was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BarrierStats {
+    /// Commands recorded (dispatches, copies and fills).
+    pub commands: u64,
+    /// Barriers between commands (not counting each batch's final one).
+    pub barriers: u64,
+    /// Commands recorded without a declaration of the memory they touch.
+    pub undeclared: u64,
 }
 
 /// How long a submission must have been in flight (submitted to seen
@@ -128,6 +192,20 @@ pub struct Stream {
     /// Whether the last command recorded (in this batch or an earlier one) was
     /// a transfer (copy, fill) rather than a dispatch; None before the first.
     last_transfer: Option<bool>,
+    /// Set with [`Self::set_mode`].
+    mode: BarrierMode,
+    /// The accesses of the commands recorded since the last barrier (in this
+    /// batch or earlier ones: a barrier orders everything before it in
+    /// submission order, other submissions too).
+    unsynced: Vec<Access>,
+    /// A command was recorded since the last barrier.
+    pending: bool,
+    /// An undeclared command was recorded since the last barrier.
+    opaque: bool,
+    /// A transfer command was ever recorded: barriers then include the
+    /// transfer stage, so that every write is made visible to both kinds.
+    transfers: bool,
+    pub stats: BarrierStats,
 }
 
 // The stream owns its queue: only one stream is created per Context.
@@ -169,14 +247,40 @@ impl Stream {
                 batch_groups: 0,
                 dispatches: 0,
                 last_transfer: None,
+                mode: barrier_mode(),
+                unsynced: Vec::new(),
+                pending: false,
+                opaque: false,
+                transfers: false,
+                stats: BarrierStats::default(),
             })
         }
     }
 
+    pub fn mode(&self) -> BarrierMode {
+        self.mode
+    }
+
+    /// Switches barrier modes (for tests and measurements; the default comes
+    /// from TORCH_VK_BARRIERS). The next command is ordered after all earlier
+    /// ones.
+    pub fn set_mode(&mut self, mode: BarrierMode) {
+        self.mode = mode;
+        self.unsynced.clear();
+        self.pending = self.last_transfer.is_some();
+        self.opaque = self.pending;
+    }
+
     /// The command buffer being recorded, starting one if needed, with a
-    /// barrier against the previous command (in this batch or an earlier one).
-    /// `transfer`: the new command is a copy or fill rather than a dispatch.
-    fn begin_command(&mut self, transfer: bool) -> Result<vk::CommandBuffer> {
+    /// barrier against earlier commands (in this batch or an earlier one)
+    /// where the new command needs one. `transfer`: the new command is a copy
+    /// or fill rather than a dispatch; `acc`: the memory it touches, or None
+    /// (undeclared) for all of it.
+    fn begin_command(&mut self, transfer: bool, acc: Option<&[Access]>) -> Result<vk::CommandBuffer> {
+        self.stats.commands += 1;
+        if acc.is_none() {
+            self.stats.undeclared += 1;
+        }
         let ctx = self.ctx.clone();
         let d = &ctx.device;
         let cb = match self.recording {
@@ -198,6 +302,11 @@ impl Stream {
                 cb
             },
         };
+        if self.mode.tracked() {
+            self.track(cb, transfer, acc);
+            return Ok(cb);
+        }
+        // TORCH_VK_BARRIERS=every and full: a barrier before every command.
         // Also before a batch's first command: submission order alone orders
         // nothing, and a barrier's first scope reaches back into earlier
         // submissions on the queue. (Without it, lavapipe could start a batch's
@@ -209,7 +318,7 @@ impl Stream {
         // earlier barrier become visible to later accesses with this one's
         // visibility operation. (The full compute + transfer barrier cost about
         // 5.5 us of GPU time per dispatch on the H100.)
-        if full_barriers() {
+        if self.mode == BarrierMode::Full {
             // (TORCH_VK_BARRIERS=full: the full compute + transfer barrier
             // before every command, as before cccade8, to rule out the
             // narrowed barriers when a race is suspected)
@@ -220,6 +329,7 @@ impl Stream {
                     vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
                 );
             unsafe { d.cmd_pipeline_barrier(cb, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
+            self.stats.barriers += 1;
         } else if let Some(prev) = self.last_transfer {
             let (src_stage, src_access) = if prev {
                 (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
@@ -233,9 +343,78 @@ impl Stream {
             };
             let barrier = vk::MemoryBarrier::default().src_access_mask(src_access).dst_access_mask(dst_access);
             unsafe { d.cmd_pipeline_barrier(cb, src_stage, dst_stage, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
+            self.stats.barriers += 1;
         }
         self.last_transfer = Some(transfer);
         Ok(cb)
+    }
+
+    /// Tracked barriers: puts a barrier into `cb` before the new command if
+    /// it needs one, then records the command's accesses.
+    ///
+    /// A barrier is needed when a command was recorded since the last one
+    /// and: the new command is undeclared, or one since the last barrier was;
+    /// the new command reads or writes memory written since the last barrier,
+    /// or writes memory read since then; it is the first transfer command;
+    /// or the accesses kept reach [`MAX_UNSYNCED`].
+    ///
+    /// Each barrier is a global memory barrier from every earlier command to
+    /// every later one (the first scope of a pipeline barrier is all commands
+    /// before it in submission order, earlier submissions included), with the
+    /// compute stage, and the transfer stage once transfers were used, on
+    /// both sides: once it is recorded, every earlier write is available and
+    /// visible to every later command, so the kept accesses are dropped.
+    /// Between barriers, commands may run in any order or concurrently, which
+    /// is right for any two of them that touch disjoint memory or only read
+    /// common memory.
+    fn track(&mut self, cb: vk::CommandBuffer, transfer: bool, acc: Option<&[Access]>) {
+        // (the first transfer: earlier barriers made writes visible to the
+        // compute stage only, so one is needed even with nothing pending)
+        let new_kind = transfer && !self.transfers && self.last_transfer.is_some();
+        let need = new_kind
+            || self.pending
+                && (self.opaque
+                    || match acc {
+                    None => true,
+                    Some(a) => {
+                        self.unsynced.len() + a.len() > MAX_UNSYNCED
+                            || a.iter().any(|x| self.unsynced.iter().any(|u| x.conflicts(u)))
+                    }
+                    });
+        self.transfers |= transfer;
+        if need {
+            let (mut stages, mut src, mut dst) =
+                (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            if self.transfers {
+                stages |= vk::PipelineStageFlags::TRANSFER;
+                src |= vk::AccessFlags::TRANSFER_WRITE;
+                dst |= vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE;
+            }
+            let barrier = vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(dst);
+            unsafe { self.ctx.device.cmd_pipeline_barrier(cb, stages, stages, vk::DependencyFlags::empty(), &[barrier], &[], &[]) };
+            self.stats.barriers += 1;
+            self.unsynced.clear();
+            self.opaque = false;
+        }
+        match acc {
+            None => self.opaque = true,
+            Some(a) => {
+                for x in a {
+                    if x.lo >= x.hi {
+                        continue;
+                    }
+                    // (the same range again, e.g. an op's output in each of
+                    // its passes, is kept once)
+                    if let Some(u) = self.unsynced.iter_mut().find(|u| u.lo == x.lo && u.hi == x.hi) {
+                        u.write |= x.write;
+                    } else {
+                        self.unsynced.push(*x);
+                    }
+                }
+            }
+        }
+        self.pending = true;
+        self.last_transfer = Some(transfer);
     }
 
     fn end_command(&mut self) -> Result<()> {
@@ -247,8 +426,16 @@ impl Stream {
     }
 
     /// Queues `kernel` over `groups` workgroups with `push` (at most
-    /// [`PUSH_CONSTANT_BYTES`] bytes) as its push constants.
+    /// [`PUSH_CONSTANT_BYTES`] bytes) as its push constants, ordered against
+    /// every command before and after it.
     pub fn dispatch(&mut self, kernel: &Kernel, push: &[u8], groups: [u32; 3]) -> Result<()> {
+        self.dispatch_declared(kernel, push, groups, None)
+    }
+
+    /// [`Self::dispatch`] for a kernel that touches only the memory `acc`
+    /// declares (None: any memory). A kernel that reads or writes memory
+    /// outside its declaration races with the commands around it.
+    pub fn dispatch_declared(&mut self, kernel: &Kernel, push: &[u8], groups: [u32; 3], acc: Option<&[Access]>) -> Result<()> {
         assert!(push.len() <= PUSH_CONSTANT_BYTES as usize, "push constants too large for {}", kernel.name);
         self.dispatches += 1;
         // Always set the whole range the layout declares, so no byte a kernel
@@ -256,7 +443,7 @@ impl Stream {
         let mut padded = [0u8; PUSH_CONSTANT_BYTES as usize];
         padded[..push.len()].copy_from_slice(push);
 
-        let cb = self.begin_command(false)?;
+        let cb = self.begin_command(false, acc)?;
         self.batch_groups += groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
         let d = &self.ctx.device;
         unsafe {
@@ -276,7 +463,11 @@ impl Stream {
         if bytes == 0 {
             return Ok(());
         }
-        let cb = self.begin_command(true)?;
+        let acc = [
+            Access { lo: src.address + src_offset, hi: src.address + src_offset + bytes, write: false },
+            Access { lo: dst.address + dst_offset, hi: dst.address + dst_offset + bytes, write: true },
+        ];
+        let cb = self.begin_command(true, Some(&acc))?;
         let region = vk::BufferCopy::default().src_offset(src.offset + src_offset).dst_offset(dst.offset + dst_offset).size(bytes);
         unsafe { self.ctx.device.cmd_copy_buffer(cb, src.buffer, dst.buffer, &[region]) };
         self.end_command()
@@ -289,7 +480,8 @@ impl Stream {
         if bytes == 0 {
             return Ok(());
         }
-        let cb = self.begin_command(true)?;
+        let acc = [Access { lo: dst.address + offset, hi: dst.address + offset + bytes, write: true }];
+        let cb = self.begin_command(true, Some(&acc))?;
         unsafe { self.ctx.device.cmd_fill_buffer(cb, dst.buffer, dst.offset + offset, bytes, value) };
         self.end_command()
     }

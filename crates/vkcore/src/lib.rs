@@ -7,6 +7,7 @@
 //! - [`Runtime`]: all of the above, shared behind mutexes.
 
 pub mod context;
+pub mod declare;
 pub mod kernels;
 pub mod memory;
 pub mod spirv_fix;
@@ -16,8 +17,9 @@ use std::sync::{Arc, Mutex};
 
 pub use context::{last_validation_message, validation_issues, validation_requested, version_string, Capabilities, Context};
 pub use kernels::{kernel_subgroup_size, Kernel, KernelCache, PUSH_CONSTANT_BYTES};
+pub use declare::Declared;
 pub use memory::{Allocation, Pool, PoolStats};
-pub use stream::Stream;
+pub use stream::{Access, BarrierMode, BarrierStats, Stream};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -60,6 +62,68 @@ impl Runtime {
     pub fn dispatch<P: Copy>(&self, name: &str, spec: &[u32], params: &P, groups: [u32; 3]) -> Result<()> {
         let kernel = self.kernels.lock().unwrap().get(name, spec)?;
         self.stream.lock().unwrap().dispatch(&kernel, as_bytes(params), groups)
+    }
+
+    /// Queues kernel `name` (specialized with `spec`) with push constants
+    /// `push`, declared to touch the memory its push constants address
+    /// ([`declare::push_accesses`]), with the caller's narrower `declared`
+    /// ranges for some of those addresses. The stream then puts a barrier
+    /// before it only where that memory conflicts with commands since the
+    /// last barrier.
+    pub fn dispatch_declared(&self, name: &str, spec: &[u32], push: &[u8], groups: [u32; 3], declared: &[Declared]) -> Result<()> {
+        let kernel = self.kernels.lock().unwrap().get(name, spec)?;
+        let mode = self.stream.lock().unwrap().mode();
+        if !mode.tracked() {
+            return self.stream.lock().unwrap().dispatch(&kernel, push, groups);
+        }
+        let acc = declare::push_accesses(&self.pool.lock().unwrap(), push, declared);
+        if mode == BarrierMode::Check {
+            if let Some(acc) = &acc {
+                return self.checked_dispatch(&kernel, push, groups, acc);
+            }
+        }
+        self.stream.lock().unwrap().dispatch_declared(&kernel, push, groups, acc.as_deref())
+    }
+
+    /// TORCH_VK_BARRIERS=check: runs the dispatch alone (synchronizing
+    /// before and after) and fails if it changed any byte of live memory
+    /// outside the ranges `acc` declares written. (A write of the value
+    /// already there goes unseen, and so do reads: the check covers the
+    /// declarations' writes.)
+    fn checked_dispatch(&self, kernel: &Kernel, push: &[u8], groups: [u32; 3], acc: &[Access]) -> Result<()> {
+        self.synchronize()?;
+        let live = self.pool.lock().unwrap().live_allocations();
+        let writes = declare::merged(acc.iter().filter(|a| a.write).map(|a| (a.lo, a.hi)).collect());
+        let hashes = |live: &[(u64, u64, *const u8)]| -> Vec<u64> {
+            live.iter().map(|&(lo, size, host)| unsafe { declare::hash_outside(lo, size, host, &writes) }).collect()
+        };
+        let before = hashes(&live);
+        self.stream.lock().unwrap().dispatch_declared(kernel, push, groups, Some(acc))?;
+        self.synchronize()?;
+        let after = hashes(&live);
+        for (i, &(lo, size, _)) in live.iter().enumerate() {
+            if before[i] != after[i] {
+                return Err(format!(
+                    "TORCH_VK_BARRIERS=check: kernel {} changed memory outside the ranges it declared written: allocation {lo:#x} + {size}; declared {acc:x?}",
+                    kernel.name
+                )
+                .into());
+            }
+        }
+        // An address at an odd 4-byte offset would escape push_accesses.
+        let pool = self.pool.lock().unwrap();
+        for word in push.get(4..).unwrap_or(&[]).as_chunks::<8>().0 {
+            let w = u64::from_le_bytes(*word);
+            if let memory::Located::Allocation(..) = pool.locate(w) {
+                eprintln!("[torch_vulkan] TORCH_VK_BARRIERS=check: kernel {} has a word {w:#x} at a 4-byte offset inside a live allocation", kernel.name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Barriers and commands recorded so far.
+    pub fn barrier_stats(&self) -> BarrierStats {
+        self.stream.lock().unwrap().stats
     }
 
     pub fn synchronize(&self) -> Result<()> {
