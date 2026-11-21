@@ -225,6 +225,176 @@ bool gemv(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   return true;
 }
 
+int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
+}  // namespace
+
+// ------------------------------------------------------------ gemv4.slang
+
+namespace {
+
+struct Gemv4Params {
+  uint64_t w, x, out, cin, scales;
+  uint64_t alpha, beta;  // float bits
+  uint32_t rows, k, w_sr;
+  int32_t x_sc, o_sr, o_sc, c_sr, c_sc;
+  uint32_t group, ncol;
+};
+static_assert(sizeof(Gemv4Params) == 96 && offsetof(Gemv4Params, rows) == 56 && offsetof(Gemv4Params, group) == 88,
+              "must match shaders/gemv4.slang");
+
+// TORCH_VK_GEMV: "vector" (gemv4.slang for products with one to eight
+// vectors), "scalar" (gemv.slang or the GEMM kernels for float products,
+// qmm8.slang for int8 weights), or unset (see use_gemv4).
+std::string gemv_choice() {
+  static const std::string choice = [] {
+    const char* env = std::getenv("TORCH_VK_GEMV");
+    return std::string(env != nullptr ? env : "");
+  }();
+  return choice;
+}
+
+}  // namespace
+
+bool use_gemv4(at::ScalarType t) {
+  // By default everywhere but for float32 on NVIDIA and AMD GPUs, where
+  // gemv.slang reads near the memory's bandwidth already (elsewhere, and for
+  // 16-bit and quantised weights, the old paths widen to float32 first, read
+  // one element per load, or take GEMM tiles for two to eight vectors).
+  static const uint32_t vendor = vkt_vendor_id();
+  static const bool all = gemv_choice() == "vector" || (gemv_choice().empty() && vendor != 0x10DE && vendor != 0x1002);
+  static const bool narrow = gemv_choice() != "scalar";
+  return all || (narrow && t != at::kFloat);
+}
+
+bool gemv4(const Gemv4& g) {
+  int64_t ncol = g.x.size(0), rows = g.rows, k = g.k;
+  at::ScalarType t = g.x.scalar_type();
+  const char* xl = t == at::kFloat ? "f32" : t == at::kHalf ? "f16" : t == at::kBFloat16 ? "bf16" : nullptr;
+  std::string w = g.weights;
+  if (xl == nullptr || storage_label(t) == nullptr || ncol < 1 || ncol > 8 || rows < 1 || k < 1 ||
+      g.out.scalar_type() != t || (g.cin != nullptr && g.cin->scalar_type() != t) ||
+      (w == "q8" && storage_label(at::kChar) == nullptr) || (w == "q4" && storage_label(at::kShort) == nullptr)) {
+    return false;
+  }
+  // (elements of W per 16-byte chunk, of x per 16-byte load: the shader's CHUNK)
+  int64_t esize = c10::elementSize(t);
+  int64_t chunk = w == "q4" ? 32 : w == "q8" ? 16 : 16 / esize;
+  int64_t wsize = w == "q8" ? 1 : esize;  // (q4: never addressed by element)
+  bool aligned = g.w % 16 == 0 && g.w_row % 16 == 0;
+  if ((w == "q4" && (!aligned || k % chunk != 0)) || g.w_row % wsize != 0 ||
+      (rows - 1) * g.w_row + ceil_div(k * (w == "q4" ? 1 : 2 * wsize), 2) >= (int64_t(1) << 32)) {
+    return false;
+  }
+  // The vectors contiguous along k, 16-byte aligned, padded with zeros to a
+  // whole chunk (else a copy: they are small).
+  at::Tensor x = g.x;
+  int64_t kp = ceil_div(k, chunk) * chunk, step = 16 / esize;
+  if (x.stride(1) != 1 || kp != k || (ncol > 1 && x.stride(0) % step != 0) || gpu_address(x) % 16 != 0) {
+    at::Tensor padded = at::zeros({ncol, kp}, x.options());
+    padded.narrow(1, 0, k).copy_(x);
+    x = padded;
+  }
+  for (const at::Tensor* o : std::initializer_list<const at::Tensor*>{&x, &g.out, g.cin}) {
+    if (o != nullptr && (max_offset(*o) < 0 || max_offset(*o) >= (int64_t(1) << 31))) {
+      return false;
+    }
+  }
+  // The kernel's vector count (1, 2, 4 or 8; its rows per thread follow:
+  // 4 for one or two vectors, else 2), and the lanes per row: on the
+  // Mali-G57, 32 for one or two vectors of float or int8 weights (13 GB/s
+  // for float32 weights, the bus's speed), 8 for 4-bit weights and for four
+  // or eight vectors, whose ALU work limits them.
+  int64_t nc = ncol <= 2 ? ncol : ncol <= 4 ? 4 : 8;
+  int64_t per_thread = nc <= 2 ? 4 : 2;
+  int64_t lanes = w == "q4" || nc >= 4 ? 8 : 32;
+  int64_t groups = ceil_div(rows, 64 / lanes * per_thread);
+  if (groups > kMaxGroups) {
+    return false;
+  }
+  bool use_cin = g.cin != nullptr && g.beta != 0.0;
+  Gemv4Params p{};
+  p.w = g.w;
+  p.x = gpu_address(x);
+  p.out = gpu_address_out(g.out);
+  p.cin = use_cin ? gpu_address(*g.cin) : 0;
+  p.scales = g.scales != nullptr ? gpu_address(*g.scales) : 0;
+  p.alpha = pack_param(g.alpha, at::kFloat);
+  p.beta = pack_param(g.beta, at::kFloat);
+  p.rows = static_cast<uint32_t>(rows);
+  p.k = static_cast<uint32_t>(k);
+  p.w_sr = static_cast<uint32_t>(g.w_row);
+  p.x_sc = static_cast<int32_t>(ncol > 1 ? x.stride(0) : 0);
+  p.o_sr = static_cast<int32_t>(g.out.stride(1));
+  p.o_sc = static_cast<int32_t>(g.out.stride(0));
+  if (use_cin) {
+    p.c_sr = static_cast<int32_t>(g.cin->stride(1));
+    p.c_sc = static_cast<int32_t>(g.cin->stride(0));
+  }
+  p.group = static_cast<uint32_t>(g.group);
+  p.ncol = static_cast<uint32_t>(ncol);
+  std::vector<uint32_t> spec = {use_cin ? 1u : 0u, static_cast<uint32_t>(lanes), aligned ? 1u : 0u};
+  dispatch(std::string("gemv4_") + w + xl + "_c" + std::to_string(nc), spec, p, static_cast<uint32_t>(groups));
+  return true;
+}
+
+namespace {
+
+// gemm()'s product as gemv4.slang's when one side has one to eight vectors
+// and the matrix side's rows are contiguous along k: C's columns (N <= 8,
+// W = A) or C's rows (M <= 8, W = B^T, as x @ W.t()). Batches of one only.
+bool gemm_vectors(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
+                  double alpha, double beta) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
+  at::ScalarType t = c.scalar_type();
+  if (!use_gemv4(t) || batch != 1 || k == 0 || a.scalar_type() != t || b.scalar_type() != t ||
+      (t != at::kFloat && t != at::kHalf && t != at::kBFloat16)) {
+    return false;
+  }
+  if (t != at::kFloat && use_coopmat(t) && std::min(m, n) > 1 && !use_gemv4(at::kFloat)) {
+    return false;  // (two to eight vectors stay on the tensor cores, where float32 keeps gemv.slang)
+  }
+  for (const at::Tensor* x : {&a, &b, &c, cin}) {
+    if (x != nullptr && (!is_vk(*x) || max_offset(*x) < 0 || max_offset(*x) >= (int64_t(1) << 31))) {
+      return false;
+    }
+  }
+  bool columns = n <= 8 && a.stride(2) == 1;  // W = A [m, k]: c[r, j] = sum_k a[r, k] b[k, j]
+  bool rowwise = m <= 8 && b.stride(1) == 1;  // W = B^T [n, k]: c[j, r] = sum_k b[k, r] a[j, k]
+  if (columns && rowwise) {
+    columns = m >= n;  // (the longer side as W's rows)
+  }
+  if (!columns && !rowwise) {
+    return false;
+  }
+  int64_t esize = c10::elementSize(t);
+  Gemv4 g;
+  g.k = k;
+  g.alpha = alpha;
+  g.beta = beta;
+  at::Tensor cin2;
+  if (columns) {
+    g.w = gpu_address(a);
+    g.w_row = a.stride(1) * esize;
+    g.rows = m;
+    g.x = b.select(0, 0).t();    // [n, k]
+    g.out = c.select(0, 0).t();  // [n, m]
+    if (cin != nullptr) cin2 = cin->select(0, 0).t();
+  } else {
+    g.w = gpu_address(b);
+    g.w_row = b.stride(2) * esize;
+    g.rows = n;
+    g.x = a.select(0, 0);    // [m, k]
+    g.out = c.select(0, 0);  // [m, n]
+    if (cin != nullptr) cin2 = cin->select(0, 0);
+  }
+  if (g.rows > 1 && g.w_row < k * esize) {
+    return false;  // (rows overlapping: a broadcast matrix)
+  }
+  if (cin != nullptr) g.cin = &cin2;
+  return gemv4(g);
+}
+
 // gemm.slang's Params (gemm4.slang's and gemmsg.slang's too) for c = alpha
 // a @ b (+ beta cin): cin is read only when beta != 0 (p.cin = 0 otherwise).
 GemmParams gemm_params(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
@@ -267,7 +437,6 @@ uint32_t coop_mode(const at::Tensor& t) {
   return 0;
 }
 
-int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 // How many pieces of k would let `groups` workgroups fill `slots` (the
 // workgroups the GPU runs at once, about), as llama.cpp's Vulkan backend
@@ -428,6 +597,9 @@ bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
 bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
           double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
+  if ((n <= 8 || m <= 8) && c.numel() > 0 && gemm_vectors(a, b, c, cin, alpha, beta)) {
+    return true;
+  }
   if (c.scalar_type() == at::kHalf || c.scalar_type() == at::kBFloat16) {
     return coop_gemm_16(a, b, c, cin, alpha, beta);
   }

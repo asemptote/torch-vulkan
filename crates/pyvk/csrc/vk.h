@@ -213,6 +213,31 @@ at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Ten
 // (GPUs without shaderFloat64 run the rest). launch.cpp.
 uint64_t pack_param(const c10::Scalar& s, at::ScalarType t);
 
+// Matrix-vector products with 16-byte loads (shaders/gemv4.slang), for up to
+// 8 vectors at once: out[j][r] = alpha * sum_k W[r, k] x[j][k] (+ beta *
+// cin[j][r]) for r < rows, j < x.size(0), W's rows contiguous along k.
+// `weights` "" for W in x's dtype, "q8" for int8 W with scales[r], "q4" for
+// _weight_int4pack_mm's 4-bit W (two per byte, even k in the high nibble)
+// with scales [k / group][rows][2] (scale, zero). linalg.cpp.
+struct Gemv4 {
+  const char* weights = "";
+  uint64_t w = 0;         // W's address
+  int64_t w_row = 0;      // W's row stride in bytes
+  int64_t rows = 0, k = 0;
+  at::Tensor x;           // [ncol, k], any strides, x's dtype float32, float16 or bfloat16
+  at::Tensor out;         // [ncol, rows] view (any strides), x's dtype
+  const at::Tensor* cin = nullptr;  // [ncol, rows] view, read where beta != 0
+  double alpha = 1, beta = 0;
+  const at::Tensor* scales = nullptr;
+  int64_t group = 0;
+};
+// Whether products with one to eight vectors and W of dtype t use it
+// (TORCH_VK_GEMV; by default on every GPU, except for float32 W on NVIDIA
+// and AMD GPUs).
+bool use_gemv4(at::ScalarType t);
+// Runs it; false if it cannot (the caller then takes another path).
+bool gemv4(const Gemv4& g);
+
 // dst = src (same element size, src broadcast to dst's shape) in one
 // dispatch of shaders/copy8.slang when the copy needs 5 to 8 dims after
 // merging (the strided kernels take 4 and loop over the rest, one dispatch

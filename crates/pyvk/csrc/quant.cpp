@@ -2,7 +2,12 @@
 // them, on the GPU:
 //
 //   _weight_int8pack_mm       float @ (int8 weights * per-channel scales).T
-//                             (shaders/qmm8.slang: dequantised as staged)
+//                             (shaders/qmm8.slang: dequantised as staged;
+//                             up to 8 rows: gemv4.slang, TORCH_VK_GEMV)
+//   _convert_weight_to_int4pack, _weight_int4pack_mm
+//                             float @ (4-bit weights, scale and zero per
+//                             group).T (gemv4.slang up to 8 rows, else
+//                             dequantised to float32 and a GEMM)
 //   _dyn_quant_pack_4bit_weight, _dyn_quant_matmul_4bit
 //                             int4 weights against activations quantised
 //                             per row to int8 (shaders/qmm4.slang, bit for
@@ -83,6 +88,21 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
   // (the CPU reads the scales as A's dtype)
   at::Tensor s = scales.to(A.scalar_type()).contiguous();
   int64_t item = A.element_size();
+  if (M <= 8 && use_gemv4(at::kChar)) {
+    // (gemv4.slang: 16-byte loads of the weights)
+    Gemv4 g;
+    g.weights = "q8";
+    g.w = gpu_address(B);
+    g.w_row = K;
+    g.rows = N;
+    g.k = K;
+    g.x = A;
+    g.out = C;
+    g.scales = &s;
+    if (gemv4(g)) {
+      return C;
+    }
+  }
   if (M <= 8) {
     // (qmm8.slang ROWS: matrix-vector products, 8 output columns per workgroup)
     TORCH_CHECK((N + 7) / 8 <= kMaxGroups, "_weight_int8pack_mm: too many output columns for one dispatch: ", N);
@@ -115,6 +135,91 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
     p.a_sk = static_cast<int32_t>(A.stride(1));
     dispatch(std::string("qmm8_") + label, {}, p, static_cast<uint32_t>(gx), static_cast<uint32_t>((rows + 63) / 64));
   }
+  return C;
+}
+
+// ------------------------------------------------------------ int4 weights, float activations
+
+// aten::_convert_weight_to_int4pack: the 4-bit weights [N, K / 2] (uint8,
+// two per byte, the even k in the high nibble, as the tests and torchao pack
+// them for non-CPU devices) in the int32 shape [N / 8, K / (16 innerKTiles),
+// 32, innerKTiles / 2] PyTorch's meta kernel gives every device. vk keeps the
+// bytes in their order (rows of K / 2 bytes): its kernels read them as they
+// are, so the "packing" is a copy.
+at::Tensor convert_weight_to_int4pack(const at::Tensor& in, int64_t innerKTiles) {
+  // (the checks of _convert_weight_to_int4pack_cuda / _mps)
+  TORCH_CHECK(in.dim() == 2, "_convert_weight_to_int4pack : expect weight to be 2D tensor.");
+  TORCH_CHECK(in.dtype() == at::kByte, "_convert_weight_to_int4pack : expect weight to be kByte.");
+  TORCH_CHECK(innerKTiles == 2 || innerKTiles == 4 || innerKTiles == 8, "_convert_weight_to_int4pack",
+              " : innerKTiles need to be 2, 4, or 8, got ", innerKTiles);
+  int64_t N = in.size(0), K = in.size(1) * 2;
+  TORCH_CHECK(N % 8 == 0, "_convert_weight_to_int4pack", " : expect N to be dividable by 8, got ", N);
+  TORCH_CHECK(K % (innerKTiles * 16) == 0, "_convert_weight_to_int4pack", " : expect K to be dividable by ", innerKTiles * 16, ", got ",
+              K);
+  at::Tensor packed = at::empty({N / 8, K / (16 * innerKTiles), 32, innerKTiles / 2}, in.options().dtype(at::kInt));
+  if (packed.numel() > 0) {
+    packed.view(at::kByte).view({N, K / 2}).copy_(in);
+  }
+  return packed;
+}
+
+// aten::_weight_int4pack_mm: C = A @ W.T for A [M, K] (float32, float16 or
+// bfloat16) and W [N, K] dequantised as the CPU's kernel does it,
+// float(q - 8) * scale + zero with a scale and a zero per output channel and
+// group of qGroupSize k (qScaleAndZeros [K / qGroupSize, N, 2], A's dtype),
+// products summed in float32 and rounded once. Up to 8 rows of A (decoding
+// steps) run gemv4.slang, reading the 4-bit weights as they are; more rows
+// dequantise W into float32 first and take the float32 GEMM.
+at::Tensor weight_int4pack_mm(const at::Tensor& A, const at::Tensor& B, int64_t qGroupSize,
+                              const at::Tensor& qScaleAndZeros) {
+  static constexpr const char* func = "_weight_int4pack_mm";
+  // (the checks of _weight_int4pack_mm_mps)
+  TORCH_CHECK(A.dtype() == at::kBFloat16 || A.dtype() == at::kHalf || A.dtype() == at::kFloat, func,
+              " : expect A to be either 32-bit or 16-bit float tensor.");
+  TORCH_CHECK(A.is_contiguous(), func, " : expect A to be contiguous.");
+  TORCH_CHECK(A.dim() == 2, func, " : expect A to be 2D tensor.");
+  TORCH_CHECK(B.dtype() == at::kInt, func, " : expect B to be int32 tensor.");
+  TORCH_CHECK(B.is_contiguous(), func, " : expect B to be contiguous.");
+  TORCH_CHECK(B.dim() == 4, func, " : expect B to 4d tensor.");
+  TORCH_CHECK(qGroupSize == 32 || qGroupSize == 64 || qGroupSize == 128 || qGroupSize == 256, func,
+              ": expect qGroupSize to be 32, 64, 128 or 256, got ", qGroupSize);
+  int64_t M = A.size(0), K = A.size(1), N = B.size(0) * 8;
+  TORCH_CHECK(B.size(1) * B.size(3) * 32 == K && B.size(2) == 32, func, ": expect B to hold N x K / 2 bytes for K = ",
+              K, ", got B of sizes ", B.sizes());
+  TORCH_CHECK(K % qGroupSize == 0, func, ": expect K to be divisible by qGroupSize, got K:", K,
+              ", qGroupSize:", qGroupSize);
+  TORCH_CHECK(qScaleAndZeros.dim() == 3 && qScaleAndZeros.size(0) == K / qGroupSize && qScaleAndZeros.size(1) == N &&
+                  qScaleAndZeros.size(2) == 2,
+              func, ": expect qScaleAndZeros to be 3d tensor with sizes [", K / qGroupSize, ", ", N, ", 2]");
+  TORCH_CHECK(all_vk({&A, &B, &qScaleAndZeros}), func, ": expect all tensors on the same device");
+  at::Tensor C = at::empty({M, N}, A.options());
+  if (C.numel() == 0) {
+    return C;
+  }
+  at::Tensor sz = qScaleAndZeros.to(A.scalar_type()).contiguous();
+  if (M <= 8) {
+    Gemv4 g;
+    g.weights = "q4";
+    g.w = gpu_address(B);
+    g.w_row = K / 2;
+    g.rows = N;
+    g.k = K;
+    g.x = A;
+    g.out = C;
+    g.scales = &sz;
+    g.group = qGroupSize;
+    if (gemv4(g)) {
+      return C;
+    }
+  }
+  // W [N, K] in float32: nibbles (high first), then q * scale + zero per group
+  at::Tensor bytes = B.view(at::kByte).view({N, K / 2}).to(at::kInt);
+  at::Tensor q = at::stack({at::bitwise_right_shift(bytes, 4), at::bitwise_and(bytes, 15)}, 2).view({N, K});
+  at::Tensor szf = sz.to(at::kFloat);
+  at::Tensor scale = szf.select(2, 0).t().repeat_interleave(qGroupSize, 1);  // [N, K]
+  at::Tensor zero = szf.select(2, 1).t().repeat_interleave(qGroupSize, 1);
+  at::Tensor W = at::add(at::mul(at::sub(q, 8).to(at::kFloat), scale), zero);
+  C.copy_(at::mm(A.to(at::kFloat), W.t()));
   return C;
 }
 
@@ -315,6 +420,8 @@ at::Tensor scaled_mm(const at::Tensor& mat_a, const at::Tensor& mat_b, const at:
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   using namespace vk;
   m.impl("_weight_int8pack_mm", &weight_int8pack_mm);
+  m.impl("_convert_weight_to_int4pack", &convert_weight_to_int4pack);
+  m.impl("_weight_int4pack_mm", &weight_int4pack_mm);
   m.impl("_dyn_quant_pack_4bit_weight", &dyn_quant_pack_4bit_weight);
   m.impl("_dyn_quant_matmul_4bit", &dyn_quant_matmul_4bit);
   m.impl("_scaled_mm", &scaled_mm);
