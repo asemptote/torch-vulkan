@@ -757,6 +757,7 @@ at::Tensor dense_of(const at::Tensor& t) { return t.layout() == at::kStrided ? t
 // a @ b for dense and 2-D compressed operands (as COO, explicit zeros
 // kept): a dense result.
 at::Tensor any_mm(const at::Tensor& a, const at::Tensor& b) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   at::Tensor x = compressed_layout(a) ? compressed_as_coo(a) : a;
   at::Tensor y = compressed_layout(b) ? compressed_as_coo(b) : b;
   if (!x.is_sparse() && !y.is_sparse()) return at::mm(x, y);
@@ -781,6 +782,7 @@ void assign_compressed(at::Tensor& out, const at::Tensor& r) {
 // operands (invalid shapes: the dense op's error).
 at::Tensor addmm_any(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
                      const at::Scalar& alpha) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   bool shapes_ok = mat1.dim() == 2 && mat2.dim() == 2 && self.dim() <= 2 && mat1.size(1) == mat2.size(0) &&
                    (!compressed_layout(mat1) || mat1.dense_dim() == 0) &&
                    (!compressed_layout(mat2) || mat2.dense_dim() == 0);
@@ -826,6 +828,7 @@ at::Tensor csr_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::T
 }
 
 at::Tensor csr_mm(const at::Tensor& self, const at::Tensor& mat2) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   bool shapes_ok = self.dim() == 2 && mat2.dim() == 2 && self.size(1) == mat2.size(0);
   if (!shapes_ok) return at::mm(dense_of(self), dense_of(mat2));  // (the dense op's error)
   if (compressed_layout(self) && compressed_layout(mat2) && self.dense_dim() == 0 && mat2.dense_dim() == 0) {
@@ -1613,6 +1616,7 @@ void check_sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const a
 // tensor made with its checks off.
 at::Tensor& sampled_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
                               const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   check_sampled_addmm(self, mat1, mat2, out);
   at::Tensor product = at::matmul(mat1, mat2);
   at::Tensor crow = self.crow_indices(), col = self.col_indices(), vals = self.values();

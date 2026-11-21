@@ -1,4 +1,4 @@
-# Sparse compressed products from PyTorch 2.15's accelerator tests (M41)
+# Sparse compressed products from PyTorch 2.15's accelerator tests (M42)
 
 Issue #89. PyTorch 2.15 runs several formerly CUDA-only tests in
 test_sparse_csr.py on any accelerator. On vk they found gaps in the sparse

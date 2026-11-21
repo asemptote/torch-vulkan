@@ -172,6 +172,7 @@ at::Tensor convert_weight_to_int4pack(const at::Tensor& in, int64_t innerKTiles)
 // dequantise W into float32 first and take the float32 GEMM.
 at::Tensor weight_int4pack_mm(const at::Tensor& A, const at::Tensor& B, int64_t qGroupSize,
                               const at::Tensor& qScaleAndZeros) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   static constexpr const char* func = "_weight_int4pack_mm";
   // (the checks of _weight_int4pack_mm_mps)
   TORCH_CHECK(A.dtype() == at::kBFloat16 || A.dtype() == at::kHalf || A.dtype() == at::kFloat, func,
@@ -340,6 +341,7 @@ at::Tensor& scaled_mm_out(const at::Tensor& mat1, const at::Tensor& mat2, const 
                           const at::Tensor& scale_b, const std::optional<at::Tensor>& bias,
                           const std::optional<at::Tensor>& scale_result, std::optional<c10::ScalarType> out_dtype,
                           bool use_fast_accum, at::Tensor& out) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   if (!all_vk({&mat1, &mat2, &out})) {
     on_cpu("aten::_scaled_mm", "out", mat1, mat2, scale_a, scale_b, bias, scale_result, out_dtype, use_fast_accum, out);
     return out;
