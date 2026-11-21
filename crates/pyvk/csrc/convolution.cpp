@@ -5,7 +5,8 @@
 //
 // Built from existing kernels:
 //  - forward: im2col as a strided view of the padded input (one copy kernel)
-//    and a batched GEMM against the weight;
+//    and a batched GEMM against the weight (for one sample or one group,
+//    the weight times the columns laid out as rows, the bias added by it);
 //  - transposed: an ordinary convolution of the zero-inserted input with the
 //    flipped, transposed weight (no accumulation into overlapping windows);
 //  - backward: grad_input is a transposed convolution, grad_weight a GEMM of
@@ -82,6 +83,38 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   int64_t Kp = 1;
   for (int64_t v : k) Kp *= v;
   int64_t Cg = C / groups, Cog = Co / groups;
+  if (groups == 1 || N == 1) {
+    // out[n, g] = W_g [Cog, Cg*K] @ cols[n, g] [Cg*K, L]: the columns are
+    // rows along the output positions (for stride 1, runs of the input),
+    // padded to a multiple of 4 positions (gemm4s.slang reads B's rows in
+    // groups of 4 and stores only the first L columns), and the bias is the
+    // product's beta * Cin (one rounding, as y + bias): the result comes out
+    // as [N, Co, L], without the transposing copy and the separate pass that
+    // the [N*L, Co] product needs.
+    int64_t L4 = (L + 3) / 4 * 4;
+    std::vector<int64_t> sizes = {N, C}, strides = {xp.stride(0), xp.stride(1)};
+    for (int64_t d = 0; d < s; ++d) {
+      sizes.push_back(k[d]);
+      strides.push_back(xp.stride(2 + d) * dilation[d]);
+    }
+    for (int64_t d = 0; d < s; ++d) {
+      sizes.push_back(out[d]);
+      strides.push_back(xp.stride(2 + d) * stride[d]);
+    }
+    at::Tensor rows = at::empty({N, C * Kp, L4}, x.options());
+    rows.narrow(2, 0, L).view(sizes).copy_(xp.as_strided(sizes, strides, xp.storage_offset()));
+    int64_t batch = groups == 1 ? N : groups;
+    at::Tensor wg = w.reshape({groups, Cog, Cg * Kp}).expand({batch, Cog, Cg * Kp});
+    at::Tensor cg = rows.view({batch, Cg * Kp, L4}).narrow(2, 0, L);
+    at::Tensor y;
+    if (bias.has_value() && bias->defined()) {
+      at::Tensor b = bias->view({groups == 1 ? 1 : groups, Cog, 1}).expand({batch, Cog, L});
+      y = at::baddbmm(b, wg, cg);
+    } else {
+      y = at::bmm(wg, cg);
+    }
+    return y.view(out_shape);
+  }
   at::Tensor cols = im2col_view(xp, k, stride, dilation, out);       // [N, L, C*K] (c-major, then k)
   cols = cols.view({N, L, groups, Cg * Kp}).permute({2, 0, 1, 3});   // [G, N, L, Cg*K]
   cols = cols.reshape({groups, N * L, Cg * Kp});

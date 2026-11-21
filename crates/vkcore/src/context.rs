@@ -89,6 +89,22 @@ impl Capabilities {
             .find(|&s| [8, 16, 32].contains(&s) && s >= self.min_subgroup_size && s <= self.max_subgroup_size)
             .unwrap_or(0)
     }
+
+    /// The subgroup size for a kernel written for exactly `lanes` lanes with
+    /// shuffles (gemm4s.slang: 16, on Arm GPUs), or 0 where it cannot run:
+    /// `lanes` where a pipeline can require that size (size control with
+    /// full subgroups), or where it is the device's only subgroup size.
+    pub fn subgroup_size_exact(&self, lanes: u32) -> u32 {
+        if !self.subgroup_ops.contains(vk::SubgroupFeatureFlags::SHUFFLE) {
+            return 0;
+        }
+        let fits = if self.subgroup_size_control {
+            lanes >= self.min_subgroup_size && lanes <= self.max_subgroup_size
+        } else {
+            self.subgroup_size == lanes
+        };
+        if fits { lanes } else { 0 }
+    }
 }
 
 /// One Vulkan device with one compute queue.
@@ -567,7 +583,7 @@ unsafe fn query_capabilities(
         properties = properties.push_next(&mut sscp);
     }
     instance.get_physical_device_properties2(pd, &mut properties);
-    let subgroup_ops = if sub.supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
+    let subgroup_ops = if sub.supported_stages.contains(vk::ShaderStageFlags::COMPUTE) && !disabled("subgroups") {
         sub.supported_operations
     } else {
         vk::SubgroupFeatureFlags::empty()

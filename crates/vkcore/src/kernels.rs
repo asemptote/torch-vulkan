@@ -117,12 +117,14 @@ impl KernelCache {
             // be the one it runs at: Intel reports 32 and may run 16).
             let lanes = kernel_subgroup_size(&caps, name);
             let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(lanes);
-            if subgroup_preference(name).is_some() {
+            if subgroup_preference(name).is_some() || exact_subgroup(name).is_some() {
                 if lanes == 0 {
                     d.destroy_shader_module(module, None);
-                    return Err(format!("kernel {name} needs subgroup size control, which this device does not support").into());
+                    return Err(format!("kernel {name} needs subgroup size control or subgroups of its size, which this device does not support").into());
                 }
-                stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut required);
+                if caps.subgroup_size_control {
+                    stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut required);
+                }
             }
             let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout);
             let result = d.create_compute_pipelines(self.cache, &[info], None);
@@ -172,13 +174,24 @@ const CAP_BFLOAT16_COOPERATIVE_MATRIX: u32 = 5118; // BFloat16CooperativeMatrixK
 /// with the size each prefers.
 const SUBGROUP_KERNELS: &[(&str, u32)] = &[("gemmsg_f64", 8), ("gemmsg", 16), ("gemmcm", 32)];
 
+/// Kernels (by name prefix) written for exactly this many lanes, which also
+/// run on devices without size control whose only subgroup size it is.
+const EXACT_SUBGROUP_KERNELS: &[(&str, u32)] = &[("gemm4s", 16)];
+
 fn subgroup_preference(name: &str) -> Option<u32> {
     SUBGROUP_KERNELS.iter().find(|(k, _)| name.starts_with(k)).map(|&(_, s)| s)
+}
+
+fn exact_subgroup(name: &str) -> Option<u32> {
+    EXACT_SUBGROUP_KERNELS.iter().find(|(k, _)| name.starts_with(k)).map(|&(_, s)| s)
 }
 
 /// The subgroup size kernel `name` runs with: 0 for kernels not written for
 /// subgroups, and for those where the device cannot run them.
 pub fn kernel_subgroup_size(caps: &crate::context::Capabilities, name: &str) -> u32 {
+    if let Some(s) = exact_subgroup(name) {
+        return caps.subgroup_size_exact(s);
+    }
     subgroup_preference(name).map_or(0, |s| caps.subgroup_size_for(s))
 }
 

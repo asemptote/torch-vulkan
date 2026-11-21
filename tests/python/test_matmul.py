@@ -163,7 +163,7 @@ GEMM4_SCRIPT = r"""
 import torch, torch_vulkan
 torch.manual_seed(0)
 cases = []
-for m, k, n in [(1, 4, 4), (9, 8, 132), (130, 64, 256), (33, 12, 20), (5, 0, 8)]:
+for m, k, n in [(1, 4, 4), (9, 8, 132), (130, 64, 256), (33, 12, 20), (5, 0, 8), (37, 1004, 70), (17, 4, 65)]:
     a, b = torch.randn(m, k), torch.randn(k, n)
     cases.append(((a.to("vk") @ b.to("vk")).cpu(), a @ b))
 a, b, c = torch.randn(3, 20, 16), torch.randn(3, 16, 36), torch.randn(20, 36)
@@ -179,11 +179,17 @@ for m, k, n in [(64, 30, 50), (40, 33, 66), (70, 64, 61)]:  # K or N not multipl
     assert torch.equal((al.to("vk") @ bl.to("vk")).cpu(), al @ bl)
 x, w = torch.randn(64, 32), torch.randn(48, 32)  # x @ W.t() and x.t() @ y: copied row-major first
 cases.append(((x.to("vk") @ w.to("vk").t()).cpu(), x @ w.t()))
+x, w, bias = torch.randn(12, 64), torch.randn(200, 64), torch.randn(200)  # (gemm4s: as (W x^T)^T, x copied)
+cases.append((torch.nn.functional.linear(x.to("vk"), w.to("vk"), bias.to("vk")).cpu(), torch.nn.functional.linear(x, w, bias)))
+cases.append((torch.addmm(bias.to("vk"), x.to("vk"), w.to("vk").t(), beta=0.5, alpha=-2).cpu(), torch.addmm(bias, x, w.t(), beta=0.5, alpha=-2)))
 cases.append(((x.to("vk").t() @ x.to("vk")).cpu(), x.t() @ x))
 x = torch.randn(65, 40)  # (views 16-byte aligned or not)
 for v in (x[1:, 4:], x[:, 1:37], x[3:, 2:34]):
     w = torch.randn(v.shape[1], 24)
     cases.append(((v.to("vk") @ w.to("vk")).cpu(), v @ w))
+x, w, b = torch.randn(1, 16, 301), torch.randn(20, 16, 7), torch.randn(20)  # (convolution: columns padded to 4)
+cases.append((torch.nn.functional.conv1d(x.to("vk"), w.to("vk"), b.to("vk"), padding=9, dilation=3).cpu(),
+              torch.nn.functional.conv1d(x, w, b, padding=9, dilation=3)))
 print(max(float((g - w).abs().max() / w.abs().max().clamp_min(1)) for g, w in cases))
 """
 
@@ -226,6 +232,11 @@ def test_subgroup_gemm_kernel(env):
     assert float(out.stdout.strip().splitlines()[-1]) < 1.0  # (errors in units of 1e-5 / 1e-13 of the largest entry)
 
 
+def test_float4_subgroup_coverage():
+    # gemm4s.slang runs with exactly 16 lanes, or not at all
+    assert tv._native.kernel_subgroup_size("gemm4s_f32") in (0, 16)
+
+
 def test_subgroup_gemm_coverage():
     # which kernel float products take: a subgroup size the kernel is built for
     # (0 where the device cannot run it); on lavapipe (llvmpipe, 256-bit
@@ -236,12 +247,63 @@ def test_subgroup_gemm_coverage():
         assert sizes[0] == 8 and (sizes[1] == 8 or not HAS_FLOAT64), sizes
 
 
-def test_float4_gemm_kernel():
-    # shaders/gemm4.slang (the Mali default) on any GPU, through its env switch
-    env = dict(os.environ, TORCH_VK_GEMM="float4")
-    out = subprocess.run([sys.executable, "-c", GEMM4_SCRIPT], env=env, capture_output=True, text=True, timeout=600)
+@pytest.mark.parametrize("env", [dict(TORCH_VK_GEMM="float4"), dict(TORCH_VK_GEMM="float4", TORCH_VK_DISABLE="subgroups")])
+def test_float4_gemm_kernel(env):
+    # the Mali default on any GPU, through its env switch: shaders/gemm4s.slang
+    # where the device runs 16-lane subgroups, else (and with subgroups
+    # hidden) gemm4.slang
+    out = subprocess.run([sys.executable, "-c", GEMM4_SCRIPT], env=dict(os.environ, **env), capture_output=True,
+                         text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     assert float(out.stdout.strip().splitlines()[-1]) < 1e-5
+
+
+GEMM4S_16BIT_SCRIPT = r"""
+import torch, torch_vulkan as tv
+if tv._native.kernel_subgroup_size("gemm4s_f32") != 16:
+    print("skip")
+    raise SystemExit
+torch.manual_seed(0)
+worst = 0.0
+for dtype in (torch.float16, torch.bfloat16):
+    def check(got, a, b, cin=None, alpha=1.0, beta=0.0):
+        # the float32 product of the same values, rounded once to dtype: one
+        # rounding apart, plus float32 rounding of the sums (in another order)
+        global worst
+        ref = alpha * (a.float() @ b.float()) + (beta * cin.float() if cin is not None else 0)
+        mag = abs(alpha) * (a.float().abs() @ b.float().abs()) + (abs(beta) * cin.float().abs() if cin is not None else 0)
+        err = (got.cpu().float() - ref).abs()
+        tol = torch.finfo(dtype).eps * ref.abs() + 2**-20 * mag + 2**-24
+        worst = max(worst, float((err / tol).max()))
+    for m, k, n in [(64, 32, 64), (65, 36, 63), (17, 200, 129), (33, 12, 20), (3, 1004, 70), (40, 6, 9)]:
+        a, b = torch.randn(m, k).to(dtype), torch.randn(k, n).to(dtype)
+        check(a.to("vk") @ b.to("vk"), a, b)
+        check(a.to("vk") @ b.t().contiguous().to("vk").t(), a, b)  # (column-major B)
+        check(a.t().contiguous().to("vk").t() @ b.to("vk"), a, b)  # (column-major A)
+    a, b, c = torch.randn(3, 20, 16).to(dtype), torch.randn(3, 16, 36).to(dtype), torch.randn(20, 36).to(dtype)
+    check(a.to("vk") @ b.to("vk"), a, b)
+    check(torch.addmm(c.to("vk"), a[1].to("vk"), b[1].to("vk"), beta=0.5, alpha=2), a[1], b[1], c, 2.0, 0.5)
+    x = torch.randn(65, 40).to(dtype)
+    v, w = x[1:, 4:], torch.randn(36, 24).to(dtype)  # (a view whose rows start 8 bytes in)
+    check(v.to("vk") @ w.to("vk"), v, w)
+    big = torch.full((40, 64), 300.0).to(dtype)  # sums past float16's range: inf, as the CPU's
+    got = (big.to("vk") @ big.t().contiguous().to("vk")).cpu()
+    assert torch.equal(got, (big.float() @ big.float().t()).to(dtype)), got
+print(worst)
+"""
+
+
+def test_float4_gemm_16bit():
+    # float16 and bfloat16 products in shaders/gemm4s.slang (the Mali default
+    # where it runs; elsewhere through TORCH_VK_GEMM=float4): float32 sums,
+    # rounded once
+    out = subprocess.run([sys.executable, "-c", GEMM4S_16BIT_SCRIPT], env=dict(os.environ, TORCH_VK_GEMM="float4"),
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    last = out.stdout.strip().splitlines()[-1]
+    if last == "skip":
+        pytest.skip("no 16-lane subgroups with shuffles")
+    assert float(last) <= 1.0
 
 
 COOPMAT = {torch.float16: bool(tv._native.capabilities() & 16), torch.bfloat16: bool(tv._native.capabilities() & 32)}
@@ -338,6 +400,11 @@ def test_split_k_gemm(env):
     # the device has cooperative matrices, gemmcm.slang's tiles (and its
     # banded launch order); TORCH_VK_COMPUTE_UNITS=300 makes the GPU look big
     # enough that the default choice splits these products
+    if tv._native.kernel_subgroup_size("gemmsg_f32") == 0 and not any(COOPMAT.values()):
+        # (Arm GPUs: gemm4s.slang, gemm4.slang and gemm.slang never split k;
+        # their unsplit float32 sums over k = 2048 can exceed this test's
+        # 2^-20 of the products' magnitudes)
+        pytest.skip("no kernel here splits k")
     out = subprocess.run([sys.executable, "-c", SPLIT_K_SCRIPT], env=dict(os.environ, **env), capture_output=True,
                          text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
