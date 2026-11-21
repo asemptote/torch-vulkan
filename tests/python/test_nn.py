@@ -186,6 +186,29 @@ def test_grid_sample_bicubic_non_finite(padding_mode):
             torch.testing.assert_close(got.cpu(), want, equal_nan=True)
 
 
+def test_grid_unnormalise_rounds_once():
+    # (bicubic grid sampling unnormalises as the CPU, whose compiler fuses
+    # (g + 1) * size / 2 - 0.5 into one rounding: from float32 operations,
+    # the exactly rounded value; checked against float64 arithmetic)
+    from torch_vulkan._kernels import _fused_multiply_add
+
+    g = torch.rand(100000, generator=torch.Generator().manual_seed(5)) * 2 - 1
+    a = g + 1
+    for size in (5, 345, 456, 4097, 2 ** 23 - 3):
+        with on_gpu():
+            got = _fused_multiply_add(a.to("vk"), size / 2, -0.5).cpu()
+        want = (a.double() * (size / 2) - 0.5).float()
+        assert (got != want).sum() <= 2, size  # (a double rounding next to a tie, at most)
+    # 2-D bicubic of 0-255 samples, where the 16 taps cancel: within the
+    # tolerance of PyTorch's test_compare_cpu
+    x = torch.randint(0, 256, (1, 2, 120, 160), generator=torch.Generator().manual_seed(6)).float()
+    grid = torch.rand(1, 120, 160, 2, generator=torch.Generator().manual_seed(7)) * 2 - 1
+    want = F.grid_sample(x, grid, mode="bicubic", padding_mode="zeros", align_corners=False)
+    with on_gpu():
+        got = F.grid_sample(x.to("vk"), grid.to("vk"), mode="bicubic", padding_mode="zeros", align_corners=False)
+    torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize("align_corners", [False, True])
 def test_grid_sample_nearest_half_way(align_corners):
     # (2-D and 3-D unnormalise the grid with the CPU's arithmetic, so samples at

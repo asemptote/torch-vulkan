@@ -453,6 +453,39 @@ def _cubic_taps(coord, size, padding_mode, align_corners):
     return coeffs, taps
 
 
+def _fused_multiply_add(a, s, c):
+    """a * s + c (s, c Python floats exact in a's dtype) rounded once, as a
+    fused multiply-add, from separately rounded operations: the product's
+    rounding error by Dekker's two-product (Veltkamp splits of a and s), the
+    sum's by Knuth's two-sum, both added back before the last rounding. (A
+    result next to a tie may still round the other way: a double rounding.)
+    Its gradient is s's, as a * s + c's: the corrections carry none."""
+    dt = a.dtype
+    k = 12 if dt == torch.float32 else 27  # (halves of 12 bits for float32, 26 and 27 for float64)
+    split = 2.0 ** k + 1
+
+    def const(v):
+        return torch.tensor(v, dtype=dt, device=a.device)
+
+    p = a * const(s)
+    q = p + c
+    with torch.no_grad():
+        ad, pd, qd = a.detach(), p.detach(), q.detach()
+        t = ad * const(split)
+        hi = t - (t - ad)
+        lo = ad - hi
+        sv = torch.tensor(s, dtype=dt)  # (the constant's halves, on the host)
+        st = sv * split
+        s_hi = st - (st - sv)
+        s_lo = sv - s_hi
+        s_hi, s_lo = const(s_hi.item()), const(s_lo.item())
+        e = ((hi * s_hi - pd) + hi * s_lo + lo * s_hi) + lo * s_lo
+        b = qd - pd
+        r = (pd - (qd - b)) + (c - b)
+        correction = r + e
+    return q + correction
+
+
 def _clip_coordinates(x, size):
     """GridSampler.h's clip_coordinates: min(size - 1, max(x, 0)), whose std::min
     and std::max make NaN size - 1."""
@@ -476,7 +509,13 @@ def _bicubic_grid_sample(input, grid, padding_mode, align_corners):
     g = grid.reshape(n, p, k)
 
     def unnormalize(v, size):
-        return (v + 1) / 2 * (size - 1) if align_corners else ((v + 1) * size - 1) / 2
+        if align_corners:
+            return (v + 1) / 2 * (size - 1)
+        # ((v + 1) size - 1) / 2, rounded once: the CPU's compiler fuses the
+        # product and the difference (an FMA), and near a cancelling sum of
+        # large samples one ulp of the coordinate shows (2-D float32: 0.0016
+        # on a value of -0.5)
+        return _fused_multiply_add(v + 1, size / 2, -0.5)
 
     coeffs, taps = [], []  # by input dim (D, H, W order)
     for d in range(k):
