@@ -1,10 +1,10 @@
-# No CPU fallback by default (M42)
+# No CPU fallback by default (M45)
 
 Issue #101. Until 0.2, an op with no Vulkan kernel for its arguments ran on
 the CPU: its "vk" tensors copied over and its results back, with a warning
 the first time each op did so, counted in `fallback_counts()`.
 `TORCH_VK_STRICT=1` made that an error. Every op PyTorch's 36 test files and
-the OpInfo sweep exercise now runs on the GPU (M36, M41), so the default is
+the OpInfo sweep exercise now runs on the GPU (M36, M44), so the default is
 flipped, as PyTorch's MPS backend does (`PYTORCH_ENABLE_MPS_FALLBACK=1`):
 
 - **Default:** an op that would compute on the CPU raises
