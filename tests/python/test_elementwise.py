@@ -268,3 +268,38 @@ def test_float32_division_correctly_rounded():
         for g_, w in zip(got, [x / y, torch.reciprocal(x)]):
             same = (g_.view(torch.int32) == w.view(torch.int32)) | (g_.isnan() & w.isnan())
             assert same.all(), (g_[~same][:4], w[~same][:4])
+
+
+INTEGERS = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
+
+
+@pytest.mark.parametrize("dtype", INTEGERS)
+def test_integer_clamp_bounds(dtype):
+    # One-sided bounds: the missing bound is the kernel's own extreme (the
+    # int32 kernel read int64's as 0 and -1, so clamp(int32, min=10) gave -1).
+    info = torch.iinfo(dtype)
+    x = torch.tensor([0, 1, 7, 100, min(info.max, 2 ** 40)], dtype=torch.int64)
+    if info.min < 0:
+        x = torch.cat([x, torch.tensor([-1, -100, max(info.min, -2 ** 40)])])
+    x = x.to(dtype)
+    for lo, hi in [(3, None), (None, 50), (3, 50), (-1, 60)]:
+        try:
+            want = torch.clamp(x, lo, hi)
+        except Exception as e:  # (the CPU's error, the same on vk)
+            with pytest.raises(type(e)) as got_error:
+                torch.clamp(x.to("vk"), lo, hi)
+            assert str(got_error.value).splitlines()[0] == str(e).splitlines()[0]
+            continue
+        with on_gpu():
+            got = torch.clamp(x.to("vk"), lo, hi)
+        assert torch.equal(got.cpu(), want), (lo, hi)
+    for bound in [3, 50]:
+        t = torch.full_like(x, bound)
+        want = [torch.clamp_min(x, bound), torch.clamp_max(x, bound),
+                torch.clamp_min(x, t), torch.clamp_max(x, t), torch.clamp(x, min=t), torch.clamp(x, max=t)]
+        xv, tv_ = x.to("vk"), t.to("vk")
+        with on_gpu():
+            got = [torch.clamp_min(xv, bound), torch.clamp_max(xv, bound),
+                   torch.clamp_min(xv, tv_), torch.clamp_max(xv, tv_), torch.clamp(xv, min=tv_), torch.clamp(xv, max=tv_)]
+        for i, (g, w) in enumerate(zip(got, want)):
+            assert torch.equal(g.cpu(), w), (bound, i)

@@ -238,8 +238,8 @@ bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& l
     auto cv = [&](const at::Scalar& s) -> int64_t {
       return dtype == at::kByte ? s.to<uint8_t>() : dtype == at::kChar ? s.to<int8_t>() : s.to<int16_t>();
     };
-    int64_t a = lo ? cv(*lo) : std::numeric_limits<int64_t>::min();
-    int64_t b = hi ? cv(*hi) : std::numeric_limits<int64_t>::max();
+    int64_t a = lo ? cv(*lo) : std::numeric_limits<int32_t>::min();
+    int64_t b = hi ? cv(*hi) : std::numeric_limits<int32_t>::max();
     at::Tensor w = to_dtype(self, dtype).to(at::kInt);
     at::Tensor r = at::empty_like(w);
     launch_strided((std::string("unary_") + dtype_label(at::kInt)).c_str(), {op::UNARY_CLAMP}, r, &w, nullptr, {a, b});
@@ -259,8 +259,11 @@ bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& l
     }
     launch_strided(kernel.c_str(), {op::UNARY_CLAMP}, out, &input, nullptr, {a, b});
   } else {
-    int64_t a = lo ? lo->toLong() : std::numeric_limits<int64_t>::min();
-    int64_t b = hi ? hi->toLong() : std::numeric_limits<int64_t>::max();
+    // (a missing bound as the dtype's own extreme: the int32 kernel reads the
+    // bounds' low words, so int64's extremes would become 0 and -1)
+    bool i32 = dtype == at::kInt;
+    int64_t a = lo ? lo->toLong() : i32 ? std::numeric_limits<int32_t>::min() : std::numeric_limits<int64_t>::min();
+    int64_t b = hi ? hi->toLong() : i32 ? std::numeric_limits<int32_t>::max() : std::numeric_limits<int64_t>::max();
     launch_strided(kernel.c_str(), {op::UNARY_CLAMP}, out, &input, nullptr, {a, b});
   }
   return true;
