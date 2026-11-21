@@ -111,8 +111,29 @@ struct Conv4sParams {
 };
 static_assert(sizeof(Conv4sParams) == 104, "must match shaders/conv4s.slang");
 
-constexpr int64_t kConv4sRows = 16;  // WY R in shaders/conv4s.slang
-constexpr int64_t kConv4sCols = 64, kConv4sColsH = 128;  // WX 4 NC (f16h: NC = 2)
+// shaders/conv4s.slang's tiles (its axis TILE): label, rows per workgroup
+// (WY R), columns per workgroup (16 lanes x 4 NC).
+struct Conv4sTile {
+  const char* label;
+  int64_t rows, cols;
+};
+constexpr Conv4sTile kConv4sTiles[] = {{"r8n1", 16, 64},  {"r4n2", 8, 128},  {"r6n2", 12, 128},
+                                       {"r8n2", 16, 128}, {"r4n4", 8, 256},  {"r12n1", 24, 64},
+                                       {"r8n1w1", 8, 64}, {"r8n1w4", 32, 64}};
+
+// The tile for float32 / 16-bit storage (f32 math) and for float16
+// arithmetic; TORCH_VK_CONV_TILE=label forces one (tuning).
+const Conv4sTile& conv4s_tile(bool half_math) {
+  static const Conv4sTile* forced = [] {
+    const char* env = std::getenv("TORCH_VK_CONV_TILE");
+    for (const Conv4sTile& t : kConv4sTiles) {
+      if (env != nullptr && std::strcmp(env, t.label) == 0) return &t;
+    }
+    return static_cast<const Conv4sTile*>(nullptr);
+  }();
+  if (forced != nullptr) return *forced;
+  return half_math ? kConv4sTiles[3] : kConv4sTiles[0];
+}
 constexpr int64_t kConv4sMaxTaps = 16;                 // MAXKW
 
 // Whether stride-1 convolutions of type t run as shaders/conv4s.slang:
@@ -122,7 +143,7 @@ constexpr int64_t kConv4sMaxTaps = 16;                 // MAXKW
 bool use_conv4s(at::ScalarType t) {
   static const bool ok = [] {
     const char* env = std::getenv("TORCH_VK_CONV");
-    return !(env != nullptr && std::strcmp(env, "im2col") == 0) && vkt_kernel_subgroup_size("conv4s_f32") == 16;
+    return !(env != nullptr && std::strcmp(env, "im2col") == 0) && vkt_kernel_subgroup_size("conv4s_f32_r8n1") == 16;
   }();
   static const bool f16 = ok && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
   static const bool bf16 = ok && has_feature(kFeatureInt16);
@@ -175,12 +196,13 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   int64_t KH = s >= 2 ? w.size(-2) : 1, KD = s == 3 ? w.size(2) : 1, KO = KD * KH;
   int64_t off_h = s >= 2 ? dilation[s - 2] * Wp : 0, off_d = s == 3 ? dilation[0] * Hp * Wp : 0;
   bool half_math = t == at::kHalf && fp16_arithmetic();
-  int64_t cols = half_math ? kConv4sColsH : kConv4sCols;
+  const Conv4sTile& tile = conv4s_tile(half_math);
+  int64_t cols = tile.cols;
   int64_t reach = ceil_div(nv, cols) * cols + (KD - 1) * off_d + (KH - 1) * off_h + (KW - 1) * DW + 8;
   int64_t slack = std::max<int64_t>(0, reach - plane);
   int64_t total = N * C * plane + slack;
   if (total >= (int64_t(1) << 31) || N * Co * (Do * Ho * Wo) >= (int64_t(1) << 31) || N * groups > 65535 ||
-      ceil_div(nv, cols) > 65535 || ceil_div(Cog, kConv4sRows) > 65535) {
+      ceil_div(nv, cols) > 65535 || ceil_div(Cog, tile.rows) > 65535) {
     return {};
   }
   at::Tensor xbuf = at::zeros({total}, x.options());
@@ -224,9 +246,9 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   p.hp = static_cast<uint32_t>(s == 3 ? Hp : nv);
   p.ho = static_cast<uint32_t>(s == 3 ? Ho : nv);
   p.groups = static_cast<uint32_t>(groups);
-  dispatch(std::string("conv4s_") + (half_math ? "f16h" : storage_label(t)),
+  dispatch(std::string("conv4s_") + (half_math ? "f16h" : storage_label(t)) + "_" + tile.label,
            {static_cast<uint32_t>(KW), static_cast<uint32_t>(DW), use_bias ? 1u : 0u}, p,
-           static_cast<uint32_t>(ceil_div(nv, cols)), static_cast<uint32_t>(ceil_div(Cog, kConv4sRows)),
+           static_cast<uint32_t>(ceil_div(nv, cols)), static_cast<uint32_t>(ceil_div(Cog, tile.rows)),
            static_cast<uint32_t>(N * groups));
   return y;
 }

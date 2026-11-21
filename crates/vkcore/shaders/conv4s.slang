@@ -1,4 +1,5 @@
 // axis T: f32=float f16=half bf16=uint16_t f16h=half
+// axis TILE: r8n1=int r4n2=int r6n2=int r8n2=int r4n4=int r12n1=int r8n1w1=int r8n1w4=int
 //
 // Direct convolution (stride 1, 1 to 3 spatial dims) for GPUs with 16-lane
 // subgroups, on gemm4s.slang's scheme (A shared across a subgroup by
@@ -39,18 +40,33 @@
 #include "_slot.slang"
 
 #define WX 16  // lanes: a subgroup
-#ifndef WY
-#define WY 2   // subgroups per workgroup
-#endif
-#ifndef R
-#define R 8    // rows per subgroup
-#endif
-#ifndef NC
-#if defined(T_f16h)
-#define NC 2   // 4-value column groups per lane
+// TILE: rows per subgroup (R), 4-value column groups per lane (NC),
+// subgroups per workgroup (WY)
+#if defined(TILE_r4n2)
+#define R 4
+#define NC 2
+#elif defined(TILE_r6n2)
+#define R 6
+#define NC 2
+#elif defined(TILE_r8n2)
+#define R 8
+#define NC 2
+#elif defined(TILE_r4n4)
+#define R 4
+#define NC 4
+#elif defined(TILE_r12n1)
+#define R 12
+#define NC 1
 #else
+#define R 8
 #define NC 1
 #endif
+#if defined(TILE_r8n1w1)
+#define WY 1
+#elif defined(TILE_r8n1w4)
+#define WY 4
+#else
+#define WY 2
 #endif
 #define MAXKW 16                         // inner taps at most
 #define MAXRQ ((R * (MAXKW / 4) + WX - 1) / WX)  // pieces of A per lane at most
