@@ -10,7 +10,37 @@ since the last barrier.
 
 ## Measured first
 
-RESULTS_BEFORE
+`benchmarks/barriers.py` times each case whole, synchronize included
+(median of 300 runs), and counts the barriers per run:
+
+- 10 or 1000 independent adds: `torch.add(a[i], 1, out=o[i])` on distinct
+  tensors of 256 float32 values;
+- 10 or 1000 dependent adds: `x.add_(1)` on one tensor;
+- one `torch.optim.Adam(foreach=True)` step over the 32 parameters of a
+  small MLP (8 layers of 256 x 256 linear, layer norm and GELU);
+- that MLP's forward, and forward plus backward, on a batch of 32.
+
+On main, H100 NVL, microseconds:
+
+| case | main | main, `TORCH_VK_BARRIERS=full` |
+|---|---|---|
+| 10 independent adds | 74.3 | 77.0 |
+| 10 dependent adds | 78.0 | 82.1 |
+| 1000 independent adds | 3777 | 3882 |
+| 1000 dependent adds | 4155 | 4241 |
+| Adam step | 1367 | 1450 |
+| MLP forward | 565 | 573 |
+| MLP forward + backward | 2108 | 2155 |
+
+- Independent kernels cost what dependent ones do: every command waits for
+  the one before.
+- With 1000 adds, about 3.8 us each, the host records about as fast as the
+  GPU runs serialised kernels, so leaving out barriers can gain at most a
+  fraction of a microsecond per op there. Short bursts, where the GPU's
+  serialised run comes on top of the recording, have more to gain.
+- The Adam step (32 tensors, 224 kernels) and the backward pass have many
+  independent kernels; the MLP's forward is a dependent chain, which
+  needs every barrier (fusion, #28, is the fix there).
 
 ## The stream (`vkcore/src/stream.rs`)
 
@@ -141,11 +171,97 @@ addresses, so it says nothing here (M25). The checks:
   dispatches, check the push-constant lookup, and pass with the barriers in
   every mode.
 
-CHECK_RESULTS
+Results (`tests/python`: 1612 tests on the NVIDIA GPUs, 1610 elsewhere;
+the strict OpInfo sweep: 689 ops):
+
+| | H100 NVL | L40S | HD 530 | lavapipe |
+|---|---|---|---|---|
+| tests/python, default / full / default again | all pass | all pass | all pass | all pass |
+| read logs differing, default vs full | 0 of 1539 tests | 0 of 1539 | 0 of 1537 | 0 of 1537 |
+| read logs differing, default vs default | 0 | 0 | 0 | 0 |
+| OpInfo strict: all on the GPU, read logs differing | H100_OPINFO | 689; 0 of 658 | 689; 0 of 658 | 689; 0 of 658 |
+| `TORCH_VK_BARRIERS=check` | L40S_CHECK | L40S_CHECK | tests/python: all pass | tests/python: all pass |
+| stress tests, 200 programs of 400 ops | pass | pass | 30 x 250: pass | |
+
+- About 11,000 reads in tests/python and 8,100 in the OpInfo sweep
+  compared bit for bit. No test read different bits in two runs with the
+  same settings either, so the comparison is exact everywhere.
+- The check reads all live device memory twice per kernel: 22 minutes for
+  tests/python on the HD 530 and lavapipe, against under a minute and a
+  half. On the NVIDIA GPUs the memory is read over PCIe, and the whole
+  suite would take hours, so there it ran on the tests of the
+  NVIDIA-only paths: cooperative-matrix and split-k products, the
+  optimisers and the stress tests. It found nothing anywhere, and no
+  address at a 4-byte offset.
+- PyTorch's test files on the H100 (the 37 files of the full runs), with
+  the default barriers and with `every`: PT_RESULTS
 
 ## Results
 
-RESULTS_AFTER
+The same build in each mode, three rounds alternating, medians of the
+three medians (`every` is main's barriers). Microseconds, and barriers per
+run in brackets.
+
+H100 NVL:
+
+| case | tracked (default) | every (as main) | full |
+|---|---|---|---|
+| 10 independent adds | **51.2** (1) | 74.1 (10) | 77.6 (10) |
+| 10 dependent adds | 79.7 (10) | 78.7 (10) | 82.5 (10) |
+| 1000 independent adds | **3311** (16) | 3863 (1000) | 3947 (1000) |
+| 1000 dependent adds | 4249 (1000) | 4180 (1000) | 4300 (1000) |
+| Adam step | **986** (6) | 1393 (224) | 1459 (224) |
+| MLP forward | 572 (24) | 567 (24) | 575 (24) |
+| MLP forward + backward | 2133 (110) | 2151 (136) | 2194 (136) |
+
+L40S:
+
+| case | tracked (default) | every (as main) | full |
+|---|---|---|---|
+| 10 independent adds | **42.0** (1) | 54.8 (10) | 60.5 (10) |
+| 10 dependent adds | 59.8 (10) | 59.0 (10) | 64.2 (10) |
+| 1000 independent adds | **2784** (16) | 3183 (1000) | 3390 (1000) |
+| 1000 dependent adds | 3607 (1000) | 3517 (1000) | 3677 (1000) |
+| Adam step | **832** (6) | 1019 (224) | 1134 (224) |
+| MLP forward | 447 (24) | 443 (24) | 454 (24) |
+| MLP forward + backward | 1687 (110) | 1691 (136) | 1752 (136) |
+
+HD 530 (Mesa ANV; a shared machine, so differences under about 10% are
+noise there):
+
+| case | tracked (default) | every (as main) | full |
+|---|---|---|---|
+| 10 independent adds | **208** (1) | 276 (10) | 282 (10) |
+| 10 dependent adds | 298 (10) | 293 (10) | 296 (10) |
+| Adam step | 4689 (6) | 4662 (224) | 4675 (224) |
+| MLP forward + backward | 9970 (110) | 9888 (136) | 9905 (136) |
+
+On the HD 530 a barrier left out between small kernels saves about 7.5 us
+(10 adds), but the Adam step does not move: the host takes about 20 us to
+record each of its kernels, far longer than the GPU takes to run them, with
+or without barriers. Its 1000-add runs varied by a third from round to
+round, more than any difference between the modes.
+
+Per barrier left out:
+
+- **A short burst of independent kernels:** 2.5 us on the H100 (10 adds,
+  74.1 to 51.2 us for 9 barriers) and 1.4 us on the L40S. That is the
+  serialisation itself: the drain and refill around each barrier.
+- **An optimiser step:** Adam over 32 tensors goes from 224 barriers to 6
+  and from 1393 to 986 us on the H100 (29% less; 1.9 us per barrier), 1019
+  to 832 on the L40S (18%; 0.9 us per barrier). Each `_foreach_` op's
+  kernels touch distinct tensors, and so do consecutive foreach ops until
+  one comes back to a tensor an earlier one wrote.
+- **Long runs of independent kernels:** 0.55 us per kernel on the H100 and
+  0.4 on the L40S (1000 adds). Here the host is the limit: it records an
+  add in about 3.3 us, and the GPU keeps up once it no longer waits
+  between kernels.
+- **Dependent chains:** nothing to leave out (every barrier is needed), and
+  the bookkeeping costs the host 70 to 90 ns per kernel (1000 dependent adds:
+  4180 to 4249 us on the H100). The MLP's forward pass, a dependent chain,
+  is within 1% either way; with its backward pass, 26 of 136 barriers go
+  and the time is within 1% too: the kernels there are larger, and the
+  independent ones are few.
 
 ## Switches
 
@@ -159,4 +275,27 @@ RESULTS_AFTER
 
 ## Limits and what next
 
-LIMITS
+- **Whole allocations, read and written.** Outside the strided element-wise
+  kernels every address counts for its whole allocation, read and written.
+  Readers of one tensor (two matrix products of one input, a backward pass
+  reading the forward's activations) are therefore ordered among
+  themselves, and so are writes to disjoint parts of one tensor by other
+  kernels. Declaring more kernels exactly (the matrix products first: out
+  written, A and B read) would let them overlap; each needs its shader
+  checked, and `TORCH_VK_BARRIERS=check` run over its tests.
+- **The device error word** that indexing kernels set is one allocation all
+  of them write, so they are ordered among themselves. It could become an
+  access kind that does not conflict with itself (atomic stores of 1).
+- **The check sees writes only.** A kernel reading outside its declaration
+  (only possible for the exact declarations of the strided kernels, which
+  were checked by reading the shaders) would not be caught by
+  `TORCH_VK_BARRIERS=check`; the A/B runs and stress tests would catch its
+  effect only where a race actually happens.
+- **Host time.** Dependent chains gain nothing and pay 70 to 90 ns per
+  kernel for the lookup and the scan. On the H100 most small ops are now
+  bound by the host's recording (about 3.3 us per add), so the next gains
+  are there and in submitting early (MPS and the old Vulkan backend commit
+  every 16 kernels, so the GPU starts while the host records), and in
+  fusion for dependent chains (#28).
+- `queryEvent` still always returns true (real events on the timeline
+  semaphore are separate work).

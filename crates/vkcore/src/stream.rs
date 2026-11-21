@@ -371,16 +371,13 @@ impl Stream {
         // (the first transfer: earlier barriers made writes visible to the
         // compute stage only, so one is needed even with nothing pending)
         let new_kind = transfer && !self.transfers && self.last_transfer.is_some();
-        let need = new_kind
-            || self.pending
-                && (self.opaque
-                    || match acc {
-                    None => true,
-                    Some(a) => {
-                        self.unsynced.len() + a.len() > MAX_UNSYNCED
-                            || a.iter().any(|x| self.unsynced.iter().any(|u| x.conflicts(u)))
-                    }
-                    });
+        let conflict = match acc {
+            None => true,
+            Some(a) => {
+                self.unsynced.len() + a.len() > MAX_UNSYNCED || a.iter().any(|x| self.unsynced.iter().any(|u| x.conflicts(u)))
+            }
+        };
+        let need = new_kind || self.pending && (self.opaque || conflict);
         self.transfers |= transfer;
         if need {
             let (mut stages, mut src, mut dst) =
