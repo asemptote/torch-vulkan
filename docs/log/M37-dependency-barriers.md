@@ -179,7 +179,7 @@ the strict OpInfo sweep: 689 ops):
 | tests/python, default / full / default again | all pass | all pass | all pass | all pass |
 | read logs differing, default vs full | 0 of 1539 tests | 0 of 1539 | 0 of 1537 | 0 of 1537 |
 | read logs differing, default vs default | 0 | 0 | 0 | 0 |
-| OpInfo strict: all on the GPU, read logs differing | H100_OPINFO | 689; 0 of 658 | 689; 0 of 658 | 689; 0 of 658 |
+| OpInfo strict: all on the GPU, read logs differing | 689; 0 of 658 | 689; 0 of 658 | 689; 0 of 658 | 689; 0 of 658 |
 | `TORCH_VK_BARRIERS=check` | not run | test_matmul, test_optim, test_barriers: 154 pass | tests/python: all pass | tests/python: all pass |
 | stress tests, 200 programs of 400 ops | pass | pass | 30 x 250: pass | 6 x 250: pass |
 
@@ -197,8 +197,10 @@ the strict OpInfo sweep: 689 ops):
   A/B runs of tests/python (1625 tests) and the OpInfo sweep were repeated
   on the HD 530 and lavapipe: 0 of 1552 tests and 0 of 658 ops differing,
   no noise.
-- PyTorch's test files on the H100 (the 37 files of the full runs), with
-  the default barriers and with `every`: PT_RESULTS
+- PyTorch's test files on the H100 (the 37 files of the full runs,
+  PyTorch 2.14.1), with the default barriers: 129,131 passed, 306 expected
+  failures, 85 that fail on the CPU too, and no failure of vk's own, so
+  nothing to re-run with `every`.
 
 ## Results
 
