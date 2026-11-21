@@ -216,6 +216,120 @@ def test_grid_sample_3d_bicubic(dtype):
                          x, grid.clone(), tol=tol)
 
 
+@pytest.mark.float64
+@pytest.mark.parametrize("padding_mode", ["zeros", "border", "reflection"])
+def test_grid_sample_bicubic_non_finite(padding_mode):
+    # (a tap that zeros padding drops reads nothing: an infinite voxel beside
+    # it does not reach the result, at either rank, as on the CPU)
+    image = make((1, 1, 5, 5), torch.float64)
+    image[0, 0, 0, 0] = float("inf")
+    volume = image.unsqueeze(2).expand(1, 1, 5, 5, 5).contiguous()
+    for coordinate in (float("nan"), float("inf"), -float("inf"), 50.0, -1.3):
+        grid_2d = torch.full((1, 1, 2, 2), coordinate, dtype=torch.float64)
+        grid_2d[0, 0, 1] = 0.1
+        grid_3d = torch.cat([grid_2d, torch.full_like(grid_2d[..., :1], 0.1)], dim=-1).unsqueeze(1)
+        for x, g in ((image, grid_2d), (volume, grid_3d)):
+            want = F.grid_sample(x, g, mode="bicubic", padding_mode=padding_mode, align_corners=False)
+            with on_gpu():
+                got = F.grid_sample(x.to("vk"), g.to("vk"), mode="bicubic", padding_mode=padding_mode,
+                                    align_corners=False)
+            torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+
+
+def test_grid_unnormalise_rounds_once():
+    # (bicubic grid sampling unnormalises as the CPU, whose compiler fuses
+    # (g + 1) * size / 2 - 0.5 into one rounding: from float32 operations,
+    # the exactly rounded value; checked against float64 arithmetic)
+    from torch_vulkan._kernels import _fused_multiply_add
+
+    g = torch.rand(100000, generator=torch.Generator().manual_seed(5)) * 2 - 1
+    a = g + 1
+    for size in (5, 345, 456, 4097, 2 ** 23 - 3):
+        with on_gpu():
+            got = _fused_multiply_add(a.to("vk"), size / 2, -0.5).cpu()
+        want = (a.double() * (size / 2) - 0.5).float()
+        assert (got != want).sum() <= 2, size  # (a double rounding next to a tie, at most)
+    # 2-D bicubic of 0-255 samples, where the 16 taps cancel: within the
+    # tolerance of PyTorch's test_compare_cpu
+    x = torch.randint(0, 256, (1, 2, 120, 160), generator=torch.Generator().manual_seed(6)).float()
+    grid = torch.rand(1, 120, 160, 2, generator=torch.Generator().manual_seed(7)) * 2 - 1
+    want = F.grid_sample(x, grid, mode="bicubic", padding_mode="zeros", align_corners=False)
+    with on_gpu():
+        got = F.grid_sample(x.to("vk"), grid.to("vk"), mode="bicubic", padding_mode="zeros", align_corners=False)
+    torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("align_corners", [False, True])
+def test_grid_sample_nearest_half_way(align_corners):
+    # (2-D and 3-D unnormalise the grid with the CPU's arithmetic, so samples at
+    # half-way coordinates round the same way at both ranks)
+    n = 10
+    i = torch.arange(0, n - 1 + 0.1, 0.1, dtype=torch.float32)
+    q = 2 * i / (n - 1) - 1 if align_corners else (i * 2 + 1) / n - 1
+    fixed = torch.full_like(q, 0.5)
+    data = make((n,), torch.float32)
+    x2, g2 = data.reshape(1, n).repeat(1, 1, 9, 1), torch.stack([q, fixed], 1).reshape(1, 1, -1, 2)
+    x3, g3 = data.reshape(1, n).repeat(1, 1, 9, 9, 1), torch.stack([q, fixed, fixed], 1).reshape(1, 1, 1, -1, 3)
+    for pad in ("zeros", "border", "reflection"):
+        for x, g in ((x2, g2), (x3, g3)):
+            want = F.grid_sample(x, g, mode="nearest", padding_mode=pad, align_corners=align_corners)
+            with on_gpu():
+                got = F.grid_sample(x.to("vk"), g.to("vk"), mode="nearest", padding_mode=pad,
+                                    align_corners=align_corners)
+            assert torch.equal(got.cpu(), want), (pad, x.dim())
+
+
+@pytest.mark.parametrize("size", [2 ** 24 + 1, 2 ** 31 + 1, 2 ** 53 + 1])
+def test_grid_sample_3d_bicubic_wide_expanded_axis(size):
+    # (an expanded axis wider than the indexing kernels address: every tap
+    # reads its one element)
+    volume = torch.ones(1, 1, 1, 1, 1, device="vk").expand(1, 1, 1, 1, size)
+    grid = torch.tensor([[[[[1.0, 0.0, 0.0]]]]], device="vk")
+    for pad in ("zeros", "border", "reflection"):
+        with on_gpu():
+            out = F.grid_sample(volume, grid, mode="bicubic", padding_mode=pad, align_corners=True)
+        assert out.item() == 1.0
+
+
+def test_index_wide_expanded_dim():
+    # (indices into an expanded dim beyond int32's range, below it)
+    x = torch.arange(3.0, device="vk")[1:2].expand(2 ** 33)
+    with on_gpu():
+        assert x[torch.tensor([5, 2 ** 31 - 2, -1], device="vk")].tolist() == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_autocast(dtype):
+    # (CUDA's policy: products in the autocast dtype, exp and sums in float32,
+    # mixed inputs promoted; under checkpointing too, as PyTorch's test)
+    from torch.utils.checkpoint import checkpoint
+
+    a, b = make((3, 3), torch.float32).to("vk"), make((3, 3), torch.float32, seed=1).to("vk")
+    with torch.autocast("vk", dtype=dtype):
+        assert torch.mm(a, b).dtype == dtype
+        assert F.linear(a, b).dtype == dtype
+        assert torch.exp(a.to(dtype)).dtype == torch.float32
+        assert torch.addcmul(a, a.to(dtype), b).dtype == torch.float32
+        assert torch.add(a, b).dtype == torch.float32
+    assert torch.mm(a, b).dtype == torch.float32
+    with torch.autocast("vk", dtype=dtype):
+        torch.testing.assert_close(torch.mm(a, b).cpu().float(), torch.mm(a.cpu().to(dtype), b.cpu().to(dtype)).float(),
+                                   rtol=2e-2, atol=2e-2)
+
+    for enabled in (True, False):
+        x, y, z = (make((3, 3), torch.float32, seed=s).to("vk").requires_grad_() for s in range(3))
+
+        def foo(x, y, z):
+            z = torch.mm(torch.mm(torch.mm(x, y), z), z)
+            assert z.dtype == (dtype if enabled else torch.float32)
+            return z
+
+        with torch.autocast("vk", enabled=enabled, dtype=dtype):
+            loss = checkpoint(foo, x, y, z, use_reentrant=False).sum()
+        loss.backward()
+        assert x.grad.dtype == torch.float32
+
+
 def test_embedding_and_small_model_training():
     import copy
 

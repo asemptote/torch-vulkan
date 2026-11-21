@@ -1077,6 +1077,14 @@ at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::
 at::Tensor& baddbmm_out(const at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2,
                         const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
   std::vector<int64_t> shape = {batch1.size(0), batch1.size(1), batch2.size(2)};
+  if (batch1.dim() == 3 && batch2.dim() == 3) {
+    // (the CPU's meta function's dtype checks, before out= is resized)
+    TORCH_CHECK(self.scalar_type() == batch1.scalar_type() && batch1.scalar_type() == batch2.scalar_type(),
+                "Input dtypes must be the same, got: input ", self.dtype(), ", batch1: ", batch1.dtype(),
+                ", batch2: ", batch2.dtype());
+    TORCH_CHECK(out.dtype() == batch1.dtype(), "Expected out tensor to have dtype ", batch1.dtype(), ", but got ",
+                out.dtype(), " instead");
+  }
   at::native::resize_output(out, shape);
   if (is_vk(self) && is_vk(batch1) && is_vk(batch2) && is_vk(out) && batch1.dim() == 3 && batch2.dim() == 3 &&
       self.dim() <= 3 && (out.numel() == 0 || batch1.size(2) == 0) && self.scalar_type() == out.scalar_type()) {

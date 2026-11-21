@@ -140,6 +140,15 @@ bool unary_gpu(uint32_t code, Kind kind, const at::Tensor& self, const at::Tenso
   if (at::isComplexType(self.scalar_type())) {
     return complex_unary_gpu(code, self, out);
   }
+  if (at::isFloat8Type(self.scalar_type()) && code == op::UNARY_ABS && is_vk(self) && is_vk(out)) {
+    // (float8's abs, the only unary op the CPU has for it besides the
+    // predicates: in float32, as c10's, which is exact, then converted back;
+    // float8_e8m0fnu, which has no sign, has none)
+    TORCH_CHECK_NOT_IMPLEMENTED(self.scalar_type() != at::kFloat8_e8m0fnu,
+                                "\"abs_cpu\" not implemented for 'Float8_e8m0fnu'");
+    out.copy_(at::abs(self.to(at::kFloat)));
+    return true;
+  }
   if (self.scalar_type() == at::kBool && code == op::UNARY_SIGN && is_vk(self) && is_vk(out)) {
     out.copy_(self);  // sign of a bool is itself
     return true;
@@ -392,6 +401,16 @@ bool binary_gpu(const BinaryOp& op, const at::Tensor& self, const at::Tensor* ot
       return false;
     }
     out.copy_(result);
+    return true;
+  }
+  if (at::isFloat8Type(promoted) && op.code == op::BINARY_MUL && is_vk(*lhs)) {
+    // (float8's mul, the CPU's only float8 arithmetic: in float32, as c10's,
+    // where the product of two float8 values is exact, then rounded once)
+    // (with a scalar the CPU has none: its reduced-float scalar kernel
+    // leaves float8 out)
+    TORCH_CHECK_NOT_IMPLEMENTED(!scalar, "\"mul_cpu_reduced_float\" not implemented for '",
+                                c10::toString(promoted), "'");
+    out.copy_(at::mul(lhs->to(at::kFloat), other->to(at::kFloat)));
     return true;
   }
   if (!at::isFloatingType(promoted) && !at::isComplexType(promoted) &&
@@ -922,7 +941,7 @@ bool compare_gpu(uint32_t code, const at::Tensor& self, const at::Tensor* other,
     return false;
   }
   at::ScalarType rt = scalar ? at::result_type(self, *scalar) : at::result_type(self, *other);
-  if (rt == at::kFloat8_e4m3fn || rt == at::kFloat8_e5m2 || rt == at::kFloat8_e4m3fnuz || rt == at::kFloat8_e5m2fnuz) {
+  if (at::isFloat8Type(rt)) {
     // (float8: compared as float32, exact)
     at::Tensor a = self.to(at::kFloat);
     if (scalar) return compare_gpu(code, a, nullptr, &*scalar, out);

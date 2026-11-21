@@ -415,6 +415,20 @@ EXPECTED = [
     (r"test_upsamplingNearest2d_launch_fail_vk", r"Unexpected success",
      "a CUDA launch-configuration limit (grid size) the test expects every accelerator to hit; vk's kernels "
      "loop over the elements and have no such limit"),
+    (r"TestInputGradBuffersVK::test_lookup_does_not_deadlock_with_python_dispatch_vk",
+     r"Torch not compiled with CUDA enabled",
+     "the test's subprocess script creates its tensor with device=\"cuda\" whatever the device under test. "
+     "With \"vk\" in its place the backward finishes (no deadlock); about one run in ten then aborts at "
+     "interpreter exit, in PyTorch's autograd device thread (no vk code on the stack), which drops the last "
+     "reference to the graph task, and with it a Python object, after finalisation has begun"),
+    (r"test_cpu_tensor_pow_device_scalar_tensor_vk", r"found at least two devices, vk:0 and cpu",
+     "an in-place pow_ of a 0-dim CPU tensor by a vk tensor raises on vk as on CUDA and XPU (the result "
+     "would have to be written to the CPU tensor); the test expects the error from those two devices by name "
+     "only"),
+    (r"test_tensor_lr_num_dim_[012]_LBFGS_vk_float32", r"Tensor-likes are not close",
+     "the 'maximize_strong_wolfe' input maximises a quadratic, so the weights grow without bound (1e19 after "
+     "two steps); a float and a tensor lr round differently, and the two runs part ways. The CPU's do too on "
+     "other inputs (vk's generator draws other numbers for the seed): with seed 19, 70% apart"),
 ]
 
 

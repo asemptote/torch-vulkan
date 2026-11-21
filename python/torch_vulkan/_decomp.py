@@ -28,6 +28,11 @@ DENYLIST = {
     # Declines (returns NotImplemented for) most shapes; _kernels.py has a general version.
     "aten::adaptive_max_pool2d",
     "aten::adaptive_max_pool3d",
+    # Unnormalises the grid as coords * mul + ofs, which rounds differently
+    # from the CPU (nearest samples at half-way coordinates differ), and its
+    # bicubic mode multiplies a dropped tap's non-finite voxel by a zero
+    # weight; _kernels.py's follows the CPU, as for 3-D.
+    "aten::grid_sampler_2d",
 }
 
 _active = threading.local()

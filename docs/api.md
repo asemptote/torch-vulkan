@@ -44,10 +44,25 @@ generator.
 - 8- and 16-bit integers are computed in int32; int64 and the unsigned types
   are supported everywhere (int64 arithmetic is emulated with 32-bit words, so
   `shaderInt64` is not needed).
-- float8 (e4m3fn, e5m2 and the fnuz variants) converts exactly to and from the
-  other types; `_scaled_mm` multiplies float8 matrices.
+- float8 (e4m3fn, e5m2, the fnuz variants and e8m0fnu) converts exactly to
+  and from the other types, as the CPU's conversions; the ops the CPU has for
+  float8 (comparisons, `isnan`/`isinf`/`isfinite`, `abs`, `mul`, `where`,
+  `any`/`all`) run on the GPU through float32, and `_scaled_mm` multiplies
+  float8 matrices.
 - Per-tensor affine quantised tensors (`quantize_per_tensor`, `dequantize`,
   `int_repr` and views) are supported; per-channel quantisation is not.
+
+## Autocast
+
+`torch.autocast("vk", dtype=torch.float16)` (or `torch.bfloat16`; float16 is
+PyTorch's default for the backend) applies the policy PyTorch uses for CUDA:
+matrix products, convolutions, `linear` and the recurrent cells run in the
+autocast dtype; ops that lose accuracy in 16 bits (`exp`, `log`, `pow`,
+norms, losses, `softmax`, `sum`, `cumsum`, ...) run in float32; ops with
+several inputs (`addcmul`, `atan2`, `dot`, `index_put`, ...) in the widest of
+their dtypes. `torch.vk.get_amp_supported_dtype()` lists float16, bfloat16
+and float32. Combine it with `torch.amp.GradScaler("vk")` for float16
+training, as on CUDA.
 
 ## float32 matrix products and `torch.set_float32_matmul_precision`
 

@@ -107,6 +107,9 @@ def _sliding_blocks(kernel_size, dilation, padding, stride):
 
 def grid_sampler(input, grid, mode, k):
     """The CPU's grid_sampler_{2,3}d checks, with its messages."""
+    if input.device != grid.device:
+        raise RuntimeError(f"grid_sampler(): expected input and grid to be on same device, but input is on "
+                           f"{input.device} and grid is on {grid.device}")
     if input.shape[0] != grid.shape[0]:
         raise RuntimeError(f"grid_sampler(): expected grid and input to have same batch size, but got input with "
                            f"sizes {list(input.shape)} and grid with sizes {list(grid.shape)}")
