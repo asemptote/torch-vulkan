@@ -58,15 +58,18 @@ Two things on the way:
 `benchmarks/conv.py` (float32, ms; the 2-D cases are an image decoder's
 stride-2 upsampling). "Before" is main on the HD 530, and elsewhere the
 zero-insertion path of this change's build (its weights reversed without
-`flip`, depthwise products by multiply-adds), so main was slower still there:
+`flip`, depthwise products by multiply-adds), so main was slower still there;
+on the L40S, the zero-insertion path's ops run from Python (zeros inserted,
+then the ordinary convolution with the flipped weight; on the HD 530 this
+gives main's times within 10%):
 
-| | Mali-G57 before -> after | HD 530 | lavapipe |
-|---|---|---|---|
-| conv_transpose1d 512 -> 256, k 20, s 10, 484 frames | 509 -> 100 | 333 -> 38 | 1506 -> 214 |
-| conv_transpose1d 256 -> 128, k 12, s 6, 4840 frames | 522 -> 91 | 347 -> 57 | 1791 -> 432 |
-| conv_transpose1d depthwise 640, k 3, s 2, 121 frames | 1.9 -> 1.9 | 1.3 -> 0.9 | 7.7 -> 10.8 |
-| conv_transpose2d 256 -> 128, k 4, s 2, 64 x 64 | 474 -> 104 | 322 -> 71 | 1304 -> 387 |
-| conv_transpose2d 128 -> 64, k 3, s 2, batch 4, 32 x 32 | 133 -> 43 | 85 -> 26 | 489 -> 125 |
+| | Mali-G57 before -> after | HD 530 | lavapipe | L40S |
+|---|---|---|---|---|
+| conv_transpose1d 512 -> 256, k 20, s 10, 484 frames | 509 -> 100 | 333 -> 38 | 1506 -> 214 | 1.79 -> 0.24 |
+| conv_transpose1d 256 -> 128, k 12, s 6, 4840 frames | 522 -> 91 | 347 -> 57 | 1791 -> 432 | 2.31 -> 0.33 |
+| conv_transpose1d depthwise 640, k 3, s 2, 121 frames | 1.9 -> 1.9 | 1.3 -> 0.9 | 7.7 -> 10.8 | - -> 0.06 |
+| conv_transpose2d 256 -> 128, k 4, s 2, 64 x 64 | 474 -> 104 | 322 -> 71 | 1304 -> 387 | 1.64 -> 0.37 |
+| conv_transpose2d 128 -> 64, k 3, s 2, batch 4, 32 x 32 | 133 -> 43 | 85 -> 26 | 489 -> 125 | 0.50 -> 0.16 |
 
 float16 runs at about the same speed (widened to float32, as before).
 lavapipe's depthwise case is slower: its per-dispatch cost outweighs the
