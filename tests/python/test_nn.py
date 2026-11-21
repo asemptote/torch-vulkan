@@ -37,6 +37,9 @@ CONV_CASES = [
     (2, 4, 4, (3, 2), (2, 1), (1, 0), (1, 2), 4),
     (2, 6, 9, 5, 3, 2, 1, 3),
     (3, 2, 4, 3, 2, 1, 1, 1),
+    # depthwise (one input channel per group: multiply-adds per tap)
+    (1, 6, 12, 5, 2, 2, 2, 6),
+    (3, 3, 3, 2, 1, 1, 1, 3),
 ]
 
 
@@ -81,6 +84,53 @@ def test_conv_transpose(dims, cin, cout, k, stride, pad, dil, groups, outpad):
     b = make((cout,), torch.float32, 2)
     conv = [F.conv_transpose1d, F.conv_transpose2d, F.conv_transpose3d][dims - 1]
     compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, outpad, groups, dil), x, w, b)
+
+
+@pytest.mark.parametrize("dims,n,cin,cout,k,stride,pad,dil,groups,outpad,length", [
+    # Kokoro's upsampling convolutions (scaled down): K a multiple of the stride
+    (1, 1, 8, 4, 20, 10, 5, 1, 1, 0, 9),
+    (1, 1, 6, 4, 12, 6, 3, 1, 1, 0, 9),
+    # depthwise stride-2 upsampling, K not a multiple of the stride
+    (1, 2, 6, 6, 3, 2, 1, 1, 6, 1, 13),
+    # padding past T - 1 (the phase convolution crops its input), output_padding
+    (1, 2, 3, 5, 5, 2, 7, 1, 1, 1, 17),
+    # dilation coprime to the stride (phases with different taps), output_padding >= stride
+    (1, 2, 4, 3, 4, (3,), 2, 2, 1, 1, 10),
+    (1, 1, 4, 3, 5, 2, 0, 3, 1, 2, 7),
+    # 2-D: strided and stride-1 dims mixed, dilation on the stride-1 dim, groups
+    (2, 2, 4, 6, (4, 3), (2, 1), (1, 2), (1, 2), 2, (1, 0), 6),
+    (2, 1, 3, 4, 4, 2, 1, 1, 1, 0, 7),
+    (2, 2, 4, 4, (5, 3), (3, 2), (2, 0), 1, 4, (2, 1), 5),
+    (3, 1, 2, 3, 3, 2, 1, 1, 1, 1, 4),
+])
+def test_conv_transpose_phases(dims, n, cin, cout, k, stride, pad, dil, groups, outpad, length):
+    # strided transposed convolutions run as one convolution per phase
+    # (convolution.cpp: conv_transpose_phases)
+    spatial = (length, length - 1, length - 2)[:dims]
+    x = make((n, cin) + spatial, torch.float32)
+    ks = k if isinstance(k, tuple) else (k,) * dims
+    w = make((cin, cout // groups) + ks, torch.float32, 1)
+    b = make((cout,), torch.float32, 2)
+    conv = [F.conv_transpose1d, F.conv_transpose2d, F.conv_transpose3d][dims - 1]
+    compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, outpad, groups, dil), x, w, b)
+    compare_with_cpu(lambda x, w: conv(x, w, None, stride, pad, outpad, groups, dil), x, w)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int32])
+def test_conv_transpose_phases_dtypes(dtype):
+    x = make((1, 8, 23), torch.float32)
+    w = make((8, 4, 12), torch.float32, 1)
+    b = make((4,), torch.float32, 2)
+    if dtype == torch.int32:
+        x, w, b = (t.mul(4).round().to(dtype) for t in (x, w, b))
+        tol = dict(rtol=0, atol=0)
+    else:
+        x, w, b = (t.to(dtype) for t in (x, w, b))
+        tol = dict(rtol=1e-2, atol=1e-2)
+    want = F.conv_transpose1d(x.float(), w.float(), b.float(), 6, 3).to(dtype)
+    with on_gpu():
+        got = F.conv_transpose1d(x.to("vk"), w.to("vk"), b.to("vk"), 6, 3)
+    check(got, want, **tol)
 
 
 @pytest.mark.float64
