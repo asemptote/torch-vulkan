@@ -419,3 +419,149 @@ def test_coopmat_coverage():
     for dtype, label in ((torch.float16, "f16"), (torch.bfloat16, "bf16")):
         if COOPMAT[dtype]:
             assert tv._native.kernel_subgroup_size(f"gemmcm_{label}") == 32
+
+
+# torch.set_float32_matmul_precision (docs/log/M41): where the device has
+# bfloat16 cooperative matrices, "medium" rounds float32 operands to bfloat16
+# and "high" splits each into two bfloat16 parts, multiplied three times.
+# Each product's error relative to |a b| is then at most 2^-8 + 2^-8 (+ their
+# product) for "medium", and 3 (1 + 2^-8) 2^-16 for "high": the two parts'
+# products dropped and the residual past them. The sums add float32's error
+# (2^-20 of the products' magnitudes, as the 16-bit tests allow).
+PRECISION_BOUND = {"medium": 2**-7 + 2**-16 + 2**-20, "high": 2**-14 + 2**-20}
+
+PRECISION_SCRIPT = r"""
+import os, sys, torch, torch_vulkan as tv
+precision, bound = sys.argv[1], float(sys.argv[2])
+torch.manual_seed(0)
+torch.set_float32_matmul_precision(precision)
+worst = 0.0
+def close(got, x, y, alpha=1.0, beta=0.0, cin=None):
+    global worst
+    x, y = x.double(), y.double()
+    ref = alpha * (x @ y) + (beta * cin.double() if cin is not None else 0)
+    mag = abs(alpha) * (x.abs() @ y.abs()) + (abs(beta) * cin.double().abs() if cin is not None else 0)
+    err = (got.cpu().double() - ref).abs()
+    assert (err <= bound * mag + 1e-30).all(), float((err / mag.clamp_min(1e-30)).max())
+    worst = max(worst, float((err / mag.clamp_min(1e-30)).max()))
+for m, k, n in [(64, 32, 64), (65, 33, 63), (17, 200, 129), (128, 1, 96), (3, 1000, 5), (300, 700, 260),
+                (70, 2048, 50)]:
+    a, b = torch.randn(m, k), torch.randn(k, n)
+    at, bt = a.t().contiguous().t(), b.t().contiguous().t()  # (column-major)
+    for x, y in [(a, b), (at, bt), (a, bt), (at, b)]:
+        vx, vy = x.to("vk"), y.to("vk")
+        runs = [vx @ vy for _ in range(3)]
+        assert all(torch.equal(runs[0].cpu(), r.cpu()) for r in runs[1:]), "not reproducible"
+        close(runs[0], a, b)
+    close(a.to("vk")[::2] @ b.to("vk"), a[::2], b)  # (a strided view: staged value by value)
+    out = torch.empty(n, m, device="vk").t()  # (a transposed result)
+    torch.mm(a.to("vk"), b.to("vk"), out=out)
+    close(out, a, b)
+a, b, c = torch.randn(3, 40, 700), torch.randn(3, 50, 700), torch.randn(40, 50)
+close(torch.bmm(a.to("vk"), b.to("vk").transpose(1, 2)), a, b.transpose(1, 2))
+close(torch.baddbmm(c.to("vk"), a.to("vk"), b.to("vk").transpose(1, 2), beta=0.5, alpha=2.0), a, b.transpose(1, 2),
+      2.0, 0.5, c)
+nan = torch.full((40, 50), float("nan"))
+close(torch.addmm(nan.to("vk"), a[0].to("vk"), b[0].to("vk").t(), beta=0), a[0], b[0].t())
+w, bias = torch.randn(96, 700), torch.randn(96)  # (nn.Linear: x @ w.t() + bias)
+close(torch.nn.functional.linear(a[0].to("vk"), w.to("vk"), bias.to("vk")), a[0], w.t(), 1.0, 1.0, bias)
+x = torch.randn(1200, 64)  # (a weight gradient's x.t() @ y)
+close(x.to("vk").t() @ x.to("vk"), x.t(), x)
+print(worst)
+"""
+
+
+def float32_precision_run(precision, env=None, bound=None):
+    bound = PRECISION_BOUND[precision] if bound is None else bound
+    out = subprocess.run([sys.executable, "-c", PRECISION_SCRIPT, precision, repr(bound)],
+                         env=dict(os.environ, **(env or {})), capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return float(out.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("precision", ["high", "medium"])
+def test_float32_matmul_precision(precision):
+    # mm, bmm, addmm, baddbmm and linear on every layout and edge, within the
+    # precision's bound per product and the same from run to run; where the
+    # device has no bfloat16 cooperative matrices, the float32 products of
+    # "highest"
+    worst = float32_precision_run(precision)
+    if COOPMAT[torch.bfloat16]:
+        # (the products did run at the lower precision: "medium" loses 8
+        # bits; "high"'s largest errors are those of its 16 bits)
+        assert worst > (2**-12 if precision == "medium" else 2**-21), worst
+    else:
+        assert worst == float32_precision_run("highest", bound=PRECISION_BOUND[precision])
+
+
+@pytest.mark.parametrize("env", [dict(TORCH_VK_SPLIT_K="3"), dict(TORCH_VK_SPLIT_K="2", TORCH_VK_GEMM_TILE="m"),
+                                 dict(TORCH_VK_SPLIT_K="5", TORCH_VK_GEMM_TILE="s", TORCH_VK_GEMM_GROUP="3")])
+@pytest.mark.parametrize("precision", ["high", "medium"])
+def test_float32_matmul_precision_tiles(precision, env):
+    # the same on gemmcm.slang's other tiles, banded launches and with k split
+    if not COOPMAT[torch.bfloat16]:
+        pytest.skip("no bfloat16 cooperative matrices")
+    float32_precision_run(precision, env)
+
+
+@contextlib.contextmanager
+def float32_matmul_precision(precision):
+    old = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(old)
+
+
+@pytest.mark.parametrize("precision", ["high", "medium"])
+def test_float32_matmul_precision_special_values(precision):
+    # infinities and NaN give the float32 product's infinities and NaN (an
+    # infinity times a zero is NaN, times a value whose bfloat16 low part is
+    # zero is not); values bfloat16 would round to infinity stay finite;
+    # the finite results keep the precision's bound
+    a, b = make((40, 64), torch.float32, 1), torch.randint(-4, 5, (64, 30)).float()  # (b exact in bfloat16)
+    a[3, 5] = float("inf")
+    a[7, 9] = -float("inf")
+    a[11, 2] = float("nan")
+    b[9, 4] = 0.0
+    big = torch.full((2, 3), 3.4e38)  # (> bfloat16's largest, 3.39e38)
+    with float32_matmul_precision(precision), on_gpu():
+        got = (a.to("vk") @ b.to("vk")).cpu()
+        got_big = (big.to("vk") @ torch.full((3, 2), 0.25, device="vk")).cpu()
+    want = a @ b
+    assert torch.equal(torch.isnan(got), torch.isnan(want))
+    assert torch.equal(torch.isposinf(got), torch.isposinf(want)) and torch.equal(torch.isneginf(got), torch.isneginf(want))
+    fin = torch.isfinite(want)
+    mag = a.double().abs().nan_to_num(posinf=0.0) @ b.double().abs()
+    assert ((got.double() - (a.double() @ b.double()))[fin].abs() <= PRECISION_BOUND[precision] * mag[fin]).all()
+    assert torch.isfinite(got_big).all(), got_big
+    assert (got_big - 2.55e38).abs().max() <= 2**-7 * 2.55e38
+
+
+def test_float32_matmul_precision_scope():
+    # The setting is for matrix products: convolutions, pooling and
+    # interpolation (written as products here), factorisations and solves
+    # give the same bits at "medium" as at "highest", as on CUDA, where
+    # cuDNN and cuSOLVER keep their own settings.
+    x, w = make((2, 8, 20, 20), torch.float32, 1), make((16, 8, 3, 3), torch.float32, 2)
+    sq = make((96, 96), torch.float32, 3)
+    spd = sq @ sq.t() + 96 * torch.eye(96)
+    vx, vw, vsq, vspd = x.to("vk"), w.to("vk"), sq.to("vk"), spd.to("vk")
+
+    def ops():
+        F = torch.nn.functional
+        return [F.conv2d(vx, vw, padding=1), F.conv_transpose2d(vx, vw.transpose(0, 1)),
+                F.interpolate(vx, size=(37, 29), mode="bilinear"), F.adaptive_avg_pool2d(vx, (7, 6)),
+                torch.linalg.cholesky(vspd), torch.linalg.solve(vsq, vspd), *torch.linalg.qr(vsq)]
+
+    with float32_matmul_precision("highest"), on_gpu():
+        want = [t.cpu() for t in ops()]
+    with float32_matmul_precision("medium"), on_gpu():
+        got = [t.cpu() for t in ops()]
+        product = (vsq @ vspd).cpu()
+    for g, r in zip(got, want):
+        assert torch.equal(g, r)
+    if COOPMAT[torch.bfloat16]:
+        with float32_matmul_precision("highest"):
+            assert not torch.equal(product, (vsq @ vspd).cpu())  # (while matmul did change)

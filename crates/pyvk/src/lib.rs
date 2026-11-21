@@ -40,6 +40,7 @@ extern "C" {
     fn vkt_get_rng_state(seed: *mut u64, offset: *mut u64);
     fn vkt_set_rng_state(seed: u64, offset: u64);
     fn vkt_fallback_counts(buf: *mut std::ffi::c_char, len: usize) -> usize;
+    fn vkt_exact_float32_products(enter: i32);
 }
 
 /// Waits until all queued GPU work has finished; raises IndexError if a
@@ -125,6 +126,15 @@ fn compute_units() -> u32 {
 #[pyfunction]
 fn kernel_subgroup_size(name: &str) -> u32 {
     runtime().map(|rt| vkcore::kernel_subgroup_size(&rt.ctx.caps, name)).unwrap_or(0)
+}
+
+/// Enters (true) or leaves (false) a scope of this thread in which float32
+/// matrix products stay in float32 whatever torch.set_float32_matmul_precision
+/// says (csrc/linalg.cpp); for ops written as products, such as pooling and
+/// interpolation.
+#[pyfunction]
+fn exact_float32_products(enter: bool) {
+    unsafe { vkt_exact_float32_products(enter as i32) }
 }
 
 /// Seeds the default random generator (offset back to 0).
@@ -245,6 +255,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_subgroup_size, m)?)?;
     m.add_function(wrap_pyfunction!(compute_units, m)?)?;
+    m.add_function(wrap_pyfunction!(exact_float32_products, m)?)?;
     m.add_function(wrap_pyfunction!(manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(seed, m)?)?;
