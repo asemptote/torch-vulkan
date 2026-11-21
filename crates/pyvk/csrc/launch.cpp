@@ -2,12 +2,14 @@
 // shaders/_strided.slang (out, a, b) and shaders/_strided4.slang (out, a,
 // b, c), planned with strided.h.
 
+#include "opcodes.h"
 #include "strided.h"
 #include "vk.h"
 
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <string_view>
 
 namespace vk {
 
@@ -49,6 +51,38 @@ uint64_t pack_param(const c10::Scalar& s, at::ScalarType t) {
 
 namespace {
 
+// Kernels on the _strided layouts that touch each operand only at its own
+// strided offsets (out[o.o] written; a[o.a], b[o.b], c[o.c] read; checked in
+// each shader): for these, launch() declares to the stream exactly the bytes
+// each operand spans in each dispatch, so independent element-wise ops, and
+// the dispatches of the >4-dim loop, need no barrier between them. move's
+// gather and scatter index with data and are left to whole allocations.
+bool exact_operands(const char* kernel, const std::vector<uint32_t>& spec) {
+  std::string_view name(kernel);
+  std::string_view family = name.substr(0, name.find('_'));
+  if (family == "move") {
+    return !spec.empty() && (spec[0] == op::MOVE_COPY || spec[0] == op::MOVE_FILL);
+  }
+  for (std::string_view f : {"unary", "binary", "cunary", "cbinary", "cabs", "cast", "compare", "special", "ternary",
+                             "where", "iota", "index"}) {
+    if (family == f) return true;
+  }
+  return false;
+}
+
+// The bytes a strided operand spans: elements at ptr + itemsize * sum_d(i_d *
+// stride[d]) for 0 <= i_d < size[d].
+VktRange strided_range(uint64_t ptr, int64_t itemsize, size_t ndim, const uint32_t* size, const int32_t* stride,
+                       bool write) {
+  int64_t lo = 0, hi = 0;
+  for (size_t d = 0; d < ndim; ++d) {
+    int64_t reach = (static_cast<int64_t>(size[d]) - 1) * stride[d];
+    (reach < 0 ? lo : hi) += reach;
+  }
+  return VktRange{ptr, ptr + static_cast<uint64_t>(lo * itemsize), ptr + static_cast<uint64_t>((hi + 1) * itemsize),
+                  write ? 1u : 0u, 0};
+}
+
 template <size_t K>
 void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::array<const at::Tensor*, K>& ops,
             c10::ArrayRef<uint64_t> bits) {
@@ -75,14 +109,20 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
     base[k] = !ops[k] ? 0 : k == 0 ? gpu_address_out(*ops[k]) : gpu_address(*ops[k]);
     itemsize[k] = ops[k] ? ops[k]->itemsize() : 0;
   }
+  bool exact = exact_operands(kernel, spec);
+  std::vector<VktRange> ranges;
   for_each_dispatch<K>(dims, D, [&](int64_t count, const std::array<int64_t, K>& offsets) {
     p.n = static_cast<uint32_t>(count);
     uint32_t groups = 0;
     check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
+    ranges.clear();
     for (size_t k = 0; k < K; ++k) {
       p.ptr[k] = ops[k] ? base[k] + offsets[k] * itemsize[k] : 0;
+      if (exact && ops[k] && p.ptr[k] != 0) {
+        ranges.push_back(strided_range(p.ptr[k], itemsize[k], inner, p.size, p.st[k], k == 0));
+      }
     }
-    dispatch(kernel, spec, p, groups);
+    dispatch_declared(kernel, spec, p, ranges, groups);
   });
 }
 
@@ -142,7 +182,10 @@ bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* si
   }
   uint32_t groups = 0;
   check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
-  dispatch(std::string("copy8_") + size_label, {}, p, groups);
+  // (copy8.slang writes out[o] and reads a[a] only: exact ranges, as launch())
+  std::vector<VktRange> ranges = {strided_range(p.out, dst.itemsize(), dims.ndim(), p.size, p.so, true),
+                                  strided_range(p.a, src.itemsize(), dims.ndim(), p.size, p.sa, false)};
+  dispatch_declared(std::string("copy8_") + size_label, {}, p, ranges, groups);
   return true;
 }
 

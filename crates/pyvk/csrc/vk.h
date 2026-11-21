@@ -61,6 +61,15 @@ int vkt_empty_cache();
 void vkt_memory_stats(uint64_t* allocated, uint64_t* reserved);
 int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush, uint32_t gx,
                  uint32_t gy, uint32_t gz);
+// For address `ptr` in a dispatch's push constants: the kernel touches memory
+// through it only within [lo, hi) (GPU addresses), and writes it only if
+// `write` (vkcore::Declared).
+struct VktRange {
+  uint64_t ptr, lo, hi;
+  uint32_t write, pad;
+};
+int vkt_dispatch_declared(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush,
+                          uint32_t gx, uint32_t gy, uint32_t gz, const VktRange* ranges, size_t nranges);
 int vkt_grid_1d(uint64_t n, uint32_t* groups, uint32_t* stride);
 int vkt_has_float64();
 uint32_t vkt_vendor_id();
@@ -381,12 +390,32 @@ torch::jit::Stack on_cpu(const char* name, const char* overload, const Args&... 
 
 // Queues `kernel` with a push-constant struct (at most 128 bytes) over a
 // gx x gy x gz grid of workgroups.
+//
+// The stream orders a dispatch only after the earlier commands that touched
+// memory it touches (docs/log/M37). It finds that memory itself: every
+// 8-byte word of `params` that is an address inside a live allocation counts
+// as reading and writing all of that allocation. So kernels must get every
+// address they use from their push constants, as uint64 fields (8-byte
+// aligned), never from memory or from another allocation's address.
 template <typename P>
 void dispatch(const std::string& kernel, const std::vector<uint32_t>& spec, const P& params, uint32_t gx,
               uint32_t gy = 1, uint32_t gz = 1) {
   static_assert(sizeof(P) <= 128, "push constants are limited to 128 bytes");
   check(vkt_dispatch(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params), sizeof(P), gx,
                      gy, gz));
+}
+
+// dispatch with narrower declarations for some of the addresses in `params`:
+// for each, the bytes the kernel reads, or reads and writes, through it
+// (ranges that do not hold their address are ignored). A kernel that touches
+// memory beyond its declarations races with the commands around it:
+// TORCH_VK_BARRIERS=check verifies the writes.
+template <typename P>
+void dispatch_declared(const std::string& kernel, const std::vector<uint32_t>& spec, const P& params,
+                       const std::vector<VktRange>& ranges, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1) {
+  static_assert(sizeof(P) <= 128, "push constants are limited to 128 bytes");
+  check(vkt_dispatch_declared(kernel.c_str(), spec.data(), spec.size(), reinterpret_cast<const uint8_t*>(&params),
+                              sizeof(P), gx, gy, gz, ranges.data(), ranges.size()));
 }
 
 }  // namespace vk

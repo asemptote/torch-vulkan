@@ -87,6 +87,13 @@ struct Block {
     ranges: RangeAllocator,
 }
 
+impl Block {
+    /// Whether GPU address `address` is in this block's buffer (guards included).
+    fn contains(&self, address: u64) -> bool {
+        address >= self.address && address - self.address < self.size + 2 * self.guard
+    }
+}
+
 /// A sub-allocation. Plain data: give it back with [`Pool::free`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Allocation {
@@ -133,6 +140,19 @@ pub struct Pool {
     ctx: Arc<Context>,
     blocks: Vec<Option<Block>>,
     allocated: u64,
+    /// Live allocations by GPU address (address -> size), for [`Pool::locate`].
+    live: BTreeMap<u64, u64>,
+}
+
+/// What a GPU address points into (see [`Pool::locate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    /// The live allocation `[lo, hi)` (GPU addresses) containing it.
+    Allocation(u64, u64),
+    /// A pool block's memory, but no live allocation: free or guard bytes.
+    Unallocated,
+    /// None of the pool's memory.
+    Outside,
 }
 
 // Block host pointers are only dereferenced through `Allocation`s, whose
@@ -141,7 +161,7 @@ unsafe impl Send for Pool {}
 
 impl Pool {
     pub fn new(ctx: Arc<Context>) -> Self {
-        Self { ctx, blocks: Vec::new(), allocated: 0 }
+        Self { ctx, blocks: Vec::new(), allocated: 0, live: BTreeMap::new() }
     }
 
     /// Sub-allocates `size` bytes, growing the pool if no cached block has
@@ -190,6 +210,7 @@ impl Pool {
             if let Some(offset) = block.ranges.alloc(size) {
                 let offset = block.guard + offset;  // (within the buffer)
                 self.allocated += size;
+                self.live.insert(block.address + offset, size);
                 return Some(Allocation {
                     block: i as u32,
                     offset,
@@ -207,6 +228,41 @@ impl Pool {
         let block = self.blocks[a.block as usize].as_mut().expect("allocation from a released block");
         block.ranges.free(a.offset - block.guard, a.size);
         self.allocated -= a.size;
+        self.live.remove(&a.address);
+    }
+
+    /// The live allocation containing GPU address `address`, if any, else
+    /// whether it lies in the pool's memory at all.
+    pub fn locate(&self, address: u64) -> Located {
+        if let Some((&lo, &size)) = self.live.range(..=address).next_back() {
+            if address - lo < size {
+                return Located::Allocation(lo, lo + size);
+            }
+        }
+        if self.blocks.iter().flatten().any(|b| b.contains(address)) {
+            Located::Unallocated
+        } else {
+            Located::Outside
+        }
+    }
+
+    /// The GPU addresses `[lo, hi)` spanning all of the pool's blocks (empty
+    /// without blocks): no address outside is the pool's.
+    pub fn span(&self) -> (u64, u64) {
+        let lo = self.blocks.iter().flatten().map(|b| b.address).min().unwrap_or(0);
+        let hi = self.blocks.iter().flatten().map(|b| b.address + b.size + 2 * b.guard).max().unwrap_or(0);
+        (lo, hi)
+    }
+
+    /// Every live allocation: its GPU address, size and host pointer.
+    pub fn live_allocations(&self) -> Vec<(u64, u64, *const u8)> {
+        let mut out = Vec::with_capacity(self.live.len());
+        for (&address, &size) in &self.live {
+            if let Some(b) = self.blocks.iter().flatten().find(|b| b.contains(address)) {
+                out.push((address, size, b.host.wrapping_add((address - b.address) as usize) as *const u8));
+            }
+        }
+        out
     }
 
     /// Returns cached blocks that hold no allocations to Vulkan. Queued GPU

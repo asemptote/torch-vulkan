@@ -2,7 +2,7 @@
 //! Run under validation with `TORCH_VK_VALIDATE=1 cargo test`; every test
 //! then also fails on any validation warning or error.
 
-use vkcore::{memory::BLOCK_SIZE, validation_issues, Result, Runtime};
+use vkcore::{as_bytes, memory::BLOCK_SIZE, validation_issues, Result, Runtime};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -223,5 +223,139 @@ fn every_kernel_builds() -> Result<()> {
 {}", failed.join("
 "));
     assert_clean();
+    Ok(())
+}
+
+// Declared dispatches (docs/log/M37): the runtime finds the memory each one
+// touches from its push constants, and the stream puts barriers only where
+// two commands conflict.
+
+fn fill_declared(rt: &Runtime, y: u64, value: f64, n: u32) -> Result<()> {
+    let (groups, stride) = rt.grid_1d(n as u64, 64);
+    rt.dispatch_declared("simple_fill_f64", &[], as_bytes(&Fill { y, value, n, stride }), [groups, 1, 1], &[])
+}
+
+fn axpy_declared(rt: &Runtime, accumulate: bool, a: f64, x: u64, y: u64, n: u32) -> Result<()> {
+    let (groups, stride) = rt.grid_1d(n as u64, 64);
+    rt.dispatch_declared("axpy_f64", &[accumulate as u32], as_bytes(&Axpy { x, y, a, n, stride }), [groups, 1, 1], &[])
+}
+
+use vkcore::Declared;
+
+fn tracked(rt: &Runtime) -> bool {
+    rt.stream.lock().unwrap().mode().tracked()
+}
+
+#[test]
+fn barriers_only_between_conflicting_dispatches() -> Result<()> {
+    let rt = Runtime::new()?;
+    let n = 1 << 16;
+    let xs = (0..8).map(|_| rt.alloc(n as u64 * 8)).collect::<Result<Vec<_>>>()?;
+    let barriers = || rt.barrier_stats().barriers;
+    let b0 = barriers();
+    for (i, x) in xs.iter().enumerate() {
+        fill_declared(&rt, x.address, i as f64, n)?; // independent
+    }
+    let b1 = barriers();
+    for x in &xs[1..] {
+        axpy_declared(&rt, true, 1.0, x.address, xs[0].address, n)?; // reads x (RAW on the first), writes x0 (WAW)
+    }
+    let b2 = barriers();
+    // Readers of x0, then a write to x0 (WAR), through an address inside it.
+    // (Undeclared beyond their addresses, the readers also count as writing
+    // x0, so they are ordered among themselves too; a declaration of x as
+    // read only lets them overlap.)
+    for x in &xs[1..] {
+        axpy_declared(&rt, false, 2.0, xs[0].address, x.address, n)?;
+    }
+    let b3 = barriers();
+    fill_declared(&rt, xs[0].address + 8 * 100, -1.0, 1)?;
+    let b4 = barriers();
+    // Declared read only, readers of x7 need no barrier between them.
+    let (groups, stride) = rt.grid_1d(n as u64, 64);
+    for x in &xs[1..4] {
+        let ro = Declared { ptr: xs[7].address, lo: xs[7].address, hi: xs[7].address + n as u64 * 8, write: 0, pad: 0 };
+        let p = Axpy { x: xs[7].address, y: x.address, a: 1.0, n, stride };
+        rt.dispatch_declared("axpy_f64", &[1], as_bytes(&p), [groups, 1, 1], &[ro])?;
+    }
+    let b4r = barriers();
+    // An undeclared dispatch is ordered against everything before and after.
+    fill(&rt, xs[7].address, 5.0, n)?;
+    fill_declared(&rt, xs[6].address, 6.0, n)?;
+    let b5 = barriers();
+    rt.synchronize()?;
+    let x0 = unsafe { xs[0].as_slice_mut::<f64>() };
+    assert_eq!(x0[0], 28.0);
+    assert_eq!(x0[100], -1.0);
+    for (i, x) in xs.iter().enumerate().skip(1).take(5) {
+        let expected = if i <= 3 { 112.0 } else { 56.0 }; // (x1..x3 += x7, which is 56 too)
+        assert!(unsafe { x.as_slice_mut::<f64>() }.iter().all(|&v| v == expected), "x{i}");
+    }
+    assert!(unsafe { xs[7].as_slice_mut::<f64>() }.iter().all(|&v| v == 5.0));
+    assert!(unsafe { xs[6].as_slice_mut::<f64>() }.iter().all(|&v| v == 6.0));
+    if tracked(&rt) {
+        assert_eq!(b1 - b0, 0, "independent fills");
+        assert_eq!(b2 - b1, 7, "each accumulation into x0 after the one before");
+        assert_eq!(b3 - b2, 7, "each reader of x0 (counted as writing it) after the one before");
+        assert_eq!(b4 - b3, 1, "the write after the reads");
+        assert_eq!(b4r - b4, 0, "readers declared read only");
+        assert_eq!(b5 - b4, 2, "around the undeclared dispatch");
+    }
+    for x in xs {
+        rt.free(x);
+    }
+    assert_clean();
+    Ok(())
+}
+
+#[test]
+fn declared_stream_ordered_reuse() -> Result<()> {
+    let rt = Runtime::new()?;
+    let n = 1 << 16;
+    let x = rt.alloc(n as u64 * 8)?;
+    for _ in 0..50 {
+        let tmp = rt.alloc(n as u64 * 8)?;
+        fill_declared(&rt, tmp.address, 7.0, n)?;
+        axpy_declared(&rt, false, 1.0, tmp.address, x.address, n)?; // x = tmp
+        rt.free(tmp);
+        let reused = rt.alloc(n as u64 * 8)?;
+        assert_eq!(reused.address, tmp.address);
+        fill_declared(&rt, reused.address, -1.0, n)?; // must wait for the read of tmp (WAR)
+        rt.free(reused);
+    }
+    rt.synchronize()?;
+    assert!(unsafe { x.as_slice_mut::<f64>() }.iter().all(|&v| v == 7.0));
+    rt.free(x);
+    assert_clean();
+    Ok(())
+}
+
+#[test]
+fn accesses_from_push_constants() -> Result<()> {
+    use vkcore::declare::push_accesses;
+    use vkcore::Access;
+    let rt = Runtime::new()?;
+    let a = rt.alloc(1000)?;
+    let b = rt.alloc(4096)?;
+    let whole = |x: &vkcore::Allocation| Access { lo: x.address, hi: x.address + x.size, write: true };
+    {
+        let pool = rt.pool.lock().unwrap();
+        // Addresses anywhere inside an allocation stand for all of it; other words are ignored.
+        let push = [a.address + 16, 12345, b.address, 0];
+        assert_eq!(push_accesses(&pool, as_bytes(&push), &[]), Some(vec![whole(&a), whole(&b)]));
+        // A declaration that holds its address narrows it; one that does not is ignored.
+        let narrow = Declared { ptr: a.address + 16, lo: a.address + 16, hi: a.address + 48, write: 0, pad: 0 };
+        let wrong = Declared { ptr: b.address, lo: b.address + 8, hi: b.address + 16, write: 0, pad: 0 };
+        let acc = push_accesses(&pool, as_bytes(&push), &[narrow, wrong]);
+        assert_eq!(acc, Some(vec![Access { lo: a.address + 16, hi: a.address + 48, write: false }, whole(&b)]));
+        // A declaration reaching outside the allocation is ignored too.
+        let outside = Declared { ptr: a.address, lo: a.address, hi: a.address + a.size + 8, write: 1, pad: 0 };
+        assert_eq!(push_accesses(&pool, as_bytes(&[a.address]), &[outside]), Some(vec![whole(&a)]));
+    }
+    let stale = b.address;
+    rt.free(b);
+    // An address in the pool's memory outside every live allocation: undeclared.
+    assert_eq!(push_accesses(&rt.pool.lock().unwrap(), as_bytes(&[stale]), &[]), None);
+    rt.free(a);
     Ok(())
 }
