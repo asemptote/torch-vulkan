@@ -63,6 +63,22 @@ running without the CPU fallback by default (#101).
   (`_bicubic_grid_sample`); in 2-D it sums in the CPU's order, four values
   along x per row and then the rows along y. The bicubic backward is
   autograd of the same composite at both ranks.
+- **The CPU's unnormalisation rounds once.** With the composite, one
+  element of 943,920 in PyTorch's `test_compare_cpu` for 2-D bicubic
+  float32 (0-255 samples, align_corners off) was 0.0016 off, on a value of
+  -0.5 where the 16 taps cancel. Its cause was the source coordinate: the
+  CPU computes `(g + 1) * (size / 2) - 0.5` (and in 3-D `((g + 1) * size -
+  1) / 2`), which its compiler contracts into a fused multiply-add, one
+  rounding; vk rounded the product and the difference separately, and one
+  ulp of a coordinate near 128 moves such a sum by 0.002. The composite now
+  computes the coordinate rounded once from separately rounded operations
+  (`_fused_multiply_add`: Dekker's two-product and Knuth's two-sum, the
+  errors added back before the last rounding), which gives the
+  float64-exact value for 100,000 random coordinates at five sizes, and
+  every grid_sample OpInfo sample is within the test's tolerance. The
+  correction carries no gradient, so autograd still sees `(g + 1) * size /
+  2`. (`gridsample.slang` keeps two roundings: its bilinear and nearest
+  results are within the tolerances, and no test showed a difference.)
 - **A very wide expanded axis.** `test_grid_sample_3d_bicubic_last_voxel_of_a_wide_axis`
   samples the last voxel of a 1-element volume expanded to 2^53 + 1. The
   indexing kernel (`index.slang`) bounds indices in int32, and took the
