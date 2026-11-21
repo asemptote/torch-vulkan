@@ -180,8 +180,8 @@ the strict OpInfo sweep: 689 ops):
 | read logs differing, default vs full | 0 of 1539 tests | 0 of 1539 | 0 of 1537 | 0 of 1537 |
 | read logs differing, default vs default | 0 | 0 | 0 | 0 |
 | OpInfo strict: all on the GPU, read logs differing | H100_OPINFO | 689; 0 of 658 | 689; 0 of 658 | 689; 0 of 658 |
-| `TORCH_VK_BARRIERS=check` | L40S_CHECK | L40S_CHECK | tests/python: all pass | tests/python: all pass |
-| stress tests, 200 programs of 400 ops | pass | pass | 30 x 250: pass | |
+| `TORCH_VK_BARRIERS=check` | not run | test_matmul, test_optim, test_barriers: 154 pass | tests/python: all pass | tests/python: all pass |
+| stress tests, 200 programs of 400 ops | pass | pass | 30 x 250: pass | 6 x 250: pass |
 
 - About 11,000 reads in tests/python and 8,100 in the OpInfo sweep
   compared bit for bit. No test read different bits in two runs with the
@@ -189,10 +189,14 @@ the strict OpInfo sweep: 689 ops):
 - The check reads all live device memory twice per kernel: 22 minutes for
   tests/python on the HD 530 and lavapipe, against under a minute and a
   half. On the NVIDIA GPUs the memory is read over PCIe, and the whole
-  suite would take hours, so there it ran on the tests of the
-  NVIDIA-only paths: cooperative-matrix and split-k products, the
-  optimisers and the stress tests. It found nothing anywhere, and no
-  address at a 4-byte offset.
+  suite would take hours, so there it ran on the L40S over the tests of
+  the paths only NVIDIA takes: cooperative-matrix and split-k products,
+  plus the optimisers and the stress tests (30 minutes for 154 tests). It
+  found nothing anywhere, and no address at a 4-byte offset.
+- The table's runs used PyTorch 2.14.1. After moving to PyTorch 2.15, the
+  A/B runs of tests/python (1625 tests) and the OpInfo sweep were repeated
+  on the HD 530 and lavapipe: 0 of 1552 tests and 0 of 658 ops differing,
+  no noise.
 - PyTorch's test files on the H100 (the 37 files of the full runs), with
   the default barriers and with `every`: PT_RESULTS
 
