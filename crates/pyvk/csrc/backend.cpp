@@ -26,8 +26,14 @@
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/impl/alloc_cpu.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <sstream>
 #include <map>
 #include <set>
@@ -759,6 +765,39 @@ void fix_up_in_place(const at::Tensor& t, bool conj, bool neg) {
   }
 }
 
+// TORCH_VK_READ_LOG=DIR: one line per read of vk memory by the host (copies
+// to the CPU, item()) with a hash of the values read, in DIR/reads-<pid>.txt,
+// between `## name` lines from read_log_mark: runs under different settings
+// can then be compared bit for bit (tools/dev/barrier_ab.py, docs/log/M37).
+std::FILE* read_log() {
+  static std::FILE* file = []() -> std::FILE* {
+    const char* dir = std::getenv("TORCH_VK_READ_LOG");
+    if (dir == nullptr || *dir == 0) return nullptr;
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = static_cast<int>(getpid());
+#endif
+    std::string path = std::string(dir) + "/reads-" + std::to_string(pid) + ".txt";
+    return std::fopen(path.c_str(), "a");
+  }();
+  return file;
+}
+
+void log_read(const at::Tensor& cpu) {
+  std::FILE* f = read_log();
+  if (f == nullptr) return;
+  at::Tensor c = cpu.resolve_conj().resolve_neg().contiguous();
+  const auto* bytes = static_cast<const uint8_t*>(c.const_data_ptr());
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0, n = c.nbytes(); i < n; ++i) h = (h ^ bytes[i]) * 1099511628211ull;
+  std::ostringstream shape;
+  shape << c.sizes();
+  std::fprintf(f, "%016llx %s %s\n", static_cast<unsigned long long>(h), c10::toString(c.scalar_type()),
+               shape.str().c_str());
+  std::fflush(f);
+}
+
 // Copies are conj/neg-aware (registered as fallthrough for the Conjugate and
 // Negative keys): data is copied as stored, then the difference between the
 // source's and destination's lazy conj/neg bits is applied.
@@ -785,6 +824,7 @@ at::Tensor copy_from(const at::Tensor& self, const at::Tensor& dst, bool /*non_b
     if (self.is_conj()) host = host.conj();
     if (self.is_neg()) host = host._neg_view();
     dst.copy_(host);
+    log_read(dst);
   }
   return dst;
 }
@@ -801,6 +841,7 @@ at::Tensor copy_from_and_resize(const at::Tensor& self, const at::Tensor& dst) {
 at::Scalar local_scalar_dense(const at::Tensor& self) {
   TORCH_CHECK(self.numel() > 0, "_local_scalar_dense: Empty tensor not supported");
   synchronize();
+  log_read(host_view_const(self));
   return host_view_const(self).item();
 }
 
@@ -1812,6 +1853,13 @@ extern "C" int vkt_record_fallback(const char* op) {
     return 0;
   } catch (const std::exception&) {
     return 1;
+  }
+}
+
+extern "C" void vkt_read_log_mark(const char* name) {
+  if (std::FILE* f = vk::read_log()) {
+    std::fprintf(f, "## %s\n", name);
+    std::fflush(f);
   }
 }
 

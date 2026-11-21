@@ -59,7 +59,7 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
 | `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
 | `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
-| `TORCH_VK_BARRIERS=full` | Put a full compute + transfer memory barrier before every command, instead of one matched to the two commands' kinds. A debugging switch: it rules out the narrowed barriers when a race is suspected, at about 0.5 us per dispatch. |
+| `TORCH_VK_BARRIERS=full` or `every` | Put a barrier before every command, instead of only where a command touches memory that one since the last barrier wrote, or writes memory one since then read (the default: kernels that touch disjoint memory then run concurrently; docs/log/M37). `every`: a barrier matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier. Debugging switches, to rule out a missed dependency when a race is suspected. |
 | `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500` on discrete GPUs, `0`, blocking at once, on integrated ones and lavapipe, which share the CPU's power or cores). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
 
 ### Choosing kernels
@@ -90,6 +90,8 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 |---|---|
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
 | `TORCH_VK_TRACE=1` | Print every kernel launch and wait for it to finish (slow; finds which kernel fails). |
+| `TORCH_VK_BARRIERS=check` | Run each kernel alone and fail with an error if it changed device memory outside what it was declared to write (the declarations that let the stream leave barriers out; docs/log/M37). Very slow: it reads all live device memory twice per kernel. |
+| `TORCH_VK_READ_LOG=dir` | Log a hash of everything the host reads back from the device (`.cpu()`, `.item()`) to `dir/reads-<pid>.txt`, so that two runs can be compared bit for bit (`tools/dev/barrier_ab.py`). |
 | `TORCH_VK_FALLBACK_DETAIL=1` | Count fallbacks per argument signature, e.g. `"aten::eq.Tensor_out [UInt16 1d, UInt16 1d, Bool 1d]"`. |
 | `TORCH_VK_FALLBACK_TRACE=1` | Print each fallback's arguments (sizes, strides, small values) and where it came from, to stderr. |
 

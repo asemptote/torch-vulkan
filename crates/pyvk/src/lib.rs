@@ -32,6 +32,7 @@ extern "C" {
     fn vkt_clear_fft_caches();
     fn vkt_release_device_error_word();
     fn vkt_take_device_error() -> i32;
+    fn vkt_read_log_mark(name: *const std::ffi::c_char);
     fn vkt_record_fallback(op: *const std::ffi::c_char) -> i32;
     fn vkt_manual_seed(seed: u64);
     fn vkt_initial_seed() -> u64;
@@ -58,6 +59,52 @@ fn synchronize() -> PyResult<()> {
 fn record_fallback(op: &str) -> bool {
     let name = std::ffi::CString::new(op.replace('\0', " ")).unwrap_or_default();
     unsafe { vkt_record_fallback(name.as_ptr()) == 0 }
+}
+
+/// The stream's counts since start-up, as (name, count) pairs: commands
+/// recorded, barriers put between them, and commands recorded without a
+/// declaration of the memory they touch (docs/log/M37).
+#[pyfunction]
+fn barrier_stats() -> PyResult<Vec<(&'static str, u64)>> {
+    let s = py_runtime()?.barrier_stats();
+    Ok(vec![("commands", s.commands), ("barriers", s.barriers), ("undeclared", s.undeclared)])
+}
+
+/// The stream's barrier mode: "tracked", "check", "every" or "full"
+/// (TORCH_VK_BARRIERS; docs/log/M37).
+#[pyfunction]
+fn barrier_mode() -> PyResult<&'static str> {
+    use vkcore::BarrierMode::*;
+    Ok(match py_runtime()?.stream.lock().unwrap().mode() {
+        Tracked => "tracked",
+        Check => "check",
+        Every => "every",
+        Full => "full",
+    })
+}
+
+/// Switches the stream's barrier mode (for tests: A/B runs in one process).
+/// "check" applies to declared dispatches only through TORCH_VK_BARRIERS.
+#[pyfunction]
+fn set_barrier_mode(mode: &str) -> PyResult<()> {
+    use vkcore::BarrierMode::*;
+    let mode = match mode {
+        "tracked" => Tracked,
+        "check" => Check,
+        "every" => Every,
+        "full" => Full,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown barrier mode {mode:?}"))),
+    };
+    py_runtime()?.stream.lock().unwrap().set_mode(mode);
+    Ok(())
+}
+
+/// TORCH_VK_READ_LOG: starts a new section, `name`, of this process's log of
+/// host reads (docs/log/M37).
+#[pyfunction]
+fn read_log_mark(name: &str) {
+    let name = std::ffi::CString::new(name.replace(['\0', '\n'], " ")).unwrap_or_default();
+    unsafe { vkt_read_log_mark(name.as_ptr()) }
 }
 
 /// Optional device features as bits (1 float64, 2 int16, 4 float16, 8 int8).
@@ -188,6 +235,10 @@ fn shutdown() {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     unsafe { vkt_register_backend() };
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
+    m.add_function(wrap_pyfunction!(barrier_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(read_log_mark, m)?)?;
+    m.add_function(wrap_pyfunction!(barrier_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(set_barrier_mode, m)?)?;
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
     m.add_function(wrap_pyfunction!(dispatch_count, m)?)?;
     m.add_function(wrap_pyfunction!(record_fallback, m)?)?;

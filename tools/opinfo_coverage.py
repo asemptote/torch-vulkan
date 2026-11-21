@@ -293,6 +293,7 @@ def worker(args):
     warnings.simplefilter("ignore")
     dtypes = [DTYPES[d] for d in args.dtypes.split(",")]
     shard, nshards = (int(x) for x in args.shard.split("/"))
+    read_log = bool(os.environ.get("TORCH_VK_READ_LOG"))  # (a section per op: tools/dev/barrier_ab.py)
     with open(args.out, "a", encoding="utf-8") as log:
         for index, info in enumerate(op_db):
             name = op_name(info)
@@ -302,6 +303,8 @@ def worker(args):
                 continue  # sparse layouts are out of scope; tensor_split takes CPU index tensors
             log.write(json.dumps({"start": name, "index": index}) + "\n")
             log.flush()
+            if read_log:
+                tv._native.read_log_mark(name)
             result = check_op(info, dtypes, args.samples)
             log.write(json.dumps({"done": name, "index": index, "result": result}) + "\n")
             log.flush()

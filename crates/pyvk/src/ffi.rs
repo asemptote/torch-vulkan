@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use vkcore::Allocation;
+use vkcore::{Allocation, Declared};
 
 use crate::{runtime, RUNTIME};
 
@@ -108,7 +108,9 @@ pub unsafe extern "C" fn vkt_memory_stats(allocated: *mut u64, reserved: *mut u6
 }
 
 /// Queues kernel `name` specialized with `spec[..nspec]`, with `push[..npush]`
-/// as push constants, over a gx x gy x gz grid of workgroups.
+/// as push constants, over a gx x gy x gz grid of workgroups. The stream
+/// orders it after the commands that touched the allocations its push
+/// constants address (`vkcore::declare`).
 #[no_mangle]
 pub unsafe extern "C" fn vkt_dispatch(
     name: *const c_char,
@@ -120,6 +122,24 @@ pub unsafe extern "C" fn vkt_dispatch(
     gy: u32,
     gz: u32,
 ) -> i32 {
+    vkt_dispatch_declared(name, spec, nspec, push, npush, gx, gy, gz, std::ptr::null(), 0)
+}
+
+/// `vkt_dispatch` with `ranges[..nranges]`: for those addresses in the push
+/// constants, the exact ranges the kernel reads or writes through them.
+#[no_mangle]
+pub unsafe extern "C" fn vkt_dispatch_declared(
+    name: *const c_char,
+    spec: *const u32,
+    nspec: usize,
+    push: *const u8,
+    npush: usize,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+    ranges: *const Declared,
+    nranges: usize,
+) -> i32 {
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(e) => return fail(e),
@@ -127,11 +147,8 @@ pub unsafe extern "C" fn vkt_dispatch(
     let Ok(name) = CStr::from_ptr(name).to_str() else { return fail("kernel name is not UTF-8") };
     let spec = if nspec == 0 { &[][..] } else { std::slice::from_raw_parts(spec, nspec) };
     let push = std::slice::from_raw_parts(push, npush);
-    let kernel = match rt.kernels.lock().unwrap().get(name, spec) {
-        Ok(k) => k,
-        Err(e) => return fail(e),
-    };
-    let queued = rt.stream.lock().unwrap().dispatch(&kernel, push, [gx, gy, gz]);
+    let ranges = if nranges == 0 { &[][..] } else { std::slice::from_raw_parts(ranges, nranges) };
+    let queued = rt.dispatch_declared(name, spec, push, [gx, gy, gz], ranges);
     if queued.is_ok() && trace() {
         // Each kernel runs to completion before the next is queued, so a
         // kernel that crashes the driver is the last one printed.
