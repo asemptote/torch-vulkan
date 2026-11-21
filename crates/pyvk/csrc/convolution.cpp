@@ -7,8 +7,12 @@
 //  - forward: im2col as a strided view of the padded input (one copy kernel)
 //    and a batched GEMM against the weight (for one sample or one group,
 //    the weight times the columns laid out as rows, the bias added by it);
-//  - transposed: an ordinary convolution of the zero-inserted input with the
-//    flipped, transposed weight (no accumulation into overlapping windows);
+//  - depthwise (one input channel per group): one multiply-add per tap;
+//  - transposed, with a stride: one convolution of the input for all the
+//    stride's phases (sub-pixel convolution), interleaved into the output;
+//    without (or where the phases would not save work): an ordinary
+//    convolution of the (zero-inserted) input with the flipped, transposed
+//    weight (no accumulation into overlapping windows);
 //  - backward: grad_input is a transposed convolution, grad_weight a GEMM of
 //    grad_output against the same columns, grad_bias a sum.
 
@@ -19,6 +23,8 @@
 namespace vk {
 
 namespace {
+
+int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 // Output length of one spatial dim of a (non-transposed) convolution.
 int64_t conv_out_size(int64_t in, int64_t k, int64_t stride, int64_t pad_lo, int64_t pad_hi, int64_t dilation) {
@@ -62,6 +68,21 @@ at::Tensor pad_spatial(const at::Tensor& x, const std::vector<std::pair<int64_t,
   return any ? at::constant_pad_nd(x, p, 0) : x;
 }
 
+// t reversed along `dims`, by one copy per index (convolution weights: dims
+// of a few taps; aten::flip gathers through a table of offsets, much slower
+// for these shapes).
+at::Tensor reversed(const at::Tensor& t, const std::vector<int64_t>& dims) {
+  at::Tensor r = t;
+  for (int64_t d : dims) {
+    int64_t n = r.size(d);
+    if (n <= 1 || r.numel() == 0) continue;
+    at::Tensor o = at::empty(r.sizes(), r.options());
+    for (int64_t i = 0; i < n; ++i) o.select(d, n - 1 - i).copy_(r.select(d, i));
+    r = o;
+  }
+  return r;
+}
+
 // Plain convolution: x [N, C, *S], w [Co, C/G, *K], symmetric or asymmetric
 // zero padding pad[d] = (lo, hi).
 at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
@@ -83,6 +104,42 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   int64_t Kp = 1;
   for (int64_t v : k) Kp *= v;
   int64_t Cg = C / groups, Cog = Co / groups;
+  if (Cg == 1 && Kp <= 32) {
+    // Depthwise (one input channel per group): per tap, one multiply-add of
+    // the input's strided view into the result, [N, G, Cog, *O] (a product
+    // per group would have one row of k = Kp values: tiny matrices).
+    std::vector<int64_t> acc_shape = {N, groups, Cog}, xv_shape = {N, groups, 1}, w_shape = {1, groups, Cog};
+    std::vector<int64_t> xv_strides = {xp.stride(0), xp.stride(1), 0};
+    for (int64_t d = 0; d < s; ++d) {
+      acc_shape.push_back(out[d]);
+      xv_shape.push_back(out[d]);
+      xv_strides.push_back(xp.stride(2 + d) * stride[d]);
+      w_shape.push_back(1);
+    }
+    at::Tensor wt = w.reshape({Co, Kp});
+    at::Tensor acc = at::empty(acc_shape, x.options());
+    bool first = true;
+    if (bias.has_value() && bias->defined()) {
+      acc.copy_(bias->view(w_shape).expand(acc_shape));
+      first = false;
+    }
+    for (int64_t t = 0; t < Kp; ++t) {
+      int64_t offset = xp.storage_offset(), rest = t;
+      for (int64_t d = s - 1; d >= 0; --d) {
+        offset += (rest % k[d]) * dilation[d] * xp.stride(2 + d);
+        rest /= k[d];
+      }
+      at::Tensor xv = xp.as_strided(xv_shape, xv_strides, offset);
+      at::Tensor wv = wt.select(1, t).view(w_shape);
+      if (first) {
+        at::mul_out(acc, xv, wv);
+        first = false;
+      } else {
+        acc.addcmul_(xv, wv);
+      }
+    }
+    return acc.view(out_shape);
+  }
   if (groups == 1 || N == 1) {
     // out[n, g] = W_g [Cog, Cg*K] @ cols[n, g] [Cg*K, L]: the columns are
     // rows along the output positions (for stride 1, runs of the input),
@@ -127,10 +184,138 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   return y.reshape(out_shape);
 }
 
+// Transposed convolution with a stride, by phases (sub-pixel convolution):
+// x [N, Ci, *S], w [Ci, Co/G, *K]. Along a dim with stride s > 1, input i
+// and tap k reach the uncropped output position o' = o + p = i s + k d.
+// Splitting o' = q s + r, the outputs of phase r (0 <= r < s) take the taps
+// with k d = r + t s, from input i = q - t: an ordinary stride-1
+// convolution of x with T = floor(d (K - 1) / s) + 1 taps (the phase's taps
+// at t, zeros where k d = r + t s has no k), the same input positions for
+// every phase. So the s phases are one convolution with s Co output
+// channels, whose result is interleaved into the output: about K / T times
+// less work than convolving the zero-inserted input (s times for d = 1 and
+// K a multiple of s; docs/log/M46). Dims with stride 1 stay ordinary
+// (flipped kernel, dilation d). Returns an undefined tensor where this does
+// not save work (no stride, or a dilation large enough that T >= K) or the
+// input is empty.
+at::Tensor conv_transpose_phases(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
+                                 at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef output_padding,
+                                 at::IntArrayRef dilation, int64_t groups) {
+  int64_t s = x.dim() - 2, N = x.size(0), Ci = x.size(1), Cog = w.size(1), Co = Cog * groups, Cig = Ci / groups;
+  std::vector<int64_t> T(s), outlen(s), q0(s), qn(s);
+  int64_t taps = 1, phase_taps = 1, P = 1;
+  for (int64_t d = 0; d < s; ++d) {
+    int64_t K = w.size(2 + d), S = x.size(2 + d), full = dilation[d] * (K - 1);
+    outlen[d] = (S - 1) * stride[d] - 2 * padding[d] + full + output_padding[d] + 1;
+    if (S == 0 || outlen[d] <= 0) return {};
+    taps *= K;
+    if (stride[d] == 1) {
+      T[d] = K;
+      phase_taps *= K;
+      continue;
+    }
+    T[d] = full / stride[d] + 1;
+    phase_taps *= T[d];
+    P *= stride[d];
+    // The phases' outputs q0 <= q < q0 + qn cover o' in [p, p + outlen).
+    q0[d] = padding[d] / stride[d];
+    qn[d] = ceil_div(padding[d] + outlen[d], stride[d]) - q0[d];
+  }
+  if (P == 1 || phase_taps >= taps || N == 0 || Co == 0) return {};
+
+  // The phases' weight [G Cog P, Cig, *T]: per strided dim, the kernel
+  // dilated (zeros between taps), zero-padded to T s, as [T, s] (tap d k = r
+  // + t s), t reversed (the convolution's tap T - 1 - t reads input q - t);
+  // other dims' kernels reversed.
+  std::vector<int64_t> wshape = {Ci, Cog};
+  for (int64_t d = 0; d < s; ++d) wshape.push_back(stride[d] == 1 ? w.size(2 + d) : T[d] * stride[d]);
+  at::Tensor wd = w;
+  bool dilate = false;
+  for (int64_t d = 0; d < s; ++d) dilate = dilate || (stride[d] > 1 && wshape[2 + d] != w.size(2 + d));
+  if (dilate) {
+    wd = at::zeros(wshape, w.options());
+    at::Tensor view = wd;
+    for (int64_t d = 0; d < s; ++d) {
+      if (stride[d] > 1) view = view.slice(2 + d, 0, dilation[d] * (w.size(2 + d) - 1) + 1, dilation[d]);
+    }
+    view.copy_(w);
+  }
+  // [G, Cig, Cog, (T, s) or K per dim] -> [G, Cog, s per strided dim, Cig, T or K per dim]
+  std::vector<int64_t> split = {groups, Cig, Cog};
+  std::vector<int64_t> phase_dims, tap_dims;
+  for (int64_t d = 0; d < s; ++d) {
+    if (stride[d] == 1) {
+      tap_dims.push_back(static_cast<int64_t>(split.size()));
+      split.push_back(w.size(2 + d));
+    } else {
+      tap_dims.push_back(static_cast<int64_t>(split.size()));
+      split.push_back(T[d]);
+      phase_dims.push_back(static_cast<int64_t>(split.size()));
+      split.push_back(stride[d]);
+    }
+  }
+  std::vector<int64_t> order = {0, 2};
+  order.insert(order.end(), phase_dims.begin(), phase_dims.end());
+  order.push_back(1);
+  order.insert(order.end(), tap_dims.begin(), tap_dims.end());
+  std::vector<int64_t> wpshape = {Co * P, Cig};
+  for (int64_t d = 0; d < s; ++d) wpshape.push_back(T[d]);
+  at::Tensor wp = reversed(wd.reshape(split), tap_dims).permute(order).reshape(wpshape);
+  std::optional<at::Tensor> bp;
+  if (bias.has_value() && bias->defined()) {
+    bp = bias->view({Co, 1}).expand({Co, P}).reshape({Co * P});
+  }
+
+  // The phases as one convolution: output q0 + j (j < qn) along a strided
+  // dim reads inputs q - t, t < T, so the input is padded by T - 1 - q0
+  // before (negative: cropped) and q0 + qn - S after; other dims as for a
+  // stride-1 transposed convolution.
+  std::vector<std::pair<int64_t, int64_t>> pad;
+  std::vector<int64_t> ones(s, 1), dil(s, 1);
+  for (int64_t d = 0; d < s; ++d) {
+    if (stride[d] == 1) {
+      int64_t full = dilation[d] * (w.size(2 + d) - 1);
+      pad.push_back({full - padding[d], full - padding[d] + output_padding[d]});
+      dil[d] = dilation[d];
+    } else {
+      pad.push_back({T[d] - 1 - q0[d], q0[d] + qn[d] - x.size(2 + d)});
+    }
+  }
+  at::Tensor y = conv_forward(x, wp, bp, ones, pad, dil, groups);  // [N, Co P, *Q]
+
+  // Interleave: out[n, c, j s + r - e] = y[n, c, r, j] per strided dim, e = p - q0 s.
+  std::vector<int64_t> yshape = {N, Co}, zshape = {N, Co}, zorder = {0, 1}, zlen = {N, Co};
+  int64_t ph = 0;
+  for (int64_t d = 0; d < s; ++d) {
+    if (stride[d] > 1) yshape.push_back(stride[d]);
+  }
+  for (int64_t d = 0; d < s; ++d) {
+    yshape.push_back(stride[d] == 1 ? outlen[d] : qn[d]);
+  }
+  int64_t nphase = static_cast<int64_t>(phase_dims.size());
+  for (int64_t d = 0; d < s; ++d) {
+    zorder.push_back(2 + nphase + d);
+    zshape.push_back(stride[d] == 1 ? outlen[d] : qn[d]);
+    if (stride[d] > 1) {
+      zorder.push_back(2 + ph++);
+      zshape.push_back(stride[d]);
+    }
+    zlen.push_back(stride[d] == 1 ? outlen[d] : qn[d] * stride[d]);
+  }
+  at::Tensor z = y.view(yshape).permute(zorder).contiguous().view(zlen);
+  for (int64_t d = 0; d < s; ++d) {
+    if (stride[d] > 1) z = z.narrow(2 + d, padding[d] - q0[d] * stride[d], outlen[d]);
+  }
+  return z.contiguous();
+}
+
 // Transposed convolution: x [N, Ci, *S], w [Ci, Co/G, *K].
 at::Tensor conv_transpose_forward(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
                                   at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef output_padding,
                                   at::IntArrayRef dilation, int64_t groups) {
+  if (at::Tensor y = conv_transpose_phases(x, w, bias, stride, padding, output_padding, dilation, groups); y.defined()) {
+    return y;
+  }
   int64_t s = x.dim() - 2, N = x.size(0), Ci = x.size(1), Cog = w.size(1), Co = Cog * groups;
   // Insert stride - 1 zeros between input elements.
   std::vector<int64_t> dil_shape = {N, Ci};
@@ -163,7 +348,7 @@ at::Tensor conv_transpose_forward(const at::Tensor& x, const at::Tensor& w, cons
   at::Tensor wt = w.reshape(gshape).transpose(1, 2);
   std::vector<int64_t> wshape = {Co, Cig};
   wshape.insert(wshape.end(), w.sizes().begin() + 2, w.sizes().end());
-  wt = wt.reshape(wshape).flip(flip_dims);
+  wt = reversed(wt.reshape(wshape), flip_dims);
   return conv_forward(xd, wt, bias, ones, pad, dilation, groups);
 }
 
@@ -244,7 +429,7 @@ at::Tensor conv_weight_grad(const at::Tensor& x, const at::Tensor& g, at::IntArr
     return at::zeros(wsize, x.options());
   }
   at::Tensor cols = im2col_view(pad_spatial(x, pad), k, stride, dilation, out);      // [N, L, C*K]
-  cols = cols.view({N * L, groups, Cg * Kp}).permute({1, 0, 2});                     // [G, N*L, Cg*K]
+  cols = cols.reshape({N * L, groups, Cg * Kp}).permute({1, 0, 2});                  // [G, N*L, Cg*K]
   at::Tensor gg = g.reshape({N, groups, Cog, L}).permute({1, 2, 0, 3}).reshape({groups, Cog, N * L});
   return at::bmm(gg, cols).reshape(wsize);                                            // [G, Cog, Cg*K]
 }
