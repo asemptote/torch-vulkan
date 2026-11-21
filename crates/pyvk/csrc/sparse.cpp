@@ -312,6 +312,13 @@ at::Tensor& mul_out(const at::Tensor& self, const at::Tensor& other, at::Tensor&
 // beta self + alpha (sparse [n, m] @ dense [m, k]) into out (dense [n, k]).
 at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
                       const at::Scalar& alpha, at::Tensor& out) {
+  // (operands on two devices reach this kernel through the sparse dispatch
+  // key: the device check of PyTorch's kernels)
+  for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&self, &mat2, &out}) {
+    TORCH_CHECK(t->device() == mat1.device(), "Expected all tensors to be on the same device, but found at least two "
+                "devices, ", is_vk(mat1) ? mat1.device() : t->device(), " and ", is_vk(mat1) ? t->device() : mat1.device(),
+                "!");
+  }
   TORCH_CHECK(mat1.is_sparse() && !mat2.is_sparse(), "addmm: expected a sparse mat1 and a dense mat2");
   TORCH_CHECK(mat1.sparse_dim() == 2 && mat1.dense_dim() == 0, "addmm: matrices expected, got ", mat1.sparse_dim(),
               "D sparse tensor");

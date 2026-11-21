@@ -288,3 +288,5 @@ def test_compressed_batched_and_reducing_products():
     with pytest.raises(RuntimeError, match="found at least two devices, vk:0 and cpu!"):
         torch.sparse_csr_tensor(torch.tensor([0, 2, 4], device="vk"), torch.tensor([0, 1, 0, 1]),
                                 torch.tensor([1.0, 2, 3, 4], device="vk"), (2, 3), check_invariants=True)
+    with pytest.raises(RuntimeError, match="Expected all tensors to be on the same device"):
+        torch.addmm(torch.rand(3, 3), torch.rand(3, 3).to_sparse().to("vk"), torch.rand(3, 3, device="vk"))
