@@ -37,6 +37,11 @@
 // column within a band, instead of row by row, so that the workgroups
 // running at once share their A and B panels in L2.
 //
+// C_F32 = 1: C and Cin are float32, and C is stored unrounded: float32
+// products at torch.set_float32_matmul_precision's "medium" and "high",
+// which csrc/linalg.cpp runs as bfloat16 products of their operands'
+// bfloat16 parts (bf16parts.slang; docs/log/M41).
+//
 // Shared memory: the A and B blocks with 8 values of padding per row (rows
 // stay 16-byte aligned, as cooperative-matrix loads need, and start in
 // different banks), plus one float32 fragment per subgroup: 38 KiB for the
@@ -82,6 +87,7 @@ struct Params
 
 [vk::constant_id(3)] const int SPLIT = 0;
 [vk::constant_id(4)] const int GROUP = 0;
+[vk::constant_id(5)] const int C_F32 = 0;
 
 // Tile shapes (csrc/linalg.cpp mirrors BM and BN). Measured at 2048^3 to
 // 8192^3 (TFLOP/s, H100 NVL / L40S, M22): 128 x 256 x 32 with 4 x 4
@@ -343,9 +349,14 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
                 else if (gm < p.m && gn < p.n)
                 {
                     float v = alpha * Cs[sg * 256 + e];
+                    int ci = batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn;
+                    int co = batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn;
                     if (USE_CIN != 0)  // beta == 0 must ignore Cin entirely (it may hold NaN)
-                        v += beta * to_f(p.cin[batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn]);
-                    p.c[batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = from_f(v);
+                        v += beta * (C_F32 != 0 ? ((float*)p.cin)[ci] : to_f(p.cin[ci]));
+                    if (C_F32 != 0)
+                        ((float*)p.c)[co] = v;
+                    else
+                        p.c[co] = from_f(v);
                 }
             }
             GroupMemoryBarrierWithWaveSync();

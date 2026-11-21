@@ -94,6 +94,39 @@ their dtypes. `torch.vk.get_amp_supported_dtype()` lists float16, bfloat16
 and float32. Combine it with `torch.amp.GradScaler("vk")` for float16
 training, as on CUDA.
 
+## float32 matrix products and `torch.set_float32_matmul_precision`
+
+By default (`"highest"`) float32 matrix products are computed in float32.
+On GPUs with bfloat16 cooperative matrices (tensor cores: NVIDIA's from
+Ampere on, with a driver that has `VK_KHR_shader_bfloat16`),
+`torch.set_float32_matmul_precision` trades precision for speed as it does
+on CUDA, but with bfloat16 where CUDA uses TF32 (Vulkan has no TF32
+cooperative matrices):
+
+| Setting | float32 products on "vk" | Error of each product a b | L40S, 8192^3 |
+|---|---|---|---|
+| `"highest"` (default) | float32 | float32's | 17 TFLOP/s |
+| `"high"` | each operand split into two bfloat16 parts, hi + lo; hi hi + hi lo + lo hi, three bfloat16 products summed in float32 | under 2^-14 \|a b\| (about 16 bits) | 49 TFLOP/s |
+| `"medium"` | operands rounded to bfloat16, one bfloat16 product summed in float32 | about 2^-7 \|a b\| (8 bits) | 142 TFLOP/s |
+
+- It applies to `mm`, `bmm`, `addmm`, `baddbmm`, `matmul`, `nn.Linear`,
+  `einsum` and other ops made of those, forward and backward, and to the
+  real and imaginary products of complex64 ones. Results are still the same
+  from run to run.
+- As on CUDA, it does not apply to convolutions, pooling and interpolation
+  (written as products on "vk"), factorisations and solves, or the products
+  inside quantised and sparse ops: those stay in float32.
+- Matrix-vector products (one row or column) stay in float32: they are
+  bound by memory, not arithmetic.
+- Elsewhere (no bfloat16 cooperative matrices, `TORCH_VK_GEMM` set,
+  `TORCH_VK_DISABLE=bfloat16` or `coopmat`) the setting changes nothing,
+  as on a CUDA GPU without TF32.
+- Infinities and NaN in the operands give the infinities and NaN of the
+  float32 product; finite values beyond bfloat16's largest (3.39e38) are
+  truncated, not rounded to infinity.
+- The bfloat16 parts are written to temporary tensors first: 2 bytes per
+  operand value for `"medium"`, 6 for `"high"`.
+
 ## Environment variables
 
 Set them before importing `torch_vulkan`; most are read once, at first use.

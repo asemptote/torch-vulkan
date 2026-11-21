@@ -211,6 +211,7 @@ at::Tensor convolution_compute(const at::Tensor& input, const at::Tensor& weight
 at::Tensor convolution(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias,
                        at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed,
                        at::IntArrayRef output_padding, int64_t groups) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   at::Tensor result =
       convolution_compute(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups);
   // (the CPU's rule, mkldnn's and the slow path's: channels-last output if
@@ -309,6 +310,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convolution_backward(
     const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride,
     at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed, at::IntArrayRef output_padding,
     int64_t groups, std::array<bool, 3> mask) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   auto [gi, gw, gb] = convolution_backward_compute(grad_output, input, weight, stride, padding, dilation, transposed,
                                                    output_padding, groups, mask);
   std::vector<int64_t> bias_sizes = {transposed ? weight.size(1) * groups : weight.size(0)};
