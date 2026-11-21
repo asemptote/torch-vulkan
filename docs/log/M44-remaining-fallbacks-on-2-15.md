@@ -1,4 +1,4 @@
-# The last CPU fallbacks and edge cases on PyTorch 2.15 (M41)
+# The last CPU fallbacks and edge cases on PyTorch 2.15 (M44)
 
 Issue #91. After the move to PyTorch 2.15 (M36), a re-run of the failing
 tests of PyTorch's 36 test files on lavapipe still reached the CPU in a few
