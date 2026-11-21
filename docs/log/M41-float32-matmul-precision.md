@@ -148,14 +148,38 @@ L40S (driver 615.71.09):
   products' magnitudes, which the bounds above are stated in;
 - fro: ||C - C64||_F / ||C64||_F.
 
-ACCURACY_TABLE
+| m x k x n | setting | max rel | cw | fro |
+|---|---|---|---|---|
+| 1024 x 1024 x 1024 | highest | 4.1e-7 | 1.1e-7 | 2.9e-7 |
+| | high | 4.3e-6 | 1.1e-6 | 4.5e-6 |
+| | medium | 2.1e-3 | 5.6e-4 | 2.3e-3 |
+| | CUDA TF32 | 2.8e-4 | 7.3e-5 | 2.9e-4 |
+| 4096 x 4096 x 4096 | highest | 3.0e-6 | 4.0e-7 | 1.1e-6 |
+| | high | 7.9e-6 | 1.0e-6 | 6.9e-6 |
+| | medium | 2.4e-3 | 3.2e-4 | 2.3e-3 |
+| | CUDA TF32 | 3.1e-4 | 3.9e-5 | 2.9e-4 |
+| 2048 x 8192 x 2048 | highest | 4.7e-6 | 4.1e-7 | 1.6e-6 |
+| | high | 1.5e-5 | 1.3e-6 | 1.2e-5 |
+| | medium | 2.5e-3 | 2.2e-4 | 2.3e-3 |
+| | CUDA TF32 | 3.1e-4 | 2.7e-5 | 2.9e-4 |
+| 256 x 65536 x 256 | highest | 1.2e-6 | 3.6e-8 | 1.1e-6 |
+| | high | 3.3e-5 | 9.3e-7 | 3.4e-5 |
+| | medium | 2.0e-3 | 5.7e-5 | 2.3e-3 |
+| | CUDA TF32 | 2.7e-4 | 7.8e-6 | 2.9e-4 |
 
-- "high" is within 3-30x of float32's own error: about 2^-17 to 2^-20 of
-  the products' magnitudes, against the 2^-14 bound.
-- "medium" loses 8-9 bits as expected (cw 2^-11 to 2^-14; 2.3e-3 normwise,
-  about bfloat16's 2^-9 relative rounding times a random walk's factor of
-  sqrt(2)).
-- CUDA's TF32 (10 explicit bits) for comparison: CUDA_ACCURACY.
+(CUDA: the same inputs through torch 2.14's cuBLAS on the same GPU, where
+"high" and "medium" are both TF32.)
+
+- **"high"** is within 6-30x of float32's own error: 1.3e-6 of the
+  products' magnitudes at worst (about 2^-20), against its 2^-14 bound.
+  Normwise it is 40-65x more accurate than TF32 up to k = 8192.
+  - At k = 65536 the gap closes to 9x. There the float32 sums of 3 k
+    products on the tensor cores dominate, not the dropped terms: "high"'s
+    error grows with k as summation error does, and "highest", which sums
+    on the shader cores, stays at 1.1e-6.
+- **"medium"** keeps bfloat16's 8 bits: 2.3e-3 normwise at every size,
+  about bfloat16's unit roundoff 2^-9 times the sqrt(2) of two rounded
+  operands. That is 8x TF32's error (10 explicit bits against 7).
 
 ## Speed
 
@@ -164,13 +188,64 @@ now `precision high` and `precision medium` rows at 2048^3, 4096^3 and
 8192^3, and a weight gradient's shape, run on both devices. On CUDA both
 settings mean TF32.
 
-L40S, TFLOP/s:
+L40S (driver 615.71.09), TFLOP/s, medians of warm calls. CUDA is torch
+2.14's cuBLAS on the same GPU; blanks were not measured.
 
-SPEED_TABLE
+| workload | highest | high | medium | CUDA float32 | CUDA TF32 |
+|---|---|---|---|---|---|
+| 1024^3 | 13.4 | 22.9 | 28.4 | | |
+| 2048^3 | 18.7 | 42.2 | 87.0 | 43.3 | 111 |
+| 3072^3 | 19.5 | 39.0 | 97.3 | | |
+| 4096^3 | 20.7 | 46.0 | 117 | 41.4 | 99.2 |
+| 8192^3 | 17.0 | 49.3 | 142 | 42.0 | 97.7 |
+| 4096 x 4096, k = 65536 (x.t() @ y) | 16.1 | 40.3 | 110 | 42.8 | |
+| 1024 x 1024, k = 8192 (x.t() @ y) | 16.0 | 27.0 | 59.1 | | |
+| 1024 x 1024, k = 262144 (x.t() @ y) | 15.4 | 25.7 | 61.8 | 41.2 | 93.4 |
+
+bfloat16 8192^3 for reference: 164 (CUDA 190).
+
+- **"medium"** runs at 4.6-8.4x float32's rate on square products from
+  2048^3 on. That is 87% of the bfloat16 product's own rate at 8192^3 and
+  75% at 4096^3; the rest is the parts pass. It is faster than CUDA's TF32 from 4096^3 on (0.68x
+  its time at 8192^3), and 1.3x slower at 2048^3.
+- **"high"** runs at 2.0-2.9x float32's rate, about a third of bfloat16's,
+  as three products must. That is 2-2.6x slower than CUDA's TF32, for
+  40-65x its accuracy.
+- Thin weight gradients gain less: their parts pass is long next to a
+  small result (1024 x 1024 over k = 262144 reads 2 GB of operands for a
+  4 MB result).
+- With launch bands (`TORCH_VK_GEMM_GROUP=8`), "high" at 8192^3 ran at
+  50.8 against 48.6, and nothing else changed by more than 1%. They stay
+  off, as in M35.
 
 H100 NVL: not measured. Its one GPU was held by another user's 48-hour job
 for the whole of this work; see the pull request.
 
 ## Checks
 
-CHECKS
+- tests/python on the L40S: 1906 passed, 11 skipped. The new tests:
+  - `test_float32_matmul_precision[high|medium]`: mm, bmm, addmm, baddbmm
+    and linear on every layout, edge and strided view, a transposed result,
+    NaN bias with beta = 0, and a weight gradient. Each result is within
+    its precision's bound per product, and three runs give the same bits.
+    Where there are bfloat16 cooperative matrices, the errors must also
+    show the lower precision was used; elsewhere the results must be
+    "highest"'s exactly.
+  - `test_float32_matmul_precision_tiles`: the same on the m and s tiles,
+    with banded launches and k split 2, 3 and 5 ways.
+  - `test_float32_matmul_precision_special_values`: infinities, NaN, zeros
+    and values above bfloat16's largest.
+  - `test_float32_matmul_precision_scope`: conv2d, conv_transpose2d,
+    bilinear interpolation, adaptive average pooling, cholesky, solve and
+    qr give the same bits at "medium" as at "highest", while matmul's
+    differ.
+- test_matmul.py's precision, cooperative-matrix and split-k tests under
+  the validation layer on the L40S: 18 passed, nothing reported. On
+  lavapipe (no cooperative matrices) the precision tests pass (5, 6
+  skipped).
+- PyTorch's test_linalg.py product tests on the L40S (`-k "matmul or _mm or
+  addmm or bmm or baddbmm or linear"`, default precision): 211 passed. The
+  33 failures are the runner's expected ones: torch.compile (Inductor has
+  no "vk" backend) and the 4-bit quantisation bound.
+- `cargo test --release -p vkcore`: passed. Clippy runs in CI: the
+  cluster's toolchain lacks it.

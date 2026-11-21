@@ -471,8 +471,9 @@ print(worst)
 """
 
 
-def float32_precision_run(precision, env=None):
-    out = subprocess.run([sys.executable, "-c", PRECISION_SCRIPT, precision, repr(PRECISION_BOUND[precision])],
+def float32_precision_run(precision, env=None, bound=None):
+    bound = PRECISION_BOUND[precision] if bound is None else bound
+    out = subprocess.run([sys.executable, "-c", PRECISION_SCRIPT, precision, repr(bound)],
                          env=dict(os.environ, **(env or {})), capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     return float(out.stdout.strip().splitlines()[-1])
@@ -482,15 +483,15 @@ def float32_precision_run(precision, env=None):
 def test_float32_matmul_precision(precision):
     # mm, bmm, addmm, baddbmm and linear on every layout and edge, within the
     # precision's bound per product and the same from run to run; where the
-    # device has no bfloat16 cooperative matrices, float32 products as at
-    # "highest" (well within the bound)
+    # device has no bfloat16 cooperative matrices, the float32 products of
+    # "highest"
     worst = float32_precision_run(precision)
     if COOPMAT[torch.bfloat16]:
         # (the products did run at the lower precision: "medium" loses 8
         # bits; "high"'s largest errors are those of its 16 bits)
         assert worst > (2**-12 if precision == "medium" else 2**-21), worst
     else:
-        assert worst < 2**-20, worst
+        assert worst == float32_precision_run("highest", bound=PRECISION_BOUND[precision])
 
 
 @pytest.mark.parametrize("env", [dict(TORCH_VK_SPLIT_K="3"), dict(TORCH_VK_SPLIT_K="2", TORCH_VK_GEMM_TILE="m"),
