@@ -89,7 +89,7 @@ other work: about 10% noise):
 float16 matrix products on the HD 530 (GFLOP/s): 1024^3 75 -> 117, 2048^3
 84 -> 133 with float16 arithmetic (gemm4s_f16h, against float32 sums).
 
-MALI_RESULTS
+Mali-G57 (Galaxy A13): to follow (tile sweep, Kokoro end to end).
 
 ## Tests
 
