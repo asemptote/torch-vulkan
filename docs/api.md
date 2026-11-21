@@ -68,6 +68,10 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 |---|---|
 | `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
 | `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size for the `subgroup` kernels (default 16 for float32, 8 for float64), within the device's range. |
+| `TORCH_VK_COMPUTE_UNITS=n` | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, `0`, unknown, elsewhere: then products are never split). |
+| `TORCH_VK_SPLIT_K=n` | Split every float matrix product's k into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size. The pieces' sums are added in a fixed order, so results are the same from run to run either way. For testing and tuning. |
+| `TORCH_VK_GEMM_TILE=l`, `m` or `s` | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every float16 and bfloat16 product, instead of choosing by the GPU's size. For testing and tuning. |
+| `TORCH_VK_GEMM_GROUP=g` | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). For testing and tuning. |
 | `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. |
 | `TORCH_VK_EIGH_QL=1` | `eigh`: use tridiagonal QL instead of divide and conquer for every size (comparison and debugging). |
 | `TORCH_VK_SVD_JACOBI=1` | `svd`: use one-sided Jacobi instead of bidiagonalisation for every size (comparison and debugging). |

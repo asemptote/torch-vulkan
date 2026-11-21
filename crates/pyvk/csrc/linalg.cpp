@@ -25,7 +25,7 @@ namespace {
 struct GemmParams {
   uint64_t a, b, c, cin;
   uint64_t alpha, beta;  // pack_param slots
-  uint32_t m, n, k, pad;
+  uint32_t m, n, k, kc;  // kc: k per split (gemmcm.slang and gemmsg.slang with SPLIT)
   int32_t a_sm, a_sk, a_sb;
   int32_t b_sk, b_sn, b_sb;
   int32_t c_sm, c_sn, c_sb;
@@ -48,9 +48,56 @@ static_assert(sizeof(GemvParams) == 96 && offsetof(GemvParams, m_sr) == 56 && of
 constexpr int64_t kTile = 64;  // BM = BN in shaders/gemm.slang
 constexpr int64_t kGemvRows0 = 8, kGemvRows1 = 64;  // rows per workgroup in shaders/gemv.slang's modes
 constexpr int64_t kSgThreads = 128, kSgRows = 8;  // WG and MR in shaders/gemmsg.slang
-constexpr int64_t kCoopTileM = 128, kCoopTileN = 256;  // BM and BN in shaders/gemmcm.slang
+constexpr int64_t kSgOccupancy = 8;  // gemmsg workgroups an SM runs at once (k is split below that)
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kMaxGroups = 65535;
+
+struct SplitKParams {
+  uint64_t ws, c, cin;
+  uint64_t alpha, beta;  // pack_param slots
+  uint32_t m, n, splits, stride;
+  int32_t c_sm, c_sn, c_sb;
+  int32_t cin_sm, cin_sn, cin_sb;
+};
+static_assert(sizeof(SplitKParams) == 80, "must match shaders/splitk.slang");
+
+// shaders/gemmcm.slang's tiles (its axis TILE): label, BM, BN.
+struct CoopTile {
+  const char* label;
+  int64_t bm, bn;
+};
+constexpr CoopTile kCoopTiles[] = {{"l", 128, 256}, {"m", 128, 128}, {"s", 64, 128}};
+
+int64_t env_int(const char* name, int64_t fallback) {
+  const char* v = std::getenv(name);
+  return v != nullptr && *v != 0 ? std::atoll(v) : fallback;
+}
+
+// The device's SMs or compute units (0: unknown).
+int64_t compute_units() {
+  static const int64_t units = vkt_compute_units();
+  return units;
+}
+
+// Testing and tuning switches: TORCH_VK_GEMM_TILE (l, m or s) forces
+// gemmcm.slang's tile, TORCH_VK_SPLIT_K=n splits every product's k n ways
+// where it can (1: never), TORCH_VK_GEMM_GROUP=g the launch order's bands
+// of tile rows (0: row by row).
+std::string forced_tile() {
+  static const std::string tile = [] {
+    const char* env = std::getenv("TORCH_VK_GEMM_TILE");
+    return std::string(env != nullptr ? env : "");
+  }();
+  return tile;
+}
+int64_t forced_splits() {
+  static const int64_t s = env_int("TORCH_VK_SPLIT_K", 0);
+  return s;
+}
+int64_t gemm_group() {
+  static const int64_t g = env_int("TORCH_VK_GEMM_GROUP", -1);
+  return g;
+}
 
 // TORCH_VK_GEMM: "tiled" (gemm.slang), "float4" (gemm4.slang where it can),
 // "subgroup" (gemmsg.slang where the device can run it), or unset. Any but
@@ -220,16 +267,131 @@ uint32_t coop_mode(const at::Tensor& t) {
   return 0;
 }
 
+int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
+// How many pieces of k would let `groups` workgroups fill `slots` (the
+// workgroups the GPU runs at once, about), as llama.cpp's Vulkan backend
+// chooses: none while k is under `min_k` or the workgroups fill more than
+// two thirds of the slots, 3 pieces between a half and two thirds, else
+// enough to fill them, at most `cap`.
+int64_t fill_splits(int64_t groups, int64_t slots, int64_t k, int64_t min_k, int64_t cap) {
+  if (slots <= 0 || k < min_k) return 1;
+  if (2 * groups <= slots) return std::min(slots / groups, cap);
+  if (3 * groups <= 2 * slots) return 3;
+  return 1;
+}
+
+// The pieces k is split into (TORCH_VK_SPLIT_K, else `wanted`), at most one
+// per 256 values of k, and the k of each (kc, a multiple of 256; the last
+// piece may be shorter): 1 for no split.
+int64_t split_pieces(int64_t wanted, int64_t k, int64_t& kc) {
+  int64_t s = forced_splits() > 0 ? forced_splits() : wanted;
+  s = std::min(s, ceil_div(k, 256));
+  if (s <= 1) {
+    return 1;
+  }
+  kc = ceil_div(ceil_div(k, s), 256) * 256;
+  return ceil_div(k, kc);
+}
+
+// c = alpha a @ b (+ beta cin) split along k: GEMM kernel `kernel` (with
+// spec constants `spec`, whose [0] is USE_CIN and [split_spec] SPLIT; p from
+// gemm_params) writes the `splits` partial sums of each product (k in
+// pieces of kc) to a workspace of `partial` values, and shaders/splitk.slang
+// adds them up in a fixed order, scales them, adds beta cin and rounds:
+// results are the same from run to run. Returns false where the workspace
+// would be too large to address (the caller then runs the product whole).
+bool split_k_gemm(const std::string& kernel, std::vector<uint32_t> spec, size_t split_spec, GemmParams p, int64_t gx,
+                  int64_t gy, int64_t splits, int64_t kc, const at::Tensor& c, const at::Tensor* cin, double alpha,
+                  double beta, at::ScalarType partial) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2);
+  if (batch * splits > kMaxGroups || batch * splits * m * n > (int64_t(1) << 28)) {
+    return false;
+  }
+  at::Tensor ws = at::empty({batch * splits, m, n}, c.options().dtype(partial));
+  bool use_cin = p.cin != 0;
+  GemmParams q = p;
+  q.c = gpu_address_out(ws);
+  q.cin = 0;
+  q.kc = static_cast<uint32_t>(kc);
+  q.c_sb = static_cast<int32_t>(m * n);
+  q.c_sm = static_cast<int32_t>(n);
+  q.c_sn = 1;
+  spec[0] = 0;
+  spec[split_spec] = 1;
+  dispatch(kernel, spec, q, static_cast<uint32_t>(gx), static_cast<uint32_t>(gy), static_cast<uint32_t>(batch * splits));
+  SplitKParams r{};
+  r.ws = gpu_address(ws);
+  r.c = gpu_address_out(c);
+  r.cin = use_cin ? gpu_address(*cin) : 0;
+  r.alpha = pack_param(alpha, partial);
+  r.beta = pack_param(beta, partial);
+  r.m = static_cast<uint32_t>(m);
+  r.n = static_cast<uint32_t>(n);
+  r.splits = static_cast<uint32_t>(splits);
+  r.c_sm = static_cast<int32_t>(c.stride(1));
+  r.c_sn = static_cast<int32_t>(c.stride(2));
+  r.c_sb = static_cast<int32_t>(c.stride(0));
+  if (use_cin) {
+    r.cin_sm = static_cast<int32_t>(cin->stride(1));
+    r.cin_sn = static_cast<int32_t>(cin->stride(2));
+    r.cin_sb = static_cast<int32_t>(cin->stride(0));
+  }
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(m * n), &groups, &r.stride));
+  at::ScalarType t = c.scalar_type();
+  const char* label = t == at::kHalf ? "f16" : t == at::kBFloat16 ? "bf16" : t == at::kFloat ? "f32" : "f64";
+  dispatch(std::string("splitk_") + label, {use_cin ? 1u : 0u}, r, groups, static_cast<uint32_t>(batch));
+  return true;
+}
+
+// gemmcm.slang's tile for a batch of m x n products and the pieces k is
+// split into, by the GPU's SM count U (docs/log/M35: measured on the
+// L40S; TORCH_VK_GEMM_TILE forces the tile). An SM runs one
+// large tile (8 subgroups) at a time, about as fast as two smaller ones.
+// - U unknown: the large tile.
+// - At least U large tiles: whole rounds of them, unless the medium tile's
+//   rounds would be fuller by a tenth (at 3072^3 the large tiles' third
+//   round runs 4 of them).
+// - Fewer: split k to fill the SMs (where k >= 2048: weight gradients'
+//   x.t() @ y); else the large tile when they fill two thirds of the SMs,
+//   else the small tile (more workgroups for a small product).
+struct CoopPlan {
+  const CoopTile* tile;
+  int64_t splits;
+};
+CoopPlan coop_plan(int64_t m, int64_t n, int64_t k, int64_t batch) {
+  int64_t units = compute_units();
+  auto tiles = [&](const CoopTile& t) { return ceil_div(m, t.bm) * ceil_div(n, t.bn) * batch; };
+  const CoopTile &large = kCoopTiles[0], &medium = kCoopTiles[1], &small = kCoopTiles[2];
+  for (const CoopTile& t : kCoopTiles) {
+    if (forced_tile() == t.label) return {&t, fill_splits(tiles(t), units, k, 2048, 8)};
+  }
+  if (units == 0) {
+    return {&large, 1};
+  }
+  int64_t tl = tiles(large), tm = tiles(medium);
+  if (tl >= units) {
+    auto full = [&](int64_t t) { return double(t) / double(ceil_div(t, units) * units); };
+    return {full(tm) >= full(tl) + 0.1 ? &medium : &large, 1};
+  }
+  int64_t s = fill_splits(tl, units, k, 2048, 8);
+  if (s > 1 || 3 * tl > 2 * units) {
+    return {&large, s};
+  }
+  return {&small, 1};
+}
+
 // gemm() for float16 and bfloat16: shaders/gemmcm.slang on cooperative
 // matrices, products accumulated in float32 and rounded once. Returns false
 // where it does not run (no cooperative matrices of the type, matrix-vector
 // products: those take the float32 route of other 16-bit products).
 bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin,
                   double alpha, double beta) {
-  int64_t batch = c.size(0), m = c.size(1), n = c.size(2);
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
   at::ScalarType t = c.scalar_type();
   if (!use_coopmat(t) || a.scalar_type() != t || b.scalar_type() != t || (cin != nullptr && cin->scalar_type() != t) ||
-      m == 1 || n == 1 || a.size(2) == 0) {
+      m == 1 || n == 1 || k == 0) {
     return false;  // (k = 0 too: gemmcm.slang's pipelined k loop needs one tile; it hung on NVIDIA)
   }
   for (const at::Tensor* t : {&a, &b, &c, cin}) {
@@ -237,7 +399,9 @@ bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
       return false;
     }
   }
-  int64_t gx = (n + kCoopTileN - 1) / kCoopTileN, gy = (m + kCoopTileM - 1) / kCoopTileM;
+  CoopPlan plan = coop_plan(m, n, k, batch);
+  const CoopTile& tile = *plan.tile;
+  int64_t gx = ceil_div(n, tile.bn), gy = ceil_div(m, tile.bm);
   if (gx > kMaxGroups || gy > kMaxGroups || batch > kMaxGroups) {
     return false;
   }
@@ -247,10 +411,14 @@ bool coop_gemm_16(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c,
   GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
   p.alpha = pack_param(alpha, at::kFloat);  // (the kernel scales in float32)
   p.beta = pack_param(beta, at::kFloat);
-  dispatch(t == at::kHalf ? "gemmcm_f16" : "gemmcm_bf16", {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b)}, p,
-           static_cast<uint32_t>(gx),
-           static_cast<uint32_t>(gy),
-           static_cast<uint32_t>(batch));
+  std::string kernel = std::string(t == at::kHalf ? "gemmcm_f16_" : "gemmcm_bf16_") + tile.label;
+  int64_t group = gemm_group() >= 0 ? gemm_group() : 0;
+  std::vector<uint32_t> spec = {p.cin != 0 ? 1u : 0u, coop_mode(a), coop_mode(b), 0u, static_cast<uint32_t>(group)};
+  int64_t kc = 0, splits = split_pieces(plan.splits, k, kc);
+  if (splits > 1 && split_k_gemm(kernel, spec, 3, p, gx, gy, splits, kc, c, cin, alpha, beta, at::kFloat)) {
+    return true;
+  }
+  dispatch(kernel, spec, p, static_cast<uint32_t>(gx), static_cast<uint32_t>(gy), static_cast<uint32_t>(batch));
   return true;
 }
 
@@ -289,8 +457,14 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     int64_t sx = (n + tile_n - 1) / tile_n, sy = (m + tile_m - 1) / tile_m;
     if (sx <= kMaxGroups && sy <= kMaxGroups) {
       GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
-      dispatch(std::string("gemmsg_") + dtype_label(c.scalar_type()), {p.cin != 0 ? 1u : 0u}, p,
-               static_cast<uint32_t>(sx), static_cast<uint32_t>(sy), static_cast<uint32_t>(batch));
+      std::string kernel = std::string("gemmsg_") + dtype_label(c.scalar_type());
+      std::vector<uint32_t> spec = {p.cin != 0 ? 1u : 0u, 0u};
+      int64_t kc = 0;
+      int64_t splits = split_pieces(fill_splits(sx * sy * batch, kSgOccupancy * compute_units(), k, 1024, 16), k, kc);
+      if (splits > 1 && split_k_gemm(kernel, spec, 1, p, sx, sy, splits, kc, c, cin, alpha, beta, c.scalar_type())) {
+        return true;
+      }
+      dispatch(kernel, spec, p, static_cast<uint32_t>(sx), static_cast<uint32_t>(sy), static_cast<uint32_t>(batch));
       return true;
     }
   }

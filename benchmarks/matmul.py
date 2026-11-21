@@ -24,6 +24,10 @@ def gflops(fn, flops, sync, reps=5):
     fn()
     sync()
     start = time.perf_counter()
+    while time.perf_counter() - start < 0.3:  # (clocks ramp up under load: a discrete GPU idles while the CPU runs)
+        fn()
+        sync()
+    start = time.perf_counter()
     for _ in range(reps):
         fn()
     sync()
