@@ -1,5 +1,7 @@
 """Sparse COO and CSR tensors on "vk" (M18) against the CPU."""
 
+import contextlib
+
 import pytest
 import torch
 
@@ -223,3 +225,66 @@ def test_sparse_products_and_reductions_without_dense():
         with on_gpu():
             g = torch._sparse_csr_prod(z.to("vk"), [d], True)
         torch.testing.assert_close(g.cpu().to_dense(), torch._sparse_csr_prod(z, [d], True).to_dense())
+
+
+def test_compressed_batched_and_reducing_products():
+    # (PyTorch 2.15's accelerator tests: bmm/baddbmm with a CSR operand,
+    # torch.sparse.mm with a reduction, sampled_addmm's checks)
+    torch.manual_seed(0)
+    a = (torch.randn(3, 4, 5) * (torch.rand(4, 5) < 0.5)).to_sparse_csr()  # batched (one pattern)
+    b, c = torch.randn(3, 5, 2), torch.randn(3, 4, 2)
+    want = torch.stack([torch.addmm(c[i], a[i].to_dense(), b[i], beta=0.5, alpha=2) for i in range(3)])
+    with on_gpu():
+        got = torch.baddbmm(*vk(c, a, b), beta=0.5, alpha=2)
+        got_bmm = torch.bmm(*vk(a, b))
+    same(got, want, 1e-4)
+    same(got_bmm, torch.bmm(a.to_dense(), b), 1e-4)
+    # one CSR matrix for every batch (indices without a batch dim, as CUDA reads them)
+    m = a[0]
+    with torch.sparse.check_sparse_tensor_invariants(enable=False):
+        mb = torch.sparse_csr_tensor(*vk(m.crow_indices(), m.col_indices(), m.values()), (3, 4, 5),
+                                     check_invariants=False)
+    with on_gpu():
+        out = torch.empty(3, 2, 4, device="vk").mT  # (a transposed out=)
+        torch.bmm(mb, b.to("vk"), out=out)
+    same(out, torch.stack([m.to_dense() @ b[i] for i in range(3)]), 1e-4)
+    # addmm of a dense self and two compressed matrices: dense, as PyTorch's
+    s, t = torch.randn(4, 5).relu().to_sparse_csr(), torch.randn(5, 3).relu().to_sparse_csc()
+    bias = torch.randn(4, 3)
+    r = torch.addmm(*vk(bias, s, t), beta=0.5)
+    same(r, torch.addmm(bias, s.to_dense(), t.to_dense(), beta=0.5), 1e-4)
+    # torch.sparse.mm with reductions, forward and backward, against the CPU's kernel
+    for dtype in (torch.float32, torch.bfloat16):
+        x = (torch.randn(5, 6) * (torch.rand(5, 6) < 0.5)).to(dtype).to_sparse_csr()  # (some empty rows)
+        w = torch.randn(6, 7, dtype=dtype)
+        for reduce in ("sum", "mean", "amax", "amin"):
+            xs, ws = [], []
+            for dev in ("cpu", "vk"):
+                xd, wd = x.to(dev).detach().requires_grad_(), w.to(dev).detach().requires_grad_()
+                with on_gpu() if dev == "vk" else contextlib.nullcontext():
+                    y = torch.sparse.mm(xd, wd, reduce)
+                    (y * torch.arange(7.0, device=dev).to(dtype)).sum().backward()
+                xs.append((y, xd.grad))
+                ws.append(wd.grad)
+            tol = 1e-5 if dtype == torch.float32 else 2e-2
+            torch.testing.assert_close(xs[1][0].cpu(), xs[0][0], rtol=tol, atol=tol)
+            torch.testing.assert_close(xs[1][1].cpu().to_dense(), xs[0][1].to_dense(), rtol=tol, atol=tol)
+            torch.testing.assert_close(ws[1].cpu(), ws[0], rtol=tol, atol=tol)
+    # sampled_addmm: PyTorch's checks, and an empty CSR self made unchecked
+    d = torch.randn(2, 3, device="vk")
+    with pytest.raises(RuntimeError, match="Expected mat1 to be a matrix"):
+        torch.sparse.sampled_addmm(d.to_sparse_csr(), d[..., 0, :], d)
+    with pytest.raises(RuntimeError, match="Expected mat2 to have strided layout"):
+        torch.sparse.sampled_addmm(d.to_sparse_csr(), d, d.mT.to_sparse_csr())
+    with torch.sparse.check_sparse_tensor_invariants(enable=False):
+        e = torch.empty(5, 5, device="vk", layout=torch.sparse_csr)
+    with torch.sparse.check_sparse_tensor_invariants(enable=True):
+        assert torch.sparse.sampled_addmm(e, *vk(torch.randn(5, 0), torch.randn(0, 5))).shape == (5, 5)
+    # a block size of 0 (built unchecked), and indices on two devices: PyTorch's errors
+    bsr = torch.sparse_bsr_tensor(*vk(torch.tensor([0, 1, 1]), torch.tensor([0]), torch.empty(0, 0, 3, 2, 1)),
+                                  check_invariants=False)
+    with pytest.raises(RuntimeError, match="expected block sizes to be strictly positive"):
+        bsr.to_dense()
+    with pytest.raises(RuntimeError, match="found at least two devices, vk:0 and cpu!"):
+        torch.sparse_csr_tensor(torch.tensor([0, 2, 4], device="vk"), torch.tensor([0, 1, 0, 1]),
+                                torch.tensor([1.0, 2, 3, 4], device="vk"), (2, 3), check_invariants=True)
