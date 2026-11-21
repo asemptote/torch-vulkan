@@ -34,8 +34,8 @@ sweeps of experimental kernels on the phone:
 
 ## gemm4s.slang: A shared across a subgroup
 
-The G57 runs compute shaders in subgroups of 16 lanes with shuffles (without
-subgroup size control; M38 did not use them). In `gemm4s.slang` a subgroup
+The G57 runs compute shaders in subgroups of 16 lanes with shuffles (M38 did
+not use them). In `gemm4s.slang` a subgroup
 computes an 8 x 64 block of C: lane l the 8 rows' columns 4l .. 4l + 3. Per
 value of k a lane loads its 4 values of B (one 16-byte load) and does 32
 multiply-adds; A's 8 values come by shuffles from the lanes that loaded
@@ -78,8 +78,7 @@ subgroup operations too, which brings back gemm4 on the Mali.
 
 When B is column-major (x @ W.t(), nn.Linear) and A is small, gemm4s
 computes C^T = B^T A^T instead (C through a transposed view), copying x
-rather than the weight: linear 95 x 768 -> 3072 float16 went from 8.7 to
-about 24 GFLOP/s.
+rather than the weight (the table below: linear, 95 x 768 -> 3072).
 
 ## Convolutions
 
