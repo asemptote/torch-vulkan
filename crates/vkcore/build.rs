@@ -54,8 +54,10 @@ const SLANGC_FLAGS: &[&str] = &[
 /// reassociate them (Mesa's NIR otherwise rewrites e.g. Cody-Waite's
 /// (x - k c1) - k c2 into x - k (c1 + c2), and error-free transformations
 /// into nothing). Matrix products keep the default: their inner loops want
-/// fused multiply-adds, which only make them more accurate.
-const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemmsg", "gemmcm", "gemv", "qmm8"];
+/// fused multiply-adds, which only make them more accurate. (gemm4s's
+/// shuffles ran 60x slower on the Mali-G57 in precise mode; gemm4 itself ran
+/// 2x slower in the default mode there, so it stays precise.)
+const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemmsg", "gemmcm", "gemm4s", "gemv", "qmm8"];
 
 fn slangc() -> PathBuf {
     if let Ok(p) = env::var("SLANGC") {

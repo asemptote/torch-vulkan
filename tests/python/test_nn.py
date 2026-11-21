@@ -51,6 +51,22 @@ def test_conv(dims, cin, cout, k, stride, pad, dil, groups):
     compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, dil, groups), x, w, b)
 
 
+@pytest.mark.parametrize("dims,cin,cout,k,stride,pad,dil,groups", [
+    (1, 6, 9, 3, 1, 1, 1, 3), (1, 16, 12, 7, 1, 9, 3, 1), (2, 4, 6, (3, 2), (2, 1), 1, 1, 2)])
+def test_conv_one_sample(dims, cin, cout, k, stride, pad, dil, groups):
+    # batches of one: the products run per group, the columns as rows along
+    # the output positions (convolution.cpp), here with lengths and K not
+    # multiples of 4
+    spatial = (301, 9, 7)[:dims]
+    x = make((1, cin) + spatial, torch.float32)
+    ks = k if isinstance(k, tuple) else (k,) * dims
+    w = make((cout, cin // groups) + ks, torch.float32, 1)
+    b = make((cout,), torch.float32, 2)
+    conv = [F.conv1d, F.conv2d, F.conv3d][dims - 1]
+    compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, dil, groups), x, w, b)
+    compare_with_cpu(lambda x, w: conv(x, w, None, stride, pad, dil, groups), x, w)
+
+
 @pytest.mark.parametrize("dims,cin,cout,k,stride,pad,dil,groups,outpad", [
     (1, 3, 5, 3, 2, 1, 1, 1, 1),
     (2, 4, 6, 3, 2, 1, 1, 2, (1, 0)),
