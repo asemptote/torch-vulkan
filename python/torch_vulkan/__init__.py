@@ -171,6 +171,21 @@ def set_rng_state(state, device="vk"):
     _native.set_rng_state(int.from_bytes(data[:8], "little"), int.from_bytes(data[8:16], "little"))
 
 
+def set_fp16_arithmetic(enabled):
+    """Lets float16 matrix products and convolutions multiply and add in
+    float16 (packed half2 arithmetic, about twice the rate on Mali and Intel
+    GPUs) instead of float32. Off by default (and with
+    TORCH_VK_FP16_ARITHMETIC unset), so results match the CPU's. With it on,
+    sums of many products lose accuracy (their error grows with the reduction
+    length) and overflow to inf past 65504. Applies to later calls."""
+    _native.set_fp16_arithmetic(bool(enabled))
+
+
+def get_fp16_arithmetic():
+    """Whether float16 arithmetic is allowed (set_fp16_arithmetic)."""
+    return _native.get_fp16_arithmetic()
+
+
 class _DeviceContext:
     """torch.vk.device(d): a context manager selecting device d (there is one)."""
 

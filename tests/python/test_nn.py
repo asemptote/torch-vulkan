@@ -2,6 +2,9 @@
 
 import contextlib
 import itertools
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -320,3 +323,67 @@ def test_rms_norm_and_robust_loss_backward_kernels(dtype):
                     out.backward(torch.ones_like(out))
                 grads.append(xx.grad.cpu())
             torch.testing.assert_close(grads[1], grads[0])
+
+
+DIRECT_CONV_SCRIPT = r"""
+import torch, torch.nn.functional as F, torch_vulkan as tv
+if tv._native.kernel_subgroup_size("conv4s_f32") != 16:
+    print("skip")
+    raise SystemExit
+torch.manual_seed(0)
+worst = 0.0
+convs = [F.conv1d, F.conv2d, F.conv3d]
+def check(got, want, mag, dtype):
+    # float32 sums of the same products in another order (and fused), plus
+    # one rounding to dtype
+    global worst
+    eps = 0.0 if dtype == torch.float32 else torch.finfo(dtype).eps
+    err = (got.cpu().double() - want).abs()
+    tol = eps * want.abs() + 2**-20 * mag + 2**-30
+    worst = max(worst, float((err / tol).max()))
+for dtype in (torch.float32, torch.float16, torch.bfloat16):
+    cases = [
+        # n, cin, cout, kernel, padding, dilation, groups, spatial
+        (1, 16, 24, 11, 5, 1, 1, (301,)),
+        (1, 8, 20, 7, 9, 3, 1, (150,)),
+        (2, 6, 9, 3, 1, 5, 3, (67,)),
+        (1, 5, 3, 16, 0, 1, 1, (200,)),
+        (1, 4, 17, 1, 0, 1, 1, (33,)),
+        (2, 4, 6, 2, (0,), 2, 2, (129,)),
+        (1, 3, 8, 3, 1, 1, 1, (20, 23)),
+        (2, 4, 6, (3, 5), (2, 1), (1, 2), 2, (11, 19)),
+        (1, 2, 4, 3, 1, 1, 1, (5, 6, 13)),
+    ]
+    for n, cin, cout, k, pad, dil, groups, spatial in cases:
+        dims = len(spatial)
+        ks = k if isinstance(k, tuple) else (k,) * dims
+        x = torch.randn((n, cin) + spatial).to(dtype)
+        w = torch.randn((cout, cin // groups) + ks).to(dtype)
+        b = torch.randn(cout).to(dtype)
+        conv = convs[dims - 1]
+        for bias in (b, None):
+            want = conv(x.double(), w.double(), None if bias is None else bias.double(), 1, pad, dil, groups)
+            mag = conv(x.double().abs(), w.double().abs(), None if bias is None else bias.double().abs(), 1, pad, dil, groups)
+            got = conv(x.to("vk"), w.to("vk"), None if bias is None else bias.to("vk"), 1, pad, dil, groups)
+            check(got, want, mag, dtype)
+    # transposed convolutions by phases: stride-1 convolutions with cropped inputs
+    x, w = torch.randn(1, 8, 40).to(dtype), torch.randn(8, 4, 20).to(dtype)
+    want = F.conv_transpose1d(x.double(), w.double(), None, 10, 5)
+    mag = F.conv_transpose1d(x.double().abs(), w.double().abs(), None, 10, 5)
+    check(F.conv_transpose1d(x.to("vk"), w.to("vk"), None, 10, 5), want, mag, dtype)
+assert not tv.fallback_counts(), tv.fallback_counts()
+print(worst)
+"""
+
+
+def test_direct_conv():
+    # shaders/conv4s.slang (the default on Mali; elsewhere through
+    # TORCH_VK_CONV=direct where the GPU runs 16-lane subgroups): stride-1
+    # convolutions reading the padded input in place, float32 sums rounded once
+    out = subprocess.run([sys.executable, "-c", DIRECT_CONV_SCRIPT], env=dict(os.environ, TORCH_VK_CONV="direct"),
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    last = out.stdout.strip().splitlines()[-1]
+    if last == "skip":
+        pytest.skip("no 16-lane subgroups with shuffles")
+    assert float(last) <= 1.0

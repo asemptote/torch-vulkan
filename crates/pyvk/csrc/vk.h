@@ -142,6 +142,11 @@ const char* dtype_label(at::ScalarType t);
 // supports them; nullptr otherwise.
 const char* storage_label(at::ScalarType t);
 
+// Whether float16 matrix products and convolutions may multiply and add in
+// float16 (TORCH_VK_FP16_ARITHMETIC=1, torch_vulkan.set_fp16_arithmetic):
+// off by default, results then matching the CPU's float32 sums rounded once.
+bool fp16_arithmetic();
+
 // The dtype element-wise kernels compute `t` in: 8- and 16-bit integers in
 // int32, float16 and bfloat16 in float32 (then cast back, which wraps
 // integers and rounds to nearest even, as on the CPU); others unchanged.

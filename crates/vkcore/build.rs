@@ -57,7 +57,7 @@ const SLANGC_FLAGS: &[&str] = &[
 /// fused multiply-adds, which only make them more accurate. (gemm4s's
 /// shuffles ran 60x slower on the Mali-G57 in precise mode; gemm4 itself ran
 /// 2x slower in the default mode there, so it stays precise.)
-const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemmsg", "gemmcm", "gemm4s", "gemv", "qmm8"];
+const DEFAULT_FP_MODE: &[&str] = &["gemm", "gemmsg", "gemmcm", "gemm4s", "conv4s", "gemv", "qmm8"];
 
 fn slangc() -> PathBuf {
     if let Ok(p) = env::var("SLANGC") {
