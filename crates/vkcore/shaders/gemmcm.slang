@@ -87,7 +87,7 @@ struct Params
 // 8192^3 (TFLOP/s, H100 NVL / L40S, M22): 128 x 256 x 32 with 4 x 4
 // fragments per subgroup 145-149 / 147-157; 256 x 128 140-146 / 143-150;
 // 128 x 128 in 8 subgroups 112-118 / 123-138, with BK 64 123-126 (H100);
-// 64 x 128 100-109 (H100). See docs/log/M34 for the choice between them.
+// 64 x 128 100-109 (H100). See docs/log/M35 for the choice between them.
 #define LANES 32
 #define BK 32
 #if defined(TILE_l)

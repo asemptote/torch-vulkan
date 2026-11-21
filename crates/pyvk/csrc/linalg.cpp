@@ -346,8 +346,8 @@ bool split_k_gemm(const std::string& kernel, std::vector<uint32_t> spec, size_t 
 }
 
 // gemmcm.slang's tile for a batch of m x n products and the pieces k is
-// split into, by the GPU's SM count U (docs/log/M34: measured on the H100
-// NVL and the L40S; TORCH_VK_GEMM_TILE forces the tile). An SM runs one
+// split into, by the GPU's SM count U (docs/log/M35: measured on the
+// L40S; TORCH_VK_GEMM_TILE forces the tile). An SM runs one
 // large tile (8 subgroups) at a time, about as fast as two smaller ones.
 // - U unknown: the large tile.
 // - At least U large tiles: whole rounds of them, unless the medium tile's
