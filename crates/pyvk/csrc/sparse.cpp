@@ -26,6 +26,8 @@
 #include <ATen/NativeFunctions.h>
 #include <ATen/SparseCsrTensorUtils.h>
 #include <ATen/TensorIndexing.h>
+#include <ATen/TensorUtils.h>
+#include <ATen/native/ReductionType.h>
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
@@ -310,6 +312,13 @@ at::Tensor& mul_out(const at::Tensor& self, const at::Tensor& other, at::Tensor&
 // beta self + alpha (sparse [n, m] @ dense [m, k]) into out (dense [n, k]).
 at::Tensor& addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
                       const at::Scalar& alpha, at::Tensor& out) {
+  // (operands on two devices reach this kernel through the sparse dispatch
+  // key: the device check of PyTorch's kernels)
+  for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&self, &mat2, &out}) {
+    TORCH_CHECK(t->device() == mat1.device(), "Expected all tensors to be on the same device, but found at least two "
+                "devices, ", is_vk(mat1) ? mat1.device() : t->device(), " and ", is_vk(mat1) ? t->device() : mat1.device(),
+                "!");
+  }
   TORCH_CHECK(mat1.is_sparse() && !mat2.is_sparse(), "addmm: expected a sparse mat1 and a dense mat2");
   TORCH_CHECK(mat1.sparse_dim() == 2 && mat1.dense_dim() == 0, "addmm: matrices expected, got ", mat1.sparse_dim(),
               "D sparse tensor");
@@ -696,6 +705,17 @@ at::Tensor compressed_to_dense(const at::Tensor& self, std::optional<at::ScalarT
     return at::native::sparse_compressed_to_dense(self, dtype, masked_grad);
   }
   at::Layout l = self.layout();
+  if ((l == at::kSparseBsr || l == at::kSparseBsc) && self.numel() > 0) {
+    // (PyTorch's checks of the blocks, which a tensor built without its
+    // invariants checked may break)
+    at::Tensor v = self.values();
+    int64_t nb = self.dim() - 2 - self.dense_dim();
+    TORCH_CHECK(v.dim() - nb + 1 >= 4,
+                "sparse_compressed_to_dense: expected values to have at least 4 dimensions, but got ", v.dim() - nb + 1);
+    TORCH_CHECK(v.size(nb + 1) > 0 && v.size(nb + 2) > 0,
+                "sparse_compressed_to_dense: expected block sizes to be strictly positive, but got ", v.size(nb + 1),
+                " and ", v.size(nb + 2));
+  }
   if ((l == at::kSparseCsr || l == at::kSparseCsc) && self.dim() == 2 && self.dense_dim() == 0) {
     // (one matrix: each entry's outer index by a sorted search, then its
     // position in the dense matrix)
@@ -794,8 +814,15 @@ at::Tensor& csr_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const 
 at::Tensor csr_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
                      const at::Scalar& alpha) {
   at::Tensor r = addmm_any(self, mat1, mat2, beta, alpha).contiguous();
-  if (compressed_layout(mat1) && compressed_layout(mat2)) {  // all sparse: in mat1's layout, as PyTorch's
-    return to_layout(r, mat1.layout(), std::nullopt, std::nullopt);
+  // (both products compressed: the result in self's layout, as PyTorch's,
+  // whose result is `empty(self.options())`: dense for a dense self)
+  if (compressed_layout(mat1) && compressed_layout(mat2) && compressed_layout(self)) {
+    std::optional<std::vector<int64_t>> bs;
+    if (self.layout() == at::kSparseBsr || self.layout() == at::kSparseBsc) {
+      int64_t nb = self.dim() - 2 - self.dense_dim();
+      bs = std::vector<int64_t>{self.values().size(nb + 1), self.values().size(nb + 2)};
+    }
+    return to_layout(r, self.layout(), bs.has_value() ? at::OptionalIntArrayRef(*bs) : std::nullopt, std::nullopt);
   }
   return r;
 }
@@ -842,8 +869,15 @@ void validate_compressed_indices(bool is_crow, const at::Tensor& cidx, const at:
   bool shapes = cidx.dim() >= 1 && idx.dim() >= 1 && cidx.size(-1) == cdim + 1 && idx.size(-1) == nnz &&
                 cidx.numel() / (cdim + 1) == (nnz > 0 ? idx.numel() / nnz : cidx.numel() / (cdim + 1));
   int64_t limit = t == at::kInt ? std::numeric_limits<int32_t>::max() : std::numeric_limits<int64_t>::max();
-  if (!is_vk(cidx) || !is_vk(idx) || !(t == at::kInt || t == at::kLong) || cidx.scalar_type() != t || !shapes ||
-      dim > limit || cdim > limit || nnz > limit) {
+  bool valid_args = (t == at::kInt || t == at::kLong) && cidx.scalar_type() == t && shapes && dim <= limit &&
+                    cdim <= limit && nnz <= limit;
+  // (indices on two devices: the error of the TensorIterator in PyTorch's
+  // kernel, whose output is on the compressed indices' device and whose
+  // first input is the plain indices)
+  TORCH_CHECK(!valid_args || cidx.device() == idx.device(),
+              "Expected all tensors to be on the same device, but found at least two devices, ", cidx.device(), " and ",
+              idx.device(), "!");
+  if (!is_vk(cidx) || !is_vk(idx) || !valid_args) {
     cpu();
     return;
   }
@@ -1537,13 +1571,56 @@ at::Tensor& conj_physical_compressed_out(const at::Tensor& self, at::Tensor& out
   return out;
 }
 
-// beta self + alpha (mat1 @ mat2) at the entries of the CSR self.
-at::Tensor sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
-                         const at::Scalar& alpha) {
+// The checks of PyTorch's sparse_sampled_addmm_check_inputs (SparseBlas.cpp),
+// in its order.
+void check_sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
+                         const at::Tensor& result) {
+  TORCH_CHECK(self.layout() == at::kSparseCsr, "sampled_addmm: expected a CSR self, got ", self.layout());
+  TORCH_CHECK(mat1.layout() == at::kStrided, "sampled_addmm: Expected mat1 to have strided layout, but got ",
+              mat1.layout());
+  TORCH_CHECK(mat2.layout() == at::kStrided, "sampled_addmm: Expected mat2 to have strided layout, but got ",
+              mat2.layout());
+  TORCH_CHECK(result.layout() == at::kSparseCsr, "sampled_addmm: Expected result to have sparse csr layout, but got ",
+              result.layout());
+  TORCH_CHECK(self.dense_dim() == 0, "sampled_addmm: Expected non-hybrid self tensor");
+  TORCH_CHECK(result.dense_dim() == 0, "sampled_addmm: Expected non-hybrid result tensor");
+  TORCH_CHECK(mat1.scalar_type() == mat2.scalar_type(),
+              "sampled_addmm: Expected mat1 and mat2 to have the same dtype, but got ", mat1.scalar_type(), " and ",
+              mat2.scalar_type());
+  TORCH_CHECK(mat1.scalar_type() == self.scalar_type(),
+              "sampled_addmm: Expected mat1 and self to have the same dtype, but got ", mat1.scalar_type(), " and ",
+              self.scalar_type());
+  TORCH_CHECK(result.scalar_type() == self.scalar_type(),
+              "sampled_addmm: Expected result and self to have the same dtype, but got ", result.scalar_type(), " and ",
+              self.scalar_type());
+  TORCH_CHECK(mat1.dim() >= 2, "sampled_addmm: Expected mat1 to be a matrix, got ", mat1.dim(), "-D tensor");
+  TORCH_CHECK(mat2.dim() >= 2, "sampled_addmm: Expected mat2 to be a matrix, got ", mat2.dim(), "-D tensor");
+  TORCH_CHECK(result.dim() >= 2, "sampled_addmm: Expected result to be a matrix, got ", result.dim(), "-D tensor");
+  at::IntArrayRef s1 = mat1.sizes(), s2 = mat2.sizes(), s = self.sizes();
+  TORCH_CHECK(s1.slice(0, mat1.dim() - 2) == s2.slice(0, mat2.dim() - 2),
+              "sampled_addmm: Expected mat1 and mat2 to have the same batch size, but got ", s1.slice(0, mat1.dim() - 2),
+              " and ", s2.slice(0, mat2.dim() - 2));
+  TORCH_CHECK(!(self.dim() > 2 && s.slice(0, self.dim() - 2) != s1.slice(0, mat1.dim() - 2)),
+              "sampled_addmm: Expected self and mat1 to have the same batch size, but got ", s.slice(0, self.dim() - 2),
+              " and ", s1.slice(0, mat1.dim() - 2));
+  TORCH_CHECK(s1[mat1.dim() - 1] == s2[mat2.dim() - 2], "sampled_addmm: mat1 and mat2 shapes cannot be multiplied (",
+              s1[mat1.dim() - 2], "x", s1[mat1.dim() - 1], " and ", s2[mat2.dim() - 2], "x", s2[mat2.dim() - 1], ")");
+  TORCH_CHECK(s[self.dim() - 2] == s1[mat1.dim() - 2], "sampled_addmm: self.shape[-2] must match mat1.shape[-2]");
+  TORCH_CHECK(s[self.dim() - 1] == s2[mat2.dim() - 1], "sampled_addmm: self.shape[-1] must match mat2.shape[-1]");
+}
+
+// beta self + alpha (mat1 @ mat2) at the entries of the CSR self, into the
+// CSR `out`. Its members are set directly, as PyTorch's resize and copy:
+// building a tensor from them would check the invariants (when enabled) of
+// indices PyTorch passes through unchecked, such as those of an empty CSR
+// tensor made with its checks off.
+at::Tensor& sampled_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
+                              const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
   at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
-  TORCH_CHECK(self.layout() == at::kSparseCsr && self.dense_dim() == 0, "sampled_addmm: expected a CSR self");
-  at::Tensor product = at::matmul(dense_of(mat1), dense_of(mat2));
-  at::Tensor c = self;
+  check_sampled_addmm(self, mat1, mat2, out);
+  at::Tensor product = at::matmul(mat1, mat2);
+  at::Tensor crow = self.crow_indices(), col = self.col_indices(), vals = self.values();
+  std::vector<int64_t> size(self.sizes().begin(), self.sizes().end());
   if (product.dim() > self.dim()) {  // self broadcast over the product's batch dims
     std::vector<int64_t> batch(product.sizes().begin(), product.sizes().end() - 2);
     auto over_batch = [&](const at::Tensor& t) {
@@ -1551,25 +1628,31 @@ at::Tensor sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const a
       shape.push_back(t.size(-1));
       return packed(t.expand(shape).contiguous());
     };
-    std::vector<int64_t> size = batch;
+    crow = over_batch(crow);
+    col = over_batch(col);
+    vals = over_batch(vals);
+    size = batch;
     size.push_back(self.size(-2));
     size.push_back(self.size(-1));
-    c = at::_sparse_compressed_tensor_unsafe(over_batch(self.crow_indices()), over_batch(self.col_indices()),
-                                             over_batch(self.values()), size, self.values().options().layout(at::kSparseCsr));
   }
-  at::Tensor idx = compressed_entries(c)._indices();  // (batch..., row, col), in storage order
-  c10::List<std::optional<at::Tensor>> where;
-  for (int64_t d = 0; d < idx.size(0); ++d) where.push_back(idx.select(0, d));
-  at::Tensor picked = at::index(product.expand(c.sizes()), where).reshape(c.values().sizes());
-  at::Tensor values = at::add(c.values() * beta, picked, alpha);
-  return at::_sparse_compressed_tensor_unsafe(packed(c.crow_indices()).clone(), packed(c.col_indices()).clone(), values,
-                                              c.sizes(), values.options().layout(at::kSparseCsr));
+  at::Tensor values = vals * beta;
+  if (col.numel() > 0) {
+    at::Tensor c = at::_sparse_compressed_tensor_unsafe(crow, col, vals, size, vals.options().layout(at::kSparseCsr));
+    at::Tensor idx = compressed_entries(c)._indices();  // (batch..., row, col), in storage order
+    c10::List<std::optional<at::Tensor>> where;
+    for (int64_t d = 0; d < idx.size(0); ++d) where.push_back(idx.select(0, d));
+    at::Tensor picked = at::index(product.expand(size), where).reshape(vals.sizes());
+    values = at::add(values, picked, alpha);
+  }
+  at::sparse_csr::get_sparse_csr_impl(out)->set_member_tensors(packed(crow).clone(), packed(col).clone(),
+                                                               packed(values), size);
+  return out;
 }
 
-at::Tensor& sampled_addmm_out(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2,
-                              const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
-  assign_compressed(out, sampled_addmm(self, mat1, mat2, beta, alpha));
-  return out;
+at::Tensor sampled_addmm(const at::Tensor& self, const at::Tensor& mat1, const at::Tensor& mat2, const at::Scalar& beta,
+                         const at::Scalar& alpha) {
+  at::Tensor out = at::empty({0, 0}, self.options());
+  return sampled_addmm_out(self, mat1, mat2, beta, alpha, out);
 }
 
 }  // namespace
@@ -1849,3 +1932,203 @@ at::Tensor flatten_indices_vk(const at::Tensor& indices, at::IntArrayRef size) {
 namespace at::native {
 REGISTER_PRIVATEUSE1_DISPATCH(flatten_indices_stub, &vk::flatten_indices_vk)
 }  // namespace at::native
+
+// ---------------------------------------------------------------- batched and reducing products with compressed operands
+
+namespace vk {
+namespace {
+
+// The entries of compressed [B, m, k] (no dense dims) as COO. A CSR tensor
+// whose indices have no batch dim (built with its invariants unchecked, as
+// PyTorch's tests do) is one matrix for every batch, as CUDA's cuSPARSE call
+// reads it.
+at::Tensor batched_entries(const at::Tensor& t) {
+  TORCH_CHECK(t.dim() == 3 && t.dense_dim() == 0, "bmm: expected a 3-D compressed tensor without dense dims, got ",
+              t.dim(), "-D with ", t.dense_dim(), " dense dims");
+  if (t.layout() == at::kSparseCsr && t.crow_indices().dim() == 1) {
+    int64_t B = t.size(0), nnz = t.col_indices().numel();
+    at::Tensor rc = convert_csr_to_coo(t.crow_indices(), t.col_indices(), false, false);  // [2, nnz]
+    at::Tensor b = at::arange(B, rc.options()).repeat_interleave(nnz);
+    at::Tensor idx = at::cat({b.unsqueeze(0), rc.repeat({1, B})}, 0);
+    return make_sparse(t, 3, 0, t.sizes(), idx, t.values().reshape({-1}).repeat({B}), true);
+  }
+  return compressed_entries(t);
+}
+
+// beta self + alpha (batch1 @ batch2), batch1 compressed [B, m, k], self and
+// batch2 strided (CUDA's checks): one block-diagonal sparse product.
+at::Tensor& baddbmm_compressed_out(const at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2,
+                                   const at::Scalar& beta, const at::Scalar& alpha, at::Tensor& out) {
+  TORCH_CHECK(self.layout() == at::kStrided, "torch.baddbmm: Expected self to be strided, but got layout ",
+              self.layout());
+  TORCH_CHECK(batch2.layout() == at::kStrided, "torch.baddbmm: Expect mat2 to be strided, but got ", batch2.layout());
+  TORCH_CHECK(out.layout() == at::kStrided, "torch.baddbmm: Expect result to be strided, but got ", out.layout());
+  TORCH_CHECK(compressed_layout(batch1), "torch.baddbmm: expected a compressed batch1, got ", batch1.layout());
+  at::Tensor r = bmm_sparse(batched_entries(batch1), batch2);  // [B, m, n]
+  if (!(alpha.isIntegral(true) && alpha.toLong() == 1)) r = r * alpha;
+  bool beta_zero = beta.isComplex() ? beta.toComplexDouble() == c10::complex<double>(0, 0) : beta.toDouble() == 0;
+  if (!beta_zero) r = r + self.expand(r.sizes()) * beta;  // (beta == 0 ignores self, NaN included)
+  if (!out.is_same(self)) at::native::resize_output(out, r.sizes());
+  out.copy_(r);
+  return out;
+}
+
+at::Tensor baddbmm_compressed(const at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2,
+                              const at::Scalar& beta, const at::Scalar& alpha) {
+  at::Tensor out = at::empty({0}, batch2.options());
+  return baddbmm_compressed_out(self, batch1, batch2, beta, alpha, out);
+}
+
+at::Tensor& baddbmm_compressed_(at::Tensor& self, const at::Tensor& batch1, const at::Tensor& batch2,
+                                const at::Scalar& beta, const at::Scalar& alpha) {
+  return baddbmm_compressed_out(self, batch1, batch2, beta, alpha, self);
+}
+
+at::Tensor bmm_compressed(const at::Tensor& self, const at::Tensor& mat2) {
+  TORCH_CHECK(mat2.layout() == at::kStrided, "torch.baddbmm: Expect mat2 to be strided, but got ", mat2.layout());
+  return bmm_sparse(batched_entries(self), mat2);
+}
+
+at::Tensor& bmm_compressed_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
+  TORCH_CHECK(out.layout() == at::kStrided, "torch.baddbmm: Expect result to be strided, but got ", out.layout());
+  at::Tensor r = bmm_compressed(self, mat2);
+  at::native::resize_output(out, r.sizes());
+  out.copy_(r);
+  return out;
+}
+
+// The checks of PyTorch's check_sparse_mm_reduce_impl_inputs.
+void check_mm_reduce_inputs(const at::Tensor& self, const at::Tensor& grad_out, const at::Tensor& other, bool train) {
+  at::ScalarType t = self.values().scalar_type();
+  at::CheckedFrom c = train ? "sparse_mm_reduce_backward" : "sparse_mm_reduce";
+  if (train) {
+    at::checkLayout(c, grad_out, at::kStrided);
+    at::checkScalarType(c, {grad_out, "grad_out", 1}, t);
+    at::check_dim_size(grad_out, 2, 0, self.size(0));
+    at::check_dim_size(grad_out, 2, 1, other.size(1));
+  }
+  at::checkLayout(c, other, at::kStrided);
+  at::checkScalarType(c, {other, "other", train ? 2 : 1}, t);
+  at::check_dim_size(other, 2, 0, self.size(1));
+}
+
+// Each entry's row (int64) and the number of entries in each row.
+std::pair<at::Tensor, at::Tensor> csr_rows(const at::Tensor& self) {
+  at::Tensor crow = self.crow_indices().to(at::kLong);
+  at::Tensor row = convert_csr_to_coo(crow, self.col_indices(), false, false).select(0, 0);
+  int64_t M = self.size(0);
+  return {row, crow.narrow(0, 1, M) - crow.narrow(0, 0, M)};
+}
+
+// torch.sparse.mm(csr, dense, reduce): each row of the product reduced over
+// the row's entries (sum, mean, amax, amin) as the CPU's SpmmReduceKernel:
+// in float32 for 16-bit dtypes, rounded once (mean: then divided by the
+// count); rows without entries 0. Sums are folded in entry order. arg_out
+// (the entry that gave each amax/amin, nnz for none: the first of equal
+// ones, the last NaN) only when autograd needs it, as the CPU's.
+std::tuple<at::Tensor, at::Tensor> sparse_mm_reduce_impl(const at::Tensor& self, const at::Tensor& other,
+                                                         c10::string_view reduce) {
+  TORCH_CHECK(self.layout() == at::kSparseCsr, "sparse_mm_reduce: expect self to be SparseCsr, got ", self.layout());
+  TORCH_CHECK(self.dense_dim() == 0, "sparse_mm_reduce: expected non-hybrid self tensor.");
+  TORCH_CHECK(self.dim() == 2, "sparse_mm_reduce: expected self to be a 2-D tensor, got ", self.dim(), "-D tensor.");
+  check_mm_reduce_inputs(self, {}, other, false);
+  at::native::ReductionType op = at::native::get_reduction_enum(reduce);
+  TORCH_CHECK(op != at::native::ReductionType::PROD, "sparse_mm_reduce: reduce type of prod has not been enabled.");
+  int64_t M = self.size(0), K = other.size(1), nnz = self._nnz();
+  at::Tensor out = at::zeros({M, K}, other.options());
+  at::Tensor arg_out = at::empty({0}, self.col_indices().options());
+  if (nnz == 0) return {out, arg_out};
+  bool extreme = op == at::native::ReductionType::MAX || op == at::native::ReductionType::MIN;
+  bool need_arg = at::GradMode::is_enabled() && (self.requires_grad() || other.requires_grad()) && extreme;
+  at::ScalarType st = other.scalar_type(), acc = is_half(st) ? at::kFloat : st;
+  auto [row, count] = csr_rows(self);
+  at::Tensor col = self.col_indices().to(at::kLong);
+  at::Tensor src = other.index_select(0, col).to(acc) * self.values().to(acc).unsqueeze(1);  // [nnz, K]
+  at::Tensor r;  // [M, K], acc
+  if (extreme) {
+    const char* how = op == at::native::ReductionType::MAX ? "amax" : "amin";
+    r = at::zeros({M, K}, src.options()).scatter_reduce_(0, row.unsqueeze(1).expand({nnz, K}), src, how, false);
+  } else {
+    r = sum_rows_by_sorted_group(src, row, at::arange(nnz, row.options()), M);  // (rows in order: CSR)
+  }
+  out.copy_(r);
+  if (op == at::native::ReductionType::MEAN) {
+    out = (out.to(acc) / count.clamp_min(1).to(acc).unsqueeze(1)).to(st);
+  }
+  if (need_arg) {
+    // the first entry equal to the result (not the initial +-inf), or the last NaN
+    at::Tensor at_row = r.index_select(0, row);
+    double init = op == at::native::ReductionType::MAX ? -std::numeric_limits<double>::infinity()
+                                                         : std::numeric_limits<double>::infinity();
+    at::Tensor e = at::arange(nnz, row.options()).unsqueeze(1).expand({nnz, K});
+    at::Tensor hit = at::logical_and(at::eq(src, at_row), at::ne(src, init));
+    at::Tensor rows = row.unsqueeze(1).expand({nnz, K});
+    at::Tensor none = at::full({}, nnz, row.options()), minus_one = at::full({}, -1, row.options());
+    at::Tensor first = at::full({M, K}, nnz, row.options()).scatter_reduce_(0, rows, at::where(hit, e, none), "amin", true);
+    at::Tensor last_nan = at::full({M, K}, -1, row.options())
+                              .scatter_reduce_(0, rows, at::where(at::isnan(src), e, minus_one), "amax", true);
+    arg_out = at::where(at::ge(last_nan, 0), last_nan, first).to(self.col_indices().scalar_type());
+  }
+  return {out, arg_out};
+}
+
+std::tuple<at::Tensor, at::Tensor> sparse_mm_reduce_impl_backward(const at::Tensor& self, const at::Tensor& grad_out,
+                                                                  const at::Tensor& other, c10::string_view reduce,
+                                                                  const at::Tensor& arg_out,
+                                                                  std::array<bool, 2> output_mask) {
+  TORCH_CHECK(self.layout() == at::kSparseCsr, "sparse_mm_reduce: expect self to be SparseCsr, got ", self.layout());
+  check_mm_reduce_inputs(self, grad_out, other, true);
+  at::native::ReductionType op = at::native::get_reduction_enum(reduce);
+  bool extreme = op == at::native::ReductionType::MAX || op == at::native::ReductionType::MIN;
+  bool mean = op == at::native::ReductionType::MEAN;
+  int64_t M = grad_out.size(0), K = grad_out.size(1), nnz = self._nnz();
+  auto [row, count] = csr_rows(self);
+  at::Tensor col = self.col_indices().to(at::kLong), val = self.values();
+  at::Tensor zero = at::zeros({}, grad_out.options());
+  // (amax/amin: each output element's entry, entry 0 standing in where none)
+  at::Tensor arg, valid, arg_col;
+  if (extreme && nnz > 0) {
+    arg = arg_out.to(at::kLong);
+    valid = at::ne(arg, nnz);
+    arg = at::where(valid, arg, at::zeros({}, arg.options()));
+    arg_col = col.index_select(0, arg.reshape({-1})).view({M, K});
+  }
+  at::Tensor grad_self, grad_other;
+  if (output_mask[0]) {
+    at::Tensor gv = at::zeros({nnz}, val.options());
+    if (nnz > 0 && extreme) {
+      at::Tensor g = at::where(valid, other.gather(0, arg_col) * grad_out, zero);
+      gv.index_add_(0, arg.reshape({-1}), g.reshape({-1}));
+    } else if (nnz > 0) {
+      gv = (other.index_select(0, col) * grad_out.index_select(0, row)).sum(1);
+      if (mean) gv = gv / count.index_select(0, row).to(gv.scalar_type());
+    }
+    grad_self = at::_sparse_compressed_tensor_unsafe(self.crow_indices().clone(), self.col_indices().clone(), gv,
+                                                     self.sizes(), gv.options().layout(at::kSparseCsr));
+  }
+  if (output_mask[1]) {
+    grad_other = at::zeros(other.sizes(), other.options());
+    if (nnz > 0 && extreme) {
+      at::Tensor g = at::where(valid, val.index_select(0, arg.reshape({-1})).view({M, K}) * grad_out, zero);
+      at::Tensor where_to = arg_col * K + at::arange(K, arg_col.options()).unsqueeze(0);
+      grad_other.view({-1}).index_add_(0, where_to.reshape({-1}), g.reshape({-1}));
+    } else if (nnz > 0) {
+      at::Tensor v = mean ? val / count.index_select(0, row).to(val.scalar_type()) : val;
+      grad_other.index_add_(0, col, grad_out.index_select(0, row) * v.unsqueeze(1));
+    }
+  }
+  return {grad_self, grad_other};
+}
+
+}  // namespace
+}  // namespace vk
+
+TORCH_LIBRARY_IMPL(aten, SparseCsrPrivateUse1, m) {
+  m.impl("bmm", TORCH_FN(vk::bmm_compressed));
+  m.impl("bmm.out", TORCH_FN(vk::bmm_compressed_out));
+  m.impl("baddbmm", TORCH_FN(vk::baddbmm_compressed));
+  m.impl("baddbmm.out", TORCH_FN(vk::baddbmm_compressed_out));
+  m.impl("baddbmm_", TORCH_FN(vk::baddbmm_compressed_));
+  m.impl("_sparse_mm_reduce_impl", TORCH_FN(vk::sparse_mm_reduce_impl));
+  m.impl("_sparse_mm_reduce_impl_backward", TORCH_FN(vk::sparse_mm_reduce_impl_backward));
+}
