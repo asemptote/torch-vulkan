@@ -99,8 +99,8 @@ the setting changes nothing). The cost is accuracy:
 
 - sums are float16, so their rounding error grows with the reduction length
   (the inner dimension of a product, in channels x taps of a convolution):
-  about 0.4% of the result's rms for 1408 terms, against 0.05% with float32
-  sums;
+  for 1408 terms (a 128-channel, 11-tap convolution) the error was 0.4% of
+  the result's rms (3.6% at most), against at most 0.14% with float32 sums;
 - partial sums overflow to inf past 65504, even when the final result would
   fit (scale inputs or weights down where that can happen).
 

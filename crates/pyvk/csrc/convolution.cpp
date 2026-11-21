@@ -170,7 +170,9 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   }
   int64_t KW = w.size(-1), DW = dilation[s - 1];
   if (KW > kConv4sMaxTaps || DW > 64) return {};
-  int64_t Cg = C / groups, Cog = Co / groups;
+  int64_t Cg = C / groups, Cog = Co / groups, taps = 1;
+  for (int64_t d = 0; d < s; ++d) taps *= w.size(2 + d);
+  if (Cg == 1 && taps <= 32) return {};  // (depthwise: multiply-adds per tap, in conv_forward)
   // Crop for negative padding; then the padded sizes.
   at::Tensor x = x_in;
   std::vector<std::pair<int64_t, int64_t>> pad = pad_in;
