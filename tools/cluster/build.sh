@@ -8,7 +8,7 @@
 cd "${TORCH_VULKAN:-$HOME/torch-vulkan}" || exit 1
 name=$(basename "$PWD")
 LOG=${LOG:-$HOME/$name-build.log}
-export PATH=$HOME/.cargo/bin:$PATH VULKAN_SDK=${VULKAN_SDK:-$(ls -d "$HOME"/opt/*/x86_64 | tail -1)}
+export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH VULKAN_SDK=${VULKAN_SDK:-$(ls -d "$HOME"/opt/*/x86_64 | tail -1)}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/$USER-$name-target} VIRTUAL_ENV=$PWD/.venv
 .venv/bin/maturin develop --release --uv > "$LOG" 2>&1
 code=$?
