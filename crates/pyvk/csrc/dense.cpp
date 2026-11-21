@@ -199,6 +199,7 @@ at::Tensor block_inverse(const at::Tensor& a3, int64_t k, int64_t b, bool upper,
 
 // Y <- T^{-1} Y for square triangular T [B, n, n] (contiguous) and Y [B, n, k].
 void triangular_solve_inplace(const at::Tensor& t3, const at::Tensor& y, bool upper, bool unit) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t n = t3.size(1);
   int64_t nblocks = (n + kBlock - 1) / kBlock;
   for (int64_t bi = 0; bi < nblocks; ++bi) {
@@ -248,6 +249,7 @@ struct Lu {
 };
 
 Lu lu_factor(const at::Tensor& a, bool pivot = true) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   Lu r;
   r.lu = batched(a);
   int64_t B = r.lu.size(0), m = r.lu.size(1), n = r.lu.size(2), kmax = std::min(m, n);
@@ -379,6 +381,7 @@ at::Tensor reflectors(const at::Tensor& a3, int64_t k, int64_t b) {
 // 36 ms for the products.) A reflector with tau = 0
 // (H = I) gets a zero column in V and 1 on the diagonal for the inverse.
 at::Tensor block_t_gemm(const at::Tensor& v_in, const at::Tensor& tau_panel) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t B = v_in.size(0), b = v_in.size(2);
   at::Tensor zero = tau_panel == 0;
   at::Tensor v = v_in * at::logical_not(zero).unsqueeze(1).to(v_in.scalar_type());
@@ -403,6 +406,7 @@ constexpr int64_t kGeqrfRows = 256;  // RW in shaders/geqrf.slang
 // (shaders/geqrf.slang); the rest of the matrix is updated by block
 // reflectors and GEMMs.
 at::Tensor geqrf_inplace(const at::Tensor& a3) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2), kmax = std::min(m, n);
   at::Tensor tau = at::zeros({B, kmax}, a3.options());
   if (B == 0 || kmax == 0) {
@@ -448,6 +452,7 @@ at::Tensor geqrf_inplace(const at::Tensor& a3) {
 // C <- op(Q) C (left) or C op(Q) (right) for Q = H_0 ... H_{k-1} from
 // reflectors in a3 [B, m, k'] and tau [B, k]; c3 [B, ...] contiguous.
 void apply_q(const at::Tensor& a3, const at::Tensor& tau, const at::Tensor& c3, bool left, bool transpose) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   // Panels of kApplyBlock reflectors (any blocking applies the same Q; wider
   // than geqrf's panels: half the panels' T, and products with more rows)
   constexpr int64_t kApplyBlock = 128;
@@ -625,6 +630,7 @@ constexpr int64_t kStedcMin = 64;   // divide and conquer from this size up (QL 
 // its spectrum, coupled by 0: they stay their own eigenpairs, sort last and
 // are dropped. False if a leaf's QL did not converge.
 bool stedc(const at::Tensor& d0, const at::Tensor& e0, int64_t B, int64_t n, at::Tensor& values, at::Tensor& vectors) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   at::ScalarType rt = d0.scalar_type();
   // scaled to largest entry 1, as dstedc: the deflation tolerances are
   // relative to the merged matrices' size, which counts the padding
@@ -718,6 +724,7 @@ constexpr int64_t kLatrdRows = 8;  // ROWS (SYMV rows per workgroup)
 // by zlatrd, shaders/latrd.slang): T's diagonal on a3's, its off-diagonal
 // into e [B, n], and Q's reflectors as a QR's in a3[1:, :n-1] with tau.
 void latrd_reduce(const at::Tensor& a3, at::Tensor& tau, at::Tensor& e) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t B = a3.size(0), n = a3.size(2);
   at::ScalarType t = a3.scalar_type();
   int64_t groups = (n - 1 + kLatrdRows - 1) / kLatrdRows;
@@ -856,6 +863,7 @@ at::Tensor orthonormalize(const at::Tensor& q3) {
 // orthonormal for that (|X^H X - I| > 1/2: dependent ones, where singular
 // values at 0 leave them in any mix) take orthonormalize()'s QR instead.
 at::Tensor polar_orthonormalize(const at::Tensor& x3) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t n = x3.size(2);
   double eps = epsilon(x3.scalar_type());
   at::Tensor x = x3.contiguous();
@@ -890,6 +898,7 @@ constexpr int64_t kSvdBidiagMin = 32;  // the bidiagonal route from this many co
 // [B, n], U [B, m, ucols], V [B, n, n]) (ucols = m with full matrices, n
 // otherwise); false (with nothing returned) if the eigensolver failed.
 bool bidiag_svd(const at::Tensor& a3, bool full, at::Tensor& sigma, at::Tensor& u, at::Tensor& v) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t B = a3.size(0), m = a3.size(1), n = a3.size(2);
   at::ScalarType t = a3.scalar_type();
   at::TensorOptions real = a3.options().dtype(c10::toRealValueType(t));
@@ -1332,6 +1341,7 @@ std::tuple<at::Tensor&, at::Tensor&> triangular_solve_legacy_out(const at::Tenso
 
 // Lower Cholesky factor of a3 [B, n, n] in place; returns info [B].
 at::Tensor cholesky_inplace(const at::Tensor& a3) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   int64_t B = a3.size(0), n = a3.size(1);
   at::Tensor info = at::zeros({B}, a3.options().dtype(at::kInt));
   FactorParams p = params_for(a3);
@@ -1669,6 +1679,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> svd_vk(const at::Tensor& a, bool 
 std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
     const at::Tensor& a, const at::Tensor& b, std::optional<double> rcond, std::optional<c10::string_view> driver,
     at::Tensor& solution, at::Tensor& residuals, at::Tensor& rank, at::Tensor& singular_values) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   TORCH_CHECK(a.dim() >= 2, "torch.linalg.lstsq: input must have at least 2 dimensions.");
   TORCH_CHECK(b.dim() >= 1, "torch.linalg.lstsq: other must have at least 1 dimension.");
   TORCH_CHECK(a.device() == b.device(), "torch.linalg.lstsq: Expected input and other to be on the same device, "
@@ -1797,6 +1808,7 @@ std::tuple<at::Tensor, at::Tensor> real_eig_pairs(const at::Tensor& w, const at:
 // form T = Z^H A Z, eigenvectors of T by back substitution, times Z. Each
 // vector has unit norm and its largest component real, as LAPACK's geev.
 std::tuple<at::Tensor, at::Tensor> general_eig(const at::Tensor& a, bool want_vectors) {
+  at::NoTF32Guard exact;  // (its products in float32 at any torch.set_float32_matmul_precision: linalg.cpp)
   TORCH_CHECK(at::isfinite(a).all().item<bool>(), "torch.linalg.eig: input tensor should not contain infs or NaNs.");
   at::ScalarType ct = complex_of(a.scalar_type());
   at::Tensor h = flat3(a).to(ct).clone(at::MemoryFormat::Contiguous);

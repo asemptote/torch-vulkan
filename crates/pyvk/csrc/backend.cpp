@@ -945,7 +945,7 @@ void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stac
   }
   bool copy = schema.name().find("copy") != std::string::npos;
   TORCH_CHECK(!any_vk || !any_cpu || copy, "Expected all tensors to be on the same device, but found at least two "
-              "devices, ", kDevice, " and cpu!");
+              "devices, ", at::Device(kDevice, 0), " and cpu!");
   // (a tensor on a third device, meta say, as FakeTensor's cross-checks pass:
   // the CPU would raise the same, after copying the rest over)
   for (size_t i = 0; i < arguments.size() && any_vk && !copy; ++i) {

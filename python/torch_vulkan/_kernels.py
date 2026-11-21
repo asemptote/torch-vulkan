@@ -28,12 +28,25 @@ _lib = None
 
 # ---------------------------------------------------------------- separable linear maps
 
+@contextlib.contextmanager
+def exact_products():
+    """float32 matrix products in float32 inside, whatever
+    torch.set_float32_matmul_precision says: for ops written as products
+    (pooling, interpolation), which PyTorch computes in float32."""
+    _native.exact_float32_products(True)
+    try:
+        yield
+    finally:
+        _native.exact_float32_products(False)
+
+
 def _apply_dims(x, mats):
     """x [..., *S] with mats[d] (out_d x in_d) applied along the last len(mats) dims."""
     k = len(mats)
-    for d, m in enumerate(mats):
-        dim = x.dim() - k + d
-        x = torch.matmul(m.to(x.dtype), x.movedim(dim, -2)).movedim(-2, dim)
+    with exact_products():
+        for d, m in enumerate(mats):
+            dim = x.dim() - k + d
+            x = torch.matmul(m.to(x.dtype), x.movedim(dim, -2)).movedim(-2, dim)
     return x
 
 
