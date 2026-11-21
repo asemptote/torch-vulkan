@@ -1,4 +1,4 @@
-# Transposed convolution by phases (M41)
+# Transposed convolution by phases (M46)
 
 Issue #77. A transposed convolution (`conv_transpose1d/2d/3d`, and the input
 gradient of every strided convolution) ran as an ordinary convolution of the
