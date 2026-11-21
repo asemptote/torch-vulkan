@@ -552,6 +552,13 @@ at::Tensor with_strides(const at::Tensor& result, std::vector<int64_t> strides) 
 }
 
 // The registered kernels: results in the CPU's layouts.
+// (never the input or a view of it: an empty or length-1 transform can
+// compute nothing, and PyTorch 2.15's custom-op and FakeTensor checks reject
+// an output that aliases an input)
+at::Tensor fresh_result(const at::Tensor& result, const at::Tensor& self) {
+  return result.is_alias_of(self) ? result.clone() : result;
+}
+
 // bfloat16 (and bcomplex32): no FFT on the CPU or CUDA either; their error.
 void reject_bfloat16_fft(const at::Tensor& t) {
   at::ScalarType st = t.scalar_type();
@@ -561,7 +568,7 @@ void reject_bfloat16_fft(const at::Tensor& t) {
 
 at::Tensor fft_c2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, bool forward) {
   reject_bfloat16_fft(self);
-  at::Tensor result = fft_c2c_compute(self, dim, normalization, forward);
+  at::Tensor result = fresh_result(fft_c2c_compute(self, dim, normalization, forward), self);
   if (dim.empty() || !is_vk(result)) {
     return result;
   }
@@ -572,7 +579,7 @@ at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
   reject_bfloat16_fft(self);
   TORCH_CHECK_TYPE(!self.is_complex() || !is_vk(self), "Only supports floating-point dtypes, but found: ",
                    self.scalar_type());  // (the CPU's error, a TypeError)
-  at::Tensor result = fft_r2c_compute(self, dim, normalization, onesided);
+  at::Tensor result = fresh_result(fft_r2c_compute(self, dim, normalization, onesided), self);
   if (dim.empty() || !is_vk(result)) {
     return result;
   }
@@ -581,7 +588,7 @@ at::Tensor fft_r2c(const at::Tensor& self, at::IntArrayRef dim, int64_t normaliz
 
 at::Tensor fft_c2r(const at::Tensor& self, at::IntArrayRef dim, int64_t normalization, int64_t last_dim_size) {
   reject_bfloat16_fft(self);
-  at::Tensor result = fft_c2r_compute(self, dim, normalization, last_dim_size);
+  at::Tensor result = fresh_result(fft_c2r_compute(self, dim, normalization, last_dim_size), self);
   if (dim.empty() || !is_vk(result)) {
     return result;
   }

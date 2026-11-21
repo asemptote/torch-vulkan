@@ -1,4 +1,4 @@
-# PyTorch 2.15 (M34)
+# PyTorch 2.15 (M36)
 
 torch-vulkan 0.2.0 was compiled and tested against PyTorch 2.14 only. This
 moves it to 2.15 (#69): `tools/torch-version` is 2.15.0 and `pyproject.toml`

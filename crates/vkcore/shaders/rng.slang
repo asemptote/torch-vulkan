@@ -8,7 +8,7 @@
 //   RNG_UNIFORM      a + (b - a) u,  u in [0, 1)
 //   RNG_NORMAL       a + b z,        z standard normal (Box-Muller)
 //   RNG_RANDOM       a + bits mod b  (integers; b == 0 means all 64 bits)
-//   RNG_EXPONENTIAL  -log(1 - u) / a
+//   RNG_EXPONENTIAL  max(-log(1 - u), b) / a  (b: half the dtype's epsilon, so never 0)
 //   RNG_GEOMETRIC    ceil(log(1 - u) / log1p(-a))
 //   RNG_CAUCHY       a + b tan(pi (u - 1/2))
 //   RNG_LOG_NORMAL   exp(a + b z)
@@ -87,7 +87,7 @@ void main(uint3 id: SV_DispatchThreadID)
         {
         case RNG_UNIFORM: v = a + (b - a) * u; break;
         case RNG_NORMAL: v = a + b * standard_normal(x); break;
-        case RNG_EXPONENTIAL: v = -m_log1p(-u) / a; break;
+        case RNG_EXPONENTIAL: v = max(-m_log1p(-u), b) / a; break;
         case RNG_GEOMETRIC: v = ceil(m_log1p(-u) / m_log1p(-a)); break;
         case RNG_CAUCHY: v = a + b * m_tan(LIT(3.141592653589793) * (u - R(0.5))); break;
         default: v = m_exp(a + b * standard_normal(x)); break;  // RNG_LOG_NORMAL

@@ -88,6 +88,13 @@ int trunc32(float x)
     return abs(x) < 2147483648.0f ? int(x) : 0;
 }
 
+// float x truncated to int32 as the CPU converts (x86's cvttss2si): out of
+// range, and NaN, int32's "indefinite" value, int32 min.
+int indef32(float x)
+{
+    return abs(x) < 2147483648.0f ? int(x) : int(0x80000000u);
+}
+
 #if defined(SRC_i64) || defined(DST_i64)
 // Conversions to and from int64 (I64, two words), as the CPU's static_casts:
 // narrower integers keep the low bits, floats round to nearest (int64 ->
@@ -146,10 +153,14 @@ DV convert(SV x)
     // 64-bit integers (Mali GPUs lack them; float64 sources keep them).
     // (Half through float: Intel's UHD 620 driver saturated half -> int64 at
     // 127, e.g. 178.6 -> 127 as uint8; lavapipe and NVIDIA wrap as the CPU.)
-#if defined(SRC_f64)
-    return DV(int64_t(x));
+#if defined(SRC_f64) && defined(DST_i16)
+    return DV(abs(x) < 2147483648.0l ? int(x) : 0);  // (through int32, as float sources)
+#elif defined(SRC_f64)
+    return DV(abs(x) < 9.223372036854775808e18l ? int64_t(x) : int64_t(0));  // (int64's indefinite: low bits 0)
+#elif defined(SRC_c128) && defined(DST_i16)
+    return DV(abs(x.x) < 2147483648.0l ? int(x.x) : 0);
 #elif defined(SRC_c128)
-    return DV(int64_t(x.x));
+    return DV(abs(x.x) < 9.223372036854775808e18l ? int64_t(x.x) : int64_t(0));
 #elif defined(SRC_COMPLEX) && defined(DST_i16)
     return DV(trunc32(x.x));
 #elif defined(SRC_COMPLEX)
@@ -161,6 +172,15 @@ DV convert(SV x)
 #else
     return DV(int(x));  // (integer sources fit)
 #endif
+#elif defined(DST_i32) && defined(SRC_f64)
+    // (as the CPU: out of range, and NaN, int32 min; GPUs saturate)
+    return abs(x) < 2147483648.0l ? DV(int(x)) : DV(int(0x80000000u));
+#elif defined(DST_i32) && defined(SRC_c128)
+    return abs(x.x) < 2147483648.0l ? DV(int(x.x)) : DV(int(0x80000000u));
+#elif defined(DST_i32) && defined(SRC_COMPLEX)
+    return DV(indef32(x.x));
+#elif defined(DST_i32) && (defined(SRC_f32) || defined(SRC_f16) || defined(SRC_bf16))
+    return DV(indef32(float(x)));
 #elif defined(DST_PART) && defined(TO_WIDE)
 #ifdef SRC_COMPLEX
     return DV(TO_WIDE(x.x), TO_WIDE(x.y));

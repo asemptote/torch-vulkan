@@ -1088,7 +1088,7 @@ at::Tensor bincount(const at::Tensor& self, const std::optional<at::Tensor>& wei
 at::Tensor& histc_out(const at::Tensor& self, int64_t bins, const at::Scalar& min, const at::Scalar& max,
                       at::Tensor& out) {
   TORCH_CHECK(bins > 0, "torch.histogram(): bins must be > 0, but got ", bins, " for dimension 0");  // (the CPU's message)
-  TORCH_CHECK(self.dtype() == out.dtype(), "torch.histc: input tensor and hist tensor should have the same dtype, "
+  TORCH_CHECK(self.dtype() == out.dtype(), "torch.histogram: input tensor and hist tensor should have the same dtype, "
               "but got input ", self.dtype(), " and hist ", out.dtype());  // (as the CPU)
   at::ScalarType t = self.scalar_type();
   if (is_vk(self) && !at::isFloatingType(t)) {
@@ -1326,7 +1326,17 @@ at::Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, at::Tensor& 
     total += t.size(dim);
   }
   shape[dim] = total;
+  // (as the CPU: a resized out takes the inputs' memory format when they share
+  // one, else the contiguous one; an out of the right shape keeps its own)
+  at::MemoryFormat format = inputs[0].suggest_memory_format();
+  for (const at::Tensor& t : inputs) {
+    if (t.suggest_memory_format() != format) format = at::MemoryFormat::Contiguous;
+  }
+  bool resized = out.sizes() != at::IntArrayRef(shape);
   at::native::resize_output(out, shape);
+  if (resized && format != at::MemoryFormat::Contiguous) {
+    out.resize_(shape, format);
+  }
   int64_t offset = 0;
   for (const at::Tensor& t : inputs) {
     if (t.numel() > 0) {
@@ -1419,28 +1429,55 @@ at::Tensor roll_vk(const at::Tensor& self, at::IntArrayRef shifts, at::IntArrayR
 
 // Padding of the last pad.size() / 2 dims (pad pairs start at the last dim)
 // by reflection or replication, as one gather.
+// (PyTorch 2.15's shared padding checks, Padding.h's pad_shape_check, with
+// its messages)
+void pad_shape_check(const at::Tensor& self, at::IntArrayRef pad, int64_t k, bool reflect) {
+  TORCH_CHECK(static_cast<int64_t>(pad.size()) == 2 * k, "padding size is expected to be ", 2 * k, ", but got: ",
+              pad.size());
+  bool batch = self.dim() == k + 2, valid = batch || self.dim() == k + 1;
+  for (int64_t d = batch ? 1 : 0; valid && d < self.dim(); ++d) {  // (only a batch can be empty)
+    valid = self.size(d) != 0;
+  }
+  TORCH_CHECK(valid, "Expected ", k + 1, "D or ", k + 2, "D (batch mode) tensor with possibly 0 batch size and other "
+              "non-zero dimensions for input, but got: ", self.sizes());
+  int64_t ndim = self.dim();
+  if (reflect) {
+    for (int64_t j = 0; j < k; ++j) {
+      int64_t d = ndim - 1 - j;
+      TORCH_CHECK(pad[2 * j] < self.size(d) && pad[2 * j + 1] < self.size(d), "Argument #", 4 + 2 * j,
+                  ": Padding size should be less than the corresponding input dimension, but got: padding (",
+                  pad[2 * j], ", ", pad[2 * j + 1], ") at dimension ", d, " of input ", self.sizes());
+    }
+  }
+  std::vector<int64_t> in(k), out(k);
+  bool ok = true;
+  for (int64_t j = 0; j < k; ++j) {
+    int64_t d = ndim - 1 - j;
+    in[k - 1 - j] = self.size(d);
+    out[k - 1 - j] = self.size(d) + pad[2 * j] + pad[2 * j + 1];
+    ok = ok && out[k - 1 - j] >= 1;
+  }
+  if (k == 1) {
+    TORCH_CHECK(ok, "input (W: ", in[0], ") is too small. Calculated output W: ", out[0]);
+  } else if (k == 2) {
+    TORCH_CHECK(ok, "Calculated output H: ", out[0], " W: ", out[1], " must be >= 1 in every dimension (input H: ",
+                in[0], ", W: ", in[1], ")");
+  } else {
+    TORCH_CHECK(ok, "Calculated output D: ", out[0], " H: ", out[1], " W: ", out[2],
+                " must be >= 1 in every dimension (input D: ", in[0], ", H: ", in[1], ", W: ", in[2], ")");
+  }
+}
+
 at::Tensor& pad_out(const at::Tensor& self, at::IntArrayRef pad, bool reflect, const char* name, at::Tensor& out) {
   int64_t k = static_cast<int64_t>(pad.size()) / 2;
-  TORCH_CHECK(self.dim() == k + 1 || self.dim() == k + 2, name, ": expected ", k + 1, "D or ", k + 2,
-              "D input, got ", self.dim(), "D");
-  for (int64_t d = self.dim() == k + 2 ? 1 : 0; d < self.dim(); ++d) {  // (as the CPU: only a batch can be empty)
-    TORCH_CHECK(self.size(d) != 0, "Expected ", k + 1, "D or ", k + 2, "D (batch mode) tensor with possibly 0 batch "
-                "size and other non-zero dimensions for input, but got: ", self.sizes());
-  }
+  pad_shape_check(self, pad, k, reflect);
   std::vector<int64_t> shape = self.sizes().vec();
   std::vector<int64_t> dims;
   std::vector<at::Tensor> indices;
   for (int64_t j = 0; j < k; ++j) {
     int64_t d = self.dim() - 1 - j;
     int64_t left = pad[2 * j], right = pad[2 * j + 1], n = self.size(d);
-    if (reflect) {
-      TORCH_CHECK(left < n && right < n, "Argument #4: Padding size should be less than the corresponding input "
-                  "dimension, but got: padding (", left, ", ", right, ") at dimension ", d, " of input ", self.sizes());
-    } else {
-      TORCH_CHECK(n > 0, name, ": input dimension must be nonzero");
-    }
     int64_t len = n + left + right;
-    TORCH_CHECK(len > 0, name, ": output size is too small");
     at::Tensor i = at::arange(-left, n + right, self.options().dtype(at::kLong));
     if (reflect) {
       i = (n - 1) - at::abs((n - 1) - at::abs(i));  // reflect at both ends (pad < n)
@@ -1466,7 +1503,7 @@ at::Tensor& pad_kernel_out(const at::Tensor& self, at::IntArrayRef pad, at::Tens
   static const std::string names[] = {"reflection_pad1d", "reflection_pad2d", "reflection_pad3d",
                                       "replication_pad1d", "replication_pad2d", "replication_pad3d"};
   const std::string& name = names[(Reflect ? 0 : 3) + K - 1];
-  TORCH_CHECK(pad.size() == 2 * K, name, ": padding size is expected to be ", 2 * K);
+  TORCH_CHECK(pad.size() == 2 * K, "padding size is expected to be ", 2 * K, ", but got: ", pad.size());
   reject_dtype(name.c_str(), self.scalar_type(), self.scalar_type() == at::kBool);
   if (!movable(self) || !is_vk(out) || out.scalar_type() != self.scalar_type()) {
     on_cpu(("aten::" + name).c_str(), "out", self, pad, out);
@@ -1696,6 +1733,12 @@ at::Tensor& eye_out(int64_t n, at::Tensor& out) {
 
 bool equal(const at::Tensor& self, const at::Tensor& other) {
   at::ScalarType t = self.scalar_type();
+  if (is_vk(self) && is_vk(other) && t == other.scalar_type() &&
+      (t == at::kUInt16 || t == at::kUInt32 || t == at::kUInt64)) {
+    // (equal integers have equal bits: compared as the signed type of their width)
+    at::ScalarType s = t == at::kUInt16 ? at::kShort : t == at::kUInt32 ? at::kInt : at::kLong;
+    return vk::equal(self.view(s), other.view(s));
+  }
   bool small_int = t == at::kChar || t == at::kByte || t == at::kShort;
   if (is_vk(self) && is_vk(other) && (at::isReducedFloatingType(t) || small_int) && t == other.scalar_type() &&
       storage_label(t) != nullptr) {

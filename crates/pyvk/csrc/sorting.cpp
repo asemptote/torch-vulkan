@@ -13,6 +13,7 @@
 #include "opcodes.h"
 #include "vk.h"
 
+#include <ATen/MemoryOverlap.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
 
@@ -825,10 +826,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> unique_consecutive(const at::Tens
 
 std::tuple<at::Tensor&, at::Tensor&> aminmax_out(const at::Tensor& self, std::optional<int64_t> dim, bool keepdim,
                                                  at::Tensor& min, at::Tensor& max) {
+  // (aminmax's meta function's checks, in its order)
+  TORCH_CHECK_TYPE(!self.is_complex(), "aminmax not implemented for ", self.scalar_type());
   for (const at::Tensor* out : {&min, &max}) {
     TORCH_CHECK(out->scalar_type() == self.scalar_type(), "Expected out tensor to have dtype ", self.dtype(),
                 ", but got ", out->dtype(), " instead");
   }
+  at::MemOverlapStatus overlap = at::get_overlap_status(min, max);
+  TORCH_CHECK_VALUE(overlap != at::MemOverlapStatus::Partial && overlap != at::MemOverlapStatus::Full,
+                    "aminmax(): the `min` and `max` out= tensors must not overlap.");
   if (dim.has_value()) {
     assign_out(min, at::amin(self, *dim, keepdim));
     assign_out(max, at::amax(self, *dim, keepdim));

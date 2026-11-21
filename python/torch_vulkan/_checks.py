@@ -120,8 +120,6 @@ def grid_sampler(input, grid, mode, k):
     if input.dim() != k + 2 or grid.dim() != input.dim():
         raise RuntimeError(f"grid_sampler(): expected {k + 2}D input and grid with same number of dimensions, but got "
                            f"input with sizes {list(input.shape)} and grid with sizes {list(grid.shape)}")
-    if k == 3 and mode == 2:
-        raise RuntimeError("grid_sampler(): bicubic interpolation only supports 4D input")
 
 
 def _ints(v):
@@ -185,10 +183,9 @@ def _max_pool(k):
         else:
             fn = "max_pool3d_with_indices_out_cpu_template()"
             for i in range(1 if x.dim() == 5 else 0, x.dim()):
-                if x.shape[i] <= 0:
-                    raise RuntimeError(f"{fn}: Expected input's non-batch dimensions to have positive length, but "
-                                       f"input has a shape of {_sizes(x)} and non-batch dimension {x.shape[i]} has "
-                                       "length zero!")
+                if x.shape[i] <= 0:  # (PoolingChecks.h's check_non_empty_dims)
+                    raise RuntimeError(f"{fn}: Expected input to have non-zero size for non-batch dimensions, but "
+                                       f"input has sizes {_sizes(x)} with dimension {i} being empty")
         if min(out) < 1:
             planes = x.shape[-k - 1]
             raise RuntimeError(f"Given input size: ({'x'.join(map(str, (planes, *spatial)))}). Calculated output "

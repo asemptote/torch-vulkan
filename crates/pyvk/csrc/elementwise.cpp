@@ -10,6 +10,7 @@
 #include "opcodes.h"
 #include "vk.h"
 
+#include <ATen/Dispatch_v2.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/native/Resize.h>
 #include <torch/library.h>
@@ -77,10 +78,8 @@ at::Tensor& elu_out(const at::Tensor& self, const at::Scalar& alpha, const at::S
 }
 
 at::Tensor& hardtanh_out(const at::Tensor& self, const at::Scalar& min, const at::Scalar& max, at::Tensor& out) {
-  at::ScalarType st = self.scalar_type();
-  if (st == at::kByte || st == at::kUInt16 || st == at::kUInt32 || st == at::kUInt64) {
-    TORCH_CHECK(min.toDouble() >= 0 && max.toDouble() >= 0, "cannot do hardtanh on an unsigned type with negative limits");
-  }
+  // (PyTorch 2.15 on: integer bounds outside the dtype's range as clamp's, no
+  // longer an error for unsigned types)
   if (is_int(self.scalar_type()) && is_vk(self) && is_vk(out)) {
     // (as the CPU: integer bounds, so the result keeps the integer dtype)
     return at::clamp_out(out, self, at::Scalar(min.toLong()), at::Scalar(max.toLong()));
@@ -222,16 +221,65 @@ std::tuple<at::Tensor&, at::Tensor&> log_sigmoid_forward_out(const at::Tensor& s
 
 // ---------------------------------------------------------------- clamp
 
+// An integer dtype's clamp bound as PyTorch's CPU takes it (2.15 on,
+// TensorCompare.cpp's prepare_clamp_bound): a bound outside the dtype's range
+// that cannot change an element (a lower bound below it, an upper bound above
+// it) is dropped; the opposite raises.
+std::optional<at::Scalar> clamp_bound(const std::optional<at::Scalar>& bound, at::ScalarType dtype, bool lower) {
+  if (!bound.has_value() || !at::isIntegralType(dtype, /*includeBool=*/false)) {
+    return bound;
+  }
+  const at::Scalar& b = *bound;
+  bool is_unsigned = dtype == at::kByte || dtype == at::kUInt16 || dtype == at::kUInt32 || dtype == at::kUInt64;
+  double lowest_d = 0, highest_d = 0;
+  int64_t lowest = 0;
+  uint64_t highest = 0;  // (as uint64: every dtype's maximum is non-negative)
+  AT_DISPATCH_V2(dtype, "clamp_bound", AT_WRAP([&] {
+    lowest_d = static_cast<double>(std::numeric_limits<scalar_t>::lowest());
+    highest_d = static_cast<double>(std::numeric_limits<scalar_t>::max());
+    lowest = is_unsigned ? 0 : static_cast<int64_t>(std::numeric_limits<scalar_t>::lowest());
+    highest = static_cast<uint64_t>(std::numeric_limits<scalar_t>::max());
+  }), AT_EXPAND(AT_INTEGRAL_TYPES_V2));
+  bool below, above;
+  if (b.isFloatingPoint()) {
+    double v = b.toDouble();
+    below = v < lowest_d;
+    above = v > highest_d;
+  } else if (b.type() == at::ScalarType::UInt64) {
+    uint64_t v = b.toUInt64();
+    below = false;
+    above = v > highest;
+  } else {
+    int64_t v = b.toLong();
+    below = v < lowest;
+    above = v >= 0 && static_cast<uint64_t>(v) > highest;
+  }
+  if (!below && !above) {
+    return bound;
+  }
+  TORCH_CHECK(lower ? below : above, "Clamp ", lower ? "min" : "max", " value ", b.toDouble(),
+              " is outside the representable range of ", dtype);
+  return std::nullopt;
+}
+
 // Scalar bounds: UNARY_CLAMP with the bounds in alpha and beta.
-bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& lo,
-                      const std::optional<at::Scalar>& hi, const at::Tensor& out) {
+bool clamp_scalar_gpu(const at::Tensor& self, const std::optional<at::Scalar>& min,
+                      const std::optional<at::Scalar>& max, const at::Tensor& out) {
   at::ScalarType result = self.scalar_type();
-  for (const auto* bound : {&lo, &hi}) {
+  for (const auto* bound : {&min, &max}) {
     if (bound->has_value()) result = at::promote_types(result, at::result_type(self, **bound));
   }
   check_out_cast(result, out);
   resize_elementwise_output(out, self.sizes(), &self);
   at::ScalarType dtype = out.scalar_type();
+  if (!is_vk(self) || !is_vk(out)) {
+    return false;
+  }
+  std::optional<at::Scalar> lo = clamp_bound(min, dtype, true), hi = clamp_bound(max, dtype, false);
+  if ((min.has_value() || max.has_value()) && !lo && !hi) {
+    out.copy_(self);  // (both bounds dropped: a copy, as the CPU)
+    return true;
+  }
   if ((dtype == at::kByte || dtype == at::kChar || dtype == at::kShort) && is_vk(self) && is_vk(out)) {
     // (8/16-bit integers: the bounds converted to the dtype as the CPU's
     // kernel converts them (uint8 takes -1 as 255), the clamp in int32)

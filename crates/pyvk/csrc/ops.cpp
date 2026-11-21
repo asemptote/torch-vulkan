@@ -856,6 +856,16 @@ at::Tensor& pow_scalar_out(const at::Tensor& self, const at::Scalar& exponent, a
       out.scalar_type() == self.scalar_type() && is_vk(self) && is_vk(out)) {
     return at::sqrt_out(out, self);  // (the CPU's x ** 0.5 is its sqrt)
   }
+  if (self.is_complex() && out.scalar_type() == self.scalar_type() && is_vk(self) && is_vk(out) &&
+      (exponent.equal(2.0) || exponent.equal(3.0) || exponent.equal(-2.0))) {
+    // (the CPU's complex x ** 2, 3 and -2 are products, which keep infinities
+    // that the general power turns to NaN: (-1 + inf j) ** 2 is -inf - inf j)
+    at::Tensor sq = at::mul(self, self);
+    at::Tensor r = exponent.equal(3.0) ? at::mul(sq, self) : exponent.equal(-2.0) ? at::reciprocal(sq) : sq;
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
+  }
   if (!binary_gpu(kBinary[kPow], self, nullptr, &exponent, 1, out)) {
     on_cpu("aten::pow", "Tensor_Scalar_out", self, exponent, out);
   }

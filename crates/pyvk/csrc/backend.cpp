@@ -822,7 +822,14 @@ at::Tensor& fill_tensor(at::Tensor& self, const at::Tensor& value) {
 }
 
 at::Tensor& zero_(at::Tensor& self) {
-  return fill_scalar(self, 0);
+  // All-zero bits, as the CPU's memset and CUDA's zero_ (PyTorch 2.15): zero in
+  // every dtype, including those with no fill kernel (bits8, float4_e2m1fn_x2).
+  std::string kernel = move_kernel(self.itemsize());
+  if (kernel.empty()) {
+    return fill_scalar(self, 0);
+  }
+  launch_strided_bits(kernel.c_str(), {op::MOVE_FILL}, self, nullptr, nullptr, std::array<uint64_t, 2>{0, 0});
+  return self;
 }
 
 // ---------------------------------------------------------------- CPU fallback

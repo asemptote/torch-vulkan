@@ -216,6 +216,18 @@ def test_equal_isin():
     check(isin[1], torch.isin(a, test, invert=True))
 
 
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+def test_equal_unsigned(dtype):
+    a = torch.tensor([[0, 1, 2 ** 15, 7], [3, 9, 65535, 2]]).to(dtype)
+    b = a.clone()
+    b[1, 2] = 4
+    va, vb = a.to("vk"), b.to("vk")
+    with on_gpu():
+        results = [torch.equal(va, va.clone()), torch.equal(va, vb), torch.equal(va, va[:1]),
+                   torch.equal(va[0, 0], va[0, 0].clone()), torch.equal(va.t(), va.t().contiguous())]
+    assert results == [True, False, False, True, True]
+
+
 def test_out_of_range_index_raises_on_sync():
     v = torch.arange(10.0).to("vk")
     with on_gpu():
