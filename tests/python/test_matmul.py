@@ -400,10 +400,11 @@ def test_split_k_gemm(env):
     # the device has cooperative matrices, gemmcm.slang's tiles (and its
     # banded launch order); TORCH_VK_COMPUTE_UNITS=300 makes the GPU look big
     # enough that the default choice splits these products
-    if tv._native.kernel_subgroup_size("gemmsg_f32") == 0 and not any(COOPMAT.values()):
-        # (Arm GPUs: gemm4s.slang, gemm4.slang and gemm.slang never split k;
-        # their unsplit float32 sums over k = 2048 can exceed this test's
-        # 2^-20 of the products' magnitudes)
+    if "Mali" in tv.device_name() or (tv._native.kernel_subgroup_size("gemmsg_f32") == 0 and not any(COOPMAT.values())):
+        # (Arm GPUs run gemm4s.slang or gemm4.slang, and others without
+        # subgroups gemm.slang, which never split k; their unsplit float32
+        # sums over k = 2048 can exceed this test's 2^-20 of the products'
+        # magnitudes)
         pytest.skip("no kernel here splits k")
     out = subprocess.run([sys.executable, "-c", SPLIT_K_SCRIPT], env=dict(os.environ, **env), capture_output=True,
                          text=True, timeout=600)

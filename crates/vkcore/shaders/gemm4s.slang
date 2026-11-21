@@ -9,26 +9,27 @@
 //
 // The host passes row-major A and B (unit k and n strides) whose rows and
 // batches start 16-byte aligned (8-byte for 16-bit T), K a multiple of 4 and
-// B's rows padded to a multiple of 4 columns (zeros past N, never written to
-// C), as gemm4.slang's.
+// B's rows readable to a multiple of 4 columns (the columns past N are read,
+// never written to C), as gemm4.slang's.
 //
 // A workgroup of WY subgroups of 16 lanes computes a (WY R) x 64 tile of C:
 // subgroup y the rows y R .. y R + R - 1, lane l the columns 4l .. 4l + 3.
-// Per k a lane loads its 4 values of B's row (one 16-byte load) and does
+// Per k a lane loads its 4 values of B's row (one load) and does
 // R x 4 multiply-adds, taking A[row][k] from the lane that loaded it: per
-// block of KB values of k, each lane loads one 16-byte piece of A (the R
+// block of KB values of k, each lane loads one 4-value piece of A (the R
 // rows' KB values are R KB / 4 pieces, spread over the subgroup's lanes),
 // and the multiply-adds read them by shuffles (WaveReadLaneAt with constant
 // lanes once unrolled). On Mali every load, from cache too, costs as much
 // as about 12 multiply-adds of the warp (and a shuffle about 1), so this
-// does 32 multiply-adds per load and 8 shuffles, against gemm4.slang's 2 x 8
-// outputs per thread (16 per 1.25 loads) that also reloads A per lane.
+// does 32 multiply-adds per load and 8 shuffles, against gemm4.slang's 64
+// per 10 loads (2 x 8 outputs per thread, A loaded by every lane).
 //
-// Measured on the Mali-G57 MC2 (Galaxy A13; float32, 2048^3): 67 GFLOP/s,
-// against gemm4.slang's 33; with operands from cache 75, about 62% of the
-// 122 the FMA units could do. 8 rows per subgroup and blocks of 8 values of
-// k were best (4, 6, 10 and 12 rows, 4, 16 and 32 values tried; 12 rows
-// spill). Needs exactly 16 lanes per subgroup (vkcore:
+// Measured on the Mali-G57 MC2 (Galaxy A13; float32, 2048^3): 63-73
+// GFLOP/s, against gemm4.slang's 29-34; with operands from cache 75, about
+// 62% of the 122 the FMA units could do. 8 rows per subgroup, blocks of 8
+// values of k and 2 subgroups per workgroup were best (4, 6, 10 and 12 rows,
+// 4, 16 and 32 values, 1, 4 and 8 subgroups tried; 12 rows spill;
+// docs/log/M39). Needs exactly 16 lanes per subgroup (vkcore:
 // EXACT_SUBGROUP_KERNELS), in order along x.
 
 #include "_half.slang"
