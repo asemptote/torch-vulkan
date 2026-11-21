@@ -30,7 +30,11 @@ jobs:
       - name: Compile the kernels
         run: |
           cargo build --release -p vkcore
-          out=$(dirname "$(ls target/release/build/vkcore-*/out/kernels.rs | head -1)")
+          # (Found wherever Cargo puts build-script outputs: Rust 1.100 moved
+          # them out of target/release/build.)
+          k=$(find target -path '*vkcore*' -name kernels.rs | head -1)
+          test -n "$k" || { echo "vkcore's kernels.rs not found under target/"; exit 1; }
+          out=$(dirname "$k")
           mkdir -p spirv && cp "$out"/*.spv spirv/
           echo "$(ls spirv | wc -l) kernels"
       - uses: actions/upload-artifact@v4
