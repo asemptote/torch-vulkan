@@ -66,6 +66,13 @@ fn capabilities() -> u32 {
     ffi::vkt_capabilities()
 }
 
+/// The device's SMs or compute units (0 where unknown), which matrix
+/// products choose their tiles and split k by.
+#[pyfunction]
+fn compute_units() -> u32 {
+    ffi::vkt_compute_units()
+}
+
 /// The subgroup size kernel `name` runs with (e.g. "gemmsg_f32"): 0 for
 /// kernels not written for subgroups and where the device cannot run it.
 #[pyfunction]
@@ -186,6 +193,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(record_fallback, m)?)?;
     m.add_function(wrap_pyfunction!(capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(kernel_subgroup_size, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_units, m)?)?;
     m.add_function(wrap_pyfunction!(manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(seed, m)?)?;

@@ -286,6 +286,64 @@ def test_coopmat_16bit_gemm(dtype):
           0.5 * bias.float().abs() + 2.0 * (a[0].float().abs() @ b[0].float().abs().t()))
 
 
+SPLIT_K_SCRIPT = r"""
+import os, torch, torch_vulkan as tv
+torch.manual_seed(0)
+coop = {torch.float16: bool(tv._native.capabilities() & 16), torch.bfloat16: bool(tv._native.capabilities() & 32)}
+dtypes = [torch.float32] + ([torch.float64] if tv._native.capabilities() & 1 else [])
+dtypes += [t for t in (torch.float16, torch.bfloat16) if coop[t]]
+worst = 0.0
+for dt in dtypes:
+    def close(got, a, b, alpha=1.0, beta=0.0, cin=None):
+        # the CPU's product in float64 (float32 for 16-bit inputs, rounded
+        # once as the kernels do), against float32 or float64 summation error
+        # relative to the products' magnitudes
+        wide = torch.float64 if dt == torch.float64 else torch.float32
+        ref = alpha * (a.to(wide) @ b.to(wide)) + (beta * cin.to(wide) if cin is not None else 0)
+        mag = abs(alpha) * (a.to(wide).abs() @ b.to(wide).abs()) + (abs(beta) * cin.to(wide).abs() if cin is not None else 0)
+        got = got.cpu().to(wide)
+        if dt in (torch.float16, torch.bfloat16):
+            ref = ref.to(dt).to(wide)
+            tol = torch.finfo(dt).eps * ref.abs().clamp_min(2**-14) + 2**-20 * mag
+        else:
+            tol = (2**-20 if dt == torch.float32 else 2**-48) * mag + 1e-30
+        assert not torch.isnan(got).any(), "NaN"
+        return float(((got - ref).abs() / tol).max())
+    for m, k, n in [(70, 600, 50), (130, 1000, 257), (8, 2048, 300), (2, 513, 2), (200, 300, 16)]:
+        a, b = torch.randn(m, k, dtype=dt), torch.randn(k, n, dtype=dt)
+        va, vb = a.to("vk"), b.to("vk")
+        runs = [(va @ vb).cpu() for _ in range(3)]
+        assert all(torch.equal(runs[0], r) for r in runs[1:]), "not reproducible"
+        worst = max(worst, close(runs[0], a, b))
+        worst = max(worst, close((va.t().contiguous().t() @ vb.t().contiguous().t()).cpu(), a, b))  # column-major
+        out = torch.empty(n, m, dtype=dt, device="vk").t()  # (a transposed result)
+        torch.mm(va, vb, out=out)
+        worst = max(worst, close(out, a, b))
+    a, b, c = torch.randn(3, 40, 700, dtype=dt), torch.randn(3, 700, 50, dtype=dt), torch.randn(40, 50, dtype=dt)
+    worst = max(worst, close(torch.baddbmm(c.to("vk"), a.to("vk"), b.to("vk"), beta=0.5, alpha=2).cpu(), a, b, 2.0, 0.5, c))
+    nan = torch.full((40, 50), float("nan"), dtype=dt)
+    worst = max(worst, close(torch.addmm(nan.to("vk"), a[0].to("vk"), b[0].to("vk"), beta=0).cpu(), a[0], b[0]))
+    x = torch.randn(1200, 64, dtype=dt)  # (a weight gradient's x.t() @ y)
+    worst = max(worst, close((x.to("vk").t() @ x.to("vk")).cpu(), x.t(), x))
+print(worst)
+"""
+
+
+@pytest.mark.parametrize("env", [dict(TORCH_VK_SPLIT_K="3"), dict(TORCH_VK_SPLIT_K="2", TORCH_VK_GEMM_TILE="m"),
+                                 dict(TORCH_VK_SPLIT_K="5", TORCH_VK_GEMM_TILE="s", TORCH_VK_GEMM_GROUP="3"),
+                                 dict(TORCH_VK_COMPUTE_UNITS="300")])
+def test_split_k_gemm(env):
+    # products split along k (shaders/splitk.slang adds the pieces' sums in a
+    # fixed order: the same results from run to run) by gemmsg.slang and, where
+    # the device has cooperative matrices, gemmcm.slang's tiles (and its
+    # banded launch order); TORCH_VK_COMPUTE_UNITS=300 makes the GPU look big
+    # enough that the default choice splits these products
+    out = subprocess.run([sys.executable, "-c", SPLIT_K_SCRIPT], env=dict(os.environ, **env), capture_output=True,
+                         text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert float(out.stdout.strip().splitlines()[-1]) <= 1.0  # (errors in units of the tolerance)
+
+
 def test_coopmat_coverage():
     # where the device has 16-bit cooperative matrices, gemmcm runs in
     # subgroups of 32 (TORCH_VK_DISABLE=coopmat hides them, =bfloat16 the

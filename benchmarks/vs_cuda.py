@@ -11,7 +11,9 @@ longer than --timeout seconds are reported as such. Either Python may be
 left out (that column is then empty).
 
 Workloads: matrix products (float16, bfloat16, float32 with CUDA's TF32 off,
-and once with it on for reference, float64) at 2048^3 and 8192^3; FFTs and
+and once with it on for reference, float64) at 2048^3, 4096^3 and 8192^3,
+and in weight gradients' shape (x.t() @ y: a 4096 x 4096 or 1024 x 1024
+result summed over 65536 or 262144 rows) in 16-bit and float32; FFTs and
 real FFTs of 2^20 and 2^24 points in complex64 / complex128; float64
 linalg.solve, eigh and svd at n = 1024 and 4096; an element-wise chain over
 2^26 float32 values (GB/s); the per-op overhead of small additions; and a
@@ -37,10 +39,16 @@ def add(name, unit, setup):
 
 
 for dt in ("float16", "bfloat16", "float32", "float64"):
-    for n in (2048, 8192):
+    for n in (2048, 4096, 8192):
         add(f"matmul {dt} {n}^3", "TFLOP/s",
             f"a = torch.randn({n}, {n}, device=dev, dtype=torch.{dt}); b = torch.randn({n}, {n}, device=dev, "
             f"dtype=torch.{dt})\nfn = lambda: a @ b\namount = 2 * {n}**3 / 1e12")
+for dt in ("float16", "bfloat16", "float32"):
+    # weight gradients' shape: x.t() @ grad, a small result summed over many rows
+    for n, k in ((4096, 65536), (1024, 262144)):
+        add(f"matmul {dt} {n}x{n}, k={k} (x.t() @ y)", "TFLOP/s",
+            f"x = torch.randn({k}, {n}, device=dev, dtype=torch.{dt}); y = torch.randn({k}, {n}, device=dev, "
+            f"dtype=torch.{dt})\nfn = lambda: x.t() @ y\namount = 2 * {n}**2 * {k} / 1e12")
 for n in (2048, 8192):
     add(f"matmul float32 {n}^3, TF32 on (CUDA)", "TFLOP/s",
         f"torch.backends.cuda.matmul.allow_tf32 = True\na = torch.randn({n}, {n}, device=dev); "
