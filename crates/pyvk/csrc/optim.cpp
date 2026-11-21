@@ -7,7 +7,10 @@
 // computed in double precision, and found_inf = 1 skips the step. float32
 // and float64 (where the device has it) are computed in their own type,
 // float16 and bfloat16 in float32 copies rounded back (the CPU's opmath);
-// anything else goes to the CPU.
+// anything else goes to the CPU. Adam and AdamW also take float32
+// parameters and gradients with bfloat16 state (exp_avg, exp_avg_sq,
+// max_exp_avg_sq), as CUDA's fused kernels (the CPU's raise): the kernel
+// reads the state into float32 and writes it back rounded to nearest even.
 
 #include "opcodes.h"
 #include "vk.h"
@@ -41,15 +44,20 @@ std::optional<at::ScalarType> compute_type(at::ScalarType t) {
   return std::nullopt;
 }
 
-// True if every tensor of the lists is a vk tensor of `t` with fewer than
-// 2^31 elements, the shape of the parameter it belongs to.
-bool on_gpu(at::ScalarType t, at::TensorList params, std::initializer_list<at::TensorList> lists) {
+// True if every tensor of the lists is a vk tensor with fewer than 2^31
+// elements, the shape of the parameter it belongs to, the parameters and
+// gradients (the first list) of dtype `t`, the other lists of `state`.
+bool on_gpu(at::ScalarType t, at::TensorList params, std::initializer_list<at::TensorList> lists,
+            std::optional<at::ScalarType> state = std::nullopt) {
   for (size_t i = 0; i < params.size(); ++i) {
     const at::Tensor& p = params[i];
     if (!is_vk(p) || p.scalar_type() != t || p.numel() >= (int64_t(1) << 31)) return false;
+    bool first = true;
     for (at::TensorList l : lists) {
+      at::ScalarType want = first ? t : state.value_or(t);
+      first = false;
       if (l.empty()) continue;
-      if (!is_vk(l[i]) || l[i].scalar_type() != t || !l[i].sizes().equals(p.sizes())) return false;
+      if (!is_vk(l[i]) || l[i].scalar_type() != want || !l[i].sizes().equals(p.sizes())) return false;
     }
   }
   return true;
@@ -99,34 +107,38 @@ HostScalars read_scalars(at::TensorList steps, const OptTensor& grad_scale, cons
   return s;
 }
 
-// A tensor the kernel can use for `x` (contiguous, of the compute type):
-// x itself, or a copy written back by finish().
+// A tensor the kernel can use for `x` (contiguous, of dtype `t`): x itself,
+// or a copy written back by finish().
 struct Operand {
   at::Tensor original, used;
-  Operand(const at::Tensor& x, at::ScalarType ct) : original(x), used(x.contiguous().to(ct)) {}
+  Operand(const at::Tensor& x, at::ScalarType t) : original(x), used(x.contiguous().to(t)) {}
   uint64_t address() { return gpu_address_out(used); }
   void finish() {
     if (!used.is_same(original)) original.copy_(used);
   }
 };
 
+// One step over one parameter tensor; the state buffers b1..b3 in the
+// compute type ct, or bfloat16 (bf16_state: read and written as such).
 void launch(uint32_t op, at::ScalarType ct, const at::Tensor& param, const at::Tensor& grad, const at::Tensor* b1,
-            const at::Tensor* b2, const at::Tensor* b3, uint32_t flags, const std::array<double, 9>& c) {
+            const at::Tensor* b2, const at::Tensor* b3, uint32_t flags, const std::array<double, 9>& c,
+            bool bf16_state = false) {
   if (param.numel() == 0) return;
   Operand p(param, ct), g(grad, ct);
+  at::ScalarType st = bf16_state ? at::kBFloat16 : ct;
   std::optional<Operand> o1, o2, o3;
   OptimParams k{};
   k.param = p.address();
   k.grad = g.address();
-  if (b1) k.buf1 = o1.emplace(*b1, ct).address();
-  if (b2) k.buf2 = o2.emplace(*b2, ct).address();
-  if (b3) k.buf3 = o3.emplace(*b3, ct).address();
+  if (b1) k.buf1 = o1.emplace(*b1, st).address();
+  if (b2) k.buf2 = o2.emplace(*b2, st).address();
+  if (b3) k.buf3 = o3.emplace(*b3, st).address();
   k.n = static_cast<uint32_t>(param.numel());
   k.flags = flags;
   for (size_t i = 0; i < c.size(); ++i) k.c[i] = pack_param(c10::Scalar(c[i]), ct);
   uint32_t grid = 0;
   check(vkt_grid_1d(k.n, &grid, &k.stride));
-  dispatch(std::string("optim_") + dtype_label(ct), {op}, k, grid);
+  dispatch(std::string("optim_") + dtype_label(ct) + (bf16_state ? "_bf16" : "_t"), {op}, k, grid);
   p.finish();
   if (flags & kScaled) g.finish();
   for (auto* o : {&o1, &o2, &o3}) {
@@ -151,8 +163,28 @@ void fused_adam(at::TensorList params, at::TensorList grads, at::TensorList exp_
   }
   TORCH_CHECK(state_steps.size() == n);
   if (n == 0) return;
-  auto ct = compute_type(params[0].scalar_type());
-  if (!ct || !on_gpu(params[0].scalar_type(), params, {grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs})) {
+  at::ScalarType t = params[0].scalar_type();
+  // Mixed precision (state dtype not the parameters'): CUDA's checks, float32
+  // parameters and gradients with bfloat16 state only
+  bool mixed = exp_avgs[0].scalar_type() != t;
+  if (mixed) {
+    const char* what = AdamW ? "Mixed-precision fused AdamW" : "Mixed-precision fused Adam";
+    TORCH_CHECK(t == at::kFloat, what, " requires float32 params, got ", t);
+    TORCH_CHECK(grads[0].scalar_type() == at::kFloat, what, " requires float32 grads, got ", grads[0].scalar_type());
+    TORCH_CHECK(exp_avgs[0].scalar_type() == at::kBFloat16, what, " requires bfloat16 optimizer states, got ",
+                exp_avgs[0].scalar_type());
+    TORCH_CHECK(exp_avg_sqs[0].scalar_type() == at::kBFloat16, what, " requires bfloat16 optimizer states, got ",
+                exp_avg_sqs[0].scalar_type());
+    if (amsgrad) {
+      TORCH_CHECK(max_exp_avg_sqs[0].scalar_type() == at::kBFloat16, what, " requires bfloat16 max_exp_avg_sqs, got ",
+                  max_exp_avg_sqs[0].scalar_type());
+    }
+  }
+  auto ct = compute_type(t);
+  bool gpu = ct && (mixed ? storage_label(at::kBFloat16) != nullptr &&
+                                on_gpu(t, params, {grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}, at::kBFloat16)
+                          : on_gpu(t, params, {grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}));
+  if (!gpu) {
     on_cpu(name, "", params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps, lr, beta1, beta2,
            weight_decay, eps, amsgrad, maximize, grad_scale, found_inf);
     return;
@@ -175,7 +207,7 @@ void fused_adam(at::TensorList params, at::TensorList grads, at::TensorList exp_
                                eps,
                                -(lr / bias_correction1)};
     launch(AdamW ? op::OPTIM_ADAMW : op::OPTIM_ADAM, *ct, params[i], grads[i], &exp_avgs[i], &exp_avg_sqs[i],
-           amsgrad ? &max_exp_avg_sqs[i] : nullptr, flags, c);
+           amsgrad ? &max_exp_avg_sqs[i] : nullptr, flags, c, mixed);
   }
 }
 
