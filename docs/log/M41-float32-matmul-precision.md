@@ -14,7 +14,7 @@ bfloat16 ones, as PyTorch's documentation of the setting allows:
 - **"highest"** (the default): float32 products as before, the same bits.
 - **"medium"**: A and B rounded to bfloat16 (to nearest even), one bfloat16
   product, summed in float32. Each product a b is off by at most
-  (2 u + u^2) |a b|, u = 2^-8: under 2^-7 of its magnitude.
+  (2 u + u^2) |a b|, u = 2^-8: 2^-7 + 2^-16 of its magnitude.
 - **"high"**: each operand split into two bfloat16 parts, hi = bf16(x) and
   lo = bf16(x - hi) (x - hi is exact in float32), and
   a b ~ hi_a hi_b + hi_a lo_b + lo_a hi_b (Henry et al.,
@@ -64,7 +64,7 @@ a complex64 product, as cuBLAS's complex products follow TF32 on CUDA. Not:
   so rounding the operands would buy nothing.
 
 The math SDPA path (`at::matmul` of q and k) follows the setting, as on
-CUDA's math backend and the CPU's.
+CUDA's math backend.
 
 ## How: bfloat16 parts first, then a bfloat16 product
 
