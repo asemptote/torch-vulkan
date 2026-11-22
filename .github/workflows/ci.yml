@@ -25,7 +25,13 @@ env:
   VVL_SDK: "1.4.363.0"
   VVL_SDK_SHA256: 197962f5cbf80baf2775a03336a01cee7c8745686c65aaa70d3f751ade4d7e43
   TORCH_VK_VALIDATE: "1"
-  # lavapipe's LLVM JIT emits AVX-512 code that faults on some runner CPUs.
+  # lavapipe's LLVM JIT compiles for the runner's CPU, AVX-512 included,
+  # which faulted on some runner CPUs: Mesa's CPU-feature override keeps its
+  # code to AVX2 on every runner. (LP_NATIVE_VECTOR_WIDTH=256 alone does not:
+  # 256 bits is already lavapipe's default, and its code still has AVX-512VL
+  # instructions there.)
+  GALLIUM_OVERRIDE_CPU_CAPS: "avx"
+  # 256-bit vectors: 8-lane subgroups (the second pytest pass below: 16)
   LP_NATIVE_VECTOR_WIDTH: "256"
   # The CPU reference the tests compare with: PyTorch's AVX2 kernels and MKL's
   # AVX2 code path on every runner, as on the development machines, instead of
@@ -134,7 +140,24 @@ jobs:
         run: maturin develop --release
 
       - name: Python tests
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
+
+      # What the pass above cannot take: the kernels for exactly 16 lanes
+      # (gemm4s, conv4s and float16 arithmetic: Intel's and Mali's GPUs), from
+      # lavapipe with 512-bit vectors (still AVX2 code, in pairs of 256-bit
+      # instructions), and the paths for GPUs without float64 (Mali), with
+      # float64 hidden (lavapipe's 16-lane float64 division crashes in Mesa
+      # 26). Also the stream's bounds for Intel GPUs under Linux (submissions
+      # in flight, workgroups per batch: docs/log/M34). Cooperative matrices
+      # (gemmcm) and i915's watchdog itself only run on the hardware:
+      # RELEASING.md's hardware check.
+      - name: Python tests, 16-lane subgroups, no float64
+        run: python -m pytest -q -rs
+        env:
+          LP_NATIVE_VECTOR_WIDTH: "512"
+          TORCH_VK_DISABLE: float64
+          TORCH_VK_MAX_IN_FLIGHT: "2"
+          TORCH_VK_MAX_BATCH_GROUPS: "8192"
 
       # vk raises the CPU's dtype errors itself, from a generated table; this
       # fails if the installed PyTorch's CPU no longer gives those errors.

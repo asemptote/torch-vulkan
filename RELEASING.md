@@ -12,15 +12,36 @@ next one starts.
   the script's `EXPECTED` table. A targeted rerun of the tests that fell back
   in the last full run is enough when that run's other results stand.
 - The strict OpInfo sweep (`python tools/opinfo_coverage.py --strict`) passes.
+- If `tools/torch-version` changed since the last release, every step of
+  CONTRIBUTING.md's "Upgrading PyTorch" was done.
 
 ## 2. Devices
 
-Run `tests/python` (with `TORCH_VK_VALIDATE=1` where the validation layer is
-installed) on each kind of device the README lists as tested:
+CI's lavapipe cannot run the cooperative-matrix kernels (gemmcm: float16 and
+bfloat16 products, float32 matmul precision by bfloat16 parts) or i915's
+request watchdog, so the release candidate goes through the **hardware
+check**, required before tagging: from the candidate's checkout,
+
+```sh
+tools/cluster/hw-check.sh
+```
+
+(site settings in the untracked `tools/cluster/cluster.env`; see
+`tools/cluster/README.md`). It builds the tree on an Intel GPU under Linux
+(16-lane kernels, the watchdog's long submissions) and on an NVIDIA GPU with
+cooperative matrices (an L40S), checks that the kernels each must run do
+run there, and runs `tests/python` with the validation layer and the strict
+smoke test, ending with one table of pass/fail per machine. Every cell must
+pass; keep the table for the release notes' tested hardware. With a Mali
+phone in `HW_MALI_HOST`, `tools/cluster/hw-check.sh intel nvidia mali` adds
+a row for the tree built from source there (the wheel check below stays).
+
+Besides that, run `tests/python` (with `TORCH_VK_VALIDATE=1` where the
+validation layer is installed) on each other kind of device the README lists
+as tested:
 
 - lavapipe: CI;
-- an NVIDIA GPU (and one with cooperative matrices, for the float16 GEMM);
-- Intel under both Windows and Mesa (Linux);
+- Intel under Windows;
 - an Arm Mali phone under Termux, with the release candidate's Termux wheel
   for its userspace (the `wheel-termux-arm` or `wheel-termux-aarch64`
   artifact of a release-workflow run by hand, `gh workflow run release.yml`)

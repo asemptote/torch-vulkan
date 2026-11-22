@@ -233,8 +233,13 @@ def test_subgroup_gemm_kernel(env):
 
 
 def test_float4_subgroup_coverage():
-    # gemm4s.slang runs with exactly 16 lanes, or not at all
-    assert tv._native.kernel_subgroup_size("gemm4s_f32") in (0, 16)
+    # gemm4s.slang (and conv4s.slang) run with exactly 16 lanes, or not at
+    # all; on lavapipe with 512-bit vectors (CI's second pass, 16-lane
+    # subgroups) they must run, so CI covers them
+    sizes = [tv._native.kernel_subgroup_size(k) for k in ("gemm4s_f32", "conv4s_f32_d1_r8n1")]
+    assert all(s in (0, 16) for s in sizes), sizes
+    if "llvmpipe" in tv.device_name() and "512 bits" in tv.device_name():
+        assert sizes == [16, 16], sizes
 
 
 def test_subgroup_gemm_coverage():
