@@ -441,7 +441,7 @@ def test_rms_norm_and_robust_loss_backward_kernels(dtype):
 
 DIRECT_CONV_SCRIPT = r"""
 import torch, torch.nn.functional as F, torch_vulkan as tv
-if tv._native.kernel_subgroup_size("conv4s_f32_r8n1") != 16:
+if tv._native.kernel_subgroup_size("conv4s_f32_d1_r8n1") != 16:
     print("skip")
     raise SystemExit
 torch.manual_seed(0)

@@ -1,5 +1,6 @@
 // axis T: f32=float f16=half bf16=uint16_t f16h=half
-// axis TILE: r8n1=int r4n2=int r6n2=int r8n2=int r4n4=int r12n1=int r8n1w1=int r8n1w4=int
+// axis D: d1=int d2=int d3=int d5=int
+// axis TILE: r8n1=int r4n2=int r8n2=int r8n1w4=int
 //
 // Direct convolution (stride 1, 1 to 3 spatial dims) for GPUs with 16-lane
 // subgroups, on gemm4s.slang's scheme (A shared across a subgroup by
@@ -15,18 +16,22 @@
 //
 // The host passes the padded input with Wp (2-D, 3-D) and each channel's
 // plane a multiple of 4 values, 16-byte aligned (8 for 16-bit T), with
-// slack after the last plane for the columns and taps past the end; the
-// weight as A [G, Cog, Cg KO, KW4]: rows of the KO = KD KH outer taps'
+// slack after the last plane for the columns and taps read past the end;
+// the weight as A [G, Cog, Cg KO, KW4]: rows of the KO = KD KH outer taps'
 // KW inner taps, zero-padded to KW4 (a multiple of 4).
 //
 // A subgroup computes R rows x 16 NC 4 columns: lane l the columns
-// 4 NC l .. 4 NC l + 4 NC - 1. Per channel and outer tap, each lane loads
-// its pieces of A (R rows x KW4 / 4 pieces over the 16 lanes) and the input
-// around its columns once: tap kw's values are 4-value windows at kw dw past
-// them, made from the 16-byte loads of the row (shifts known once KW and dw
-// are specialised, so a load serves every tap it overlaps). Sums are float32
-// with fused multiply-adds, rounded once (to nearest even) with the bias
-// added, as gemm4s.slang's.
+// 4 NC l .. 4 NC l + 4 NC - 1. The inner taps are taken 4 at a time (a
+// group): lane i < R loads row i's 4 weights of the group (one 4-value
+// piece of A) and the others take them by shuffles; the group's 4 taps read
+// the lane's columns at 0, dw, 2 dw and 3 dw, which are 4-value windows of
+// the NW 4-value pieces of the input row around them (dw is the variant's
+// D, so the windows' shifts are compile-time constants). The next group
+// starts dw pieces further on, so the pieces it shares with this one stay in
+// registers: for dw = 1, one load of the input and one of A per 4 taps, where
+// a product of im2col columns loads 4 of B. Sums are float32 with fused
+// multiply-adds, rounded once (to nearest even) with the bias added, as
+// gemm4s.slang's.
 //
 // f16h: float16 arithmetic (torch_vulkan.set_fp16_arithmetic): float16
 // storage, products and sums in float16 (packed half2 multiply-adds), so a
@@ -45,31 +50,28 @@
 #if defined(TILE_r4n2)
 #define R 4
 #define NC 2
-#elif defined(TILE_r6n2)
-#define R 6
-#define NC 2
 #elif defined(TILE_r8n2)
 #define R 8
 #define NC 2
-#elif defined(TILE_r4n4)
-#define R 4
-#define NC 4
-#elif defined(TILE_r12n1)
-#define R 12
-#define NC 1
 #else
 #define R 8
 #define NC 1
 #endif
-#if defined(TILE_r8n1w1)
-#define WY 1
-#elif defined(TILE_r8n1w4)
+#if defined(TILE_r8n1w4)
 #define WY 4
 #else
 #define WY 2
 #endif
-#define MAXKW 16                         // inner taps at most
-#define MAXRQ ((R * (MAXKW / 4) + WX - 1) / WX)  // pieces of A per lane at most
+#if defined(D_d2)
+#define DW 2
+#elif defined(D_d3)
+#define DW 3
+#elif defined(D_d5)
+#define DW 5
+#else
+#define DW 1
+#endif
+#define NW ((3 * DW + 3) / 4 + NC)  // 4-value pieces of the input row a group reads
 
 struct Params
 {
@@ -94,13 +96,12 @@ struct Params
     uint hp;         // 88: padded rows per plane (3-D; else nv)
     uint ho;         // 92: output rows per plane (3-D; else nv)
     uint groups;     // 96
+    uint kg;         // 100: groups of 4 inner taps (KW4 / 4)
 };
 
 [[vk::push_constant]] ConstantBuffer<Params> p;
 
-[vk::constant_id(0)] const int KW = 3;        // inner taps (<= MAXKW)
-[vk::constant_id(1)] const int DW = 1;        // inner dilation
-[vk::constant_id(2)] const int USE_BIAS = 0;
+[vk::constant_id(0)] const int USE_BIAS = 0;
 
 #if defined(T_f32)
 typedef float4 S4;  // four values as stored
@@ -120,7 +121,7 @@ V4 ld4(S4* q)
 {
     uint2 v = loadAligned<8>(q);
 #if defined(T_f16)
-    return float4(f16tof32(v.x & 0xffffu), f16tof32(v.x >> 16), f16tof32(v.y & 0xffffu), f16tof32(v.y >> 16));
+    return float4(bit_cast<half4>(v));  // (exact)
 #else
     return float4(asfloat(v.x << 16), asfloat(v.x & 0xffff0000u), asfloat(v.y << 16), asfloat(v.y & 0xffff0000u));
 #endif
@@ -151,40 +152,51 @@ T st(float f)
 #endif
 }
 
-// Values s .. s + 3 of the 8 in a, b (s known at compile time once specialised).
-V4 window(V4 a, V4 b, int s)
+// The input's pieces are kept as loaded (W4: 16-bit values for f16 and
+// bf16 storage, widened per tap after the window is taken: widening each
+// piece once as it was loaded ran 3x slower on the HD 530).
+#if defined(T_f16)
+typedef half4 W4;
+W4 ldw(S4* q) { return bit_cast<half4>(loadAligned<8>(q)); }
+V4 widen(W4 v) { return float4(v); }
+#elif defined(T_bf16)
+typedef vector<uint16_t, 4> W4;
+W4 ldw(S4* q)
+{
+    uint2 v = loadAligned<8>(q);
+    return W4(uint16_t(v.x & 0xffffu), uint16_t(v.x >> 16), uint16_t(v.y & 0xffffu), uint16_t(v.y >> 16));
+}
+V4 widen(W4 v) { return asfloat(uint4(v) << 16); }
+#else
+typedef V4 W4;
+W4 ldw(S4* q) { return ld4(q); }
+V4 widen(W4 v) { return v; }
+#endif
+
+// Values s .. s + 3 of the 8 in a, b.
+W4 window(W4 a, W4 b, int s)
 {
     if (s == 0)
         return a;
     if (s == 1)
-        return V4(a.y, a.z, a.w, b.x);
+        return W4(a.y, a.z, a.w, b.x);
     if (s == 2)
-        return V4(a.z, a.w, b.x, b.y);
-    return V4(a.w, b.x, b.y, b.z);
+        return W4(a.z, a.w, b.x, b.y);
+    return W4(a.w, b.x, b.y, b.z);
 }
 
 [shader("compute")]
 [numthreads(WX, WY, 1)]
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 {
-    const int KW4 = (KW + 3) / 4 * 4;
-    const int KC = KW4 / 4;                 // pieces of A per row per (c, outer tap)
-    const int RQ = (R * KC + WX - 1) / WX;  // pieces per lane
     uint lane = WaveGetLaneIndex();
     uint n = gid.z / p.groups, grp = gid.z % p.groups;
     uint g = gid.x * WX + lane;  // this lane's column group (of 4 NC columns)
     uint row0 = gid.y * (WY * R) + tid.y * R;
     S4* x4 = (S4*)p.x + (int(n) * p.x_sn + int(grp * p.cg * p.plane)) / 4 + int(g * NC);
-    S4* w4 = (S4*)p.w + int(grp * p.cog) * (p.w_sm / 4);
-    // This lane's pieces of A: piece i of a (c, outer tap) block is row
-    // i / KC's piece i % KC (pieces past R KC repeat the last, unused).
-    S4* pa[MAXRQ];
-    [ForceUnroll]
-    for (int q = 0; q < MAXRQ; q++)
-    {
-        uint i = min(uint(q * WX) + lane, uint(R * KC - 1));
-        pa[q] = w4 + int(min(row0 + i / uint(KC), p.cog - 1)) * (p.w_sm / 4) + int(i % uint(KC));
-    }
+    // This lane's row of A (lanes past R repeat the rows, unused).
+    uint arow = min(row0 + lane % R, p.cog - 1);
+    S4* pa = (S4*)p.w + int(grp * p.cog + arow) * (p.w_sm / 4);
 
     V4 acc[R][NC];
     [ForceUnroll]
@@ -199,87 +211,46 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         {
             int off = int(o / p.kh) * p.off_d + int(o % p.kh) * p.off_h;
             S4* xb = x4 + (int(c * p.plane) + off) / 4;
+            S4* pab = pa + int(c * p.ko + o) * int(p.kg);
+            W4 win[NW];
+            [ForceUnroll]
+            for (int i = 0; i < NW; i++)
+                win[i] = ldw(xb + i);
+            for (uint kg = 0; kg < p.kg; kg++)
+            {
 #if defined(T_f16h)
-            // A's pieces as stored (4 halves in a uint2): a shuffle of one
-            // uint carries two taps' weights for a row.
-            uint2 av[MAXRQ];
-            [ForceUnroll]
-            for (int q = 0; q < MAXRQ; q++)
-            {
-                if (q < RQ)
-                    av[q] = loadAligned<8>(pa[q] + int(c * p.ko + o) * KC);
-            }
-            [ForceUnroll]
-            for (int t2 = 0; t2 < MAXKW; t2 += 2)
-            {
-                if (t2 < KW)
-                {
-                    uint pair[R];
-                    [ForceUnroll]
-                    for (int i = 0; i < R; i++)
-                    {
-                        const int piece = i * KC + t2 / 4;
-                        pair[i] = WaveReadLaneAt(av[piece / WX][(t2 % 4) / 2], piece % WX);
-                    }
-                    [ForceUnroll]
-                    for (int h = 0; h < 2; h++)
-                    {
-                        const int t = t2 + h;
-                        if (t < KW)
-                        {
-                            const int e = t * DW, e4 = e >> 2, s = e & 3;
-                            V4 bv[NC];
-                            [ForceUnroll]
-                            for (int j = 0; j < NC; j++)
-                            {
-                                V4 lo = ld4(xb + e4 + j);
-                                bv[j] = s == 0 ? lo : window(lo, ld4(xb + e4 + j + 1), s);
-                            }
-                            [ForceUnroll]
-                            for (int i = 0; i < R; i++)
-                            {
-                                half a = bit_cast<half>(uint16_t(h == 0 ? pair[i] & 0xffffu : pair[i] >> 16));
-                                [ForceUnroll]
-                                for (int j = 0; j < NC; j++)
-                                    acc[i][j] += a * bv[j];
-                            }
-                        }
-                    }
-                }
-            }
+                uint2 av = loadAligned<8>(pab + int(kg));  // (4 halves: this group's taps of row lane % R)
 #else
-            V4 av[MAXRQ];
-            [ForceUnroll]
-            for (int q = 0; q < MAXRQ; q++)
-            {
-                if (q < RQ)
-                    av[q] = ld4(pa[q] + int(c * p.ko + o) * KC);
-            }
-            [ForceUnroll]
-            for (int t = 0; t < MAXKW; t++)
-            {
-                if (t < KW)
+                V4 av = ld4(pab + int(kg));
+#endif
+                [ForceUnroll]
+                for (int t = 0; t < 4; t++)
                 {
                     const int e = t * DW, e4 = e >> 2, s = e & 3;
                     V4 bv[NC];
                     [ForceUnroll]
                     for (int j = 0; j < NC; j++)
-                    {
-                        V4 lo = ld4(xb + e4 + j);
-                        bv[j] = s == 0 ? lo : window(lo, ld4(xb + e4 + j + 1), s);
-                    }
+                        bv[j] = widen(window(win[e4 + j], win[e4 + j + (s == 0 ? 0 : 1)], s));
                     [ForceUnroll]
                     for (int i = 0; i < R; i++)
                     {
-                        const int piece = i * KC + t / 4;
-                        V a = WaveReadLaneAt(av[piece / WX][t % 4], piece % WX);
+#if defined(T_f16h)
+                        uint pair = WaveReadLaneAt(t < 2 ? av.x : av.y, i);
+                        half a = bit_cast<half>(uint16_t((t % 2) == 0 ? pair & 0xffffu : pair >> 16));
+#else
+                        V a = WaveReadLaneAt(av[t], i);
+#endif
                         [ForceUnroll]
                         for (int j = 0; j < NC; j++)
                             acc[i][j] += a * bv[j];
                     }
                 }
+                // The next group: DW pieces on; keep the pieces it shares.
+                xb = xb + DW;
+                [ForceUnroll]
+                for (int i = 0; i < NW; i++)
+                    win[i] = i + DW < NW ? win[i + DW] : ldw(xb + i);
             }
-#endif
         }
     }
 

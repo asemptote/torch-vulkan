@@ -107,7 +107,7 @@ struct Conv4sParams {
   uint32_t nv, plane;
   int32_t x_sn, w_sm, y_sn, y_sc;
   uint32_t wp, wo, hp, ho;
-  uint32_t groups;
+  uint32_t groups, kg;
 };
 static_assert(sizeof(Conv4sParams) == 104, "must match shaders/conv4s.slang");
 
@@ -117,9 +117,7 @@ struct Conv4sTile {
   const char* label;
   int64_t rows, cols;
 };
-constexpr Conv4sTile kConv4sTiles[] = {{"r8n1", 16, 64},  {"r4n2", 8, 128},  {"r6n2", 12, 128},
-                                       {"r8n2", 16, 128}, {"r4n4", 8, 256},  {"r12n1", 24, 64},
-                                       {"r8n1w1", 8, 64}, {"r8n1w4", 32, 64}};
+constexpr Conv4sTile kConv4sTiles[] = {{"r8n1", 16, 64}, {"r4n2", 8, 128}, {"r8n2", 16, 128}, {"r8n1w4", 32, 64}};
 
 // The tile for float32 / 16-bit storage (f32 math) and for float16
 // arithmetic; TORCH_VK_CONV_TILE=label forces one (tuning).
@@ -132,9 +130,8 @@ const Conv4sTile& conv4s_tile(bool half_math) {
     return static_cast<const Conv4sTile*>(nullptr);
   }();
   if (forced != nullptr) return *forced;
-  return half_math ? kConv4sTiles[3] : kConv4sTiles[0];
+  return half_math ? kConv4sTiles[2] : kConv4sTiles[0];
 }
-constexpr int64_t kConv4sMaxTaps = 16;                 // MAXKW
 
 // Whether stride-1 convolutions of type t run as shaders/conv4s.slang:
 // wherever the device runs it (16-lane subgroups with shuffles: Mali's
@@ -143,7 +140,7 @@ constexpr int64_t kConv4sMaxTaps = 16;                 // MAXKW
 bool use_conv4s(at::ScalarType t) {
   static const bool ok = [] {
     const char* env = std::getenv("TORCH_VK_CONV");
-    return !(env != nullptr && std::strcmp(env, "im2col") == 0) && vkt_kernel_subgroup_size("conv4s_f32_r8n1") == 16;
+    return !(env != nullptr && std::strcmp(env, "im2col") == 0) && vkt_kernel_subgroup_size("conv4s_f32_d1_r8n1") == 16;
   }();
   static const bool f16 = ok && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
   static const bool bf16 = ok && has_feature(kFeatureInt16);
@@ -169,7 +166,7 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
     if (stride[d] != 1) return {};
   }
   int64_t KW = w.size(-1), DW = dilation[s - 1];
-  if (KW > kConv4sMaxTaps || DW > 64) return {};
+  if (DW != 1 && DW != 2 && DW != 3 && DW != 5) return {};  // (the kernel's variants: axis D)
   int64_t Cg = C / groups, Cog = Co / groups, taps = 1;
   for (int64_t d = 0; d < s; ++d) taps *= w.size(2 + d);
   if (Cg == 1 && taps <= 32) return {};  // (depthwise: multiply-adds per tap, in conv_forward)
@@ -200,7 +197,7 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   bool half_math = t == at::kHalf && fp16_arithmetic();
   const Conv4sTile& tile = conv4s_tile(half_math);
   int64_t cols = tile.cols;
-  int64_t reach = ceil_div(nv, cols) * cols + (KD - 1) * off_d + (KH - 1) * off_h + (KW - 1) * DW + 8;
+  int64_t reach = ceil_div(nv, cols) * cols + (KD - 1) * off_d + (KH - 1) * off_h + (KW + 8) * DW + 32;
   int64_t slack = std::max<int64_t>(0, reach - plane);
   int64_t total = N * C * plane + slack;
   if (total >= (int64_t(1) << 31) || N * Co * (Do * Ho * Wo) >= (int64_t(1) << 31) || N * groups > 65535 ||
@@ -248,8 +245,10 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   p.hp = static_cast<uint32_t>(s == 3 ? Hp : nv);
   p.ho = static_cast<uint32_t>(s == 3 ? Ho : nv);
   p.groups = static_cast<uint32_t>(groups);
-  dispatch(std::string("conv4s_") + (half_math ? "f16h" : storage_label(t)) + "_" + tile.label,
-           {static_cast<uint32_t>(KW), static_cast<uint32_t>(DW), use_bias ? 1u : 0u}, p,
+  p.kg = static_cast<uint32_t>(KW4 / 4);
+  dispatch(std::string("conv4s_") + (half_math ? "f16h" : storage_label(t)) + "_d" + std::to_string(DW) + "_" +
+               tile.label,
+           {use_bias ? 1u : 0u}, p,
            static_cast<uint32_t>(ceil_div(nv, cols)), static_cast<uint32_t>(ceil_div(Cog, tile.rows)),
            static_cast<uint32_t>(N * groups));
   return y;
