@@ -64,15 +64,13 @@ pub fn default_max_in_flight(vendor_id: u32) -> u32 {
         .unwrap_or(if intel_linux(vendor_id) { 2 } else { 0 })
 }
 
-/// Microseconds [`Stream::wait`] polls before blocking: TORCH_VK_SPIN_US, by
-/// default 500 on discrete GPUs and 0 (block at once) elsewhere. Integrated
-/// GPUs share the CPU's power budget (and a phone's battery), lavapipe its
-/// cores; on the HD 530 polling saved nothing measurable and cost ~5% more CPU
-/// time, while on NVIDIA it took ~19 us off every synchronize.
+/// Microseconds [`Stream::wait`] polls before blocking: 500 on discrete GPUs
+/// and 0 (block at once) elsewhere. Integrated GPUs share the CPU's power
+/// budget (and a phone's battery), lavapipe its cores; on the HD 530 polling
+/// saved nothing measurable and cost ~5% more CPU time, while on NVIDIA it
+/// took ~19 us off every synchronize.
 pub fn spin_us(discrete: bool) -> u64 {
-    static SPIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    SPIN.get_or_init(|| std::env::var("TORCH_VK_SPIN_US").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(if discrete { 500 } else { 0 })
+    if discrete { 500 } else { 0 }
 }
 
 /// Where the stream puts barriers (TORCH_VK_BARRIERS).
