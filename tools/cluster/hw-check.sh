@@ -29,7 +29,7 @@
 #                where the SDK's validation layer is in ~/opt (HW_VALIDATE=0:
 #                without);
 #   long         (intel) TORCH_VK_LONG_TESTS=1 test_long_submissions.py;
-#   smoke        TORCH_VK_STRICT=1 tools/release_smoke.py.
+#   smoke        tools/release_smoke.py, with the CPU fallback off.
 # Logs: $HW_LOGS (default a new directory under /tmp), one file per machine.
 #
 # Settings (environment, or tools/cluster/cluster.env: see
@@ -103,6 +103,7 @@ sys.exit(1 if missing else 0)
 run_checks() {
   KIND=$1
   if [ -f tools/cluster/cluster.env ]; then . tools/cluster/cluster.env; fi  # (HW_VALIDATION_LIBS)
+  unset TORCH_VK_CPU_FALLBACK TORCH_VK_STRICT  # (the defaults: the CPU fallback off, as for users)
   mkdir -p .hw-check
   local py=.venv/bin/python
   export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
@@ -140,7 +141,7 @@ run_checks() {
   if [ "$KIND" = intel ]; then
     TORCH_VK_LONG_TESTS=1 check long "$py" -m pytest -q -rs -p no:cacheprovider tests/python/test_long_submissions.py
   fi
-  TORCH_VK_STRICT=1 check smoke "$py" tools/release_smoke.py
+  check smoke "$py" tools/release_smoke.py
 }
 
 if [ -n "${HW_RUN:-}" ]; then  # (the PBS job)
