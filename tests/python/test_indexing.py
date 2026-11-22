@@ -120,6 +120,34 @@ def test_scatter_index_copy_fill_put(dtype):
         check(a, b)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.float16])
+def test_scatter_expanded_index(dtype):
+    # an index expanded along other dims than the scattered one (grid_sampler's
+    # double backward, #113): its distinct rows sorted once, the expanded dims
+    # as the width; an index smaller than out, several expanded dims, every
+    # reduction
+    g = torch.Generator().manual_seed(3)
+    out = sample((3, 4, 9, 2), dtype)
+    src = sample((3, 5, 12, 2), dtype, 1)
+    cases = [
+        (2, torch.randint(0, 9, (3, 1, 12, 1), generator=g).expand(3, 4, 12, 2)),
+        (2, torch.randint(0, 9, (2, 1, 7, 1), generator=g).expand(2, 3, 7, 2)),
+        (0, torch.randint(0, 3, (3, 1, 1, 1), generator=g).expand(3, 4, 9, 2)[:, :, :8]),
+        (1, torch.randint(0, 4, (1, 5, 1, 2), generator=g).expand(3, 5, 6, 2)),
+    ]
+    for dim, index in cases:
+        v, vi, vs = out.to("vk"), index.to("vk"), src.to("vk")
+        with on_gpu():
+            got = [v.scatter_add(dim, vi, vs)] + [
+                v.scatter_reduce(dim, vi, vs, reduce, include_self=include)
+                for reduce in ("sum", "prod", "amax", "amin", "mean") for include in (True, False)]
+        want = [out.scatter_add(dim, index, src)] + [
+            out.scatter_reduce(dim, index, src, reduce, include_self=include)
+            for reduce in ("sum", "prod", "amax", "amin", "mean") for include in (True, False)]
+        for a, b in zip(got, want):
+            check(a, b, **({"rtol": 1e-2, "atol": 1e-2} if dtype == torch.float16 else {}))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
 def test_nonzero_masked(dtype):
     x = sample((4, 3, 5), dtype)
@@ -147,6 +175,38 @@ def test_cat_flip_roll(dtype):
             a.roll(1, 0), a.roll((-5, 2), (1, 0)), a.roll(3), torch.cat([a, a.new_empty(0)])]
     for g, w in zip(got, want):
         check(g, w)
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int16, torch.float32, torch.int64, torch.complex128])
+def test_flip_many_dims(dtype):
+    """flip as one strided copy with negated strides (#112): few dims and
+    many (5 to 8 after merging: copy8; more: the host's loop), views with
+    offsets and transposes, expanded (stride-0) dims, channels-last kept."""
+    x = sample((3, 4, 2, 5, 3, 2, 2, 3), dtype)
+    v = x.to("vk")
+    w = sample((4, 3, 5, 6), dtype, 1)
+    vw = w.to("vk")
+    cases = [
+        lambda t, u: t.flip(0),
+        lambda t, u: t.flip(-1, 3, 1),
+        lambda t, u: t.flip(*range(8)),
+        lambda t, u: t[1:, :, :, 2:].flip(2, 3, 5),
+        lambda t, u: t.permute(3, 0, 7, 1, 6, 2, 5, 4).flip(0, 2, 4),
+        lambda t, u: t.reshape(3, 4, 2, 5, 3, 2, 2, 3, 1).flip(8, 7, 0),
+        lambda t, u: t.reshape(3, 2, 2, 2, 5, 3, 2, 1, 2, 3).flip(1, 4, 9),  # (10 dims: past copy8)
+        lambda t, u: u.flip(2, 3),
+        lambda t, u: u[:, 1:2].expand(4, 3, 5, 6).flip(1, 2),
+        lambda t, u: u.contiguous(memory_format=torch.channels_last).flip(1, 3),
+        lambda t, u: u[..., ::2].flip(-1),
+        lambda t, u: u[0, 0, 0, 0].flip(0),
+        lambda t, u: u[:0].flip(1),
+    ]
+    for case in cases:
+        with on_gpu():
+            got = case(v, vw)
+        want = case(x, w)
+        check(got, want)
+        assert got.stride() == want.stride()
 
 
 @pytest.mark.parametrize("mode,dims", [("reflect", 1), ("reflect", 2), ("reflect", 3), ("replicate", 1),
