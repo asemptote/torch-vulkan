@@ -176,7 +176,7 @@ const SUBGROUP_KERNELS: &[(&str, u32)] = &[("gemmsg_f64", 8), ("gemmsg", 16), ("
 
 /// Kernels (by name prefix) written for exactly this many lanes, which also
 /// run on devices without size control whose only subgroup size it is.
-const EXACT_SUBGROUP_KERNELS: &[(&str, u32)] = &[("gemm4s", 16)];
+const EXACT_SUBGROUP_KERNELS: &[(&str, u32)] = &[("gemm4s", 16), ("conv4s", 16)];
 
 fn subgroup_preference(name: &str) -> Option<u32> {
     SUBGROUP_KERNELS.iter().find(|(k, _)| name.starts_with(k)).map(|&(_, s)| s)

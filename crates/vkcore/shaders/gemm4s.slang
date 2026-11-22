@@ -1,4 +1,4 @@
-// axis T: f32=float f16=half bf16=uint16_t
+// axis T: f32=float f16=half bf16=uint16_t f16h=half
 //
 // Batched GEMM for Arm Mali GPUs with 16-lane subgroups (Valhall), as
 // shaders/gemm4.slang (same parameters, C[b] = alpha * A[b] @ B[b]
@@ -24,6 +24,14 @@
 // does 32 multiply-adds per load and 8 shuffles, against gemm4.slang's 64
 // per 10 loads (2 x 8 outputs per thread, A loaded by every lane).
 //
+// f16h: float16 arithmetic (torch_vulkan.set_fp16_arithmetic): float16
+// storage, products and sums in float16 (packed half2 multiply-adds). A lane
+// then holds 8 columns (two 4-value loads of B per k, BN = 128) in the
+// registers 4 float32 columns took, and a shuffle carries two values of k
+// of a row of A. alpha, beta and Cin are applied in float32 and the sum
+// rounded once more. Sums of many products lose accuracy and overflow past
+// 65504. The host makes B's rows readable to a multiple of 8 columns.
+//
 // Measured on the Mali-G57 MC2 (Galaxy A13; float32, 2048^3): 63-73
 // GFLOP/s, against gemm4.slang's 29-34; with operands from cache 75, about
 // 62% of the 122 the FMA units could do. 8 rows per subgroup, blocks of 8
@@ -46,7 +54,12 @@
 #define KC (KB / 4)              // 4-value pieces of a row per block
 #define RQ ((R * KC + WX - 1) / WX)  // pieces of A per lane per block
 #define BM (WY * R)
-#define BN (WX * 4)
+#if defined(T_f16h)
+#define NB 2   // 4-column groups per lane
+#else
+#define NB 1
+#endif
+#define BN (WX * 4 * NB)
 
 struct Params
 {
@@ -74,6 +87,8 @@ struct Params
 #if defined(T_f32)
 typedef float4 S4;
 float4 widen(S4 v) { return v; }
+#elif defined(T_f16h)
+typedef uint2 S4;
 #else
 typedef uint2 S4;
 #if defined(T_f16)
@@ -89,6 +104,9 @@ float4 widen(S4 v)
 #endif
 #endif
 
+#if defined(T_f16h)
+half4 ld4(S4* q) { return bit_cast<half4>(loadAligned<8>(q)); }
+#else
 float4 ld4(S4* q)
 {
 #if defined(T_f32)
@@ -97,6 +115,7 @@ float4 ld4(S4* q)
     return widen(loadAligned<8>(q));
 #endif
 }
+#endif
 
 float ld(T v)
 {
@@ -109,7 +128,7 @@ float ld(T v)
 
 T st(float f)
 {
-#if defined(T_f16)
+#if defined(T_f16) || defined(T_f16h)
     return to_half(f);
 #elif defined(T_bf16)
     if (isnan(f))
@@ -122,6 +141,120 @@ T st(float f)
 #endif
 }
 
+#if defined(T_f16h)
+[shader("compute")]
+[numthreads(WX, WY, 1)]
+void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
+{
+    uint lane = WaveGetLaneIndex();
+    int batch = int(gid.z);
+    uint n4 = (p.n + 3) / 4;  // (B's column groups of 4; rows readable to a multiple of 8 columns)
+    uint g = (gid.x * WX + lane) * NB;  // this lane's first column group
+    uint row0 = gid.y * BM + tid.y * R;
+    S4* a4 = (S4*)p.a + (batch * p.a_sb) / 4;
+    int bstep = p.b_sk / 4;
+    S4* pb = (S4*)p.b + (batch * p.b_sb) / 4 + int(min(g, ((n4 + 1) / 2) * 2 - NB));
+    S4* pa[RQ];
+    [ForceUnroll]
+    for (uint q = 0; q < RQ; q++)
+    {
+        uint i = min(q * WX + lane, uint(R * KC - 1));
+        pa[q] = a4 + int(min(row0 + i / KC, p.m - 1)) * (p.a_sm / 4) + int(i % KC);
+    }
+
+    half4 acc[R][NB];
+    [ForceUnroll]
+    for (uint i = 0; i < R; i++)
+        [ForceUnroll]
+        for (uint j = 0; j < NB; j++)
+            acc[i][j] = half4(0);
+
+    uint blocks = p.k / KB;
+    for (uint kb = 0; kb < blocks; kb++)
+    {
+        uint2 av[RQ];
+        [ForceUnroll]
+        for (uint q = 0; q < RQ; q++)
+            av[q] = loadAligned<8>(pa[q] + int(kb * KC));
+        [ForceUnroll]
+        for (uint k2 = 0; k2 < KB; k2 += 2)
+        {
+            uint pair[R];
+            [ForceUnroll]
+            for (uint i = 0; i < R; i++)
+            {
+                const uint piece = i * KC + k2 / 4;
+                pair[i] = WaveReadLaneAt(av[piece / WX][(k2 % 4) / 2], piece % WX);
+            }
+            [ForceUnroll]
+            for (uint h = 0; h < 2; h++)
+            {
+                half4 bv[NB];
+                [ForceUnroll]
+                for (uint j = 0; j < NB; j++)
+                    bv[j] = ld4(pb + int(k2 + h) * bstep + int(j));
+                [ForceUnroll]
+                for (uint i = 0; i < R; i++)
+                {
+                    half a = bit_cast<half>(uint16_t(h == 0 ? pair[i] & 0xffffu : pair[i] >> 16));
+                    [ForceUnroll]
+                    for (uint j = 0; j < NB; j++)
+                        acc[i][j] += a * bv[j];
+                }
+            }
+        }
+        pb = pb + KB * bstep;
+    }
+    // The last K % KB values of k (K is a multiple of 4), A read directly.
+    for (uint k4 = blocks * KC; k4 < p.k / 4; k4++)
+    {
+        half4 av[R];
+        [ForceUnroll]
+        for (uint i = 0; i < R; i++)
+            av[i] = ld4(a4 + int(min(row0 + i, p.m - 1)) * (p.a_sm / 4) + int(k4));
+        [ForceUnroll]
+        for (uint kk = 0; kk < 4; kk++)
+        {
+            half4 bv[NB];
+            [ForceUnroll]
+            for (uint j = 0; j < NB; j++)
+                bv[j] = ld4(pb + int(kk) * bstep + int(j));
+            [ForceUnroll]
+            for (uint i = 0; i < R; i++)
+                [ForceUnroll]
+                for (uint j = 0; j < NB; j++)
+                    acc[i][j] += av[i][kk] * bv[j];
+        }
+        pb = pb + 4 * bstep;
+    }
+
+    float alpha = slot_float(p.alpha), beta = slot_float(p.beta);
+    [ForceUnroll]
+    for (uint j = 0; j < NB; j++)
+    {
+        if (g + j >= n4)
+            break;
+        [ForceUnroll]
+        for (uint i = 0; i < R; i++)
+        {
+            uint gm = row0 + i;
+            if (gm >= p.m)
+                break;
+            [ForceUnroll]
+            for (uint e = 0; e < 4; e++)
+            {
+                uint gn = (g + j) * 4 + e;
+                if (gn >= p.n)
+                    break;
+                float v = alpha * float(acc[i][j][e]);
+                if (USE_CIN != 0)
+                    v += beta * ld(p.cin[batch * p.cin_sb + int(gm) * p.cin_sm + int(gn) * p.cin_sn]);
+                p.c[batch * p.c_sb + int(gm) * p.c_sm + int(gn) * p.c_sn] = st(v);
+            }
+        }
+    }
+}
+#else
 [shader("compute")]
 [numthreads(WX, WY, 1)]
 void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
@@ -209,3 +342,4 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         }
     }
 }
+#endif

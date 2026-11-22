@@ -20,7 +20,23 @@
 
 #include <torch/library.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 namespace vk {
+
+namespace {
+std::atomic<bool>& fp16_arithmetic_flag() {
+  static std::atomic<bool> flag{[] {
+    const char* env = std::getenv("TORCH_VK_FP16_ARITHMETIC");
+    return env != nullptr && *env != 0 && std::strcmp(env, "0") != 0;
+  }()};
+  return flag;
+}
+}  // namespace
+
+bool fp16_arithmetic() { return fp16_arithmetic_flag().load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -83,6 +99,174 @@ at::Tensor reversed(const at::Tensor& t, const std::vector<int64_t>& dims) {
   return r;
 }
 
+// shaders/conv4s.slang's Params.
+struct Conv4sParams {
+  uint64_t x, w, y, bias;
+  uint32_t cog, cg, ko, kh;
+  int32_t off_d, off_h;
+  uint32_t nv, plane;
+  int32_t x_sn, w_sm, y_sn, y_sc;
+  uint32_t wp, wo, hp, ho;
+  uint32_t groups, kg;
+};
+static_assert(sizeof(Conv4sParams) == 104, "must match shaders/conv4s.slang");
+
+// shaders/conv4s.slang's tiles (its axis TILE): label, rows per workgroup
+// (WY R), columns per workgroup (16 lanes x 4 NC).
+struct Conv4sTile {
+  const char* label;
+  int64_t rows, cols;
+};
+constexpr Conv4sTile kConv4sR8N1 = {"r8n1", 16, 64}, kConv4sR4N2 = {"r4n2", 8, 128}, kConv4sR8N2 = {"r8n2", 16, 128};
+
+bool arm_gpu() {
+  static const bool arm = vkt_vendor_id() == 0x13B5;
+  return arm;
+}
+
+// The tile, from docs/log/M47's sweeps: on Mali 4 rows x 8 columns per lane
+// (more rows spill float32 accumulators there), elsewhere (Intel) 8 x 4,
+// and 8 x 8 for float16 arithmetic.
+const Conv4sTile& conv4s_tile(bool half_math) {
+  if (arm_gpu()) return kConv4sR4N2;
+  return half_math ? kConv4sR8N2 : kConv4sR8N1;
+}
+
+// Whether a stride-1 convolution of type t with kw inner taps runs as
+// shaders/conv4s.slang: where the device runs it (16-lane subgroups with
+// shuffles: Intel's and Mali's Valhall GPUs) and it was measured faster than
+// im2col columns and a matrix product (docs/log/M47): on Intel always; on
+// Mali for float16 arithmetic, and float16 and bfloat16 with 5 or more
+// inner taps (float32, and 16-bit types with 3 or 4 taps, stay with
+// gemm4s's product, as fast or faster there). TORCH_VK_CONV=im2col never,
+// =direct wherever it runs.
+bool use_conv4s(at::ScalarType t, int64_t kw, bool half_math) {
+  static const std::string choice = [] {
+    const char* env = std::getenv("TORCH_VK_CONV");
+    return std::string(env != nullptr ? env : "");
+  }();
+  static const bool runs = choice != "im2col" && vkt_kernel_subgroup_size("conv4s_f32_d1_r8n1") == 16;
+  static const bool f16 = runs && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
+  static const bool bf16 = runs && has_feature(kFeatureInt16);
+  bool can = t == at::kFloat ? runs : t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
+  if (!can || choice == "direct" || !arm_gpu()) return can;
+  return half_math || (t != at::kFloat && kw >= 5);
+}
+
+// A stride-1 convolution by shaders/conv4s.slang (where use_conv4s), reading
+// the zero-padded input in place: no im2col columns. The input is copied
+// once into a buffer padded as the kernel needs (rows of Wp, a multiple of
+// 4 values, for 2-D and 3-D; each channel's plane a multiple of 4; slack at
+// the end for the columns and taps read past the last valid one), the
+// weight into rows of KW taps padded to a multiple of 4. Returns an
+// undefined tensor where it does not apply.
+at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::optional<at::Tensor>& bias,
+                       at::IntArrayRef stride, const std::vector<std::pair<int64_t, int64_t>>& pad_in,
+                       at::IntArrayRef dilation, int64_t groups, at::IntArrayRef out) {
+  at::ScalarType t = x_in.scalar_type();
+  int64_t s = x_in.dim() - 2, N = x_in.size(0), C = x_in.size(1), Co = w.size(0);
+  bool half_math = t == at::kHalf && fp16_arithmetic();
+  if (!use_conv4s(t, w.size(-1), half_math) || w.scalar_type() != t ||
+      (bias.has_value() && bias->defined() && bias->scalar_type() != t)) {
+    return {};
+  }
+  for (int64_t d = 0; d < s; ++d) {
+    if (stride[d] != 1) return {};
+  }
+  int64_t KW = w.size(-1), DW = dilation[s - 1];
+  if (DW != 1 && DW != 2 && DW != 3 && DW != 5) return {};  // (the kernel's variants: axis D)
+  // (fewer than 3 inner taps, padded to 4, waste half the work or more:
+  // M46's transposed-convolution phases, with 2 taps, ran 1.5x slower)
+  if (KW < 3) return {};
+  int64_t Cg = C / groups, Cog = Co / groups, taps = 1;
+  for (int64_t d = 0; d < s; ++d) taps *= w.size(2 + d);
+  if (Cg == 1 && taps <= 32) return {};  // (depthwise: multiply-adds per tap, in conv_forward)
+  // Crop for negative padding; then the padded sizes.
+  at::Tensor x = x_in;
+  std::vector<std::pair<int64_t, int64_t>> pad = pad_in;
+  for (int64_t d = 0; d < s; ++d) {
+    if (pad[d].first < 0) {
+      x = x.narrow(2 + d, -pad[d].first, x.size(2 + d) + pad[d].first);
+      pad[d].first = 0;
+    }
+    if (pad[d].second < 0) {
+      x = x.narrow(2 + d, 0, x.size(2 + d) + pad[d].second);
+      pad[d].second = 0;
+    }
+  }
+  std::vector<int64_t> padded(s);
+  for (int64_t d = 0; d < s; ++d) padded[d] = x.size(2 + d) + pad[d].first + pad[d].second;
+  int64_t Wo = out[s - 1], Wp = s == 1 ? padded[0] : ceil_div(padded[s - 1], 4) * 4;
+  int64_t Hp = s >= 2 ? padded[s - 2] : 1, Ho = s >= 2 ? out[s - 2] : 1, Dp = s == 3 ? padded[0] : 1,
+          Do = s == 3 ? out[0] : 1;
+  int64_t plane = ceil_div(Dp * Hp * Wp, 4) * 4;
+  // (virtual columns: up to the last output's, rounded up to whole workgroups of columns)
+  int64_t nv = ((Do - 1) * Hp + (Ho - 1)) * Wp + Wo;
+  if (s >= 2 && Wo < 8) return {};  // (mostly wrapped columns: the columns' product does better)
+  // (few output positions, many channels: the product of columns did better
+  // on both GPUs measured, e.g. 1024 channels over 242 frames)
+  if (N * nv < 2048) return {};
+  int64_t KH = s >= 2 ? w.size(-2) : 1, KD = s == 3 ? w.size(2) : 1, KO = KD * KH;
+  int64_t off_h = s >= 2 ? dilation[s - 2] * Wp : 0, off_d = s == 3 ? dilation[0] * Hp * Wp : 0;
+  const Conv4sTile& tile = conv4s_tile(half_math);
+  int64_t cols = tile.cols;
+  int64_t reach = ceil_div(nv, cols) * cols + (KD - 1) * off_d + (KH - 1) * off_h + (KW + 8) * DW + 32;
+  int64_t slack = std::max<int64_t>(0, reach - plane);
+  int64_t total = N * C * plane + slack;
+  if (total >= (int64_t(1) << 31) || N * Co * (Do * Ho * Wo) >= (int64_t(1) << 31) || N * groups > 65535 ||
+      ceil_div(nv, cols) > 65535 || ceil_div(Cog, tile.rows) > 65535) {
+    return {};
+  }
+  at::Tensor xbuf = at::zeros({total}, x.options());
+  {
+    at::Tensor view = xbuf.narrow(0, 0, N * C * plane).view({N, C, plane}).narrow(2, 0, Dp * Hp * Wp);
+    std::vector<int64_t> grid = {N, C};
+    if (s == 3) grid.push_back(Dp);
+    if (s >= 2) grid.push_back(Hp);
+    grid.push_back(Wp);
+    view = view.reshape(grid);
+    for (int64_t d = 0; d < s; ++d) view = view.narrow(2 + d, pad[d].first, x.size(2 + d));
+    view.copy_(x);
+  }
+  int64_t KW4 = ceil_div(KW, 4) * 4;
+  at::Tensor a = at::zeros({Co, Cg * KO, KW4}, w.options());
+  a.narrow(2, 0, KW).copy_(w.reshape({Co, Cg * KO, KW}));
+  std::vector<int64_t> out_shape = {N, Co};
+  out_shape.insert(out_shape.end(), out.begin(), out.end());
+  at::Tensor y = at::empty(out_shape, x.options());
+  bool use_bias = bias.has_value() && bias->defined();
+  at::Tensor b = use_bias ? bias->contiguous() : at::Tensor();
+  Conv4sParams p{};
+  p.x = gpu_address(xbuf);
+  p.w = gpu_address(a);
+  p.y = gpu_address_out(y);
+  p.bias = use_bias ? gpu_address(b) : 0;
+  p.cog = static_cast<uint32_t>(Cog);
+  p.cg = static_cast<uint32_t>(Cg);
+  p.ko = static_cast<uint32_t>(KO);
+  p.kh = static_cast<uint32_t>(KH);
+  p.off_d = static_cast<int32_t>(off_d);
+  p.off_h = static_cast<int32_t>(off_h);
+  p.nv = static_cast<uint32_t>(nv);
+  p.plane = static_cast<uint32_t>(plane);
+  p.x_sn = static_cast<int32_t>(C * plane);
+  p.w_sm = static_cast<int32_t>(Cg * KO * KW4);
+  p.y_sc = static_cast<int32_t>(Do * Ho * Wo);
+  p.y_sn = static_cast<int32_t>(Co * Do * Ho * Wo);
+  p.wp = static_cast<uint32_t>(s == 1 ? nv : Wp);
+  p.wo = static_cast<uint32_t>(s == 1 ? nv : Wo);
+  p.hp = static_cast<uint32_t>(s == 3 ? Hp : nv);
+  p.ho = static_cast<uint32_t>(s == 3 ? Ho : nv);
+  p.groups = static_cast<uint32_t>(groups);
+  p.kg = static_cast<uint32_t>(KW4 / 4);
+  dispatch(std::string("conv4s_") + (half_math ? "f16h" : storage_label(t)) + "_d" + std::to_string(DW) + "_" +
+               tile.label,
+           {use_bias ? 1u : 0u}, p,
+           static_cast<uint32_t>(ceil_div(nv, cols)), static_cast<uint32_t>(ceil_div(Cog, tile.rows)),
+           static_cast<uint32_t>(N * groups));
+  return y;
+}
+
 // Plain convolution: x [N, C, *S], w [Co, C/G, *K], symmetric or asymmetric
 // zero padding pad[d] = (lo, hi).
 at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
@@ -99,6 +283,15 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   for (int64_t o : out) L *= o;
   if (N == 0 || Co == 0 || L == 0) {
     return at::zeros(out_shape, x.options());
+  }
+  if (at::Tensor y = conv_direct(x, w, bias, stride, pad, dilation, groups, out); y.defined()) {
+    return y;
+  }
+  if (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) {
+    // (16-bit storage the direct kernel does not take: in float32, rounded once)
+    std::optional<at::Tensor> bf;
+    if (bias.has_value() && bias->defined()) bf = bias->to(at::kFloat);
+    return conv_forward(x.to(at::kFloat), w.to(at::kFloat), bf, stride, pad, dilation, groups).to(x.scalar_type());
   }
   at::Tensor xp = pad_spatial(x, pad);
   int64_t Kp = 1;
@@ -365,10 +558,16 @@ std::vector<int64_t> per_dim(at::IntArrayRef v, int64_t s) {
   return std::vector<int64_t>(s, v[0]);
 }
 
-bool conv_ok(const at::Tensor& x, const at::Tensor& w) {
+// Whether vk computes the convolution; `half`: float16 and bfloat16 too
+// (the forward: shaders/conv4s.slang in 16-bit storage where it applies,
+// else in float32 and rounded once; other ops reach these dtypes through
+// half_via_float).
+bool conv_ok(const at::Tensor& x, const at::Tensor& w, bool half = false) {
   at::ScalarType t = x.scalar_type();
+  bool t16 = half && (t == at::kHalf || t == at::kBFloat16) && storage_label(t) != nullptr;
   return is_vk(x) && is_vk(w) && x.dim() >= 3 && x.dim() <= 5 && w.dim() == x.dim() &&
-         (t == at::kFloat || t == at::kInt || t == at::kLong || (t == at::kDouble && has_feature(kFeatureFloat64))) &&
+         (t == at::kFloat || t == at::kInt || t == at::kLong || (t == at::kDouble && has_feature(kFeatureFloat64)) ||
+          t16) &&
          w.scalar_type() == t;
 }
 
@@ -376,7 +575,7 @@ at::Tensor convolution_compute(const at::Tensor& input, const at::Tensor& weight
                                const std::optional<at::Tensor>& bias, at::IntArrayRef stride_,
                                at::IntArrayRef padding_, at::IntArrayRef dilation_, bool transposed,
                                at::IntArrayRef output_padding_, int64_t groups) {
-  if (!conv_ok(input, weight)) {
+  if (!conv_ok(input, weight, true) || (bias.has_value() && bias->defined() && bias->scalar_type() != input.scalar_type())) {
     // (convolution_overrideable has no CPU kernel; aten::convolution does.)
     return on_cpu("aten::convolution", "", input, weight, bias, stride_, padding_, dilation_, transposed,
                   output_padding_, groups)[0]
@@ -511,3 +710,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("convolution_overrideable", &vk::convolution);
   m.impl("convolution_backward_overrideable", &vk::convolution_backward);
 }
+
+extern "C" void vkt_set_fp16_arithmetic(int enabled) { vk::fp16_arithmetic_flag().store(enabled != 0); }
+extern "C" int vkt_fp16_arithmetic() { return vk::fp16_arithmetic() ? 1 : 0; }

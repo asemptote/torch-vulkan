@@ -43,6 +43,8 @@ extern "C" {
     fn vkt_set_rng_state(seed: u64, offset: u64);
     fn vkt_fallback_counts(buf: *mut std::ffi::c_char, len: usize) -> usize;
     fn vkt_exact_float32_products(enter: i32);
+    fn vkt_set_fp16_arithmetic(enabled: i32);
+    fn vkt_fp16_arithmetic() -> i32;
 }
 
 /// Waits until all queued GPU work has finished; raises IndexError if a
@@ -182,6 +184,17 @@ fn set_rng_state(seed: u64, offset: u64) {
     unsafe { vkt_set_rng_state(seed, offset) }
 }
 
+/// Lets float16 matrix products and convolutions multiply and add in float16.
+#[pyfunction]
+fn set_fp16_arithmetic(enabled: bool) {
+    unsafe { vkt_set_fp16_arithmetic(i32::from(enabled)) }
+}
+
+#[pyfunction]
+fn get_fp16_arithmetic() -> bool {
+    unsafe { vkt_fp16_arithmetic() != 0 }
+}
+
 #[pyfunction]
 fn device_name() -> PyResult<String> {
     Ok(py_runtime()?.ctx.device_name.clone())
@@ -277,6 +290,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(seed, m)?)?;
     m.add_function(wrap_pyfunction!(get_rng_state, m)?)?;
     m.add_function(wrap_pyfunction!(set_rng_state, m)?)?;
+    m.add_function(wrap_pyfunction!(set_fp16_arithmetic, m)?)?;
+    m.add_function(wrap_pyfunction!(get_fp16_arithmetic, m)?)?;
     m.add_function(wrap_pyfunction!(kernels, m)?)?;
     m.add_function(wrap_pyfunction!(memory_stats, m)?)?;
     m.add_function(wrap_pyfunction!(empty_cache, m)?)?;

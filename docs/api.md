@@ -31,6 +31,7 @@ a `python-torch` upgrade, install the matching build or rebuild).
 | `seed()` | Seeds the `"vk"` generator nondeterministically and returns the seed. |
 | `initial_seed()` | The seed the generator started from. |
 | `get_rng_state(device="vk")` / `set_rng_state(state, device="vk")` | The generator's state (seed and offset) as a `uint8` tensor, and restoring it. |
+| `set_fp16_arithmetic(enabled)` / `get_fp16_arithmetic()` | Lets float16 matrix products and convolutions multiply and add in float16 instead of float32 (off by default; see [float16 arithmetic](#float16-arithmetic)). Applies to calls made after it. |
 
 Random numbers come from a Philox generator on the GPU. They are
 deterministic for a given seed, but not the same numbers as the CPU's
@@ -43,6 +44,8 @@ generator.
   creating such a tensor raises `TypeError` (as on Apple's MPS).
 - float16 and bfloat16 are computed in float32 and rounded once (matrix
   products on tensor cores where the GPU has them); complex32 likewise.
+  `set_fp16_arithmetic(True)` lets float16 matrix products and
+  convolutions compute in float16 instead (below).
 - 8- and 16-bit integers are computed in int32; int64 and the unsigned types
   are supported everywhere (int64 arithmetic is emulated with 32-bit words, so
   `shaderInt64` is not needed).
@@ -127,6 +130,28 @@ cooperative matrices):
 - The bfloat16 parts are written to temporary tensors first: 2 bytes per
   operand value for `"medium"`, 6 for `"high"`.
 
+## float16 arithmetic
+
+By default float16 results match the CPU's: products and sums in float32,
+rounded once. `torch_vulkan.set_fp16_arithmetic(True)` (or
+`TORCH_VK_FP16_ARITHMETIC=1` in the environment) lets float16 matrix
+products (`mm`, `bmm`, `addmm`, `linear`, ...) and convolutions multiply and
+add in float16, with packed half2 arithmetic, as PyTorch's
+`torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction` does for
+CUDA. On GPUs with twice the float16 rate this runs them faster (on GPUs
+whose kernels run 16-lane subgroups: Mali's Valhall GPUs and Intel's; elsewhere
+the setting changes nothing). The cost is accuracy:
+
+- sums are float16, so their rounding error grows with the reduction length
+  (the inner dimension of a product, in channels x taps of a convolution):
+  for 1408 terms (a 128-channel, 11-tap convolution) the error was 0.4% of
+  the result's rms (3.6% at most), against at most 0.14% with float32 sums;
+- partial sums overflow to inf past 65504, even when the final result would
+  fit (scale inputs or weights down where that can happen).
+
+bfloat16 and float32 are unaffected; so are matrix-vector products (decoding
+steps), which are bound by memory bandwidth.
+
 ## Environment variables
 
 Set them before importing `torch_vulkan`; most are read once, at first use.
@@ -149,6 +174,8 @@ For on/off flags, any value other than empty or `0` switches the flag on.
 | Variable | Effect |
 |---|---|
 | `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. `float4` shares operands across subgroups where the GPU runs 16-lane subgroups (Mali's Valhall GPUs; `TORCH_VK_DISABLE=subgroups` turns that off), and there also runs float16 and bfloat16 products, computed in float32. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
+| `TORCH_VK_CONV=im2col` or `direct` | Stride-1 convolutions: `im2col` runs them as im2col columns and a matrix product, `direct` with the direct convolution kernel (`conv4s.slang`) wherever the GPU can run it (16-lane subgroups: Intel, Mali). By default, direct on Intel GPUs and, for float16 and bfloat16, on Mali; im2col elsewhere and where the direct kernel does not apply. For comparison and testing. |
+| `TORCH_VK_FP16_ARITHMETIC=1` | Start with float16 arithmetic allowed (`set_fp16_arithmetic(True)`; see [float16 arithmetic](#float16-arithmetic)). |
 | `TORCH_VK_GEMV=vector` or `scalar` | Matrix products with one to eight vectors (decoding steps: `x @ W.t()` for a few rows of `x`, `W @ v`, `addmv`, `_weight_int8pack_mm` with up to 8 rows): `vector` reads the weights in 16-byte loads and keeps float32 sums (`gemv4.slang`), `scalar` uses `gemv.slang` and the GEMM kernels for float weights and `qmm8.slang` for int8 ones. By default `vector`, except for float32 weights on NVIDIA and AMD GPUs. `_weight_int4pack_mm` always reads its 4-bit weights in 16-byte loads. |
 | `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size for the `subgroup` kernels (default 16 for float32, 8 for float64), within the device's range. |
 | `TORCH_VK_COMPUTE_UNITS=n` | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, `0`, unknown, elsewhere: then products are never split). |

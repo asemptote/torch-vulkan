@@ -129,11 +129,18 @@ bool prefer_gemm4() {
 // runs subgroups of exactly 16 lanes with shuffles (Mali's Valhall GPUs);
 // for float32, and for float16 and bfloat16 (computed in float32), which
 // otherwise run as float32 products of widened copies.
+// With float16 arithmetic allowed (fp16_arithmetic()), float16 products use
+// it wherever it runs (Intel GPUs too), unless TORCH_VK_GEMM chooses another
+// kernel.
 bool use_gemm4s(at::ScalarType t) {
-  static const bool ok = prefer_gemm4() && vkt_kernel_subgroup_size("gemm4s_f32") == 16;
-  static const bool f16 = ok && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
+  static const bool runs = vkt_kernel_subgroup_size("gemm4s_f32") == 16;
+  static const bool ok = prefer_gemm4() && runs;
+  static const bool f16_caps = has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
   static const bool bf16 = ok && has_feature(kFeatureInt16);
-  return t == at::kFloat ? ok : t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
+  if (t == at::kHalf) {
+    return f16_caps && (ok || (runs && (gemm_choice().empty() || gemm_choice() == "float4") && fp16_arithmetic()));
+  }
+  return t == at::kFloat ? ok : t == at::kBFloat16 ? bf16 : false;
 }
 
 // Lanes of shaders/gemmsg.slang for float32 or float64 products, 0 where it
@@ -201,15 +208,15 @@ int64_t max_offset(const at::Tensor& t);
 // whole groups of 4 and does not store the columns past N): its view is
 // that wide, or its storage goes on far enough (a narrowed view of a padded
 // buffer, as convolution.cpp's columns).
-bool padded_cols(const at::Tensor& b, int64_t n) {
-  int64_t extra = round4(n) - b.size(2);
+bool padded_cols(const at::Tensor& b, int64_t n, int64_t mult = 4) {
+  int64_t extra = (n + mult - 1) / mult * mult - b.size(2);
   if (extra <= 0) return true;
   int64_t last = b.storage_offset() + max_offset(b) + extra;
   return b.numel() > 0 && max_offset(b) >= 0 && (last + 1) * static_cast<int64_t>(b.element_size()) <=
                                                      static_cast<int64_t>(b.storage().nbytes());
 }
-bool gemm4s_layout(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t k) {
-  return k % 4 == 0 && vec4_rows(a) && vec4_rows(b) && padded_cols(b, n);
+bool gemm4s_layout(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t k, int64_t mult = 4) {
+  return k % 4 == 0 && vec4_rows(a) && vec4_rows(b) && padded_cols(b, n, mult);
 }
 
 // t [B, R, C] in a zeroed [B, rows, cols] (rows >= R, cols >= C), row-major.
@@ -725,10 +732,11 @@ bool coop_gemm(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor&
 // Values gemm4s.slang's layout needs copied for c = a @ b (n = c's columns):
 // operands in another layout, or with K or N not multiples of 4, are copied
 // row-major and zero-padded (the padding adds zero products).
-int64_t gemm4s_copies(const at::Tensor& a, const at::Tensor& b, int64_t n) {
+// (mult: B's rows read to a multiple of 4 columns, 8 for float16 arithmetic)
+int64_t gemm4s_copies(const at::Tensor& a, const at::Tensor& b, int64_t n, int64_t mult = 4) {
   int64_t m = a.size(1), k = a.size(2), k4 = round4(k);
-  bool copy_a = !vec4_rows(a) || k4 != k, copy_b = !vec4_rows(b) || k4 != k || !padded_cols(b, n);
-  return (copy_a ? a.size(0) * m * k4 : 0) + (copy_b ? b.size(0) * k4 * round4(n) : 0);
+  bool copy_a = !vec4_rows(a) || k4 != k, copy_b = !vec4_rows(b) || k4 != k || !padded_cols(b, n, mult);
+  return (copy_a ? a.size(0) * m * k4 : 0) + (copy_b ? b.size(0) * k4 * ceil_div(n, mult) * mult : 0);
 }
 
 // gemm()'s product by shaders/gemm4s.slang (where use_gemm4s), all operands
@@ -753,8 +761,12 @@ bool gemm4s(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& c_
   if (c_in.numel() == 0) {
     return true;
   }
-  int64_t direct = gemm4s_copies(a_in, b_in, n);
-  bool swap = direct > 0 && gemm4s_copies(b_in.transpose(1, 2), a_in.transpose(1, 2), m) < direct;
+  // float16 arithmetic (fp16_arithmetic(): shaders/gemm4s.slang's f16h, 8
+  // columns per lane)
+  bool half_math = t == at::kHalf && fp16_arithmetic();
+  int64_t mult = half_math ? 8 : 4, tile_n = half_math ? 2 * kTile4sN : kTile4sN;
+  int64_t direct = gemm4s_copies(a_in, b_in, n, mult);
+  bool swap = direct > 0 && gemm4s_copies(b_in.transpose(1, 2), a_in.transpose(1, 2), m, mult) < direct;
   at::Tensor a = swap ? b_in.transpose(1, 2) : a_in, b = swap ? a_in.transpose(1, 2) : b_in;
   at::Tensor c = swap ? c_in.transpose(1, 2) : c_in, cin_t;
   const at::Tensor* cin = cin_in;
@@ -765,25 +777,25 @@ bool gemm4s(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& c_
       cin = &cin_t;
     }
   }
-  if (ceil_div(m, kTile4sM) > kMaxGroups || ceil_div(n, kTile4sN) > kMaxGroups) {
+  if (ceil_div(m, kTile4sM) > kMaxGroups || ceil_div(n, tile_n) > kMaxGroups) {
     return false;
   }
-  if (int64_t copied = gemm4s_copies(a, b, n); copied > 0) {
+  if (int64_t copied = gemm4s_copies(a, b, n, mult); copied > 0) {
     int64_t k4 = round4(k);
     if (copied * 16 > batch * m * n * k) {
       return false;
     }
     if (!vec4_rows(a) || k4 != k) a = padded(a, m, k4);
-    if (!vec4_rows(b) || k4 != k || !padded_cols(b, n)) b = padded(b, k4, round4(n));
-    if (!gemm4s_layout(a, b, n, k4)) {
+    if (!vec4_rows(b) || k4 != k || !padded_cols(b, n, mult)) b = padded(b, k4, ceil_div(n, mult) * mult);
+    if (!gemm4s_layout(a, b, n, k4, mult)) {
       return false;
     }
   }
   GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
   p.alpha = pack_param(alpha, at::kFloat);  // (the kernel scales in float32)
   p.beta = pack_param(beta, at::kFloat);
-  dispatch(std::string("gemm4s_") + storage_label(t), {p.cin != 0 ? 1u : 0u}, p,
-           static_cast<uint32_t>(ceil_div(n, kTile4sN)), static_cast<uint32_t>(ceil_div(m, kTile4sM)),
+  dispatch(std::string("gemm4s_") + (half_math ? "f16h" : storage_label(t)), {p.cin != 0 ? 1u : 0u}, p,
+           static_cast<uint32_t>(ceil_div(n, tile_n)), static_cast<uint32_t>(ceil_div(m, kTile4sM)),
            static_cast<uint32_t>(batch));
   return true;
 }
