@@ -22,7 +22,7 @@ struct StridedLayout {
   static constexpr size_t D = 12 / K;
   uint64_t ptr[K];
   uint64_t param[6 - K];
-  uint32_t n, ndim, stride, pad;
+  uint32_t n, ndim, stride, rev;  // (rev: _strided.slang's, operand a reversed per dim)
   uint32_t size[4];
   int32_t st[K][D];
 };
@@ -95,10 +95,22 @@ void launch_dims(const char* kernel, const std::vector<uint32_t>& spec, const St
   std::copy(bits.begin(), bits.end(), p.param);
   size_t inner = std::min(dims.ndim(), D);
   p.ndim = static_cast<uint32_t>(inner);
+  // Operand a's negative strides (copy_reversed) become reversed dims with
+  // positive strides read from the lowest address, so that no kernel indexes
+  // a pointer with a negative 32-bit offset (NVIDIA's driver faults on it);
+  // `back` is how far that moves a's pointer back, in elements.
+  int64_t back = 0;
   for (size_t d = 0; d < D; ++d) {
     p.size[d] = d < inner ? static_cast<uint32_t>(dims.size[d]) : 1;
     for (size_t k = 0; k < K; ++k) {
-      p.st[k][d] = d < inner ? static_cast<int32_t>(dims.stride[d][k]) : 0;
+      int64_t st = d < inner ? dims.stride[d][k] : 0;
+      TORCH_CHECK(st >= 0 || (k == 1 && K == 3), "torch_vulkan: negative stride for an operand of ", kernel);
+      if (st < 0) {
+        p.rev |= 1u << d;
+        back += (dims.size[d] - 1) * -st;
+        st = -st;
+      }
+      p.st[k][d] = static_cast<int32_t>(st);
     }
   }
   bool exact = exact_operands(kernel, spec);
@@ -109,7 +121,7 @@ void launch_dims(const char* kernel, const std::vector<uint32_t>& spec, const St
     check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
     ranges.clear();
     for (size_t k = 0; k < K; ++k) {
-      p.ptr[k] = base[k] != 0 ? base[k] + offsets[k] * itemsize[k] : 0;
+      p.ptr[k] = base[k] != 0 ? base[k] + (offsets[k] - (k == 1 ? back : 0)) * itemsize[k] : 0;
       if (exact && p.ptr[k] != 0) {
         ranges.push_back(strided_range(p.ptr[k], itemsize[k], inner, p.size, p.st[k], k == 0));
       }
@@ -136,7 +148,7 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
 
 struct Copy8Layout {
   uint64_t out, a;
-  uint32_t n, ndim, stride, pad;
+  uint32_t n, ndim, stride, rev;  // (rev: copy8.slang's, a reversed per dim)
   uint32_t size[8];
   int32_t so[8], sa[8];
 };
@@ -178,15 +190,22 @@ bool copy8_dims(const StridedDims<2>& dims, uint64_t out, uint64_t a, int64_t it
   }
   Copy8Layout p{};
   p.out = out;
-  p.a = a;
   p.n = static_cast<uint32_t>(count);
   p.ndim = static_cast<uint32_t>(dims.ndim());
+  int64_t back = 0;  // (a's negative strides as reversed dims, as in launch_dims)
   for (size_t d = 0; d < 8; ++d) {
     bool used = d < dims.ndim();
+    int64_t sa = used ? dims.stride[d][1] : 0;
+    if (sa < 0) {
+      p.rev |= 1u << d;
+      back += (dims.size[d] - 1) * -sa;
+      sa = -sa;
+    }
     p.size[d] = used ? static_cast<uint32_t>(dims.size[d]) : 1;
     p.so[d] = used ? static_cast<int32_t>(dims.stride[d][0]) : 0;
-    p.sa[d] = used ? static_cast<int32_t>(dims.stride[d][1]) : 0;
+    p.sa[d] = static_cast<int32_t>(sa);
   }
+  p.a = a - static_cast<uint64_t>(back * itemsize);
   uint32_t groups = 0;
   check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
   // (copy8.slang writes out[o] and reads a[a] only: exact ranges, as launch())
