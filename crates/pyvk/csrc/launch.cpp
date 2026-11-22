@@ -83,18 +83,16 @@ VktRange strided_range(uint64_t ptr, int64_t itemsize, size_t ndim, const uint32
                   write ? 1u : 0u, 0};
 }
 
+// Launches `kernel` over `dims` (planned by strided.h), operand k at GPU
+// address base[k] (0: absent) with elements of itemsize[k] bytes.
 template <size_t K>
-void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::array<const at::Tensor*, K>& ops,
-            c10::ArrayRef<uint64_t> bits) {
-  const at::Tensor& out = *ops[0];
-  if (out.numel() == 0) {
-    return;
-  }
+void launch_dims(const char* kernel, const std::vector<uint32_t>& spec, const StridedDims<K>& dims,
+                 const std::array<uint64_t, K>& base, const std::array<int64_t, K>& itemsize,
+                 c10::ArrayRef<uint64_t> bits) {
   StridedLayout<K> p{};
   constexpr size_t D = StridedLayout<K>::D;
   TORCH_CHECK(bits.size() <= std::size(p.param), "torch_vulkan: too many kernel parameters for ", kernel);
   std::copy(bits.begin(), bits.end(), p.param);
-  StridedDims<K> dims = plan_operands<K>(out, ops);
   size_t inner = std::min(dims.ndim(), D);
   p.ndim = static_cast<uint32_t>(inner);
   for (size_t d = 0; d < D; ++d) {
@@ -102,12 +100,6 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
     for (size_t k = 0; k < K; ++k) {
       p.st[k][d] = d < inner ? static_cast<int32_t>(dims.stride[d][k]) : 0;
     }
-  }
-  std::array<uint64_t, K> base{};
-  std::array<int64_t, K> itemsize{};
-  for (size_t k = 0; k < K; ++k) {
-    base[k] = !ops[k] ? 0 : k == 0 ? gpu_address_out(*ops[k]) : gpu_address(*ops[k]);
-    itemsize[k] = ops[k] ? ops[k]->itemsize() : 0;
   }
   bool exact = exact_operands(kernel, spec);
   std::vector<VktRange> ranges;
@@ -117,13 +109,29 @@ void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::ar
     check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
     ranges.clear();
     for (size_t k = 0; k < K; ++k) {
-      p.ptr[k] = ops[k] ? base[k] + offsets[k] * itemsize[k] : 0;
-      if (exact && ops[k] && p.ptr[k] != 0) {
+      p.ptr[k] = base[k] != 0 ? base[k] + offsets[k] * itemsize[k] : 0;
+      if (exact && p.ptr[k] != 0) {
         ranges.push_back(strided_range(p.ptr[k], itemsize[k], inner, p.size, p.st[k], k == 0));
       }
     }
     dispatch_declared(kernel, spec, p, ranges, groups);
   });
+}
+
+template <size_t K>
+void launch(const char* kernel, const std::vector<uint32_t>& spec, const std::array<const at::Tensor*, K>& ops,
+            c10::ArrayRef<uint64_t> bits) {
+  const at::Tensor& out = *ops[0];
+  if (out.numel() == 0) {
+    return;
+  }
+  std::array<uint64_t, K> base{};
+  std::array<int64_t, K> itemsize{};
+  for (size_t k = 0; k < K; ++k) {
+    base[k] = !ops[k] ? 0 : k == 0 ? gpu_address_out(*ops[k]) : gpu_address(*ops[k]);
+    itemsize[k] = ops[k] ? ops[k]->itemsize() : 0;
+  }
+  launch_dims<K>(kernel, spec, plan_operands<K>(out, ops), base, itemsize, bits);
 }
 
 struct Copy8Layout {
@@ -150,28 +158,27 @@ void launch_strided(const char* kernel, std::vector<uint32_t> spec, const at::Te
   launch<3>(kernel, spec, {&out, a, b}, pack_params(params, (a ? *a : out).scalar_type()));
 }
 
-bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* size_label) {
-  StridedDims<2> dims = plan_operands<2>(dst, {&dst, &src});
-  if (dims.ndim() <= 4 || dims.ndim() > 8 || dst.numel() == 0) {
+namespace {
+
+// dst = src over `dims` (planned by strided.h; strides may be negative) in
+// one dispatch of shaders/copy8.slang, operands at GPU addresses out and a;
+// false where it does not apply (not 5 to 8 dims, or past 32-bit offsets).
+bool copy8_dims(const StridedDims<2>& dims, uint64_t out, uint64_t a, int64_t itemsize, const char* size_label) {
+  if (dims.ndim() <= 4 || dims.ndim() > 8) {
     return false;
   }
   int64_t count = 1;
   std::array<int64_t, 2> span{};
   for (size_t d = 0; d < dims.ndim(); ++d) {
     count *= dims.size[d];
-    for (size_t k = 0; k < 2; ++k) {
-      if (dims.stride[d][k] < 0) {
-        return false;
-      }
-      span[k] += (dims.size[d] - 1) * dims.stride[d][k];
-    }
+    for (size_t k = 0; k < 2; ++k) span[k] += (dims.size[d] - 1) * std::abs(dims.stride[d][k]);
   }
   if (count >= (int64_t(1) << 32) || span[0] >= (int64_t(1) << 31) || span[1] >= (int64_t(1) << 31)) {
     return false;
   }
   Copy8Layout p{};
-  p.out = gpu_address_out(dst);
-  p.a = gpu_address(src);
+  p.out = out;
+  p.a = a;
   p.n = static_cast<uint32_t>(count);
   p.ndim = static_cast<uint32_t>(dims.ndim());
   for (size_t d = 0; d < 8; ++d) {
@@ -183,10 +190,45 @@ bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* si
   uint32_t groups = 0;
   check(vkt_grid_1d(static_cast<uint64_t>(count), &groups, &p.stride));
   // (copy8.slang writes out[o] and reads a[a] only: exact ranges, as launch())
-  std::vector<VktRange> ranges = {strided_range(p.out, dst.itemsize(), dims.ndim(), p.size, p.so, true),
-                                  strided_range(p.a, src.itemsize(), dims.ndim(), p.size, p.sa, false)};
+  std::vector<VktRange> ranges = {strided_range(p.out, itemsize, dims.ndim(), p.size, p.so, true),
+                                  strided_range(p.a, itemsize, dims.ndim(), p.size, p.sa, false)};
   dispatch_declared(std::string("copy8_") + size_label, {}, p, ranges, groups);
   return true;
+}
+
+}  // namespace
+
+bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* size_label) {
+  if (dst.numel() == 0) {
+    return false;
+  }
+  StridedDims<2> dims = plan_operands<2>(dst, {&dst, &src});
+  return copy8_dims(dims, gpu_address_out(dst), gpu_address(src), dst.itemsize(), size_label);
+}
+
+void copy_reversed(const at::Tensor& dst, const at::Tensor& src, const std::vector<int64_t>& dims) {
+  TORCH_CHECK(dst.sizes() == src.sizes() && dst.itemsize() == src.itemsize(),
+              "torch_vulkan: copy_reversed needs operands of one shape and element size");
+  if (dst.numel() == 0) {
+    return;
+  }
+  std::string kernel = move_kernel(src.itemsize());
+  TORCH_CHECK(!kernel.empty(), "torch_vulkan: no copy kernel for elements of ", src.itemsize(), " bytes");
+  std::vector<int64_t> strides = src.strides().vec();
+  int64_t start = 0;  // (src's element offset of the first element read)
+  for (int64_t d : dims) {
+    start += (src.size(d) - 1) * strides[d];
+    strides[d] = -strides[d];
+  }
+  int64_t itemsize = src.itemsize();
+  uint64_t out = gpu_address_out(dst), a = gpu_address(src) + start * itemsize;
+  if (!copy8_dims(merge_dims<2>(dst.sizes(), {dst.strides().vec(), strides}), out, a, itemsize,
+                  kernel.c_str() + kernel.find('_') + 1)) {
+    // (move.slang's layout is _strided.slang's three operands: b absent)
+    std::vector<int64_t> none(dst.dim(), 0);
+    launch_dims<3>(kernel.c_str(), {op::MOVE_COPY}, merge_dims<3>(dst.sizes(), {dst.strides().vec(), strides, none}),
+                   {out, a, 0}, {itemsize, itemsize, 0}, {});
+  }
 }
 
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,

@@ -82,21 +82,6 @@ at::Tensor pad_spatial(const at::Tensor& x, const std::vector<std::pair<int64_t,
   return any ? at::constant_pad_nd(x, p, 0) : x;
 }
 
-// t reversed along `dims`, by one copy per index (convolution weights: dims
-// of a few taps; aten::flip gathers through a table of offsets, much slower
-// for these shapes).
-at::Tensor reversed(const at::Tensor& t, const std::vector<int64_t>& dims) {
-  at::Tensor r = t;
-  for (int64_t d : dims) {
-    int64_t n = r.size(d);
-    if (n <= 1 || r.numel() == 0) continue;
-    at::Tensor o = at::empty(r.sizes(), r.options());
-    for (int64_t i = 0; i < n; ++i) o.select(d, n - 1 - i).copy_(r.select(d, i));
-    r = o;
-  }
-  return r;
-}
-
 // shaders/conv4s.slang's Params.
 struct Conv4sParams {
   uint64_t x, w, y, bias;
@@ -451,7 +436,7 @@ at::Tensor conv_transpose_phases(const at::Tensor& x, const at::Tensor& w, const
   order.insert(order.end(), tap_dims.begin(), tap_dims.end());
   std::vector<int64_t> wpshape = {Co * P, Cig};
   for (int64_t d = 0; d < s; ++d) wpshape.push_back(T[d]);
-  at::Tensor wp = reversed(wd.reshape(split), tap_dims).permute(order).reshape(wpshape);
+  at::Tensor wp = wd.reshape(split).flip(tap_dims).permute(order).reshape(wpshape);
   std::optional<at::Tensor> bp;
   if (bias.has_value() && bias->defined()) {
     bp = bias->view({Co, 1}).expand({Co, P}).reshape({Co * P});
@@ -539,7 +524,7 @@ at::Tensor conv_transpose_forward(const at::Tensor& x, const at::Tensor& w, cons
   at::Tensor wt = w.reshape(gshape).transpose(1, 2);
   std::vector<int64_t> wshape = {Co, Cig};
   wshape.insert(wshape.end(), w.sizes().begin() + 2, w.sizes().end());
-  wt = reversed(wt.reshape(wshape), flip_dims);
+  wt = wt.reshape(wshape).flip(flip_dims);
   return conv_forward(xd, wt, bias, ones, pad, dilation, groups);
 }
 

@@ -1372,27 +1372,24 @@ at::Tensor gather_dims(const at::Tensor& self, at::IntArrayRef out_shape, const 
   return out;
 }
 
+// One strided copy reading self backwards along the flipped dims
+// (copy_reversed: a direct index computation, no table of offsets), into a
+// result laid out as self (the CPU's empty_like with the preserved format).
 at::Tensor flip(const at::Tensor& self, at::IntArrayRef dims) {
   if (!movable(self)) {
     return on_cpu("aten::flip", "", self, dims)[0].toTensor();
   }
   at::dim_list_to_bitset(dims, std::max<int64_t>(self.dim(), 1));  // (rejects repeated and out-of-range dims)
-  if (self.dim() == 0) {
-    return self.clone();  // (a scalar flips to itself)
-  }
+  at::Tensor out = at::empty_like(self, at::MemoryFormat::Preserve);
   std::vector<int64_t> flipped;
-  std::vector<at::Tensor> indices;
   for (int64_t d : dims) {
-    int64_t w = at::maybe_wrap_dim(d, self.dim());
-    if (self.size(w) > 1) {
+    int64_t w = at::maybe_wrap_dim(d, std::max<int64_t>(self.dim(), 1));
+    if (self.dim() > 0 && self.size(w) > 1 && self.stride(w) != 0) {
       flipped.push_back(w);
-      indices.push_back(at::arange(self.size(w) - 1, -1, -1, self.options().dtype(at::kLong)));
     }
   }
-  if (flipped.empty() || self.numel() == 0) {
-    return self.clone(at::MemoryFormat::Contiguous);
-  }
-  return gather_dims(self, self.sizes(), flipped, indices);
+  copy_reversed(out, self, flipped);
+  return out;
 }
 
 at::Tensor roll_vk(const at::Tensor& self, at::IntArrayRef shifts, at::IntArrayRef dims) {

@@ -275,6 +275,12 @@ bool gemv4(const Gemv4& g);
 // each); false otherwise. size_label: b1, b2, b4, b8 or b16. launch.cpp.
 bool copy_many_dims(const at::Tensor& dst, const at::Tensor& src, const char* size_label);
 
+// dst = src reversed along `dims` (same shape and element size; dims
+// wrapped, each once): one strided copy that reads src from its last element
+// along those dims with their strides negated, as a view with negative
+// strides would. launch.cpp.
+void copy_reversed(const at::Tensor& dst, const at::Tensor& src, const std::vector<int64_t>& dims);
+
 // launch_strided with the parameter slots given as raw bits (e.g. a fill
 // value's bytes).
 void launch_strided_bits(const char* kernel, std::vector<uint32_t> spec, const at::Tensor& out, const at::Tensor* a,
