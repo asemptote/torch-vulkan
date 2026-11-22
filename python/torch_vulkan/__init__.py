@@ -129,6 +129,25 @@ def _warn_llvmpipe_on_android():
 _warn_llvmpipe_on_android()
 
 
+def _warn_strict_deprecated():
+    """TORCH_VK_STRICT, the CPU fallback's switch before 0.3.0, still works
+    (backend.cpp) until 0.4, with a warning: TORCH_VK_CPU_FALLBACK replaces it."""
+    import os
+
+    if os.environ.get("TORCH_VK_STRICT", ""):
+        import warnings
+
+        # (stacklevel 3: the module that imports torch_vulkan, so that Python
+        # shows it there by default, as for __main__)
+        warnings.warn(
+            "torch_vulkan: TORCH_VK_STRICT is deprecated and will be removed in 0.4. The CPU fallback is off "
+            "by default; TORCH_VK_CPU_FALLBACK=1 turns it on (as TORCH_VK_STRICT=0 does until then).",
+            DeprecationWarning, stacklevel=3)
+
+
+_warn_strict_deprecated()
+
+
 def synchronize(device=None):
     """Waits for all queued GPU work."""
     _native.synchronize()

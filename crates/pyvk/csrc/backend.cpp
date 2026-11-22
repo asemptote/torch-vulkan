@@ -896,8 +896,9 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 // The CPU fallback: off by default (an op without a Vulkan kernel for its
 // arguments raises NotImplementedError, as on Apple's MPS), on with
 // TORCH_VK_CPU_FALLBACK=1 or torch_vulkan.set_cpu_fallback(True). The older
-// TORCH_VK_STRICT still works: STRICT=1 is the default, STRICT=0 turns the
-// fallback on; TORCH_VK_CPU_FALLBACK wins where both are set.
+// TORCH_VK_STRICT still works until 0.4 (deprecated: the Python package
+// warns at import): STRICT=1 is the default, STRICT=0 turns the fallback on;
+// TORCH_VK_CPU_FALLBACK wins where both are set.
 // TORCH_VK_LINALG=cpu, which asks for LAPACK on the CPU, turns it on too.
 namespace {
 std::atomic<bool>& fallback_switch() {

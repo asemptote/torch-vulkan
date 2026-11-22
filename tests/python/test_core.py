@@ -126,6 +126,8 @@ def test_cpu_fallback_environment(env, expected):
                          timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.split() == [expected, str(expected == "ran")]
+    # (the older switch warns, once, that it goes in 0.4)
+    assert out.stderr.count("TORCH_VK_STRICT is deprecated") == ("TORCH_VK_STRICT" in env)
 
 
 def test_autograd():
