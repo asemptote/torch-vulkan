@@ -117,7 +117,7 @@ cover each route by shape.
 | Reductions (`reduce.cpp`) | one thread per output where there are at least 256 outputs and the reduced dim is strided with contiguous outputs, or at most 32 long (lavapipe); else workgroups per output, with the reduced dim split in chunks of at least 2048 elements over up to 1024 workgroups and further passes; 1-D `max`/`min` of 2^31 or more elements in rows of 65536 |
 | `index_add`, `scatter_reduce`, `index_put` with accumulation (`indexing.cpp`) | whole rows by `segreduce` when dim 0 is contiguous and the index expanded; else per element; indices beyond 2^26 elements in slices |
 | Sparse products (`sparse.cpp`) | sparse @ sparse by `spgemm` without dense dims, else densified; dense @ sparse computed transposed; compressed layouts through COO |
-| Copies (`launch.cpp`) | `copy8` for 5 to 8 dims after merging, else the strided kernels with a dispatch per outer index |
+| Copies (`launch.cpp`), and `flip` as a copy with the flipped dims' strides negated | `copy8` for 5 to 8 dims after merging, else the strided kernels with a dispatch per outer index |
 | Interpolation, grid sampling (`python/torch_vulkan/_kernels.py`) | uint8 bilinear/bicubic/antialiased resizes in fixed point; float resizes by `resample` or by products; `grid_sample` bicubic composite, nearest and bilinear by `gridsample` |
 
 ## Tests that force routes
