@@ -61,7 +61,7 @@ in chunks.
 |---|---|---|---|---|
 | Direct | `conv4s` (`conv4s_f16h` with float16 arithmetic); tile `r4n2` on Mali, else `r8n2` with float16 arithmetic, `r8n1` without | GPUs with 16-lane subgroups; on Mali only for float16 arithmetic, or float16/bfloat16 with 5 or more inner taps. Stride 1, inner dilation 1, 2, 3 or 5, at least 3 inner taps, not depthwise, 2-D/3-D outputs at least 8 wide, at least 2048 output positions over the batch, sizes within 32-bit offsets and 65535 workgroups | `TORCH_VK_CONV=direct` / `im2col`, `TORCH_VK_FP16_ARITHMETIC` | HD 530, Mali-G57 (M47; the 2048 and width rules on both) |
 | float16/bfloat16 in float32 | the float32 routes below | 16-bit inputs `conv4s` did not take: computed in float32, rounded once | shape | — |
-| Depthwise | `dwconv` | one input channel per group (any taps, stride, dilation, multiplier; float32, float64, int32, int64, and float16/bfloat16 storage), element offsets within 32 bits: one invocation per output | `TORCH_VK_DWCONV=0` (the products below) | HD 530, Mali-G57, lavapipe, L40S (M48) |
+| Depthwise | `dwconv` | one input channel per group (any taps, stride, dilation, multiplier; float32, float64, int32, int64, and float16/bfloat16 storage), element offsets within 32 bits: one invocation per output | `TORCH_VK_DWCONV=0` (the products below) | HD 530, Mali-G57, lavapipe, L40S (M49) |
 | Rows layout | im2col columns and `bmm` | one group, or one sample: W [Cout, Cin K] @ columns, bias as the product's beta | shape | Mali-G57, HD 530, lavapipe (M39) |
 | Columns layout | im2col columns and `bmm` | groups > 1 and a batch: columns [G, N L, Cin K] @ W^T | shape | — |
 

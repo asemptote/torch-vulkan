@@ -1,4 +1,4 @@
-# Depthwise convolution kernel (M48)
+# Depthwise convolution kernel (M49)
 
 Part of a cleanup of ops built from many small kernel launches. M46 (#110)
 ran depthwise convolutions (one input channel per group) as one
