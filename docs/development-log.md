@@ -91,7 +91,7 @@ tests/python/test_*.py     results on "vk" vs CPU (statistics for random ops)
 tools/opinfo_coverage.py   runs PyTorch's OpInfo samples on "vk": GPU / fallback / mismatch per op
 tools/port_special.py      regenerates shaders/_special.slang from torch's ATen/native/Math.h
 tools/pytorch_tests.py     runs PyTorch's device-generic test files on "vk" (M15), with a CPU re-check
-tools/cluster/             runs them on a PBS cluster (full-run.sh), and a dev copy there (dev.sh)
+tools/cluster/             runs them on a PBS cluster and workstations (queue-run.sh), and a dev copy there (dev.sh)
 tools/dev/                 pt.py (one test file on "vk", tracebacks), optrace.py (ops differing from
                            the CPU inside a test), seedsweep.py (a test under shifted seeds)
 .github/workflows/ci.yml   Linux CI on lavapipe (Mesa's CPU Vulkan) with validation
@@ -158,11 +158,12 @@ Checks, cheapest first; a change goes on to the next only once it passes:
 
    Lavapipe finds what real GPUs hide: races between a workgroup's SIMD
    chunks, loads on untaken paths, inaccurate built-ins.
-3. Full run, once per batch of changes and before every push: on the head
-   node, after `tools/cluster/sync.sh HOST --build -J GATEWAY`,
-   `bash tools/cluster/full-run.sh NAME --gpu` (48 lavapipe shards and one
-   H100 job, about an hour; see `tools/cluster/README.md`). Push only if no
-   test that passed in an earlier run fails.
+3. Full run, once per batch of changes and before every push: after
+   `tools/cluster/sync.sh HOST --build`, from the local repo root,
+   `tools/cluster/queue-run.sh start NAME --from PREV` (lavapipe shards on the
+   cluster and the workstations, and the NVIDIA GPUs, planned from the earlier
+   run PREV's times; about an hour; see `tools/cluster/README.md`). Push only
+   if no test that passed in an earlier run fails.
 
 For a failure, `tools/dev/optrace.py` shows which ops differ from the CPU
 inside a test, and `tools/dev/seedsweep.py` whether the CPU passes the same
