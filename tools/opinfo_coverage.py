@@ -3,13 +3,16 @@
 Runs every OpInfo in PyTorch's test database (torch.testing._internal) on
 device "vk" with its sample inputs, for a few dtypes, and records per op:
   - "gpu":      no CPU fallback was used and results match the CPU
-  - "fallback": correct, but these aten ops ran on the CPU (listed)
+  - "fallback": correct, but these aten ops ran on the CPU (listed; with
+                --cpu-fallback, else such an op raises NotImplementedError,
+                an "error" listing the op as "(refused)")
   - "mismatch": result differs from the CPU
   - "error":    raised on vk but not on the CPU
   - "crash":    killed the process (e.g. an access violation)
 Writes tools/opinfo_coverage.json and prints a summary.
 
     python tools/opinfo_coverage.py [--jobs 4] [--dtypes float32,float64] [--samples 3] [--filter substr]
+                                    [--strict] [--cpu-fallback]
 
 The op list is split across --jobs worker processes (each limited to one
 PyTorch CPU thread so they do not oversubscribe the cores). Workers append
@@ -318,6 +321,8 @@ def run_shard(args, k, results):
     part = pathlib.Path(args.out).with_suffix(f".part{k}.jsonl")
     part.unlink(missing_ok=True)
     env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    if args.cpu_fallback:
+        env["TORCH_VK_CPU_FALLBACK"] = "1"
     after = -1
     while True:
         cmd = [sys.executable, __file__, "--shard", f"{k}/{args.jobs}", "--after", str(after), "--out", str(part),
@@ -353,6 +358,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=1, help="worker processes")
     parser.add_argument("--strict", action="store_true",
                         help="exit 1 if any op crashes, errors, mismatches or runs an aten op on the CPU")
+    parser.add_argument("--cpu-fallback", action="store_true",
+                        help="let ops without a Vulkan kernel run on the CPU (listed as fallbacks) instead of raising")
     parser.add_argument("--shard", default="", help="internal: K/N, run every N-th op starting at K")
     parser.add_argument("--after", type=int, default=-1, help="internal: skip ops up to this index")
     args = parser.parse_args()

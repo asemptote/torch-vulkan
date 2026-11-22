@@ -137,16 +137,17 @@ print("warned" if any("running it on the CPU" in str(x.message) for x in w) else
 """
 
 
-@pytest.mark.parametrize("strict", ["0", "1"])
-def test_cpu_check_that_only_raises_is_no_fallback(strict):
+@pytest.mark.parametrize("fallback", ["0", "1"])
+def test_cpu_check_that_only_raises_is_no_fallback(fallback):
     # (a CPU call that only raises, as for invalid compressed indices, gives
-    # the CPU's error with no "running it on the CPU" warning, also under
-    # TORCH_VK_STRICT, which then must not turn it into NotImplementedError)
+    # the CPU's error with no "running it on the CPU" warning, with the CPU
+    # fallback on, and with it off, which then must not turn it into
+    # NotImplementedError)
     import os
     import subprocess
     import sys
 
-    out = subprocess.run([sys.executable, "-c", STRICT_SCRIPT], env=dict(os.environ, TORCH_VK_STRICT=strict),
+    out = subprocess.run([sys.executable, "-c", STRICT_SCRIPT], env=dict(os.environ, TORCH_VK_CPU_FALLBACK=fallback),
                          capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.split() == ["same", "error", "no", "warning"], out.stdout
@@ -483,6 +484,87 @@ def test_float8_casts(f8, src):
     assert torch.equal(got.cpu().view(torch.uint8), x.to(f8).view(torch.uint8))
     back = no_fallback(lambda: codes.to("vk").to(src))
     torch.testing.assert_close(back.cpu(), codes.to(src), equal_nan=True, atol=0, rtol=0)
+
+
+def test_float8_e8m0fnu():
+    # (float8_e8m0fnu, a power of two or NaN: casts both ways, bit for bit as the
+    # CPU's, which ignores the sign and rounds to the nearest power, and the ops
+    # the CPU has for it: comparisons, the predicates, mul, any/all)
+    e8 = torch.float8_e8m0fnu
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(e8)
+    x = torch.cat([make((300,), torch.float32) * 3, make((300,), torch.float32, seed=1) * 1e30,
+                   torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.5, 3.0, -6.0, 2.0 ** -127,
+                                 2.0 ** -126, 1e-40, 3e38, 2.0 ** 127, 1.4 * 2.0 ** 127])])
+    for src in (torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.int64, torch.bool):
+        got = no_fallback(lambda: x.to(src).to("vk").to(e8))
+        assert torch.equal(got.cpu().view(torch.uint8), x.to(src).to(e8).view(torch.uint8)), src
+        back = no_fallback(lambda: codes.to("vk").to(src))
+        torch.testing.assert_close(back.cpu(), codes.to(src), equal_nan=True, atol=0, rtol=0)
+    for f8 in FLOAT8:  # (float8 to float8, through float32)
+        got = no_fallback(lambda: codes.to("vk").to(f8))
+        assert torch.equal(got.cpu().view(torch.uint8), codes.to(f8).view(torch.uint8)), f8
+    v = torch.tensor([1.0, 4.0, float("nan"), 0.5, 2.0 ** 100]).to(e8)
+    w = torch.tensor([2.0 ** 100, 4.0, 1.0, float("nan"), 2.0 ** 30]).to(e8)
+    for f in (lambda t: t == w.to(t.device), lambda t: t != 4.0, torch.isnan, torch.isinf, torch.isfinite,
+              lambda t: t * w.to(t.device), torch.any, torch.all):
+        torch.testing.assert_close(no_fallback(lambda: f(v.to("vk"))).cpu(), f(v), equal_nan=True, atol=0, rtol=0)
+    for f, message in ((torch.abs, "abs_cpu"), (lambda t: t * 8.0, "mul_cpu_reduced_float")):  # (as the CPU)
+        with pytest.raises(NotImplementedError, match=message):
+            f(v)
+        with pytest.raises(NotImplementedError, match=message):
+            no_fallback(lambda: f(v.to("vk")))
+
+
+@pytest.mark.parametrize("f8", FLOAT8, ids=str)
+def test_float8_ops(f8):
+    # (the other ops the CPU computes for float8: abs, mul (in float32, rounded
+    # once), any/all, and isinf/isfinite, which PyTorch builds from abs)
+    v = torch.tensor([1.0, -2.0, 0.5, 0.0, -0.0, 448.0, float("nan"), float("inf"), -float("inf"), 1e-3, 7.5, -0.25])
+    x = v.to(f8)
+    y = (v.flip(0) * 3).to(f8)
+    for f in (torch.abs, torch.isinf, torch.isfinite, lambda t: t * y.to(t.device),
+              lambda t: torch.mul(t, y.to(t.device), out=torch.empty_like(t)), torch.any, torch.all,
+              lambda t: torch.any(t[3:5]), lambda t: torch.all(t.view(3, 4), 1)):
+        got = no_fallback(lambda: f(x.to("vk"))).cpu()
+        want = f(x)
+        assert got.dtype == want.dtype
+        if got.dtype == f8:
+            torch.testing.assert_close(got.float(), want.float(), equal_nan=True, atol=0, rtol=0)
+        else:
+            assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_masked_softmax_backward(dim):
+    # (the CPU's: the gradient where unmasked, 0 where masked, and 0 for a row
+    # with every position masked, whose output is NaN)
+    x = make((3, 4, 5), torch.float32)
+    mask = make((3, 4, 5), torch.float32, seed=1) > 0.4
+    mask[0, 1] = True
+    mask[:, :, 2] = True
+    out = torch._masked_softmax(x, mask, dim)
+    g = make((3, 4, 5), torch.float32, seed=2)
+    got = no_fallback(lambda: torch.ops.aten._masked_softmax_backward(g.to("vk"), out.to("vk"), mask.to("vk"), dim))
+    torch.testing.assert_close(got.cpu(), torch.ops.aten._masked_softmax_backward(g, out, mask, dim), equal_nan=True)
+    # and through autograd (MaskedTensor's softmax)
+    xs = [x.clone().requires_grad_(), x.to("vk").requires_grad_()]
+    for t in xs:
+        torch._masked_softmax(t, mask.to(t.device), dim).backward(g.to(t.device))
+    torch.testing.assert_close(xs[1].grad.cpu(), xs[0].grad, equal_nan=True)
+
+
+def test_baddbmm_out_dtype_raises_without_cpu():
+    # (the CPU's meta checks: vk raises them itself, before any work)
+    s, b1, b2 = make((2, 3, 4), torch.float32), torch.empty(2, 3, 0), torch.empty(2, 0, 4)
+    for args, out_dtype in [((s, b1, b2), torch.int64), ((s, make((2, 3, 5), torch.float32), make((2, 5, 4),
+                            torch.float32)), torch.float16), ((s.half(), b1, b2), torch.float32)]:
+        with pytest.raises(RuntimeError) as cpu:
+            torch.baddbmm(*args, out=torch.empty(2, 3, 4, dtype=out_dtype))
+        before = torch_vulkan.fallback_counts()
+        with pytest.raises(RuntimeError) as vk:
+            torch.baddbmm(*(a.to("vk") for a in args), out=torch.empty(2, 3, 4, dtype=out_dtype, device="vk"))
+        assert str(vk.value) == str(cpu.value)
+        assert torch_vulkan.fallback_counts() == before
 
 
 def test_out_on_another_device_raises_without_cpu():

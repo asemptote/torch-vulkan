@@ -156,14 +156,19 @@ at::ScalarType widened(at::ScalarType t);
 // bytes, or "" if the device cannot address elements of that size.
 std::string move_kernel(int64_t itemsize);
 
+// Whether the CPU fallback is on (off by default: TORCH_VK_CPU_FALLBACK,
+// torch_vulkan.set_cpu_fallback; backend.cpp).
+bool cpu_fallback_enabled();
+void set_cpu_fallback(bool on);
+
 // Records that `op` ran on the CPU instead of the GPU (warns once per op);
-// under TORCH_VK_STRICT raises NotImplementedError instead.
+// with the fallback off raises NotImplementedError instead.
 void record_fallback(const std::string& op);
 
 // Counts `op` in fallback_counts(), warning once per op if `warn`.
 void count_fallback(const std::string& op, bool warn);
 
-// TORCH_VK_STRICT: runs `op` on CPU copies of the stack's vk tensors and
+// With the fallback off: runs `op` on CPU copies of the stack's vk tensors and
 // rethrows its error, or raises NotImplementedError if it computes.
 void strict_probe(const c10::OperatorHandle& op, const torch::jit::Stack& stack, const std::string& key);
 

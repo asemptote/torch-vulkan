@@ -140,9 +140,10 @@ jobs:
           /tmp/t/bin/pip install --quiet "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
           /tmp/t/bin/pip install --quiet dist/*.whl numpy
           cd /tmp
-          TORCH_VK_STRICT=1 /tmp/t/bin/python - <<'EOF'
+          /tmp/t/bin/python - <<'EOF'
           import torch, torch_vulkan
           assert torch_vulkan.is_available(), "no Vulkan device"
+          assert not torch_vulkan.cpu_fallback_enabled()  # (the default: any CPU fallback raises)
           print(torch_vulkan.device_name())
           n = 64
           a = torch.randn(n, n, dtype=torch.float64, device="vk")

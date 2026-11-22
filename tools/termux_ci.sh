@@ -62,7 +62,7 @@ else:
 EOF
     case $(uname -m) in
     aarch64|x86_64)
-        TORCH_VK_STRICT=1 python release_smoke.py
+        python release_smoke.py
         # Not run here (docs/log/M40-termux-packages.md):
         # - lavapipe on aarch64 flushes subnormals to 0 (float32 and float64);
         # - this CPU, the tests' reference, differs from x86's for NaN and inf

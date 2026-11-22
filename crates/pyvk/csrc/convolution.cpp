@@ -42,6 +42,8 @@ namespace {
 
 int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
+int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
 // Output length of one spatial dim of a (non-transposed) convolution.
 int64_t conv_out_size(int64_t in, int64_t k, int64_t stride, int64_t pad_lo, int64_t pad_hi, int64_t dilation) {
   return (in + pad_lo + pad_hi - dilation * (k - 1) - 1) / stride + 1;
