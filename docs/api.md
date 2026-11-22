@@ -76,9 +76,11 @@ the first time each op does so, and each call is counted in
 arguments (a dtype check, say), that error is raised either way.
 
 `TORCH_VK_STRICT`, the switch before 0.3.0 (when the fallback was on by
-default), still works: `TORCH_VK_STRICT=1` is the default, and
-`TORCH_VK_STRICT=0` turns the fallback on. `TORCH_VK_CPU_FALLBACK` wins where
-both are set. `TORCH_VK_LINALG=cpu` (below) turns the fallback on too.
+default), still works but is deprecated: it warns once, at import
+(`DeprecationWarning`), and will be removed in 0.4. `TORCH_VK_STRICT=1` is
+the default, and `TORCH_VK_STRICT=0` turns the fallback on.
+`TORCH_VK_CPU_FALLBACK` wins where both are set. `TORCH_VK_LINALG=cpu`
+(below) turns the fallback on too.
 
 Two uses of the CPU are not fallbacks and need no switch: an op's CPU call
 that only raises its error (above), and, on GPUs without float64,
@@ -157,61 +159,60 @@ steps), which are bound by memory bandwidth.
 Set them before importing `torch_vulkan`; most are read once, at first use.
 For on/off flags, any value other than empty or `0` switches the flag on.
 
-### Behaviour
+### Settings
+
+These are the supported settings: they keep their meaning from release to
+release, and a change to one is announced in the release notes.
 
 | Variable | Effect |
 |---|---|
 | `TORCH_VK_CPU_FALLBACK=1` | Run an op that has no Vulkan kernel for its arguments on the CPU (with a one-time warning, counted in `fallback_counts()`) instead of raising `NotImplementedError`, the default. `0` keeps it off. See [The CPU fallback](#the-cpu-fallback). |
-| `TORCH_VK_STRICT=0` or `1` | The older switch: `0` turns the CPU fallback on, `1` (the default) leaves it off. `TORCH_VK_CPU_FALLBACK` wins where both are set. |
-| `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
-| `TORCH_VK_MAX_BATCH_GROUPS=n` | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
-| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
-| `TORCH_VK_BARRIERS=full` or `every` | Put a barrier before every command, instead of only where a command touches memory that one since the last barrier wrote, or writes memory one since then read (the default: kernels that touch disjoint memory then run concurrently; docs/log/M37). `every`: a barrier matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier. Debugging switches, to rule out a missed dependency when a race is suspected. |
-| `TORCH_VK_SPIN_US=n` | How long a synchronize polls for the GPU before it blocks in the driver's wait, in microseconds (default `500` on discrete GPUs, `0`, blocking at once, on integrated ones and lavapipe, which share the CPU's power or cores). Polling saves the wake-up after short work: about 19 us per synchronize on NVIDIA. |
-
-### Choosing kernels
-
-| Variable | Effect |
-|---|---|
-| `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. `float4` shares operands across subgroups where the GPU runs 16-lane subgroups (Mali's Valhall GPUs; `TORCH_VK_DISABLE=subgroups` turns that off), and there also runs float16 and bfloat16 products, computed in float32. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
-| `TORCH_VK_CONV=im2col` or `direct` | Stride-1 convolutions: `im2col` runs them as im2col columns and a matrix product, `direct` with the direct convolution kernel (`conv4s.slang`) wherever the GPU can run it (16-lane subgroups: Intel, Mali). By default, direct on Intel GPUs and, for float16 and bfloat16, on Mali; im2col elsewhere and where the direct kernel does not apply. For comparison and testing. |
 | `TORCH_VK_FP16_ARITHMETIC=1` | Start with float16 arithmetic allowed (`set_fp16_arithmetic(True)`; see [float16 arithmetic](#float16-arithmetic)). |
-| `TORCH_VK_GEMV=vector` or `scalar` | Matrix products with one to eight vectors (decoding steps: `x @ W.t()` for a few rows of `x`, `W @ v`, `addmv`, `_weight_int8pack_mm` with up to 8 rows): `vector` reads the weights in 16-byte loads and keeps float32 sums (`gemv4.slang`), `scalar` uses `gemv.slang` and the GEMM kernels for float weights and `qmm8.slang` for int8 ones. By default `vector`, except for float32 weights on NVIDIA and AMD GPUs. `_weight_int4pack_mm` always reads its 4-bit weights in 16-byte loads. |
-| `TORCH_VK_SUBGROUP=8`, `16` or `32` | Subgroup size for the `subgroup` kernels (default 16 for float32, 8 for float64), within the device's range. |
-| `TORCH_VK_COMPUTE_UNITS=n` | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, `0`, unknown, elsewhere: then products are never split). |
-| `TORCH_VK_SPLIT_K=n` | Split every float matrix product's k into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size. The pieces' sums are added in a fixed order, so results are the same from run to run either way. For testing and tuning. |
-| `TORCH_VK_GEMM_TILE=l`, `m` or `s` | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every float16 and bfloat16 product, instead of choosing by the GPU's size. For testing and tuning. |
-| `TORCH_VK_GEMM_GROUP=g` | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). For testing and tuning. |
-| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. Turns the CPU fallback on (unless `TORCH_VK_CPU_FALLBACK=0`). |
-| `TORCH_VK_EIGH_QL=1` | `eigh`: use tridiagonal QL instead of divide and conquer for every size (comparison and debugging). |
-| `TORCH_VK_SVD_JACOBI=1` | `svd`: use one-sided Jacobi instead of bidiagonalisation for every size (comparison and debugging). |
-
-### Testing a smaller GPU's paths on a bigger one
-
-| Variable | Effect |
-|---|---|
-| `TORCH_VK_API=1.1` | Use the Vulkan 1.1 code path on a newer driver. |
-| `TORCH_VK_DISABLE=a,b,...` | Hide device features: `int64`, `float64`, `int16`, `float16`, `int8`, `storage16`, `storage8`, `denorm`, `subgroups`, `coopmat`, `bfloat16`. |
-
-### Debugging
-
-| Variable | Effect |
-|---|---|
+| `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`). |
+| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
+| `TORCH_VK_DISABLE=a,b,...` | Hide device features: `int64`, `float64`, `int16`, `float16`, `int8`, `storage16`, `storage8`, `denorm`, `subgroups`, `coopmat`, `bfloat16`. To work around a driver's bug in one feature, or to test a smaller GPU's code paths on a bigger one. |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
-| `TORCH_VK_TRACE=1` | Print every kernel launch and wait for it to finish (slow; finds which kernel fails). |
-| `TORCH_VK_BARRIERS=check` | Run each kernel alone and fail with an error if it changed device memory outside what it was declared to write (the declarations that let the stream leave barriers out; docs/log/M37). Very slow: it reads all live device memory twice per kernel. |
-| `TORCH_VK_READ_LOG=dir` | Log a hash of everything the host reads back from the device (`.cpu()`, `.item()`) to `dir/reads-<pid>.txt`, so that two runs can be compared bit for bit (`tools/dev/barrier_ab.py`). |
-| `TORCH_VK_FALLBACK_DETAIL=1` | Count fallbacks per argument signature, e.g. `"aten::eq.Tensor_out [UInt16 1d, UInt16 1d, Bool 1d]"`. |
-| `TORCH_VK_FALLBACK_TRACE=1` | Print each fallback's arguments (sizes, strides, small values) and where it came from, to stderr. |
+| `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. Turns the CPU fallback on (unless `TORCH_VK_CPU_FALLBACK=0`). |
+| `TORCH_VK_STRICT=0` or `1` | Deprecated, to be removed in 0.4 (a `DeprecationWarning` at import): the switch before `TORCH_VK_CPU_FALLBACK`. `0` turns the CPU fallback on, `1` (the default) leaves it off; `TORCH_VK_CPU_FALLBACK` wins where both are set. |
 
-### Benchmark scripts
+### Developer and tuning switches (unstable, may change without notice)
 
-Read by `benchmarks/*.py`, not by the library.
+For testing, tuning and debugging torch-vulkan itself: they choose between
+kernels, override the measurements that defaults are chosen by, or trace
+what the library does. Any of them may change or go in any release. The
+kernels each op chooses between, and the rules that choose them, are listed
+in [kernel-routes.md](kernel-routes.md).
+
+| Variable | Kind | Effect |
+|---|---|---|
+| `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | kernel | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. `float4` shares operands across subgroups where the GPU runs 16-lane subgroups (Mali's Valhall GPUs; `TORCH_VK_DISABLE=subgroups` turns that off), and there also runs float16 and bfloat16 products, computed in float32. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
+| `TORCH_VK_CONV=im2col` or `direct` | kernel | Stride-1 convolutions: `im2col` runs them as im2col columns and a matrix product, `direct` with the direct convolution kernel (`conv4s.slang`) wherever the GPU can run it (16-lane subgroups: Intel, Mali). By default, direct wherever it runs except on Mali, where only float16 arithmetic and float16 and bfloat16 with 5 or more inner taps take it; im2col elsewhere and where the direct kernel does not apply. |
+| `TORCH_VK_GEMV=vector` or `scalar` | kernel | Matrix products with one to eight vectors (decoding steps: `x @ W.t()` for a few rows of `x`, `W @ v`, `addmv`, `_weight_int8pack_mm` with up to 8 rows): `vector` reads the weights in 16-byte loads and keeps float32 sums (`gemv4.slang`), `scalar` uses `gemv.slang` and the GEMM kernels for float weights and `qmm8.slang` for int8 ones. By default `vector`, except for float32 weights on NVIDIA and AMD GPUs. `_weight_int4pack_mm` always reads its 4-bit weights in 16-byte loads. |
+| `TORCH_VK_EIGH_QL=1` | kernel | `eigh`: tridiagonal QL instead of divide and conquer for every size from 4 (Jacobi below). |
+| `TORCH_VK_SVD_JACOBI=1` | kernel | `svd`: one-sided Jacobi instead of bidiagonalisation for every size. |
+| `TORCH_VK_SUBGROUP=8`, `16` or `32` | tuning | Subgroup size for the `subgroup` kernels (default 16 for float32, 8 for float64), within the device's range. It applies to the cooperative-matrix kernel too, which needs 32: any other size the device runs turns cooperative matrices off. |
+| `TORCH_VK_COMPUTE_UNITS=n` | tuning | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, or a table's for Intel's discrete GPUs; `0`, unknown, elsewhere: then products are never split). |
+| `TORCH_VK_SPLIT_K=n` | tuning | Split the k of every matrix product on the `subgroup` or cooperative-matrix kernels into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size; the other kernels never split. The pieces' sums are added in a fixed order, so results are the same from run to run either way. |
+| `TORCH_VK_GEMM_TILE=l`, `m` or `s` | tuning | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every product it runs (float16, bfloat16, and float32 in bfloat16 parts), instead of choosing by the GPU's size. |
+| `TORCH_VK_GEMM_GROUP=g` | tuning | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). |
+| `TORCH_VK_MAX_BATCH_GROUPS=n` | tuning | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
+| `TORCH_VK_API=1.1` | small GPUs | Use the Vulkan 1.1 code path on a newer driver. |
+| `TORCH_VK_BARRIERS=full`, `every` or `check` | debugging | Where the stream puts barriers. By default only where a command touches memory that one since the last barrier wrote, or writes memory one since then read, so kernels that touch disjoint memory run concurrently (docs/log/M37). `every`: a barrier before every command, matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier before every command. Both rule out a missed dependency when a race is suspected. `check`: run each kernel alone and fail with an error if it changed device memory outside what it was declared to write; very slow, as it reads all live device memory twice per kernel. |
+| `TORCH_VK_TRACE=1` | debugging | Print every kernel launch and wait for it to finish (slow; finds which kernel fails). |
+| `TORCH_VK_READ_LOG=dir` | debugging | Log a hash of everything the host reads back from the device (`.cpu()`, `.item()`) to `dir/reads-<pid>.txt`, so that two runs can be compared bit for bit (`tools/dev/barrier_ab.py`). |
+| `TORCH_VK_FALLBACK_DETAIL=1` | debugging | Count fallbacks per argument signature, e.g. `"aten::eq.Tensor_out [UInt16 1d, UInt16 1d, Bool 1d]"`. |
+| `TORCH_VK_FALLBACK_TRACE=1` | debugging | Print each fallback's arguments (sizes, strides, small values) and where it came from, to stderr. |
+
+### Benchmark and test scripts
+
+Read by `benchmarks/*.py` and `tests/python`, not by the library.
 
 | Variable | Effect |
 |---|---|
-| `TORCH_VK_BENCH_SMALL=1` | Small sizes only: a quick check that the scripts run (`benchmarks/integrated.py --small` sets it). |
+| `TORCH_VK_BENCH_SMALL=1` | Small sizes only: a quick check that the benchmark scripts run (`benchmarks/integrated.py --small` sets it). |
 | `TORCH_VK_BENCH_COMMIT=sha` | The commit `benchmarks/integrated.py` names on its results page, where the tree is not a git checkout. |
+| `TORCH_VK_LONG_TESTS=1` | Also run `tests/python/test_long_submissions.py`'s tests, each more than 20 s of GPU work. |
+| `TORCH_VK_STRESS_SEEDS=n`, `TORCH_VK_STRESS_STEPS=n` | The seeds (default 6) and steps per seed (default 250) of `tests/python/test_barriers.py`'s random sequences of ops. |
 
 ## `torch.compile`
 
