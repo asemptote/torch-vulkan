@@ -68,9 +68,14 @@ def _upsample_matrices(name, input_size, output_size, align_corners, scales, lik
             fn = decomposition_table[aten._upsample_nearest_exact1d.default if exact else aten.upsample_nearest1d.default]
             m = _interp_matrix(lambda x, o, s: fn(x, [o], s), n_in, n_out, like, scale)
         elif name == "bicubic2d":
-            fn = decomposition_table[aten.upsample_bicubic2d.default]
-            eye = torch.eye(n_in, device=like.device, dtype=like.dtype).view(1, n_in, n_in, 1)
-            m = fn(eye, [n_out, 1], align_corners, scale, None)[0, :, :, 0].transpose(0, 1)
+            # (upsample_bicubic2d of an identity, one row per input position,
+            # along this dim only: gridsample.slang's upsample mode)
+            eye = torch.eye(n_in, device=like.device, dtype=like.dtype).view(1, n_in, 1, n_in)
+            m = _upsample_bicubic2d_kernel(eye, [1, n_out], align_corners, (None, scale))
+            if m is None:
+                fn = decomposition_table[aten.upsample_bicubic2d.default]
+                m = fn(eye, [1, n_out], align_corners, None, scale)
+            m = m[0, :, 0, :].transpose(0, 1)
         else:  # linear1d, bilinear2d, trilinear3d: separable linear
             m = _linear_matrix(n_in, n_out, align_corners, scale, like)
         mats.append(m)
@@ -513,7 +518,9 @@ def _bicubic_grid_sample(input, grid, padding_mode, align_corners):
     point, each sample * (z y) * x, summed; 2-D: the CPU's order, four
     values along x per row, then the rows along y. Differentiable: autograd
     gives grid_sampler's backward, through the coefficients and the sampled
-    values."""
+    values. (Some 250 launches forward, 700 backward: only for inputs whose
+    extents shaders/gridsample.slang's 32-bit sizes cannot hold, expanded
+    views; the kernel takes the rest.)"""
     k = input.dim() - 2
     n, c = input.shape[:2]
     spatial = input.shape[2:]
@@ -562,13 +569,20 @@ def _bicubic_grid_sample(input, grid, padding_mode, align_corners):
     return value.transpose(1, 2).reshape(n, c, *points)
 
 
+def _wide_extent(input):
+    """Whether input has a spatial extent past the kernel's 32-bit sizes (only
+    an expanded view can): bicubic sampling then takes the decomposition."""
+    return max(input.shape[2:], default=0) >= 2 ** 31
+
+
 def _make_grid_sampler_forward(k):
     def forward(input, grid, mode, padding_mode, align_corners):
         _checks.grid_sampler(input, grid, mode, k)
         dt = _grid_dtype(input.dtype)
-        if mode not in (0, 1):  # bicubic
+        if mode not in (0, 1) and _wide_extent(input):
             return _bicubic_grid_sample(input.to(dt), grid.to(dt), padding_mode, align_corners).to(input.dtype)
-        # (shaders/gridsample.slang: the CPU's arithmetic, the same at both ranks)
+        # (shaders/gridsample.slang: the CPU's arithmetic, the same at both
+        # ranks; bicubic reads the input through its strides)
         out = torch.ops.torch_vulkan.grid_sampler(input.to(dt), grid.to(dt), mode, padding_mode, align_corners)
         return out.to(input.dtype)
 
@@ -613,30 +627,85 @@ def _make_grid_sampler_backward(name):
         if list(grad_output.shape) != expected:
             raise ValueError(f"{name}(): expected grad_output to have sizes {expected}, but got grad_output with "
                              f"sizes {list(grad_output.shape)}")
-        if mode not in (0, 1):  # bicubic: differentiate a decomposition
+        if mode not in (0, 1) and _wide_extent(input):  # (differentiate the decomposition)
             return _bicubic_grid_sampler_backward(grad_output, input, grid, padding_mode, align_corners, output_mask)
-        # (shaders/gridsample.slang: grad_grid, and each output point's corners
-        # with their weights, which one scatter-add turns into grad_input)
+        # (shaders/gridsample.slang: grad_grid, and each output point's corners,
+        # or bicubic taps, with their weights, which one scatter-add turns into
+        # grad_input)
         dt = _grid_dtype(input.dtype)
         gg, idx, wgt = torch.ops.torch_vulkan.grid_sampler_backward(
             grad_output.to(dt), input.to(dt), grid.to(dt), mode, padding_mode, align_corners, output_mask[1])
-        gi = None
-        if output_mask[0]:
-            # Rows (n, point, corner) of grad_output[n, :, point] * weight,
-            # summed by input position in (point, corner) order, as the CPU:
-            # one sort of the n * points * corners keys, all channels at once.
-            n, c = input.shape[:2]
-            points, corners = idx.shape[1], idx.shape[2]
-            plane = math.prod(input.shape[2:])
-            go = grad_output.to(dt).reshape(n, c, points).transpose(1, 2)  # [n, points, c]
-            rows = (go.unsqueeze(2) * wgt.reshape(n, points, corners, 1)).reshape(n * points * corners, c)
-            base = (torch.arange(n, device=idx.device) * plane).reshape(n, 1, 1)
-            keys = torch.where(idx >= 0, idx + base, -1).reshape(-1)
-            gi = torch.ops.torch_vulkan.sum_rows_by_key(keys, rows, n * plane)  # [n * plane, c]
-            gi = gi.reshape(n, plane, c).transpose(1, 2).reshape(input.shape).to(input.dtype)
+        gi = _scatter_corners(grad_output.to(dt), idx, wgt, input.shape).to(input.dtype) if output_mask[0] else None
         return gi, (gg.to(grid.dtype) if output_mask[1] else None)
 
     return backward
+
+
+def _scatter_corners(grad_output, idx, wgt, input_shape):
+    """grad_input [n, c, *S] from gridsample.slang's corners: rows (n, point,
+    corner) of grad_output[n, :, point] * weight, summed by input position in
+    (point, corner) order, as the CPU: one sort of the n * points * corners
+    keys, all channels at once."""
+    n, c = input_shape[:2]
+    points, corners = idx.shape[1], idx.shape[2]
+    plane = math.prod(input_shape[2:])
+    go = grad_output.reshape(n, c, points).transpose(1, 2)  # [n, points, c]
+    rows = (go.unsqueeze(2) * wgt.reshape(n, points, corners, 1)).reshape(n * points * corners, c)
+    base = (torch.arange(n, device=idx.device) * plane).reshape(n, 1, 1)
+    keys = torch.where(idx >= 0, idx + base, -1).reshape(-1)
+    gi = torch.ops.torch_vulkan.sum_rows_by_key(keys, rows, n * plane)  # [n * plane, c]
+    return gi.reshape(n, plane, c).transpose(1, 2).reshape(input_shape)
+
+
+def _bicubic_upsample_grid(input_size, output_size, align_corners, scales, dt, device):
+    """[N, Ho, Wo, 2] source coordinates (x, y) of upsample_bicubic2d's
+    outputs, with the CPU's arithmetic in dt (UpSample.h's
+    area_pixel_compute_scale and area_pixel_compute_source_index, cubic):
+    per dim on the host (Ho + Wo values), then stacked on the GPU."""
+    coords = []
+    for d in range(2):
+        n_in, n_out, scale = input_size[2 + d], output_size[d], scales[d] if d < len(scales) else None
+        if align_corners:
+            sc = torch.tensor(n_in - 1, dtype=dt) / (n_out - 1) if n_out > 1 else torch.tensor(0, dtype=dt)
+            real = sc * torch.arange(n_out, dtype=dt)
+        else:
+            sc = torch.tensor(1.0 / scale, dtype=dt) if scale is not None and scale > 0 else \
+                torch.tensor(n_in, dtype=dt) / torch.tensor(n_out, dtype=dt)
+            real = sc * (torch.arange(n_out, dtype=dt) + 0.5) - 0.5
+        coords.append(real.to(device))
+    ho, wo = output_size
+    grid = torch.stack([coords[1].expand(ho, wo), coords[0].reshape(ho, 1).expand(ho, wo)], -1)
+    return grid.expand(input_size[0], ho, wo, 2)
+
+
+def _upsample_bicubic2d_kernel(x, output_size, align_corners, scales):
+    """upsample_bicubic2d of a float input by gridsample.slang's mode 3 (one
+    launch where PyTorch's decomposition took 193 and 0.5 s for [8, 64, 56,
+    56] -> 112 x 112 on the HD 530), or None where it does not apply."""
+    if not x.is_floating_point() or x.dim() != 4 or len(output_size) != 2 or min(x.shape) == 0 or \
+            min(output_size) <= 0 or max(x.shape[2:]) >= 2 ** 31:
+        return None
+    dt = _grid_dtype(x.dtype)
+    grid = _bicubic_upsample_grid(x.shape, output_size, align_corners, scales, dt, x.device)
+    out = torch.ops.torch_vulkan.grid_sampler(x.to(dt), grid, 3, 1, align_corners)
+    return out.to(x.dtype)
+
+
+def _col2im(input, output_size, kernel_size, dilation, padding, stride):
+    """col2im (fold) by shaders/col2im.slang: each output element gathers its
+    blocks' values in the CPU's order (PyTorch's decomposition scatters them
+    with index_put, a sort of every element: 139 launches and 2.5 s for
+    [8, 576, 3136] columns on the HD 530). The shapes are checked by the
+    decomposition on meta tensors; 16-bit floats are summed in float32 and
+    rounded once."""
+    shape = torch.ops.aten.col2im(input.to("meta"), output_size, kernel_size, dilation, padding, stride).shape
+    if input.is_complex():
+        return decomposition_table[torch.ops.aten.col2im.default](input, output_size, kernel_size, dilation,
+                                                                  padding, stride)
+    dt =torch.float64 if input.dtype == torch.float64 else torch.float32
+    cols = input.to(dt) if input.dim() == 3 else input.to(dt).unsqueeze(0)
+    out = torch.ops.torch_vulkan.col2im(cols, output_size, kernel_size, dilation, padding, stride)
+    return out.reshape(shape).to(input.dtype)
 
 
 def _on_cpu(name, *args):
@@ -673,21 +742,36 @@ def _pad_backward_shape_check(grad_output, x, padding, dims):
                                                                f"{want}, Got: {grad_output.shape[d]}")
 
 
+def _pad_backward_kernel(grad_output, x, padding, dims, mode):
+    """shaders/padgrad.slang for float32/float64 (each input element gathers
+    the outputs that read it, in the CPU's order: one launch, where PyTorch's
+    decomposition took 193 for a 2-D reflection pad of [8, 64, 56, 56] on the
+    HD 530); None for other dtypes or shapes."""
+    ok = grad_output.dtype in (torch.float32, torch.float64) and x.dtype == grad_output.dtype and \
+        len(padding) == 2 * dims and grad_output.dim() == x.dim() and x.dim() >= dims
+    if not ok:
+        return None
+    return torch.ops.torch_vulkan.pad_backward(grad_output, list(x.shape), list(padding), mode)
+
+
 def _reflection_pad_backward(dims):
-    """reflection_pad{1,2,3}d_backward: the CPU's checks, then PyTorch's
-    decomposition (gathers and index_add on vk)."""
+    """reflection_pad{1,2,3}d_backward: the CPU's checks, then
+    shaders/padgrad.slang (float32, float64) or PyTorch's decomposition
+    (gathers and index_add on vk)."""
     decomp = decomposition_table[getattr(torch.ops.aten, f"reflection_pad{dims}d_backward").default]
 
     def kernel(grad_output, x, padding):
         _pad_backward_shape_check(grad_output, x, padding, dims)
-        return decomp(grad_output, x, padding)
+        gi = _pad_backward_kernel(grad_output, x, padding, dims, 0)
+        return gi if gi is not None else decomp(grad_output, x, padding)
 
     return kernel
 
 
 def _replication_pad_backward(dims):
-    """replication_pad{1,2,3}d_backward: each padded dim's gradient summed into
-    the input position it replicates (the clamped index), a dim at a time."""
+    """replication_pad{1,2,3}d_backward: shaders/padgrad.slang (float32,
+    float64), else each padded dim's gradient summed into the input position
+    it replicates (the clamped index), a dim at a time."""
     name = f"replication_pad{dims}d_backward"
 
     def kernel(grad_output, x, padding):
@@ -698,6 +782,9 @@ def _replication_pad_backward(dims):
             ok = ok and x.shape[d] > 0 and grad_output.shape[d] == x.shape[d] + padding[2 * i] + padding[2 * i + 1]
         if not ok:
             return _on_cpu(name, grad_output, x, padding)
+        gi = _pad_backward_kernel(grad_output, x, padding, dims, 1)
+        if gi is not None:
+            return gi
         g = grad_output
         for i in range(dims):
             d = x.dim() - 1 - i
@@ -1192,10 +1279,15 @@ def _u8_resize(x, output_size, align_corners, scales, kind, antialias):
 
 
 def _upsample_bicubic2d(x, output_size, align_corners, scales_h=None, scales_w=None):
-    """uint8 as the CPU's fixed-point kernel; other dtypes PyTorch's
+    """uint8 as the CPU's fixed-point kernel; floats by gridsample.slang's
+    upsample mode (_upsample_bicubic2d_kernel); other dtypes PyTorch's
     decomposition (as before this registration)."""
-    if x.dtype == torch.uint8 and x.dim() == 4 and len(output_size) == 2 and min(x.shape[-2:]) > 0             and min(output_size) > 0:
+    if x.dtype == torch.uint8 and x.dim() == 4 and len(output_size) == 2 and min(x.shape[-2:]) > 0 \
+            and min(output_size) > 0:
         return _u8_resize(x, output_size, align_corners, (scales_h, scales_w), "bicubic", False)
+    out = _upsample_bicubic2d_kernel(x, output_size, align_corners, (scales_h, scales_w))
+    if out is not None:
+        return out
     return decomposition_table[aten.upsample_bicubic2d.default](x, output_size, align_corners, scales_h, scales_w)
 
 
@@ -2275,6 +2367,7 @@ def _kernels():
         "max_pool3d_with_indices_backward": _make_max_pool_backward(3),
         "adaptive_max_pool2d": _make_adaptive_max(2),
         "adaptive_max_pool3d": _make_adaptive_max(3),
+        "col2im": _col2im,
         "grid_sampler_2d": _make_grid_sampler_forward(2),
         "grid_sampler_3d": _make_grid_sampler_forward(3),
         "grid_sampler_2d_backward": _make_grid_sampler_backward("grid_sampler_2d_backward"),

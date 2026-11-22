@@ -219,6 +219,32 @@ def test_padding(mode, dims):
     check(got, F.pad(x, pad, mode=mode))
 
 
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_padding_backward(mode, dtype):
+    # shaders/padgrad.slang: each input element gathers the outputs that read
+    # it, in the CPU's order, so the gradients are the CPU's bit for bit; one
+    # launch; negative padding crops
+    pads = {1: [(2, 3), (4, 0), (-1, 2), (0, 0)],
+            2: [(2, 1, 0, 3), (1, 1, 4, 4), (-2, 1, 1, -1)],
+            3: [(1, 2, 2, 1, 0, 3), (3, 0, -1, 1, 2, 2)]}
+    for dims, cases in pads.items():
+        for pad in cases:
+            x = make((2, 3) + (5, 6, 7)[:dims], dtype)
+            out = F.pad(x, pad, mode=mode)
+            g = make(tuple(out.shape), dtype, 1)
+            xg = x.clone().requires_grad_()
+            F.pad(xg, pad, mode=mode).backward(g)
+            vx = x.to("vk").requires_grad_()
+            with on_gpu():
+                vout = F.pad(vx, pad, mode=mode)
+                before = tv._native.dispatch_count()
+                vout.backward(g.to("vk"))
+                n = tv._native.dispatch_count() - before
+            assert torch.equal(vx.grad.cpu(), xg.grad), (dims, pad)
+            assert n <= 2, n  # (the kernel, and accumulating into .grad)
+
+
 def test_channel_shuffle():
     x = make((2, 6, 3, 2), torch.float32)
     with on_gpu():

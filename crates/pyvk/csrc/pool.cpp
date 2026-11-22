@@ -227,13 +227,17 @@ at::Tensor upsample_linear_backward_dim(const at::Tensor& g, int64_t n_in, bool 
 
 struct GridParams {
   uint64_t input, grid, out, gout, ggrid, idx, wgt;
-  uint32_t n, c, p, k, padding, align, ngroups, want_grid, pad[2];
+  uint32_t n, c, p, k, padding, align, ngroups, want_grid;
+  int32_t sc, sn;
   uint32_t isz[4];
+  int32_t ist[4];
 };
-static_assert(sizeof(GridParams) == 112 && offsetof(GridParams, isz) == 96, "must match shaders/gridsample.slang");
+static_assert(sizeof(GridParams) == 128 && offsetof(GridParams, isz) == 96, "must match shaders/gridsample.slang");
 
 // input [N, C, *S] and grid [N, *P, k] (k = 2 or 3) of one float dtype:
 // the parameters common to both directions; P the output points per batch.
+// The input's strides go to the kernel (bicubic reads through them: an
+// expanded input is not copied; the other modes take it contiguous).
 GridParams grid_params(const at::Tensor& input, const at::Tensor& grid, int64_t padding, bool align) {
   int64_t k = grid.size(-1);
   TORCH_CHECK((k == 2 || k == 3) && input.dim() == k + 2 && grid.dim() == k + 2 &&
@@ -247,11 +251,18 @@ GridParams grid_params(const at::Tensor& input, const at::Tensor& grid, int64_t 
   p.k = static_cast<uint32_t>(k);
   p.padding = static_cast<uint32_t>(padding);
   p.align = align ? 1u : 0u;
+  int64_t span = 0, plane = 1;
+  for (int64_t d = 0; d < input.dim(); ++d) span += (input.size(d) - 1) * input.stride(d);
   for (int64_t d = 0; d < 3; ++d) {  // (by grid coordinate: W, H, D)
-    p.isz[d] = d < k ? static_cast<uint32_t>(input.size(input.dim() - 1 - d)) : 1u;
+    int64_t size = d < k ? input.size(input.dim() - 1 - d) : 1;
+    p.isz[d] = static_cast<uint32_t>(std::min<int64_t>(size, UINT32_MAX));
+    p.ist[d] = d < k ? static_cast<int32_t>(input.stride(input.dim() - 1 - d)) : 0;
+    plane *= size;
   }
-  TORCH_CHECK(input.numel() < (int64_t(1) << 31) && grid.numel() < (int64_t(1) << 31) &&
-                  int64_t(p.c) * p.n * p.p < (int64_t(1) << 31),
+  p.sc = static_cast<int32_t>(input.stride(1));
+  p.sn = static_cast<int32_t>(input.stride(0));
+  TORCH_CHECK(grid.numel() < (int64_t(1) << 31) && int64_t(p.c) * p.n * p.p < (int64_t(1) << 31) &&
+                  (input.numel() == 0 || span < (int64_t(1) << 31)),
               "grid_sampler: more elements than 32-bit offsets address");
   return p;
 }
@@ -263,10 +274,11 @@ void launch_grid(uint32_t op, int64_t mode, GridParams& p, at::ScalarType t) {
   dispatch(std::string("gridsample_") + dtype_label(t), {op, static_cast<uint32_t>(mode)}, p, p.ngroups);
 }
 
-// [N, C, *P]: bilinear (mode 0) or nearest (1) samples of input at grid.
+// [N, C, *P]: bilinear (mode 0), nearest (1) or bicubic (2) samples of
+// input at grid; mode 3: upsample_bicubic2d at the source coordinates in grid.
 at::Tensor grid_sampler(const at::Tensor& input, const at::Tensor& grid, int64_t mode, int64_t padding,
                         bool align_corners) {
-  at::Tensor in = input.contiguous(), g = grid.contiguous();
+  at::Tensor in = mode >= 2 ? input : input.contiguous(), g = grid.contiguous();
   GridParams p = grid_params(in, g, padding, align_corners);
   std::vector<int64_t> shape = {in.size(0), in.size(1)};
   shape.insert(shape.end(), g.sizes().begin() + 1, g.sizes().end() - 1);
@@ -281,15 +293,16 @@ at::Tensor grid_sampler(const at::Tensor& input, const at::Tensor& grid, int64_t
   return out;
 }
 
-// (grad_grid [N, *P, k] (empty unless want_grid), corner offsets [N, P, 2^k]
-// (-1: outside the input), corner weights [N, P, 2^k]).
+// (grad_grid [N, *P, k] (empty unless want_grid), corner offsets [N, P,
+// corners] (-1: outside the input), corner weights [N, P, corners]), with
+// 2^k corners (bilinear, nearest) or 4^k taps (bicubic).
 std::tuple<at::Tensor, at::Tensor, at::Tensor> grid_sampler_backward(const at::Tensor& grad_output,
                                                                      const at::Tensor& input, const at::Tensor& grid,
                                                                      int64_t mode, int64_t padding,
                                                                      bool align_corners, bool want_grid) {
-  at::Tensor in = input.contiguous(), g = grid.contiguous(), go = grad_output.contiguous();
+  at::Tensor in = mode >= 2 ? input : input.contiguous(), g = grid.contiguous(), go = grad_output.contiguous();
   GridParams p = grid_params(in, g, padding, align_corners);
-  int64_t corners = int64_t(1) << p.k;
+  int64_t corners = mode >= 2 ? int64_t(1) << (2 * p.k) : int64_t(1) << p.k;  // (bicubic: 4^k taps)
   at::Tensor ggrid = want_grid ? at::empty(g.sizes(), g.options()) : at::empty({0}, g.options());
   at::Tensor idx = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options().dtype(at::kLong));
   at::Tensor wgt = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options());
@@ -305,6 +318,102 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> grid_sampler_backward(const at::T
   p.want_grid = want_grid ? 1u : 0u;
   launch_grid(op::GRID_BACKWARD, mode, p, in.scalar_type());
   return {ggrid, idx, wgt};
+}
+
+struct Col2imParams {
+  uint64_t cols, out;
+  uint32_t total, gstride, h, w, oh, ow, kh, kw, sh, sw, dh, dw, ph, pw;
+};
+static_assert(sizeof(Col2imParams) == 72, "must match shaders/col2im.slang");
+
+// col2im (fold) of float32/float64 columns [N, C KH KW, OH OW] into [N, C,
+// H, W] by shaders/col2im.slang: each output gathers its blocks' values,
+// in the CPU's order. The shapes are checked by the caller (_kernels.py's
+// col2im, through the decomposition on meta tensors).
+at::Tensor col2im(const at::Tensor& cols_in, at::IntArrayRef output_size, at::IntArrayRef kernel_size,
+                  at::IntArrayRef dilation, at::IntArrayRef padding, at::IntArrayRef stride) {
+  TORCH_CHECK(cols_in.dim() == 3 && output_size.size() == 2 && kernel_size.size() == 2 && dilation.size() == 2 &&
+                  padding.size() == 2 && stride.size() == 2 &&
+                  (cols_in.scalar_type() == at::kFloat || cols_in.scalar_type() == at::kDouble),
+              "torch_vulkan::col2im: expected float32/float64 columns [N, C KH KW, L] and 2-D block parameters");
+  at::Tensor cols = cols_in.contiguous();
+  int64_t K = kernel_size[0] * kernel_size[1], N = cols.size(0), C = cols.size(1) / K;
+  int64_t H = output_size[0], W = output_size[1];
+  int64_t OH = (H + 2 * padding[0] - (dilation[0] * (kernel_size[0] - 1) + 1)) / stride[0] + 1;
+  int64_t OW = (W + 2 * padding[1] - (dilation[1] * (kernel_size[1] - 1) + 1)) / stride[1] + 1;
+  at::Tensor out = at::empty({N, C, H, W}, cols.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  TORCH_CHECK(cols.size(1) == C * K && cols.size(2) == OH * OW && cols.numel() < (int64_t(1) << 31) &&
+                  out.numel() < (int64_t(1) << 31),
+              "torch_vulkan::col2im: columns of ", cols.sizes(), " do not match the blocks, or past 32-bit offsets");
+  Col2imParams p{};
+  p.cols = gpu_address(cols);
+  p.out = gpu_address_out(out);
+  p.total = static_cast<uint32_t>(out.numel());
+  p.h = static_cast<uint32_t>(H);
+  p.w = static_cast<uint32_t>(W);
+  p.oh = static_cast<uint32_t>(OH);
+  p.ow = static_cast<uint32_t>(OW);
+  p.kh = static_cast<uint32_t>(kernel_size[0]);
+  p.kw = static_cast<uint32_t>(kernel_size[1]);
+  p.sh = static_cast<uint32_t>(stride[0]);
+  p.sw = static_cast<uint32_t>(stride[1]);
+  p.dh = static_cast<uint32_t>(dilation[0]);
+  p.dw = static_cast<uint32_t>(dilation[1]);
+  p.ph = static_cast<uint32_t>(padding[0]);
+  p.pw = static_cast<uint32_t>(padding[1]);
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(p.total), &groups, &p.gstride));
+  dispatch(std::string("col2im_") + dtype_label(cols.scalar_type()), {}, p, groups);
+  return out;
+}
+
+struct PadGradParams {
+  uint64_t gout, gin;
+  uint32_t total, gstride;
+  uint32_t isz[4], osz[4];
+  int32_t pl[4];
+};
+static_assert(sizeof(PadGradParams) == 72, "must match shaders/padgrad.slang");
+
+// reflection_pad / replication_pad's backward (mode 0 / 1) over the last
+// k = padding.size() / 2 dims of grad_output (float32/float64; padding in
+// constant_pad_nd's order, last dim first), into grad_input of
+// input_sizes, by shaders/padgrad.slang: each input element gathers the
+// outputs that read it, in the CPU's order. Shapes are checked by the
+// caller (_kernels.py).
+at::Tensor pad_backward(const at::Tensor& grad_output, at::IntArrayRef input_sizes, at::IntArrayRef padding,
+                        int64_t mode) {
+  int64_t k = static_cast<int64_t>(padding.size()) / 2;
+  TORCH_CHECK(k >= 1 && k <= 3 && padding.size() == size_t(2 * k) && grad_output.dim() == int64_t(input_sizes.size()) &&
+                  grad_output.dim() >= k && (mode == 0 || mode == 1) &&
+                  (grad_output.scalar_type() == at::kFloat || grad_output.scalar_type() == at::kDouble),
+              "torch_vulkan::pad_backward: expected float32/float64 grad_output and 1-3 padded dims");
+  at::Tensor g = grad_output.contiguous();
+  at::Tensor gi = at::empty(input_sizes, g.options());
+  if (gi.numel() == 0) {
+    return gi;
+  }
+  TORCH_CHECK(g.numel() < (int64_t(1) << 31) && gi.numel() < (int64_t(1) << 31),
+              "torch_vulkan::pad_backward: more elements than 32-bit offsets address");
+  PadGradParams p{};
+  p.gout = gpu_address(g);
+  p.gin = gpu_address_out(gi);
+  p.total = static_cast<uint32_t>(gi.numel());
+  for (int64_t e = 0; e < 3; ++e) {  // (D, H, W; size 1 and no padding for dims beyond k)
+    int64_t i = 2 - e;                // (padding's pair: the last dim first)
+    int64_t d = g.dim() - 1 - i;
+    bool used = i < k;
+    p.isz[e] = used ? static_cast<uint32_t>(input_sizes[d]) : 1u;
+    p.osz[e] = used ? static_cast<uint32_t>(g.size(d)) : 1u;
+    p.pl[e] = used ? static_cast<int32_t>(padding[2 * i]) : 0;
+  }
+  uint32_t groups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(p.total), &groups, &p.gstride));
+  dispatch(std::string("padgrad_") + dtype_label(g.scalar_type()), {static_cast<uint32_t>(mode)}, p, groups);
+  return gi;
 }
 
 }  // namespace
@@ -324,6 +433,9 @@ TORCH_LIBRARY(torch_vulkan, m) {
   m.def("grid_sampler(Tensor input, Tensor grid, int mode, int padding, bool align_corners) -> Tensor");
   m.def("grid_sampler_backward(Tensor grad_output, Tensor input, Tensor grid, int mode, int padding, "
         "bool align_corners, bool want_grid) -> (Tensor, Tensor, Tensor)");
+  m.def("col2im(Tensor cols, int[] output_size, int[] kernel_size, int[] dilation, int[] padding, int[] stride) "
+        "-> Tensor");
+  m.def("pad_backward(Tensor grad_output, int[] input_sizes, int[] padding, int mode) -> Tensor");
   // (indexing.cpp)
   m.def("sum_rows_by_key(Tensor keys, Tensor vals, int num_rows) -> Tensor");
 }
@@ -337,4 +449,6 @@ TORCH_LIBRARY_IMPL(torch_vulkan, PrivateUse1, m) {
   m.impl("upsample_linear_backward_dim", &vk::upsample_linear_backward_dim);
   m.impl("grid_sampler", &vk::grid_sampler);
   m.impl("grid_sampler_backward", &vk::grid_sampler_backward);
+  m.impl("col2im", &vk::col2im);
+  m.impl("pad_backward", &vk::pad_backward);
 }

@@ -118,7 +118,9 @@ cover each route by shape.
 | `index_add`, `scatter_reduce`, `index_put` with accumulation (`indexing.cpp`) | whole rows by `segreduce` when dim 0 is contiguous and the index expanded; for `scatter_add`/`scatter_reduce` with an index expanded along other dims than the scattered one, its distinct rows sorted once and the expanded dims as the rows' width (out copied with them last, and back); else per element; indices beyond 2^26 elements in slices |
 | Sparse products (`sparse.cpp`) | sparse @ sparse by `spgemm` without dense dims, else densified; dense @ sparse computed transposed; compressed layouts through COO |
 | Copies (`launch.cpp`), and `flip` as a copy that reads the flipped dims backwards (a bit per dim) | `copy8` for 5 to 8 dims after merging, else the strided kernels with a dispatch per outer index |
-| Interpolation, grid sampling (`python/torch_vulkan/_kernels.py`) | uint8 bilinear/bicubic/antialiased resizes in fixed point; float resizes by `resample` or by products; `grid_sample` bicubic composite, nearest and bilinear by `gridsample` |
+| Interpolation, grid sampling (`python/torch_vulkan/_kernels.py`) | uint8 bilinear/bicubic/antialiased resizes in fixed point; float resizes by `resample` or by products, bicubic ones by `gridsample` (its upsample mode, as the backward's per-dim matrices); `grid_sample` by `gridsample` (bicubic: the composite of gathers for an input extent of 2^31 or more, which only an expanded view has) |
+| `col2im` (`fold`), `_kernels.py` | `col2im` for real dtypes (16-bit ones in float32), PyTorch's decomposition for complex |
+| Reflection and replication padding's backward (`_kernels.py`) | `padgrad` for float32 and float64; other dtypes the decomposition (reflection) or an `index_add` per padded dim (replication) |
 
 ## Tests that force routes
 
