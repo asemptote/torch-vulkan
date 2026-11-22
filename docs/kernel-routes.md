@@ -16,8 +16,9 @@ them), cooperative matrices with 32-lane subgroups (NVIDIA; hidden by
 `TORCH_VK_DISABLE=coopmat`, bfloat16 ones by `bfloat16`), and the compute-unit
 count (from the driver on NVIDIA, AMD and Arm, a table of Intel's discrete
 GPUs, otherwise 0, unknown; `TORCH_VK_COMPUTE_UNITS` overrides it). CI runs
-lavapipe, whose subgroups have 8 lanes: it reaches neither the 16-lane
-kernels nor cooperative matrices, which are tested on hardware runs.
+lavapipe, whose subgroup width follows its vector width (8 lanes at its
+default 256 bits, so the 16-lane kernels run only in a pass at 512 bits);
+no CPU driver has cooperative matrices, which are tested on hardware runs.
 
 float16 and bfloat16 ops whose kernels decline them run in float32 on the
 GPU and are rounded once (`half_via_float`, `backend.cpp`); for matrix
