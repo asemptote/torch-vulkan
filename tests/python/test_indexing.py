@@ -120,6 +120,34 @@ def test_scatter_index_copy_fill_put(dtype):
         check(a, b)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.float16])
+def test_scatter_expanded_index(dtype):
+    # an index expanded along other dims than the scattered one (grid_sampler's
+    # double backward, #113): its distinct rows sorted once, the expanded dims
+    # as the width; an index smaller than out, several expanded dims, every
+    # reduction
+    g = torch.Generator().manual_seed(3)
+    out = sample((3, 4, 9, 2), dtype)
+    src = sample((3, 5, 12, 2), dtype, 1)
+    cases = [
+        (2, torch.randint(0, 9, (3, 1, 12, 1), generator=g).expand(3, 4, 12, 2)),
+        (2, torch.randint(0, 9, (2, 1, 7, 1), generator=g).expand(2, 3, 7, 2)),
+        (0, torch.randint(0, 3, (3, 1, 1, 1), generator=g).expand(3, 4, 9, 2)[:, :, :8]),
+        (1, torch.randint(0, 4, (1, 5, 1, 2), generator=g).expand(3, 5, 6, 2)),
+    ]
+    for dim, index in cases:
+        v, vi, vs = out.to("vk"), index.to("vk"), src.to("vk")
+        with on_gpu():
+            got = [v.scatter_add(dim, vi, vs)] + [
+                v.scatter_reduce(dim, vi, vs, reduce, include_self=include)
+                for reduce in ("sum", "prod", "amax", "amin", "mean") for include in (True, False)]
+        want = [out.scatter_add(dim, index, src)] + [
+            out.scatter_reduce(dim, index, src, reduce, include_self=include)
+            for reduce in ("sum", "prod", "amax", "amin", "mean") for include in (True, False)]
+        for a, b in zip(got, want):
+            check(a, b, **({"rtol": 1e-2, "atol": 1e-2} if dtype == torch.float16 else {}))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
 def test_nonzero_masked(dtype):
     x = sample((4, 3, 5), dtype)
