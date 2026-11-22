@@ -197,7 +197,7 @@ def test_conv_depthwise_grouped_products():
     # other route, for comparison), in a subprocess
     script = ("import sys; sys.path.insert(0, %r)\n" % os.path.dirname(__file__) +
               "import test_nn as t\n"
-              "for case in [(1, 3, 5, 3, 1, 1, 1, 2, 30), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15), (3, 1, 3, 1, 1, 1, 1, 7)]:\n"
+              "for case in [(1, 3, 5, 1, 2, 1, 2, 30), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15), (3, 1, 3, 1, 1, 1, 1, 7)]:\n"
               "    t.compare_with_cpu(*t.depthwise_case(*case))\n"
               "print('ok')\n")
     out = subprocess.run([sys.executable, "-c", script], env=dict(os.environ, TORCH_VK_DWCONV="0"),
