@@ -117,34 +117,39 @@ struct Conv4sTile {
   const char* label;
   int64_t rows, cols;
 };
-constexpr Conv4sTile kConv4sTiles[] = {{"r8n1", 16, 64}, {"r4n2", 8, 128}, {"r8n2", 16, 128}, {"r8n1w4", 32, 64}};
+constexpr Conv4sTile kConv4sR8N1 = {"r8n1", 16, 64}, kConv4sR4N2 = {"r4n2", 8, 128}, kConv4sR8N2 = {"r8n2", 16, 128};
 
-// The tile for float32 / 16-bit storage (f32 math) and for float16
-// arithmetic; TORCH_VK_CONV_TILE=label forces one (tuning).
-const Conv4sTile& conv4s_tile(bool half_math) {
-  static const Conv4sTile* forced = [] {
-    const char* env = std::getenv("TORCH_VK_CONV_TILE");
-    for (const Conv4sTile& t : kConv4sTiles) {
-      if (env != nullptr && std::strcmp(env, t.label) == 0) return &t;
-    }
-    return static_cast<const Conv4sTile*>(nullptr);
-  }();
-  if (forced != nullptr) return *forced;
-  return half_math ? kConv4sTiles[2] : kConv4sTiles[0];
+bool arm_gpu() {
+  static const bool arm = vkt_vendor_id() == 0x13B5;
+  return arm;
 }
 
-// Whether stride-1 convolutions of type t run as shaders/conv4s.slang:
-// wherever the device runs it (16-lane subgroups with shuffles: Mali's
-// Valhall GPUs, Intel's), unless TORCH_VK_CONV=im2col (columns and a matrix
-// product, as elsewhere).
+// The tile, from docs/log/M47's sweeps: on Mali 4 rows x 8 columns per lane
+// (more rows spill float32 accumulators there), elsewhere (Intel) 8 x 4,
+// and 8 x 8 for float16 arithmetic.
+const Conv4sTile& conv4s_tile(bool half_math) {
+  if (arm_gpu()) return kConv4sR4N2;
+  return half_math ? kConv4sR8N2 : kConv4sR8N1;
+}
+
+// Whether a stride-1 convolution of type t with kw inner taps runs as
+// shaders/conv4s.slang: where the device runs it (16-lane subgroups with
+// shuffles: Intel's and Mali's Valhall GPUs) and it was measured faster than
+// im2col columns and a matrix product (docs/log/M47): on Intel always; on
+// Mali for float16 and bfloat16 (float32 stays with gemm4s's product, as
+// fast or faster there). TORCH_VK_CONV=im2col never, =direct wherever it
+// runs.
 bool use_conv4s(at::ScalarType t) {
-  static const bool ok = [] {
+  static const std::string choice = [] {
     const char* env = std::getenv("TORCH_VK_CONV");
-    return !(env != nullptr && std::strcmp(env, "im2col") == 0) && vkt_kernel_subgroup_size("conv4s_f32_d1_r8n1") == 16;
+    return std::string(env != nullptr ? env : "");
   }();
-  static const bool f16 = ok && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
-  static const bool bf16 = ok && has_feature(kFeatureInt16);
-  return t == at::kFloat ? ok : t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
+  static const bool runs = choice != "im2col" && vkt_kernel_subgroup_size("conv4s_f32_d1_r8n1") == 16;
+  static const bool f16 = runs && has_feature(kFeatureFloat16) && has_feature(kFeatureInt16);
+  static const bool bf16 = runs && has_feature(kFeatureInt16);
+  bool can = t == at::kFloat ? runs : t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
+  if (!can || choice == "direct" || !arm_gpu()) return can;
+  return t != at::kFloat;
 }
 
 // A stride-1 convolution by shaders/conv4s.slang (where use_conv4s), reading
@@ -159,7 +164,9 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
                        at::IntArrayRef dilation, int64_t groups, at::IntArrayRef out) {
   at::ScalarType t = x_in.scalar_type();
   int64_t s = x_in.dim() - 2, N = x_in.size(0), C = x_in.size(1), Co = w.size(0);
-  if (!use_conv4s(t) || w.scalar_type() != t || (bias.has_value() && bias->defined() && bias->scalar_type() != t)) {
+  bool half_math = t == at::kHalf && fp16_arithmetic();
+  if (!use_conv4s(t) || w.scalar_type() != t ||
+      (bias.has_value() && bias->defined() && bias->scalar_type() != t)) {
     return {};
   }
   for (int64_t d = 0; d < s; ++d) {
@@ -194,7 +201,6 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   if (s >= 2 && Wo < 8) return {};  // (mostly wrapped columns: the columns' product does better)
   int64_t KH = s >= 2 ? w.size(-2) : 1, KD = s == 3 ? w.size(2) : 1, KO = KD * KH;
   int64_t off_h = s >= 2 ? dilation[s - 2] * Wp : 0, off_d = s == 3 ? dilation[0] * Hp * Wp : 0;
-  bool half_math = t == at::kHalf && fp16_arithmetic();
   const Conv4sTile& tile = conv4s_tile(half_math);
   int64_t cols = tile.cols;
   int64_t reach = ceil_div(nv, cols) * cols + (KD - 1) * off_d + (KH - 1) * off_h + (KW + 8) * DW + 32;

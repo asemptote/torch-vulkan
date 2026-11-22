@@ -1,6 +1,6 @@
 // axis T: f32=float f16=half bf16=uint16_t f16h=half
 // axis D: d1=int d2=int d3=int d5=int
-// axis TILE: r8n1=int r4n2=int r8n2=int r8n1w4=int
+// axis TILE: r8n1=int r4n2=int r8n2=int
 //
 // Direct convolution (stride 1, 1 to 3 spatial dims) for GPUs with 16-lane
 // subgroups, on gemm4s.slang's scheme (A shared across a subgroup by
@@ -45,8 +45,10 @@
 #include "_slot.slang"
 
 #define WX 16  // lanes: a subgroup
-// TILE: rows per subgroup (R), 4-value column groups per lane (NC),
-// subgroups per workgroup (WY)
+// TILE: rows per subgroup (R) and 4-value column groups per lane (NC)
+// (docs/log/M47's sweeps on the Mali-G57: 4 x 2 best there, also for
+// float16 arithmetic; 8 x 1 on the HD 530, 8 x 2 for float16 arithmetic;
+// 6 x 1, 4 x 1 and 4 subgroups per workgroup were tried)
 #if defined(TILE_r4n2)
 #define R 4
 #define NC 2
@@ -57,11 +59,7 @@
 #define R 8
 #define NC 1
 #endif
-#if defined(TILE_r8n1w4)
-#define WY 4
-#else
 #define WY 2
-#endif
 #if defined(D_d2)
 #define DW 2
 #elif defined(D_d3)
@@ -205,53 +203,64 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
         for (int j = 0; j < NC; j++)
             acc[i][j] = V4(0);
 
+    // (pointers stepped per channel and outer tap: no divisions in the loop)
+    uint kd = p.ko / p.kh;
+    S4* pab = pa;
+    S4* xc = x4;
     for (uint c = 0; c < p.cg; c++)
     {
-        for (uint o = 0; o < p.ko; o++)
+        S4* xd = xc;
+        for (uint od = 0; od < kd; od++)
         {
-            int off = int(o / p.kh) * p.off_d + int(o % p.kh) * p.off_h;
-            S4* xb = x4 + (int(c * p.plane) + off) / 4;
-            S4* pab = pa + int(c * p.ko + o) * int(p.kg);
-            W4 win[NW];
-            [ForceUnroll]
-            for (int i = 0; i < NW; i++)
-                win[i] = ldw(xb + i);
-            for (uint kg = 0; kg < p.kg; kg++)
+            S4* xh = xd;
+            for (uint oh = 0; oh < p.kh; oh++)
             {
-#if defined(T_f16h)
-                uint2 av = loadAligned<8>(pab + int(kg));  // (4 halves: this group's taps of row lane % R)
-#else
-                V4 av = ld4(pab + int(kg));
-#endif
-                [ForceUnroll]
-                for (int t = 0; t < 4; t++)
-                {
-                    const int e = t * DW, e4 = e >> 2, s = e & 3;
-                    V4 bv[NC];
-                    [ForceUnroll]
-                    for (int j = 0; j < NC; j++)
-                        bv[j] = widen(window(win[e4 + j], win[e4 + j + (s == 0 ? 0 : 1)], s));
-                    [ForceUnroll]
-                    for (int i = 0; i < R; i++)
-                    {
-#if defined(T_f16h)
-                        uint pair = WaveReadLaneAt(t < 2 ? av.x : av.y, i);
-                        half a = bit_cast<half>(uint16_t((t % 2) == 0 ? pair & 0xffffu : pair >> 16));
-#else
-                        V a = WaveReadLaneAt(av[t], i);
-#endif
-                        [ForceUnroll]
-                        for (int j = 0; j < NC; j++)
-                            acc[i][j] += a * bv[j];
-                    }
-                }
-                // The next group: DW pieces on; keep the pieces it shares.
-                xb = xb + DW;
+                S4* xb = xh;
+                W4 win[NW];
                 [ForceUnroll]
                 for (int i = 0; i < NW; i++)
-                    win[i] = i + DW < NW ? win[i + DW] : ldw(xb + i);
+                    win[i] = ldw(xb + i);
+                for (uint kg = 0; kg < p.kg; kg++)
+                {
+#if defined(T_f16h)
+                    uint2 av = loadAligned<8>(pab + int(kg));  // (4 halves: this group's taps of row lane % R)
+#else
+                    V4 av = ld4(pab + int(kg));
+#endif
+                    [ForceUnroll]
+                    for (int t = 0; t < 4; t++)
+                    {
+                        const int e = t * DW, e4 = e >> 2, s = e & 3;
+                        V4 bv[NC];
+                        [ForceUnroll]
+                        for (int j = 0; j < NC; j++)
+                            bv[j] = widen(window(win[e4 + j], win[e4 + j + (s == 0 ? 0 : 1)], s));
+                        [ForceUnroll]
+                        for (int i = 0; i < R; i++)
+                        {
+#if defined(T_f16h)
+                            uint pair = WaveReadLaneAt(t < 2 ? av.x : av.y, i);
+                            half a = bit_cast<half>(uint16_t((t % 2) == 0 ? pair & 0xffffu : pair >> 16));
+#else
+                            V a = WaveReadLaneAt(av[t], i);
+#endif
+                            [ForceUnroll]
+                            for (int j = 0; j < NC; j++)
+                                acc[i][j] += a * bv[j];
+                        }
+                    }
+                    // The next group: DW pieces on; keep the pieces it shares.
+                    xb = xb + DW;
+                    [ForceUnroll]
+                    for (int i = 0; i < NW; i++)
+                        win[i] = i + DW < NW ? win[i + DW] : ldw(xb + i);
+                }
+                pab = pab + int(p.kg);
+                xh = xh + p.off_h / 4;
             }
+            xd = xd + p.off_d / 4;
         }
+        xc = xc + int(p.plane / 4);
     }
 
     // Store the valid columns: v -> (od, oh, ow), stored at (od Ho + oh) Wo + ow.
