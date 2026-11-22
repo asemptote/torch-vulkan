@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from _util import check, make, on_gpu
+from _util import MAX_NUMEL, check, make, on_gpu
 
 TOL = dict(rtol=2e-4, atol=2e-4)
 
@@ -286,6 +286,8 @@ def test_grid_sample_nearest_half_way(align_corners):
 def test_grid_sample_3d_bicubic_wide_expanded_axis(size):
     # (an expanded axis wider than the indexing kernels address: every tap
     # reads its one element)
+    if size > MAX_NUMEL:
+        pytest.skip("more elements than this build of PyTorch allows (32-bit)")
     volume = torch.ones(1, 1, 1, 1, 1, device="vk").expand(1, 1, 1, 1, size)
     grid = torch.tensor([[[[[1.0, 0.0, 0.0]]]]], device="vk")
     for pad in ("zeros", "border", "reflection"):
@@ -296,6 +298,8 @@ def test_grid_sample_3d_bicubic_wide_expanded_axis(size):
 
 def test_index_wide_expanded_dim():
     # (indices into an expanded dim beyond int32's range, below it)
+    if 2 ** 33 > MAX_NUMEL:
+        pytest.skip("more elements than this build of PyTorch allows (32-bit)")
     x = torch.arange(3.0, device="vk")[1:2].expand(2 ** 33)
     with on_gpu():
         assert x[torch.tensor([5, 2 ** 31 - 2, -1], device="vk")].tolist() == [1.0, 1.0, 1.0]
