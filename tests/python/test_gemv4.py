@@ -3,9 +3,9 @@ loads, float32 sums): float32, float16 and bfloat16 mm / addmm / addmv /
 linear, int8 weights (_weight_int8pack_mm) and 4-bit weights
 (_convert_weight_to_int4pack, _weight_int4pack_mm).
 
-gemv4 runs by default on Arm GPUs (Mali); TORCH_VK_GEMV=vector runs it on
-any GPU, which is how the desktop and lavapipe runs exercise it. Without it
-the same tests check the other paths."""
+gemv4 runs by default on every GPU except for float32 weights on NVIDIA
+and AMD GPUs (TORCH_VK_GEMV=vector runs it there too, =scalar nowhere but
+for 4-bit weights); test_gemv_routes runs these tests' products both ways."""
 
 import pytest
 import torch
@@ -169,3 +169,21 @@ def test_int4pack_errors():
         torch._weight_int4pack_mm(a, b4, 16, sz)
     with pytest.raises(RuntimeError, match="expect qScaleAndZeros to be 3d tensor"):
         torch._weight_int4pack_mm(a, b4, 32, sz[:, :8])
+
+
+@pytest.mark.parametrize("route", ["vector", "scalar"])
+def test_gemv_routes(route):
+    # (the developer switch: gemv4 for every weight dtype, or for none but
+    # 4-bit weights; some of the tests above, in a fresh process)
+    import os
+    import subprocess
+    import sys
+
+    if os.environ.get("TORCH_VK_GEMV"):
+        pytest.skip("TORCH_VK_GEMV is set: the tests above take that route already")
+    env = dict(os.environ, TORCH_VK_GEMV=route)
+    sel = ("((test_linear and (33- or 1001-)) or (test_int8pack and 1000-) or test_mm_columns)"
+           " and not test_gemv_routes")
+    out = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", __file__, "-k", sel],
+                         env=env, capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stdout[-3000:] + out.stderr[-2000:]
