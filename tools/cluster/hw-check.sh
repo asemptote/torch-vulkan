@@ -35,9 +35,9 @@
 # Settings (environment, or tools/cluster/cluster.env: see
 # cluster.env.example): HW_INTEL_HOST (default LAB_HOST), HW_INTEL_SSH
 # (its ssh options), HW_NVIDIA_QUEUE (default the first of GPU_QUEUES),
-# HW_NVIDIA_QSUB (qsub resources), HW_MALI_HOST, HW_MALI_SSH, HW_DIR
-# (torch-vulkan-hwcheck), HW_BUILD_JOBS (4), HW_VALIDATE (1),
-# HW_VALIDATION_LIBS, and the cluster's CLUSTER_SSH, CLUSTER_USER, DEV_HOST
+# HW_NVIDIA_QSUB (qsub resources), HW_QSUB_WAIT (minutes, 60), HW_MALI_HOST,
+# HW_MALI_SSH, HW_DIR (torch-vulkan-hwcheck), HW_BUILD_JOBS (4), HW_VALIDATE
+# (1), HW_VALIDATION_LIBS, and the cluster's CLUSTER_SSH, CLUSTER_USER, DEV_HOST
 # (where the NVIDIA build runs) and PBS_HEAD.
 #
 # Internally, `hw-check.sh --run KIND` runs one machine's checks in its copy
@@ -223,10 +223,16 @@ if want intel; then
 fi
 if want nvidia; then
   if built nvidia; then
-    # (qsub -W block=true returns when the job ends; PBS then copies its output back)
+    # (qsub -W block=true returns when the job ends; PBS then copies its output
+    # back. While the queue's per-user GPU limit is taken, by this user's other
+    # jobs, qsub refuses at once: it is tried again each minute for
+    # HW_QSUB_WAIT minutes, 60, rather than left queued.)
     out="~/$HW_DIR/.hw-check-nvidia.out"
-    cluster "$PBS_HEAD" "rm -f $out; qsub -q $Q $QSUB -N tv-hw-check -W block=true -j oe -o $out \
-      -v HW_RUN=nvidia,HW_TREE=\$HOME/$HW_DIR ~/$HW_DIR/tools/cluster/hw-check.sh > /dev/null
+    cluster "$PBS_HEAD" "rm -f $out; for i in \$(seq ${HW_QSUB_WAIT:-60}); do
+        r=\$(qsub -q $Q $QSUB -N tv-hw-check -W block=true -j oe -o $out \
+          -v HW_RUN=nvidia,HW_TREE=\$HOME/$HW_DIR ~/$HW_DIR/tools/cluster/hw-check.sh 2>&1 > /dev/null) && break
+        case \"\$r\" in *'would exceed'*) echo \"\$(date +%T) waiting: \$r\"; sleep 60 ;; *) echo \"\$r\"; break ;; esac
+      done
       for i in \$(seq 60); do [ -f $out ] && break; sleep 1; done; cat $out" > "$LOGS/nvidia.log" 2>&1 &
     pids+=($!)
   else
@@ -265,7 +271,8 @@ for k in "${KINDS[@]}"; do
     if [ "$name" = build ]; then cell[$k,tests]="FAIL (build: $detail)"; continue; fi
     cell[$k,$name]="$status${detail:+ ($detail)}"
   done < <(grep -a '^HW|' "$LOGS/$k.log")
-  [ $seen = 1 ] || { cell[$k,tests]="FAIL (no results: see $LOGS/$k.log)"; fail=1; }
+  [ $seen = 1 ] || { cell[$k,tests]="FAIL (no results: $(grep -av '^cat:' "$LOGS/$k.log" | tail -1 | tr -d '|' |
+    cut -c1-100))"; fail=1; }
 done
 echo
 echo "| machine | device | fast paths | tests/python | long submissions | release smoke |"
