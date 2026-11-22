@@ -85,7 +85,8 @@ With a multiplier, the input gradient (a transposed convolution with 2
 input channels per group) still takes the grouped products, most of the
 1148 ms on lavapipe.
 
-L40S
+L40S (a sanity check, `benchmarks/conv.py`, ms): forward 0.02-0.08 for the
+2-D cases above and the 1-D k31 one; forward and backward 0.12-0.71.
 
 ## Tests
 
