@@ -436,11 +436,17 @@ EXPECTED = [
 ]
 
 
-def expected_reason(nodeid, message):
-    for id_pattern, message_pattern, reason in EXPECTED:
+def expected_entry(nodeid, message):
+    """The index in EXPECTED of the entry a failure matches, or None."""
+    for i, (id_pattern, message_pattern, _) in enumerate(EXPECTED):
         if re.search(id_pattern, nodeid) and re.search(message_pattern, message):
-            return reason
+            return i
     return None
+
+
+def expected_reason(nodeid, message):
+    i = expected_entry(nodeid, message)
+    return None if i is None else EXPECTED[i][2]
 
 
 def failing_on_cpu(tests, nodeids, out, stem, timeout):
@@ -473,8 +479,10 @@ def summarize(out, stems):
     total = collections.Counter()
     messages = collections.Counter()
     calls, tests, example = collections.Counter(), collections.Counter(), {}
+    ran, used = set(), set()  # (EXPECTED entries whose tests ran, and those a failure matched)
     for stem in stems:
         results, _ = read_results(out / f"{stem}.jsonl")
+        ran.update(i for i, (id_pattern, _, _) in enumerate(EXPECTED) if any(re.search(id_pattern, n) for n in results))
         for nodeid, ops in sorted(read_cpu_ops(out / f"{stem}.jsonl").items()):
             for op, n in ops.items():
                 calls[op] += n
@@ -490,8 +498,9 @@ def summarize(out, stems):
         for nodeid, (outcome, message) in sorted(results.items()):
             if outcome in FAILING and nodeid in both:
                 counts["fails on CPU too"] += 1
-            elif outcome in FAILING and expected_reason(nodeid, message):
+            elif outcome in FAILING and expected_entry(nodeid, message) is not None:
                 counts["expected"] += 1
+                used.add(expected_entry(nodeid, message))
                 expected.append((nodeid, expected_reason(nodeid, message)))
             else:
                 counts[outcome] += 1
@@ -519,6 +528,14 @@ def summarize(out, stems):
         print("\nmost common failure messages (vk only):")
         for message, count in messages.most_common(40):
             print(f"{count:6d}  {message}")
+    # Entries whose tests ran but matched no failure: fixed, no longer failing
+    # on this PyTorch, or failing on another driver only (CONTRIBUTING.md,
+    # "Upgrading PyTorch": merge each driver's full run and check these).
+    stale = sorted(ran - used)
+    if stale:
+        print(f"\n{len(stale)} EXPECTED entries matched no failure here, though their tests ran:")
+        for i in stale:
+            print(f"  {EXPECTED[i][0]!r}  ({EXPECTED[i][2][:70]}...)")
     return total
 
 
