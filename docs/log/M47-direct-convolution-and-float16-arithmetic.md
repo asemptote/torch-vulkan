@@ -132,20 +132,26 @@ arithmetic): 1024^3 72 -> 119, 2048^3 71 -> 153 (above the 122 the FMA
 units do in float32), 29,041 x 1408 x 128 60 -> 85, 4840 x 2816 x 256 65
 -> 117.
 
-Kokoro-82M end to end on the A13 (#75's sentence, best of 3; the same
-session, so comparable with each other; M39 measured float32 11.6 s and
-float16 15.7 s in a cooler session):
+Kokoro-82M end to end on the A13 (#75's sentence, best of 3, one session;
+M39 measured float32 11.6 s and float16 15.7 s, M46 float32 10.7 s, in
+other sessions: runs of the same build vary by up to 10% between sessions):
 
 | | time | RTF |
 |---|---|---|
 | float32 | 11.35 s | 1.88 |
-| float16 | 15.05 s | 2.49 |
+| float16 | 14.49 s | 2.40 |
 | float16, float16 arithmetic | 12.41 s | 2.05 |
 
 float16 stays slower than float32: its LSTMs, normalisations and
 element-wise ops still widen to float32 copies (#75 item 3, #78), and the
 transposed convolutions' 2-tap phases use im2col.
-KOKORO_ACCURACY
+The audio of the three runs (same phonemes and durations): the waveforms
+differ mostly in phase (the vocoder's harmonic source accumulates phase in
+the run's dtype), so they are compared as magnitude spectrograms (1024-point
+frames, hop 256): float16 differs from float32 by 8.9% (rms of the
+difference over the float32 spectrogram's; mean log-spectral difference
+2.2 dB), float16 with float16 arithmetic by 10.4% (3.2 dB), and from plain
+float16 by 8.3%.
 
 ## Tests
 
