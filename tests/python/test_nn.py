@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 from _util import MAX_NUMEL, check, make, on_gpu
 
+import torch_vulkan as tv
+
 TOL = dict(rtol=2e-4, atol=2e-4)
 
 
@@ -134,6 +136,71 @@ def test_conv_transpose_phases_dtypes(dtype):
     with on_gpu():
         got = F.conv_transpose1d(x.to("vk"), w.to("vk"), b.to("vk"), 6, 3)
     check(got, want, **tol)
+
+
+@pytest.mark.parametrize("dims,mult,k,stride,pad,dil,n,length", [
+    (1, 1, 3, 1, 1, 1, 2, 30), (1, 3, 31, 1, 15, 1, 1, 64), (1, 2, 5, 3, 0, 2, 2, 41),
+    (2, 1, 3, 1, 1, 1, 2, 12), (2, 1, 3, 2, 1, 1, 3, 13), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15),
+    (2, 1, (3, 1), (1, 2), (0, 0), (2, 1), 2, 9), (3, 1, 3, 1, 1, 1, 1, 7), (3, 2, (2, 3, 1), 2, 1, (1, 2, 1), 2, 8),
+])
+def test_conv_depthwise(dims, mult, k, stride, pad, dil, n, length):
+    # one input channel per group, mult outputs each: shaders/dwconv.slang,
+    # forward (one launch) and backward; taps past 32, strides, dilations
+    c = 5
+    spatial = (length, length - 2, length - 1)[:dims]
+    x = make((n, c) + spatial, torch.float32)
+    ks = k if isinstance(k, tuple) else (k,) * dims
+    w = make((c * mult, 1) + ks, torch.float32, 1)
+    b = make((c * mult,), torch.float32, 2)
+    conv = [F.conv1d, F.conv2d, F.conv3d][dims - 1]
+    compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, dil, c), x, w, b)
+    compare_with_cpu(lambda x, w: conv(x, w, None, stride, pad, dil, c), x, w)
+    with on_gpu():
+        before = tv._native.dispatch_count()
+        conv(x.to("vk"), w.to("vk"), b.to("vk"), stride, pad, dil, c)
+        assert tv._native.dispatch_count() - before == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int32, torch.int64,
+                                   pytest.param(torch.float64, marks=pytest.mark.float64)])
+def test_conv_depthwise_dtypes(dtype):
+    x = make((2, 6, 17, 13), torch.float32)
+    w = make((12, 1, 3, 3), torch.float32, 1)
+    b = make((12,), torch.float32, 2)
+    if dtype in (torch.int32, torch.int64):
+        x, w, b = (t.mul(4).round().to(dtype) for t in (x, w, b))
+        want = F.conv2d(x.double(), w.double(), b.double(), 2, 1, 1, 6).to(dtype)
+        tol = dict(rtol=0, atol=0)
+    elif dtype == torch.float64:
+        x, w, b = (t.to(dtype) for t in (x, w, b))
+        want = F.conv2d(x, w, b, 2, 1, 1, 6)
+        tol = dict(rtol=1e-12, atol=1e-12)
+    else:
+        # float32 sums rounded once: within one rounding of the exact result
+        x, w, b = (t.to(dtype) for t in (x, w, b))
+        want = F.conv2d(x.double(), w.double(), b.double(), 2, 1, 1, 6).to(dtype)
+        tol = dict(rtol=torch.finfo(dtype).eps, atol=1e-3)
+    with on_gpu():
+        got = F.conv2d(x.to("vk"), w.to("vk"), b.to("vk"), 2, 1, 1, 6)
+    check(got, want, **tol)
+
+
+def test_conv_depthwise_layouts_and_nonfinite():
+    # channels-last and strided inputs; an infinite or NaN weight does not
+    # reach the outputs whose window meets it only in the padding, as in
+    # oneDNN's depthwise convolution (the CPU's on x86)
+    x = make((2, 4, 9, 8), torch.float32)
+    w = make((4, 1, 3, 3), torch.float32, 1)
+    backend = torch._C._select_conv_backend(x, w, None, (1, 1), (1, 1), (1, 1), False, (0, 0), 4, None)
+    if backend != torch._C._ConvBackend.Mkldnn:
+        pytest.skip(f"the CPU's convolution here is {backend}, not oneDNN's")
+    w[1, 0, 0, 0] = float("inf")
+    w[2, 0, 2, 1] = float("nan")
+    for xi in (x.contiguous(memory_format=torch.channels_last), x[:, :, ::2], x.transpose(2, 3)):
+        want = F.conv2d(xi, w, None, 1, 1, 1, 4)
+        with on_gpu():
+            got = F.conv2d(xi.to("vk"), w.to("vk"), None, 1, 1, 1, 4)
+        check(got, want, **TOL, equal_nan=True)
 
 
 @pytest.mark.float64
