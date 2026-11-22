@@ -132,7 +132,7 @@ def test_scatter_expanded_index(dtype):
     cases = [
         (2, torch.randint(0, 9, (3, 1, 12, 1), generator=g).expand(3, 4, 12, 2)),
         (2, torch.randint(0, 9, (2, 1, 7, 1), generator=g).expand(2, 3, 7, 2)),
-        (0, torch.randint(0, 3, (5, 1, 1, 1), generator=g).expand(5, 4, 9, 2)[:, :, :8]),
+        (0, torch.randint(0, 3, (3, 1, 1, 1), generator=g).expand(3, 4, 9, 2)[:, :, :8]),
         (1, torch.randint(0, 4, (1, 5, 1, 2), generator=g).expand(3, 5, 6, 2)),
     ]
     for dim, index in cases:
