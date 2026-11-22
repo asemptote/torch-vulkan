@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <vector>
 
 namespace vk {
@@ -83,7 +84,7 @@ void for_each_dispatch(const StridedDims<K>& d, size_t max_inner, F&& emit) {
   std::array<int64_t, K> span{};
   for (size_t i = 0; i < inner; ++i) {
     inner_count *= d.size[i];
-    for (size_t k = 0; k < K; ++k) span[k] += (d.size[i] - 1) * d.stride[i][k];
+    for (size_t k = 0; k < K; ++k) span[k] += (d.size[i] - 1) * std::abs(d.stride[i][k]);
   }
   TORCH_CHECK(inner_count < (int64_t(1) << 32), "torch_vulkan: more than 2^32 elements per dispatch");
   for (size_t k = 0; k < K; ++k) {

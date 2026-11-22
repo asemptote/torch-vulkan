@@ -15,7 +15,11 @@
 //                               integer and bool kernels, double bits for
 //                               float64/complex128, float bits in the low
 //                               word otherwise
-//   48  n, ndim, stride, _pad   element count, merged dims (<= 4), grid stride
+//   48  n, ndim, stride, rev    element count, merged dims (<= 4), grid
+//                               stride; rev: bit d reverses a along dim d
+//                               (a reads index size - 1 - c: flip, without
+//                               negative offsets, which NVIDIA's driver
+//                               does not take in 32-bit pointer indices)
 //   64  size                    dim sizes, innermost first
 //   80  so, sa, sb              element strides of out, a, b (0 = broadcast)
 
@@ -37,7 +41,7 @@ struct Params
     uint n;
     uint ndim;
     uint stride;
-    uint _pad;
+    uint rev;
     uint4 size;
     int4 so;
     int4 sa;
@@ -82,7 +86,7 @@ Offsets offsets(uint i)
             int c = int(rem % s);
             rem /= s;
             r.o += c * p.so[d];
-            r.a += c * p.sa[d];
+            r.a += (((p.rev >> d) & 1u) != 0u ? int(s) - 1 - c : c) * p.sa[d];
             r.b += c * p.sb[d];
         }
     }

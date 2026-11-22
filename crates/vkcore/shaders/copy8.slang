@@ -16,7 +16,7 @@ struct Params
     uint n;        // 16  elements
     uint ndim;     // 20  dims (<= 8), innermost first
     uint stride;   // 24  grid stride
-    uint _pad;     // 28
+    uint rev;      // 28  bit d reverses a along dim d (as _strided.slang's)
     uint4 size0;   // 32  sizes of dims 0..3
     uint4 size1;   // 48  dims 4..7
     int4 so0;      // 64  out's element strides
@@ -43,7 +43,7 @@ void main(uint3 id: SV_DispatchThreadID)
                 int c = int(rem % p.size0[d]);
                 rem /= p.size0[d];
                 o += c * p.so0[d];
-                a += c * p.sa0[d];
+                a += (((p.rev >> d) & 1u) != 0u ? int(p.size0[d]) - 1 - c : c) * p.sa0[d];
             }
         }
         [unroll]
@@ -54,7 +54,7 @@ void main(uint3 id: SV_DispatchThreadID)
                 int c = int(rem % p.size1[d]);
                 rem /= p.size1[d];
                 o += c * p.so1[d];
-                a += c * p.sa1[d];
+                a += (((p.rev >> (d + 4)) & 1u) != 0u ? int(p.size1[d]) - 1 - c : c) * p.sa1[d];
             }
         }
         p.out[o] = p.a[a];
