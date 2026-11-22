@@ -58,10 +58,11 @@ on both GPUs), Wo >= 8 in 2-D and 3-D, and not depthwise (M46's
 multiply-adds do those):
 
 - Intel (HD 530): every dtype; 8 rows x 4 columns per lane.
-- Mali (Valhall): float16 and bfloat16 only; 4 rows x 8 columns per lane.
-  float32 stays with im2col and gemm4s: with float32 windows the
-  accumulators of 8 rows spill there, and at 4 or 6 rows it was at best
-  level with gemm4s (k = 11: 206-229 ms against 216).
+- Mali (Valhall): float16 arithmetic, and float16 and bfloat16 with 5 or
+  more inner taps (3-tap ones were as fast or faster as im2col); 4 rows x
+  8 columns per lane. float32 stays with im2col and gemm4s: with float32
+  windows the accumulators of 8 rows spill there, and at 4 or 6 rows it was
+  at best level with gemm4s (k = 11: 206-229 ms against 216-243).
 
 `TORCH_VK_CONV=im2col` restores the columns and product, `=direct` uses
 conv4s wherever it runs (comparison and testing).
@@ -109,7 +110,42 @@ about 10% noise):
 float16 matrix products on the HD 530 (GFLOP/s): 1024^3 75 -> 117, 2048^3
 84 -> 133 with float16 arithmetic (gemm4s_f16h, against float32 sums).
 
-MALI_RESULTS
+Mali-G57 (Galaxy A13; it throttles as it warms and ran beside other
+work: runs vary by 10-15%), float16, conv4s (forced where the default keeps
+im2col) against im2col (float32 products of widened copies):
+
+| | float16 im2col | conv4s | conv4s, float16 arithmetic |
+|---|---|---|---|
+| conv1d 128 -> 128, k 11, L 29,041 | 226 | 158 | 112 |
+| conv1d 128 -> 128, k 11, d 3 | 242 | 177 | 124 |
+| conv1d 128 -> 128, k 7 | 167 | 121 | 83 |
+| conv1d 128 -> 128, k 3 | 82 | 78 | 66 |
+| conv1d 256 -> 256, k 11, L 4,840 | 148 | 103 | 73 |
+| conv1d 256 -> 256, k 3 | 45 | 52-56 | 36 |
+| conv2d 64 -> 64, k 3, 56 x 56, batch 8 | 105 | 47 | 33 |
+
+float32 there: im2col 216-243 ms for the first row, conv4s 206-229 at its
+best tiles (4 or 6 rows), 351-437 with 8 rows.
+
+float16 matrix products on the A13 (GFLOP/s, float32 sums -> float16
+arithmetic): 1024^3 72 -> 119, 2048^3 71 -> 153 (above the 122 the FMA
+units do in float32), 29,041 x 1408 x 128 60 -> 85, 4840 x 2816 x 256 65
+-> 117.
+
+Kokoro-82M end to end on the A13 (#75's sentence, best of 3; the same
+session, so comparable with each other; M39 measured float32 11.6 s and
+float16 15.7 s in a cooler session):
+
+| | time | RTF |
+|---|---|---|
+| float32 | 11.35 s | 1.88 |
+| float16 | 15.05 s | 2.49 |
+| float16, float16 arithmetic | 12.41 s | 2.05 |
+
+float16 stays slower than float32: its LSTMs, normalisations and
+element-wise ops still widen to float32 copies (#75 item 3, #78), and the
+transposed convolutions' 2-tap phases use im2col.
+KOKORO_ACCURACY
 
 ## Tests
 
