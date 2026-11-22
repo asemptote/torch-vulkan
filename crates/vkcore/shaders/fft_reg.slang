@@ -1,5 +1,7 @@
 // axis T: c64=float2 c128=double2
 // axis V: e16=uint e8=uint
+// skip: T=c128 V=e16
+// (complex128 always takes 8 values per thread: csrc/fft.cpp)
 //
 // One radix-R Stockham pass of a power-of-two FFT, R = 128 to 1024, with the
 // values in registers: csrc/fft.cpp's fft_pow2 takes longer rows in two or
