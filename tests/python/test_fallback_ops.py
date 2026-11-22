@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch_vulkan
 
-from _util import ARM32, make, make_complex
+from _util import ARM32, HAS_FLOAT64, make, make_complex
 
 # A 32-bit Arm CPU converts NaN, infinities and values past int32 to integers
 # by saturating (its quantize kernels use that, and NEON's magic-number
@@ -496,6 +496,8 @@ def test_float8_e8m0fnu():
                    torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.5, 3.0, -6.0, 2.0 ** -127,
                                  2.0 ** -126, 1e-40, 3e38, 2.0 ** 127, 1.4 * 2.0 ** 127])])
     for src in (torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.int64, torch.bool):
+        if src == torch.float64 and not HAS_FLOAT64:
+            continue  # (no float64 vk tensors there: Mali, TORCH_VK_DISABLE=float64)
         got = no_fallback(lambda: x.to(src).to("vk").to(e8))
         assert torch.equal(got.cpu().view(torch.uint8), x.to(src).to(e8).view(torch.uint8)), src
         back = no_fallback(lambda: codes.to("vk").to(src))
