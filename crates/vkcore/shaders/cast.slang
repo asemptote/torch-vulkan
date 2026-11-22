@@ -1,5 +1,17 @@
 // axis SRC: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
 // axis DST: f32=float f64=double i32=int i64=I64 b8=uint8_t c64=float2 c128=double2 u8=uint8_t i8=int8_t i16=int16_t f16=half bf16=uint16_t
+// skip: SRC=f32 DST=f32
+// skip: SRC=f64 DST=f64
+// skip: SRC=i32 DST=i32
+// skip: SRC=i64 DST=i64
+// skip: SRC=b8 DST=b8
+// skip: SRC=c64 DST=c64
+// skip: SRC=c128 DST=c128
+// skip: SRC=u8 DST=u8
+// skip: SRC=i8 DST=i8
+// skip: SRC=i16 DST=i16
+// skip: SRC=f16 DST=f16
+// skip: SRC=bf16 DST=bf16
 //
 // out = DST(a), strided, between dtypes (same-dtype copies use move.slang).
 // Conversion to bool maps nonzero to 1; complex to real keeps the real part
