@@ -69,6 +69,25 @@ decisions and their reasons, one file per milestone in `docs/log/`; a change
 that deserves a design note adds a new `docs/log/MNN-topic.md` rather than
 editing an earlier one.
 
+### Adding a new kernel route
+
+A second (or further) kernel for an op that already has one, chosen by
+device, dtype or size, is a new route. Every route is code to maintain and
+a path that tests must reach, so a new one needs all of:
+
+- **a measured gain**: at least 1.5x faster than the existing route on a
+  target device, in a benchmark in `benchmarks/` that the pull request adds
+  or extends (with its results for that device);
+- **a way to force it from tests**: a developer switch
+  (`TORCH_VK_<NAME>`, listed in the developer table of
+  [docs/api.md](docs/api.md#environment-variables)) or a test hook, and a
+  test in `tests/python` that uses it, so that CI and runs on real hardware
+  exercise the route wherever the device can run it, not only where it is
+  the default;
+- **documented selection rules**: the thresholds that choose it, in its
+  design note (`docs/log/MNN-topic.md`), with the devices they were
+  measured on, and a row in [docs/kernel-routes.md](docs/kernel-routes.md).
+
 `tools/cluster/` runs PyTorch's test files in shards on a PBS cluster; it
 needs a `tools/cluster/cluster.env` (see `cluster.env.example`) and is
 optional.
