@@ -152,7 +152,7 @@ T st(float f)
 
 // The input's pieces are kept as loaded (W4: 16-bit values for f16 and
 // bf16 storage, widened per tap after the window is taken: widening each
-// piece once as it was loaded ran 3x slower on the HD 530).
+// piece once as it was loaded ran 2x slower on the HD 530).
 #if defined(T_f16)
 typedef half4 W4;
 W4 ldw(S4* q) { return bit_cast<half4>(loadAligned<8>(q)); }
