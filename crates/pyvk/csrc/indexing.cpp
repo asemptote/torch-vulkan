@@ -818,6 +818,63 @@ bool accumulate_rows(const at::Tensor& dst, const at::Tensor& offsets, const at:
   return true;
 }
 
+// scatter_accumulate's part for an index expanded (stride 0) along other
+// dims than `dim`, as [N, 1, K].expand(N, C, K) in grid_sampler's double
+// backward (#113): the index's distinct rows are sorted once and the
+// expanded dims become the width of the rows accumulate_rows adds (out
+// copied with those dims last, and back), instead of a sort key per element
+// (C times as many). The order of accumulation is the generic path's.
+// False (nothing done) where it does not apply.
+bool scatter_expanded(const at::Tensor& out, int64_t dim, const at::Tensor& index, const at::Tensor& src,
+                      uint32_t op, bool include_self) {
+  if (at::isComplexType(out.scalar_type()) || out.dim() == 0 || index.dim() != out.dim() ||
+      src.dim() != index.dim()) {
+    return false;
+  }
+  std::vector<int64_t> kept, wide, perm;
+  for (int64_t d = 0; d < index.dim(); ++d) {
+    (d != dim && index.stride(d) == 0 && index.size(d) > 1 ? wide : kept).push_back(d);
+  }
+  if (wide.empty()) {
+    return false;
+  }
+  perm = kept;
+  perm.insert(perm.end(), wide.begin(), wide.end());
+  // out and src over the index's extent (out's whole extent along dim)
+  at::Tensor o = out;
+  for (int64_t d = 0; d < out.dim(); ++d) {
+    if (d != dim) o = o.narrow(d, 0, index.size(d));
+  }
+  at::Tensor s = src.as_strided(index.sizes(), src.strides(), src.storage_offset());
+  int64_t width = 1;
+  for (int64_t d : wide) width *= index.size(d);
+  at::Tensor ot = o.permute(perm).contiguous();  // [kept..., wide...]
+  std::vector<int64_t> kept_sizes, idx_sizes;
+  for (int64_t d : kept) {
+    kept_sizes.push_back(o.size(d));
+    idx_sizes.push_back(index.size(d));
+  }
+  std::vector<int64_t> row_shape = kept_sizes;
+  row_shape.push_back(width);
+  at::Tensor rows = ot.view(row_shape).select(-1, 0);  // (each row's first element: strides in rows)
+  int64_t pd = std::find(kept.begin(), kept.end(), dim) - kept.begin();
+  at::Tensor idx = index;
+  for (int64_t d : wide) idx = idx.narrow(d, 0, 1);
+  idx = idx.permute(perm).reshape(idx_sizes);
+  at::Tensor dst_view = restride_without(rows, idx_sizes, pd);
+  at::Tensor offsets = index_offsets(idx_sizes, {{idx, size_at(rows, pd), stride_at(rows, pd)}}, out.options(),
+                                     /*wrap=*/false) +
+                       view_positions(dst_view);
+  at::Tensor vals = s.permute(perm).reshape({-1, width});
+  if (!accumulate_rows(ot.view({-1, width}), offsets.reshape({-1}), vals, width, op, include_self)) {
+    return false;
+  }
+  std::vector<int64_t> inverse(perm.size());
+  for (size_t i = 0; i < perm.size(); ++i) inverse[perm[i]] = static_cast<int64_t>(i);
+  o.copy_(ot.permute(inverse));
+  return true;
+}
+
 // out = self, then out[index along dim] op= src (scatter_add, scatter_reduce, scatter(reduce=...)).
 bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& index, const at::Tensor& src,
                         uint32_t op, bool include_self, at::Tensor& out) {
@@ -847,6 +904,9 @@ bool scatter_accumulate(const at::Tensor& self, int64_t dim, const at::Tensor& i
     at::Tensor offsets = index_offsets({n}, {{keys, out.size(0), width}}, out.options(), /*wrap=*/false);
     at::Tensor vals = src.narrow(0, 0, n).reshape({n, width});
     if (accumulate_rows(out, offsets, vals, width, op, include_self)) return true;
+  }
+  if (scatter_expanded(out, dim, index, src, op, include_self)) {
+    return true;
   }
   // A large index in slices along its longest other dim: an int64 offset and
   // a sort key per element would pass the 4 GiB a buffer may hold (the
