@@ -201,7 +201,8 @@ def test_eigh_tridiagonal(dtype, shape):
 
 @pytest.mark.parametrize("dtype,n", [(torch.float64, 520), (torch.float32, 1030)])
 def test_eigh_tridiagonal_large(dtype, n):
-    # past shaders/tridiag.slang's QL_SHARED: QL iterates on d and e in global memory
+    # divide and conquer (with TORCH_VK_EIGH_QL, past shaders/tridiag.slang's
+    # QL_SHARED, QL iterating on d and e in global memory: #118)
     a = make((n, n), dtype, 2)
     h = hermitian(a, False)
     with on_gpu():
@@ -352,3 +353,26 @@ def test_matrix_exp(dtype):
     with on_gpu():
         got = torch.linalg.matrix_exp(a.to("vk"))
     check(got, torch.linalg.matrix_exp(a), **tol(dtype, 100))
+
+
+@pytest.mark.parametrize("switch,sel", [
+    # (not test_eigh_tridiagonal_large: QL past n ~ 1000 loses the device on
+    # the HD 530, #118)
+    ("TORCH_VK_EIGH_QL", "(test_eigh_tridiagonal or test_eigh_blocked_scaled) and not large"),
+    ("TORCH_VK_SVD_JACOBI", "test_svd_bidiagonal"),
+], ids=["eigh_ql", "svd_jacobi"])
+def test_forced_routes(switch, sel):
+    # (the developer switches that force the other route for every size: QL
+    # instead of divide and conquer, Jacobi instead of bidiagonalisation,
+    # through the tests above that otherwise take the defaults; in a fresh
+    # process, as they are read once)
+    import os
+    import subprocess
+    import sys
+
+    if os.environ.get(switch):
+        pytest.skip(f"{switch} is set: the tests above take the route already")
+    out = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", __file__, "-k",
+                          f"({sel}) and not test_forced_routes"],
+                         env=dict(os.environ, **{switch: "1"}), capture_output=True, text=True, timeout=1200)
+    assert out.returncode == 0, out.stdout[-3000:] + out.stderr[-2000:]
