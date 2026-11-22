@@ -27,7 +27,6 @@ static_assert(sizeof(PoolParams) == 128 && offsetof(PoolParams, isz) == 32 && of
               "must match shaders/pool.slang");
 
 constexpr int64_t kGroup = 256;
-constexpr int64_t kMaxGroups = 65535;
 
 // Window settings per spatial dim: [D, H, W] (3 values each).
 void set_window(PoolParams& p, at::IntArrayRef in, at::IntArrayRef out, at::IntArrayRef kernel,

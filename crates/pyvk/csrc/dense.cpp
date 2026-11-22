@@ -60,10 +60,6 @@ struct TriangleParams {
 };
 static_assert(sizeof(TriangleParams) == 64, "must match shaders/triangle.slang");
 
-uint32_t groups_for(int64_t threads) {
-  return static_cast<uint32_t>(std::clamp<int64_t>((threads + 255) / 256, 1, 65535));
-}
-
 // TORCH_VK_LINALG=cpu sends these ops to LAPACK on the CPU.
 bool linalg_on_cpu() {
   static const bool cpu = [] {

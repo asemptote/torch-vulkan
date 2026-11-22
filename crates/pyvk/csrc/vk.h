@@ -86,6 +86,18 @@ inline void check(int rc) {
   TORCH_CHECK(rc == 0, "torch_vulkan: ", vkt_last_error());
 }
 
+// Workgroups per dispatch dimension: Vulkan's guaranteed minimum of
+// maxComputeWorkGroupCount.
+constexpr int64_t kMaxGroups = 65535;
+
+inline int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
+// Workgroups of 256 threads for `threads` threads, at least 1 and at most
+// kMaxGroups (kernels then loop over the rest).
+inline uint32_t groups_for(int64_t threads) {
+  return static_cast<uint32_t>(std::clamp<int64_t>((threads + 255) / 256, 1, kMaxGroups));
+}
+
 // Waits for queued GPU work; raises IndexError if an indexing kernel met an
 // out-of-range index since the last check (backend.cpp).
 void synchronize();
@@ -372,6 +384,26 @@ inline bool is_half(at::ScalarType t) {
 
 inline bool is_integral_or_bool(at::ScalarType t) {
   return at::isIntegralType(t, /*includeBool=*/true);
+}
+
+// uint16, uint32 and uint64: no arithmetic kernels of their own (they are
+// computed as a wider or reordered signed type and converted back).
+inline bool wide_unsigned(at::ScalarType t) {
+  return t == at::kUInt16 || t == at::kUInt32 || t == at::kUInt64;
+}
+
+// The dtype of a functional result: floats keep theirs, integers and bools
+// become the default float dtype.
+inline at::ScalarType float_result(at::ScalarType t) {
+  return at::isFloatingType(t) ? t : c10::typeMetaToScalarType(c10::get_default_dtype());
+}
+
+// The dtype float kernels compute `t` in: float32 for float32, float16 and
+// bfloat16, float64 for float64 where the device has it; nullopt otherwise.
+inline std::optional<at::ScalarType> float_compute_type(at::ScalarType t) {
+  if (t == at::kFloat || t == at::kHalf || t == at::kBFloat16) return at::kFloat;
+  if (t == at::kDouble && vkt_has_float64()) return at::kDouble;
+  return std::nullopt;
 }
 
 // PyTorch's rule for out= arguments: the result dtype must cast safely to

@@ -23,8 +23,6 @@ struct SoftmaxParams {
 };
 static_assert(sizeof(SoftmaxParams) == 40 && offsetof(SoftmaxParams, rows) == 24, "must match shaders/softmax.slang");
 
-constexpr int64_t kMaxGroups = 65535;
-
 bool kernel_dtype(const at::Tensor& t) {
   return is_vk(t) && (t.scalar_type() == at::kFloat || (t.scalar_type() == at::kDouble && vkt_has_float64()));
 }
@@ -56,7 +54,7 @@ at::Tensor run(uint32_t op, const at::Tensor& a_in, const at::Tensor* b_in, int6
   return out;
 }
 
-void assign_out(const at::Tensor& r, at::Tensor& out) {
+void assign_out_same_dtype(const at::Tensor& r, at::Tensor& out) {
   check_out_device(r, out);
   TORCH_CHECK(out.scalar_type() == r.scalar_type(), "Expected out tensor to have dtype ", r.scalar_type(),
               ", but got ", out.scalar_type(), " instead");
@@ -78,7 +76,7 @@ at::Tensor softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
 
 template <bool Log>
 at::Tensor& softmax_out(const at::Tensor& self, int64_t dim, bool half_to_float, at::Tensor& out) {
-  assign_out(softmax<Log>(self, dim, half_to_float), out);
+  assign_out_same_dtype(softmax<Log>(self, dim, half_to_float), out);
   return out;
 }
 
@@ -107,7 +105,7 @@ at::Tensor softmax_backward(const at::Tensor& grad_output, const at::Tensor& out
 template <bool Log>
 at::Tensor& softmax_backward_out(const at::Tensor& grad_output, const at::Tensor& output, int64_t dim,
                                  at::ScalarType input_dtype, at::Tensor& grad_input) {
-  assign_out(softmax_backward<Log>(grad_output, output, dim, input_dtype), grad_input);
+  assign_out_same_dtype(softmax_backward<Log>(grad_output, output, dim, input_dtype), grad_input);
   return grad_input;
 }
 

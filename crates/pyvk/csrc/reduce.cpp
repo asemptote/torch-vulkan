@@ -68,8 +68,6 @@ struct ScanParams {
 };
 static_assert(sizeof(ScanParams) == 128 && offsetof(ScanParams, rows) == 32 && offsetof(ScanParams, osz) == 64);
 
-constexpr uint32_t kMaxGroups = 65535;
-
 // Up to 4 dims, innermost first.
 struct Dims {
   uint32_t n = 0;
@@ -79,7 +77,7 @@ struct Dims {
 
 // Merges dims given outermost-first into innermost-first Dims (strided.h);
 // false if more than 4 remain.
-bool coalesce(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, Dims& out) {
+bool coalesce_dims(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, Dims& out) {
   StridedDims<1> d = merge_dims<1>(sizes, {strides});
   if (d.ndim() > 4) {
     return false;
@@ -175,7 +173,7 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
     rs.push_back(red_size[i]);
     rt.push_back(red_stride[i]);
   }
-  return coalesce(kept_size, kept_stride, plan.outer) && coalesce(rs, rt, plan.red);
+  return coalesce_dims(kept_size, kept_stride, plan.outer) && coalesce_dims(rs, rt, plan.red);
 }
 
 // Workgroup chunks per output: enough work items to fill the GPU, each
@@ -854,7 +852,7 @@ at::Tensor& cumulative_out(const at::Tensor& self, int64_t dim, std::optional<at
   }
   moved_shape.push_back(n);
   Dims rowdims;
-  if (!coalesce(row_size, row_stride, rowdims) || span >= (int64_t(1) << 31) || rows * n >= (int64_t(1) << 32)) {
+  if (!coalesce_dims(row_size, row_stride, rowdims) || span >= (int64_t(1) << 31) || rows * n >= (int64_t(1) << 32)) {
     on_cpu(name, "out", self, dim, dtype, out);
     return out;
   }
