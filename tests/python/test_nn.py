@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 from _util import MAX_NUMEL, check, make, on_gpu
 
+import torch_vulkan as tv
+
 TOL = dict(rtol=2e-4, atol=2e-4)
 
 
@@ -260,6 +262,83 @@ def test_grid_unnormalise_rounds_once():
     with on_gpu():
         got = F.grid_sample(x.to("vk"), grid.to("vk"), mode="bicubic", padding_mode="zeros", align_corners=False)
     torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
+
+
+def launches(fn):
+    before = tv._native.dispatch_count()
+    out = fn()
+    return out, tv._native.dispatch_count() - before
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_grid_sample_bicubic_one_launch(k):
+    # (shaders/gridsample.slang's bicubic mode: the forward in one launch, the
+    # backward's grad_grid with the taps for grad_input's scatter in one; an
+    # input with strides read in place)
+    x = make((2, 3) + (6, 7, 5)[:k], torch.float32)
+    g = make((2,) + (4, 3, 2)[:k] + (k,), torch.float32, 1)
+    layouts = (lambda t: t, lambda t: t.transpose(-1, -2).contiguous().transpose(-1, -2),
+               lambda t: t[:1].expand(2, *t.shape[1:]))
+    for layout in layouts:
+        want = F.grid_sample(layout(x), g, mode="bicubic", padding_mode="reflection", align_corners=False)
+        with on_gpu():
+            vx, vg = layout(x.to("vk")), g.to("vk")
+            got, n = launches(lambda: F.grid_sample(vx, vg, mode="bicubic", padding_mode="reflection",
+                                                    align_corners=False))
+        check(got, want, **TOL)
+        assert n == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_upsample_bicubic_kernel(dtype):
+    # (upsample_bicubic2d by gridsample.slang's upsample mode: the CPU's source
+    # coordinates, clamped taps; forward in one launch; the backward by the
+    # taps' weights and one scatter-add)
+    x = make((2, 3, 7, 9), dtype)
+    for kw in (dict(scale_factor=2), dict(size=(5, 4)), dict(size=(13, 20), align_corners=True),
+               dict(scale_factor=(1.7, 0.6)), dict(size=(1, 1)), dict(size=(7, 9), align_corners=True)):
+        kw.setdefault("align_corners", False)
+        compare_with_cpu(lambda x: F.interpolate(x, mode="bicubic", **kw), x)
+        with on_gpu():
+            vx = x.to("vk")
+            _, n = launches(lambda: F.interpolate(vx, mode="bicubic", **kw))
+        assert n <= 4, n  # (the coordinates' stack and copy, and the kernel)
+
+
+@pytest.mark.parametrize("mode", ["bilinear", "bicubic"])
+def test_grid_sample_reflection_whole_spans(mode):
+    # (a coordinate a whole number of spans from the low edge: the reflection
+    # counts its spans with a correctly rounded division, where the GPU's may
+    # round 455 / 455 just below 1, the reference input's width minus 1)
+    for width in (6, 100, 455, 456, 457, 1000):
+        x = torch.arange(2 * width, dtype=torch.float32).reshape(1, 1, 2, width)
+        g = torch.tensor([1.0, 1.0006271600723267, -1.0, 3.0, 0.5]).reshape(1, 1, 5, 1)
+        grid = torch.cat([g, torch.full_like(g, 0.3)], -1)
+        want = F.grid_sample(x, grid, mode=mode, padding_mode="reflection", align_corners=True)
+        with on_gpu():
+            got = F.grid_sample(x.to("vk"), grid.to("vk"), mode=mode, padding_mode="reflection", align_corners=True)
+        check(got, want, rtol=1e-5, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("kernel,dilation,padding,stride,size", [
+    (3, 1, 1, 1, (9, 8)), ((2, 3), (2, 1), (0, 2), (2, 3), (11, 10)), (4, 1, 0, 4, (8, 12)), (1, 1, 0, 1, (3, 5))])
+def test_fold_unfold(dtype, kernel, dilation, padding, stride, size):
+    # fold (col2im) by shaders/col2im.slang: each output gathers its blocks'
+    # values in the CPU's order, so the sums are the CPU's bit for bit;
+    # unfold's backward is fold
+    x = make((2, 3) + size, dtype)
+    blocks = dict(kernel_size=kernel, dilation=dilation, padding=padding, stride=stride)
+    cols = F.unfold(x, **blocks)
+    c = make(tuple(cols.shape), dtype, 1)
+    want = F.fold(c, size, **blocks)
+    with on_gpu():
+        got, n = launches(lambda: F.fold(c.to("vk"), size, **blocks))
+        unbatched = F.fold(c[0].to("vk"), size, **blocks)
+    assert torch.equal(got.cpu(), want) and n == 1
+    assert torch.equal(unbatched.cpu(), want[0])
+    compare_with_cpu(lambda x: F.unfold(x, **blocks), x)
+    compare_with_cpu(lambda c: F.fold(c, size, **blocks), c)
 
 
 @pytest.mark.parametrize("align_corners", [False, True])
