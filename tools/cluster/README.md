@@ -2,8 +2,9 @@
 
 > Maintainer tooling for one PBS cluster setup (and the workstations beside
 > it). Site details (hosts, queues, paths) live in the untracked
-> `cluster.env`; see `cluster.env.example`. Nothing else in the repository
-> depends on these scripts.
+> `cluster.env`; see `cluster.env.example`. Apart from the release's
+> hardware check (`hw-check.sh`, RELEASING.md), nothing else in the
+> repository depends on these scripts.
 
 `tools/pytorch_tests.py` runs PyTorch's own device-generic tests (`test_ops.py`,
 `test_torch.py`, ...) on device `"vk"`. A full `test_ops.py` is ~33,000 tests
@@ -131,6 +132,38 @@ uses `~/torch-vulkan`. From the local repo root: `dev.sh init` once, then
 `dev.sh build` (sync and rebuild), `dev.sh run ID...`, `dev.sh pt FILE -k
 EXPR`, `dev.sh rss ID...` (peak memory and time per test) and `dev.sh py
 SCRIPT`; the script's header lists the settings.
+
+## The release's hardware check
+
+`hw-check.sh` (RELEASING.md, before tagging) runs what CI's lavapipe cannot:
+from the local repo root of the release candidate,
+
+```sh
+tools/cluster/hw-check.sh            # intel and nvidia (and mali if HW_MALI_HOST is set)
+tools/cluster/hw-check.sh nvidia     # one machine
+```
+
+copies the working tree to `~/$HW_DIR` (default `torch-vulkan-hwcheck`) on
+an Intel GPU under Linux (`HW_INTEL_HOST`, plain ssh) and on the cluster
+(built on `DEV_HOST`; the first time with `setup.sh`), builds both, and runs
+on the Intel GPU and, as a PBS job on `HW_NVIDIA_QUEUE`, on an NVIDIA GPU
+with cooperative matrices (an L40S):
+
+- **fast paths**: the kernels that GPU must take do run (Intel: 16-lane
+  gemm4s and conv4s, float16 arithmetic; NVIDIA: float16 and bfloat16
+  gemmcm, so bf16parts and split k), since their tests skip where a feature
+  is missing and would pass unnoticed if a driver stopped exposing it;
+- **tests/python**, with the validation layer (from the SDK in `~/opt`;
+  `HW_VALIDATE=0` without);
+- on Intel, the **long submissions** past i915's 20 s request watchdog
+  (`TORCH_VK_LONG_TESTS=1`, test_long_submissions.py);
+- the **release smoke** test with the CPU fallback off.
+
+It prints one Markdown table, a row per machine and a pass/fail cell per
+check, and exits non-zero unless every cell passed; the logs (also each
+machine's `.hw-check/*.log`) are in a temporary directory it names. With
+`HW_MALI_HOST` (a phone in Termux), `mali` adds a row for the tree built
+there by `tools/build-termux.sh`, from the Intel build's SPIR-V.
 
 ## Things learned the hard way
 
