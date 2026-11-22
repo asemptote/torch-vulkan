@@ -444,8 +444,8 @@ def test_rms_norm_and_robust_loss_backward_kernels(dtype):
 
 
 DIRECT_CONV_SCRIPT = r"""
-import torch, torch.nn.functional as F, torch_vulkan as tv
-if tv._native.kernel_subgroup_size("conv4s_f32_d1_r8n1") != 16:
+import os, torch, torch.nn.functional as F, torch_vulkan as tv
+if os.environ["TORCH_VK_CONV"] == "direct" and tv._native.kernel_subgroup_size("conv4s_f32_d1_r8n1") != 16:
     print("skip")
     raise SystemExit
 torch.manual_seed(0)
@@ -494,11 +494,14 @@ print(worst)
 """
 
 
-def test_direct_conv():
-    # shaders/conv4s.slang (the default on Mali; elsewhere through
-    # TORCH_VK_CONV=direct where the GPU runs 16-lane subgroups): stride-1
-    # convolutions reading the padded input in place, float32 sums rounded once
-    out = subprocess.run([sys.executable, "-c", DIRECT_CONV_SCRIPT], env=dict(os.environ, TORCH_VK_CONV="direct"),
+@pytest.mark.parametrize("route", ["direct", "im2col"])
+def test_direct_conv(route):
+    # shaders/conv4s.slang (TORCH_VK_CONV=direct: wherever the GPU runs
+    # 16-lane subgroups, by default on Intel and for some 16-bit cases on
+    # Mali): stride-1 convolutions reading the padded input in place, float32
+    # sums rounded once; and the same through im2col columns, which the
+    # direct kernel otherwise takes on those GPUs
+    out = subprocess.run([sys.executable, "-c", DIRECT_CONV_SCRIPT], env=dict(os.environ, TORCH_VK_CONV=route),
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     last = out.stdout.strip().splitlines()[-1]
