@@ -55,10 +55,6 @@ bool is_pow2(int64_t n) {
   return n > 0 && (n & (n - 1)) == 0;
 }
 
-uint32_t groups_for(int64_t threads) {
-  return static_cast<uint32_t>(std::clamp<int64_t>((threads + 255) / 256, 1, 65535));
-}
-
 std::mutex g_cache_mutex;
 std::map<std::pair<int64_t, at::ScalarType>, at::Tensor> g_twiddles;
 std::map<std::tuple<int64_t, at::ScalarType, bool>, std::pair<at::Tensor, at::Tensor>> g_bluestein;

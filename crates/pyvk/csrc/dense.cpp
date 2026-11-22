@@ -9,11 +9,14 @@
 // diagonal blocks, inverses of small triangular blocks, row interchanges)
 // run in shaders/factor.slang with one workgroup per matrix; the O(n^3)
 // trailing updates are batched GEMMs (csrc/linalg.cpp). eigh reduces to a
-// tridiagonal matrix and runs implicit QL on it (shaders/tridiag.slang), as
-// LAPACK does; the SVD (and eigh of 2 x 2 and 3 x 3 matrices) use Jacobi
-// methods (rotations of disjoint index pairs in parallel, round-robin
-// ordering). Both are accurate to working precision. TORCH_VK_LINALG=cpu
-// sends these ops to LAPACK on the CPU instead, as a reference for testing.
+// tridiagonal matrix and solves it by divide and conquer
+// (shaders/stedc.slang; implicit QL, shaders/tridiag.slang, below 64), as
+// LAPACK does; the SVD bidiagonalises from 32 columns. Small SVDs (and eigh
+// of 2 x 2 and 3 x 3 matrices) use Jacobi methods (rotations of disjoint
+// index pairs in parallel, round-robin ordering). All are accurate to
+// working precision. docs/kernel-routes.md lists the routes and their
+// thresholds. TORCH_VK_LINALG=cpu sends these ops to LAPACK on the CPU
+// instead, as a reference for testing.
 //
 // Complex matrices (M14) run through the same code: factor.slang has complex
 // variants following LAPACK's z* routines, and transposes that stand for
@@ -60,10 +63,6 @@ struct TriangleParams {
 };
 static_assert(sizeof(TriangleParams) == 64, "must match shaders/triangle.slang");
 
-uint32_t groups_for(int64_t threads) {
-  return static_cast<uint32_t>(std::clamp<int64_t>((threads + 255) / 256, 1, 65535));
-}
-
 // TORCH_VK_LINALG=cpu sends these ops to LAPACK on the CPU.
 bool linalg_on_cpu() {
   static const bool cpu = [] {
@@ -71,6 +70,23 @@ bool linalg_on_cpu() {
     return v != nullptr && std::string(v) == "cpu";
   }();
   return cpu;
+}
+
+// Developer switches that force one route for every size, read once:
+// TORCH_VK_EIGH_QL (eigh by QL, not divide and conquer) and
+// TORCH_VK_SVD_JACOBI (svd by Jacobi, not bidiagonalisation); on for any
+// value but empty and 0, as docs/api.md says of flags.
+bool env_flag(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && *v != 0 && std::string(v) != "0";
+}
+bool force_eigh_ql() {
+  static const bool on = env_flag("TORCH_VK_EIGH_QL");
+  return on;
+}
+bool force_svd_jacobi() {
+  static const bool on = env_flag("TORCH_VK_SVD_JACOBI");
+  return on;
 }
 
 bool float_dtype(at::ScalarType s) {
@@ -788,7 +804,7 @@ bool tridiag_eigh(const at::Tensor& a3, bool want_vectors, at::Tensor& values, a
 
   at::Tensor d = at::real(a3.diagonal(0, 1, 2)).contiguous();
   at::Tensor z;  // the eigenvectors of T, columns in ascending order of the eigenvalues
-  if (n >= kStedcMin && std::getenv("TORCH_VK_EIGH_QL") == nullptr) {
+  if (n >= kStedcMin && !force_eigh_ql()) {
     // divide and conquer (its vectors are part of the method)
     at::Tensor zr;
     if (!stedc(d, e, B, n, values, zr)) {
@@ -1635,7 +1651,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> svd_out(const at::Tensor& a, b
     v = at::empty({0, tn, tn}, a3.options());
     done = true;
   }
-  if (!done && tn >= kSvdBidiagMin && std::getenv("TORCH_VK_SVD_JACOBI") == nullptr) {
+  if (!done && tn >= kSvdBidiagMin && !force_svd_jacobi()) {
     // (a3 is a fresh copy: batched() of a view, or of adj(a), copies)
     at::Tensor work = a3.contiguous().clone();
     done = bidiag_svd(work, compute_uv && full_matrices, sigma, left, v);

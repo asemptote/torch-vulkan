@@ -303,9 +303,8 @@ void update_float_bounds(at::ScalarType t, int64_t& from, int64_t* to) {
 
 // uint16, uint32 and uint64 (no storage kernels of their own): [from, to)
 // drawn in int64, then stored (as bits for uint64), after the CPU's checks.
-bool wide_unsigned(const at::Tensor& self) {
-  at::ScalarType t = self.scalar_type();
-  return is_vk(self) && (t == at::kUInt16 || t == at::kUInt32 || t == at::kUInt64);
+bool wide_unsigned_vk(const at::Tensor& self) {
+  return is_vk(self) && wide_unsigned(self.scalar_type());
 }
 
 at::Tensor& random_unsigned(at::Tensor& self, int64_t from, int64_t to, std::optional<at::Generator> gen) {
@@ -337,8 +336,8 @@ void complex_random_error(const at::Tensor& self, int64_t from, std::optional<in
 
 at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<at::Generator> gen) {
   complex_random_error(self, from, to);
-  if (to.has_value() && wide_unsigned(self)) return random_unsigned(self, from, *to, gen);
-  if (!to.has_value() && wide_unsigned(self) && self.scalar_type() != at::kUInt64) {
+  if (to.has_value() && wide_unsigned_vk(self)) return random_unsigned(self, from, *to, gen);
+  if (!to.has_value() && wide_unsigned_vk(self) && self.scalar_type() != at::kUInt64) {
     int64_t top = self.scalar_type() == at::kUInt16 ? 65535 : 4294967295LL;
     TORCH_CHECK(from <= top, "random_ expects 'from' casted to dtype to be less than or equal to 'to'");
     return random_unsigned(self, from, top + 1, gen);
@@ -362,7 +361,7 @@ at::Tensor& random_from(at::Tensor& self, int64_t from, std::optional<int64_t> t
 }
 
 at::Tensor& random_to(at::Tensor& self, int64_t to, std::optional<at::Generator> gen) {
-  if (wide_unsigned(self)) return random_unsigned(self, 0, to, gen);
+  if (wide_unsigned_vk(self)) return random_unsigned(self, 0, to, gen);
   complex_random_error(self, 0, to);
   if (!random_ok(self)) {
     on_cpu("aten::random_", "to", self, to, gen);

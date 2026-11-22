@@ -23,6 +23,10 @@ WIDE = torch.float64 if HAS_FLOAT64 else torch.float32
 # A 32-bit Arm userspace (Termux on Android phones), whose CPU kernels differ
 # from x86's in a few results the tests compare against (see their uses).
 ARM32 = platform.machine().startswith("arm") and sys.maxsize < 2**32
+# The most elements a tensor may have: PyTorch's numel check refuses more than
+# size_t holds ("numel: integer multiplication overflow"), 2^32 - 1 on 32-bit
+# builds (c10/core/TensorImpl.h, safe_compute_numel).
+MAX_NUMEL = min(2**63 - 1, 2 * sys.maxsize + 1)
 # Android (Termux): sys.platform is "android" from Python 3.13, and Android
 # builds of older versions have sys.getandroidapilevel.
 ANDROID = sys.platform == "android" or hasattr(sys, "getandroidapilevel")

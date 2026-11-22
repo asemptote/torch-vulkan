@@ -27,22 +27,17 @@ struct NormGradParams {
 static_assert(sizeof(NormGradParams) == 88 && offsetof(NormGradParams, outer) == 72,
               "must match shaders/normgrad.slang");
 
-constexpr int64_t kMaxGroups = 65535;
-
 bool defined(const std::optional<at::Tensor>& t) {
   return t.has_value() && t->defined();
 }
 
-// float64 for float64, float32 for float32 and the 16-bit types; Undefined
-// when the kernels cannot take x.
+// The dtype the kernels compute x in (float_compute_type); Undefined when
+// they cannot take x.
 at::ScalarType compute_type(const at::Tensor& x) {
-  at::ScalarType t = x.scalar_type();
-  if (t == at::kDouble) return vkt_has_float64() ? at::kDouble : at::ScalarType::Undefined;
-  if (t == at::kFloat || t == at::kHalf || t == at::kBFloat16) return at::kFloat;
-  return at::ScalarType::Undefined;
+  return float_compute_type(x.scalar_type()).value_or(at::ScalarType::Undefined);
 }
 
-bool all_vk(std::initializer_list<const std::optional<at::Tensor>*> ts) {
+bool all_vk_float(std::initializer_list<const std::optional<at::Tensor>*> ts) {
   for (const auto* t : ts) {
     if (defined(*t) && (!is_vk(**t) || !at::isFloatingType((*t)->scalar_type()))) return false;
   }
@@ -101,7 +96,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_backward(
   std::optional<at::Tensor> g_opt = grad_out, x_opt = input;
   bool kernel = t != at::ScalarType::Undefined && input.dim() >= 2 && input.numel() > 0 &&
                 input.numel() < (int64_t(1) << 31) && grad_out.sizes().equals(input.sizes()) && stats_given &&
-                all_vk({&g_opt, &x_opt, &weight, &running_mean, &running_var, &save_mean, &save_invstd});
+                all_vk_float({&g_opt, &x_opt, &weight, &running_mean, &running_var, &save_mean, &save_invstd});
   for (const auto* s : {&weight, &running_mean, &running_var, &save_mean, &save_invstd}) {
     kernel = kernel && (!defined(*s) || (*s)->numel() == C);
   }
@@ -156,9 +151,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
   bool kernel = t != at::ScalarType::Undefined && group > 0 && C % group == 0 && N > 0 && C > 0 && HxW > 0 &&
                 input.numel() == N * C * HxW && input.numel() < (int64_t(1) << 31) &&
                 grad_out.sizes().equals(input.sizes()) && mean.numel() == N * group && rstd.numel() == N * group &&
-                (!defined(gamma) || gamma->numel() == C) && all_vk({&g_opt, &x_opt, &m_opt, &r_opt, &gamma});
+                (!defined(gamma) || gamma->numel() == C) && all_vk_float({&g_opt, &x_opt, &m_opt, &r_opt, &gamma});
   if (!kernel && N == 0 && t != at::ScalarType::Undefined && group > 0 && C > 0 && HxW > 0 && C % group == 0 &&
-      input.numel() == 0 && all_vk({&g_opt, &x_opt, &m_opt, &r_opt, &gamma})) {
+      input.numel() == 0 && all_vk_float({&g_opt, &x_opt, &m_opt, &r_opt, &gamma})) {
     // (no samples: the parameter gradients are zeros, as the CPU's)
     auto popts = input.options().dtype(defined(gamma) ? gamma->scalar_type() : input.scalar_type());
     return {mask[0] ? at::empty(input.sizes(), input.options()) : at::Tensor(),
@@ -201,9 +196,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_group_norm_backward(
 }
 
 }  // namespace
-
-std::pair<at::Tensor, at::Tensor> slice_moments(const at::Tensor& x3);
-at::Tensor slice_affine(const at::Tensor& x3, const at::Tensor& a, const at::Tensor& c);
 
 namespace {
 

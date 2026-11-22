@@ -10,6 +10,12 @@
 //!
 //!   and is then compiled once per combination of axis values, as kernel
 //!   `<stem>_<label>[_<label>...]` with `-D T=<type> -D T_<label>`.
+//!   Combinations the host never launches are left out with `skip` lines,
+//!   each naming one or more labels of some of the axes (a variant is
+//!   skipped if every axis named has one of the labels listed):
+//!
+//!       // skip: T=f64 S=bf16
+//!       // skip: T=f32,f16 TILE=r8n2
 //! - `shaders/test/*.slang` (kernels used only by vkcore's own tests and
 //!   examples) are compiled only with the `test-kernels` feature.
 //! - Each variant is recompiled only when its inputs change: a hash of the
@@ -94,23 +100,60 @@ fn axes(source: &str) -> Vec<(String, Vec<(String, String)>)> {
         .collect()
 }
 
-/// Every combination of axis values: (name suffix, defines).
-fn variants(axes: &[(String, Vec<(String, String)>)]) -> Vec<(String, Vec<String>)> {
-    let mut out = vec![(String::new(), Vec::new())];
+/// A `// skip:` line: for some axes, the labels a skipped variant has.
+type Skip = Vec<(String, Vec<String>)>;
+
+/// The `// skip:` lines at the top of `source`, checked against its axes.
+fn skips(source: &str, axes: &[(String, Vec<(String, String)>)]) -> Vec<Skip> {
+    source
+        .lines()
+        .take_while(|l| l.starts_with("//"))
+        .filter_map(|l| l.trim_start_matches('/').trim().strip_prefix("skip:"))
+        .map(|rest| {
+            rest.split_whitespace()
+                .map(|term| {
+                    let (axis, labels) = term.split_once('=').expect("skip term needs AXIS=label[,label...]");
+                    let values = &axes.iter().find(|(n, _)| n == axis).unwrap_or_else(|| panic!("skip: no axis {axis}")).1;
+                    let labels: Vec<String> = labels.split(',').map(str::to_owned).collect();
+                    for l in &labels {
+                        assert!(values.iter().any(|(v, _)| v == l), "skip: axis {axis} has no label {l}");
+                    }
+                    (axis.to_owned(), labels)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A variant being built: (name suffix, defines, (axis, label) pairs).
+type Partial<'a> = (String, Vec<String>, Vec<(&'a str, &'a str)>);
+
+/// Every combination of axis values but the skipped ones: (name suffix,
+/// defines).
+fn variants(axes: &[(String, Vec<(String, String)>)], skips: &[Skip]) -> Vec<(String, Vec<String>)> {
+    // (with each variant, its label per axis, to match against the skips)
+    let mut out: Vec<Partial> = vec![(String::new(), Vec::new(), Vec::new())];
     for (name, values) in axes {
         out = out
             .into_iter()
-            .flat_map(|(suffix, defines)| {
+            .flat_map(|(suffix, defines, labels)| {
                 values.iter().map(move |(label, ty)| {
                     let mut d = defines.clone();
                     d.push(format!("{name}={ty}"));
                     d.push(format!("{name}_{label}"));
-                    (format!("{suffix}_{label}"), d)
+                    let mut l = labels.clone();
+                    l.push((name.as_str(), label.as_str()));
+                    (format!("{suffix}_{label}"), d, l)
                 })
             })
             .collect();
     }
-    out
+    let skipped = |labels: &[(&str, &str)]| {
+        skips.iter().any(|skip| {
+            skip.iter().all(|(axis, ls)| labels.iter().any(|(a, l)| a == axis && ls.iter().any(|x| x == l)))
+        })
+    };
+    out.into_iter().filter(|(_, _, labels)| !skipped(labels)).map(|(s, d, _)| (s, d)).collect()
 }
 
 /// `opcodes.txt` lines as (FAMILY_NAME, code).
@@ -215,7 +258,8 @@ fn main() {
             continue;
         }
         let text = std::fs::read_to_string(src).unwrap();
-        for (suffix, defines) in variants(&axes(&text)) {
+        let axes = axes(&text);
+        for (suffix, defines) in variants(&axes, &skips(&text, &axes)) {
             let name = format!("{stem}{suffix}");
             assert!(names.insert(name.clone()), "two shaders produce kernel {name}; rename one");
             let spv = out.join(format!("{name}.spv"));

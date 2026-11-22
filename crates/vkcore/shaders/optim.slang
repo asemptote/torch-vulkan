@@ -1,5 +1,7 @@
 // axis T: f32=float f64=double
 // axis S: t=T bf16=uint16_t
+// skip: T=f64 S=bf16
+// (bfloat16 state: float32 parameters only, as CUDA's fused Adam)
 //
 // Fused optimiser steps (torch.optim with fused=True), one launch per
 // parameter tensor, elementwise over its n contiguous elements, with the

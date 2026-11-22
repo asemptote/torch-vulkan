@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from _util import check, make, on_gpu
+from _util import MAX_NUMEL, check, make, on_gpu
 
 TOL = dict(rtol=2e-4, atol=2e-4)
 
@@ -286,6 +286,8 @@ def test_grid_sample_nearest_half_way(align_corners):
 def test_grid_sample_3d_bicubic_wide_expanded_axis(size):
     # (an expanded axis wider than the indexing kernels address: every tap
     # reads its one element)
+    if size > MAX_NUMEL:
+        pytest.skip("more elements than this build of PyTorch allows (32-bit)")
     volume = torch.ones(1, 1, 1, 1, 1, device="vk").expand(1, 1, 1, 1, size)
     grid = torch.tensor([[[[[1.0, 0.0, 0.0]]]]], device="vk")
     for pad in ("zeros", "border", "reflection"):
@@ -296,6 +298,8 @@ def test_grid_sample_3d_bicubic_wide_expanded_axis(size):
 
 def test_index_wide_expanded_dim():
     # (indices into an expanded dim beyond int32's range, below it)
+    if 2 ** 33 > MAX_NUMEL:
+        pytest.skip("more elements than this build of PyTorch allows (32-bit)")
     x = torch.arange(3.0, device="vk")[1:2].expand(2 ** 33)
     with on_gpu():
         assert x[torch.tensor([5, 2 ** 31 - 2, -1], device="vk")].tolist() == [1.0, 1.0, 1.0]
@@ -440,8 +444,8 @@ def test_rms_norm_and_robust_loss_backward_kernels(dtype):
 
 
 DIRECT_CONV_SCRIPT = r"""
-import torch, torch.nn.functional as F, torch_vulkan as tv
-if tv._native.kernel_subgroup_size("conv4s_f32_d1_r8n1") != 16:
+import os, torch, torch.nn.functional as F, torch_vulkan as tv
+if os.environ["TORCH_VK_CONV"] == "direct" and tv._native.kernel_subgroup_size("conv4s_f32_d1_r8n1") != 16:
     print("skip")
     raise SystemExit
 torch.manual_seed(0)
@@ -490,11 +494,14 @@ print(worst)
 """
 
 
-def test_direct_conv():
-    # shaders/conv4s.slang (the default on Mali; elsewhere through
-    # TORCH_VK_CONV=direct where the GPU runs 16-lane subgroups): stride-1
-    # convolutions reading the padded input in place, float32 sums rounded once
-    out = subprocess.run([sys.executable, "-c", DIRECT_CONV_SCRIPT], env=dict(os.environ, TORCH_VK_CONV="direct"),
+@pytest.mark.parametrize("route", ["direct", "im2col"])
+def test_direct_conv(route):
+    # shaders/conv4s.slang (TORCH_VK_CONV=direct: wherever the GPU runs
+    # 16-lane subgroups, by default on Intel and for some 16-bit cases on
+    # Mali): stride-1 convolutions reading the padded input in place, float32
+    # sums rounded once; and the same through im2col columns, which the
+    # direct kernel otherwise takes on those GPUs
+    out = subprocess.run([sys.executable, "-c", DIRECT_CONV_SCRIPT], env=dict(os.environ, TORCH_VK_CONV=route),
                          capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
     last = out.stdout.strip().splitlines()[-1]

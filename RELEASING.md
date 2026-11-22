@@ -46,7 +46,7 @@ as tested:
   for its userspace (the `wheel-termux-arm` or `wheel-termux-aarch64`
   artifact of a release-workflow run by hand, `gh workflow run release.yml`)
   installed with pip as a Termux user would, and the smoke test
-  (`TORCH_VK_STRICT=1 python tools/release_smoke.py`) on the GPU. The
+  (`python tools/release_smoke.py`, with the CPU fallback off) on the GPU. The
   workflow tests the aarch64 wheel only on lavapipe, and the arm wheel only
   for importing (lavapipe's 32-bit ARM shaders fault), so this is their GPU
   check.

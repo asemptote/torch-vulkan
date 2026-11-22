@@ -94,12 +94,6 @@ bool special_gpu(uint32_t code, const at::Tensor& a, const at::Tensor* b, double
   return true;
 }
 
-// The dtype of a functional result: floats keep theirs, integers and bools
-// become the default float dtype.
-at::ScalarType float_result(at::ScalarType t) {
-  return at::isFloatingType(t) ? t : at::typeMetaToScalarType(c10::get_default_dtype());
-}
-
 struct Special {
   const char* name;  // aten op (functional; "out" is the out= overload)
   uint32_t code;

@@ -31,8 +31,6 @@
 namespace vk {
 namespace {
 
-constexpr int64_t kMaxGroups = 65535;
-
 struct Q8Params {
   uint64_t a, b, scales, c;
   uint32_t m, n, k;

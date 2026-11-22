@@ -56,7 +56,6 @@ constexpr int64_t kSgThreads = 128, kSgRows = 8;  // WG and MR in shaders/gemmsg
 constexpr int64_t kSgOccupancy = 8;  // gemmsg workgroups an SM runs at once (k is split below that)
 constexpr int64_t kTile4M = 8, kTile4N = 128;  // BM, BN in shaders/gemm4.slang
 constexpr int64_t kTile4sM = 16, kTile4sN = 64;  // BM, BN in shaders/gemm4s.slang
-constexpr int64_t kMaxGroups = 65535;
 
 struct SplitKParams {
   uint64_t ws, c, cin;
@@ -293,8 +292,6 @@ bool gemv(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
            static_cast<uint32_t>(groups), static_cast<uint32_t>(batch));
   return true;
 }
-
-int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 }  // namespace
 

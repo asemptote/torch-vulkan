@@ -896,8 +896,9 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 // The CPU fallback: off by default (an op without a Vulkan kernel for its
 // arguments raises NotImplementedError, as on Apple's MPS), on with
 // TORCH_VK_CPU_FALLBACK=1 or torch_vulkan.set_cpu_fallback(True). The older
-// TORCH_VK_STRICT still works: STRICT=1 is the default, STRICT=0 turns the
-// fallback on; TORCH_VK_CPU_FALLBACK wins where both are set.
+// TORCH_VK_STRICT still works until 0.4 (deprecated: the Python package
+// warns at import): STRICT=1 is the default, STRICT=0 turns the fallback on;
+// TORCH_VK_CPU_FALLBACK wins where both are set.
 // TORCH_VK_LINALG=cpu, which asks for LAPACK on the CPU, turns it on too.
 namespace {
 std::atomic<bool>& fallback_switch() {
@@ -1042,13 +1043,13 @@ bool is_half_vk(const at::Tensor& t) {
   return s == at::kHalf || s == at::kBFloat16 || is_small_int(s);
 }
 
-at::ScalarType widened(at::ScalarType s) {
+at::ScalarType half_arg_type(at::ScalarType s) {
   return is_small_int(s) ? at::kInt : (at::isComplexType(s) ? at::kComplexFloat : at::kFloat);
 }
 
 at::Tensor widen_half_arg(const at::Tensor& t) {
   if (!is_half_vk(t)) return t;
-  return at::_to_copy(t, t.options().dtype(widened(t.scalar_type())));
+  return at::_to_copy(t, t.options().dtype(half_arg_type(t.scalar_type())));
 }
 
 // Ops whose integer results depend on the dtype's width beyond wrapping

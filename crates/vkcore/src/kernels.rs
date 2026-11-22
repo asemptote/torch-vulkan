@@ -426,6 +426,22 @@ mod tests {
         assert_eq!(w.len(), n);
     }
 
+    /// The shaders' `// skip:` lines leave out the variants the host never
+    /// launches, and only those (build.rs).
+    #[test]
+    fn skipped_variants() {
+        let has = |name: &str| SPIRV.iter().any(|(n, _)| *n == name);
+        for name in ["optim_f64_bf16", "fft_reg_c128_e16", "cast_f32_f32", "cast_bf16_bf16", "conv4s_f16h_d1_r8n1",
+                     "conv4s_f32_d2_r8n2", "conv4s_bf16_d5_r8n2"] {
+            assert!(!has(name), "{name} compiled");
+        }
+        for name in ["optim_f32_bf16", "optim_f64_t", "fft_reg_c64_e16", "fft_reg_c128_e8", "cast_f32_f64", "cast_b8_u8",
+                     "cast_bf16_f16", "conv4s_f16h_d1_r8n2", "conv4s_f16h_d5_r4n2", "conv4s_f32_d1_r8n1",
+                     "conv4s_bf16_d3_r4n2"] {
+            assert!(has(name), "{name} missing");
+        }
+    }
+
     /// build.rs removes every OpTypeForwardPointer (spirv_fix.rs).
     #[test]
     fn kernels_have_no_forward_pointers() {

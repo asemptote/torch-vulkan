@@ -1,6 +1,10 @@
 // axis T: f32=float f16=half bf16=uint16_t f16h=half
 // axis D: d1=int d2=int d3=int d5=int
 // axis TILE: r8n1=int r4n2=int r8n2=int
+// skip: T=f16h TILE=r8n1
+// skip: T=f32,f16,bf16 TILE=r8n2
+// (the tiles csrc/convolution.cpp's conv4s_tile picks: r4n2 on Mali, else
+// r8n2 for float16 arithmetic, r8n1 otherwise)
 //
 // Direct convolution (stride 1, 1 to 3 spatial dims) for GPUs with 16-lane
 // subgroups, on gemm4s.slang's scheme (A shared across a subgroup by

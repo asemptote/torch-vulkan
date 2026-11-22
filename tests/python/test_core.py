@@ -12,17 +12,20 @@ import torch_vulkan as tv
 from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
-def test_version_matches_the_installed_package():
+def test_version():
     import importlib.metadata
+    import pathlib
+    import tomllib
 
-    try:
-        installed = importlib.metadata.version("torch-vulkan")
-    except importlib.metadata.PackageNotFoundError:
-        # An in-tree build on the path, not installed (Termux's build-termux.sh):
-        # there is no metadata, and __version__ says so (#66).
-        assert tv.__version__ == "unknown"
-        return
-    assert tv.__version__ == installed
+    # A source tree's package (an in-tree build: maturin develop, or Termux's
+    # build-termux.sh through PYTHONPATH, which installs no metadata) has
+    # pyproject.toml's version (#66); a wheel's, the installed metadata's.
+    pyproject = pathlib.Path(tv.__file__).resolve().parents[2] / "pyproject.toml"
+    if pyproject.is_file():
+        with open(pyproject, "rb") as f:
+            assert tv.__version__ == tomllib.load(f)["project"]["version"]
+    else:
+        assert tv.__version__ == importlib.metadata.version("torch-vulkan")
 
 
 @pytest.mark.parametrize("dtype", ALL + [torch.float16, torch.uint8, torch.complex64])
@@ -126,6 +129,8 @@ def test_cpu_fallback_environment(env, expected):
                          timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.split() == [expected, str(expected == "ran")]
+    # (the older switch warns, once, that it goes in 0.4)
+    assert out.stderr.count("TORCH_VK_STRICT is deprecated") == ("TORCH_VK_STRICT" in env)
 
 
 def test_autograd():
