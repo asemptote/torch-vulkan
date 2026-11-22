@@ -7,7 +7,8 @@
 //  - forward: im2col as a strided view of the padded input (one copy kernel)
 //    and a batched GEMM against the weight (for one sample or one group,
 //    the weight times the columns laid out as rows, the bias added by it);
-//  - depthwise (one input channel per group): one multiply-add per tap;
+//  - depthwise (one input channel per group): shaders/dwconv.slang, forward
+//    and the weight's gradient in one launch each;
 //  - transposed, with a stride: one convolution of the input for all the
 //    stride's phases (sub-pixel convolution), interleaved into the output;
 //    without (or where the phases would not save work): an ordinary
@@ -161,9 +162,7 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   // (fewer than 3 inner taps, padded to 4, waste half the work or more:
   // M46's transposed-convolution phases, with 2 taps, ran 1.5x slower)
   if (KW < 3) return {};
-  int64_t Cg = C / groups, Cog = Co / groups, taps = 1;
-  for (int64_t d = 0; d < s; ++d) taps *= w.size(2 + d);
-  if (Cg == 1 && taps <= 32) return {};  // (depthwise: multiply-adds per tap, in conv_forward)
+  int64_t Cg = C / groups, Cog = Co / groups;
   // Crop for negative padding; then the padded sizes.
   at::Tensor x = x_in;
   std::vector<std::pair<int64_t, int64_t>> pad = pad_in;
@@ -250,6 +249,126 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   return y;
 }
 
+// shaders/dwconv.slang's Params.
+struct DwconvParams {
+  uint64_t x, w, y, bias;
+  uint32_t total, gstride, cm, m;
+  uint32_t osz[4], isz[4], st[4], dl[4];
+  int32_t pd[4];
+};
+static_assert(sizeof(DwconvParams) == 128, "must match shaders/dwconv.slang");
+
+// dwconv.slang's variant (axis T) for dtype t on this device, or null.
+const char* dwconv_label(at::ScalarType t) {
+  switch (t) {
+    case at::kFloat: return "f32";
+    case at::kDouble: return has_feature(kFeatureFloat64) ? "f64" : nullptr;
+    case at::kInt: return "i32";
+    case at::kLong: return "i64";
+    case at::kHalf: return has_feature(kFeatureFloat16) && has_feature(kFeatureInt16) ? "f16" : nullptr;
+    case at::kBFloat16: return has_feature(kFeatureInt16) ? "bf16" : nullptr;
+    default: return nullptr;
+  }
+}
+
+// Whether shaders/dwconv.slang can take a depthwise convolution (x [N, G,
+// *S], w [G M, 1, *K], output [N, G M, *O]) of dtype t: a variant for t
+// on this device, and 32-bit element offsets. TORCH_VK_DWCONV=0 turns it
+// off (comparisons: depthwise convolutions then take the grouped products).
+bool dwconv_ok(const at::Tensor& x, at::IntArrayRef wsize, int64_t groups, at::IntArrayRef out) {
+  static const bool off = [] {
+    const char* env = std::getenv("TORCH_VK_DWCONV");
+    return env != nullptr && std::strcmp(env, "0") == 0;
+  }();
+  int64_t s = x.dim() - 2, Co = wsize[0], L = 1, taps = 1;
+  if (off || dwconv_label(x.scalar_type()) == nullptr || x.size(1) != groups || wsize[1] != 1 || Co % groups != 0) {
+    return false;
+  }
+  for (int64_t d = 0; d < s; ++d) {
+    L *= out[d];
+    taps *= wsize[2 + d];
+  }
+  return x.size(0) * Co * L < (int64_t(1) << 31) && x.numel() < (int64_t(1) << 31) && Co * taps < (int64_t(1) << 31);
+}
+
+// dwconv.slang's sizes, strides, dilations and padding for x [N, G, *S], a
+// weight of size wsize, output sizes out (all contiguous).
+DwconvParams dwconv_params(const at::Tensor& x, at::IntArrayRef wsize, at::IntArrayRef stride,
+                           const std::vector<std::pair<int64_t, int64_t>>& pad, at::IntArrayRef dilation,
+                           int64_t groups, at::IntArrayRef out) {
+  int64_t s = x.dim() - 2;
+  DwconvParams p{};
+  p.cm = static_cast<uint32_t>(wsize[0]);
+  p.m = static_cast<uint32_t>(wsize[0] / groups);
+  uint32_t* ksz[3] = {&p.osz[3], &p.isz[3], &p.st[3]};  // (KD, KH, KW ride in the 4th lanes)
+  for (int64_t e = 0; e < 3; ++e) {
+    int64_t d = e - (3 - s);  // (the spatial dim, or < 0 for a leading size-1 dim)
+    p.osz[e] = d < 0 ? 1 : static_cast<uint32_t>(out[d]);
+    p.isz[e] = d < 0 ? 1 : static_cast<uint32_t>(x.size(2 + d));
+    *ksz[e] = d < 0 ? 1 : static_cast<uint32_t>(wsize[2 + d]);
+    p.st[e] = d < 0 ? 1 : static_cast<uint32_t>(stride[d]);
+    p.dl[e] = d < 0 ? 1 : static_cast<uint32_t>(dilation[d]);
+    p.pd[e] = d < 0 ? 0 : static_cast<int32_t>(pad[d].first);
+  }
+  return p;
+}
+
+// A depthwise convolution (one input channel per group: x [N, G, *S], w
+// [G M, 1, *K]) by shaders/dwconv.slang: one launch, x read in place
+// (taps outside it skipped; negative padding crops), each output's taps
+// summed in order in T (float32 for 16-bit types, rounded once), the bias
+// added last. Returns an undefined tensor where it does not apply.
+at::Tensor conv_depthwise(const at::Tensor& x_in, const at::Tensor& w, const std::optional<at::Tensor>& bias,
+                          at::IntArrayRef stride, const std::vector<std::pair<int64_t, int64_t>>& pad,
+                          at::IntArrayRef dilation, int64_t groups, at::IntArrayRef out) {
+  at::ScalarType t = x_in.scalar_type();
+  bool use_bias = bias.has_value() && bias->defined();
+  if (w.scalar_type() != t || (use_bias && bias->scalar_type() != t) || !dwconv_ok(x_in, w.sizes(), groups, out)) {
+    return {};
+  }
+  at::Tensor x = x_in.contiguous(), wc = w.contiguous();
+  std::vector<int64_t> out_shape = {x.size(0), w.size(0)};
+  out_shape.insert(out_shape.end(), out.begin(), out.end());
+  at::Tensor y = at::empty(out_shape, x.options());
+  at::Tensor b = use_bias ? bias->contiguous() : at::Tensor();
+  DwconvParams p = dwconv_params(x, w.sizes(), stride, pad, dilation, groups, out);
+  p.x = gpu_address(x);
+  p.w = gpu_address(wc);
+  p.y = gpu_address_out(y);
+  p.bias = use_bias ? gpu_address(b) : 0;
+  p.total = static_cast<uint32_t>(y.numel());
+  uint32_t ngroups = 0;
+  check(vkt_grid_1d(static_cast<uint64_t>(p.total), &ngroups, &p.gstride));
+  dispatch(std::string("dwconv_") + dwconv_label(t), {use_bias ? 1u : 0u, 0u}, p, ngroups);
+  return y;
+}
+
+// The weight's gradient of a depthwise convolution (x [N, G, *S], g [N, G M,
+// *O], weight [G M, 1, *K]) by shaders/dwconv.slang: one workgroup per
+// (tap, output channel) sums g x over the batch and positions. Returns an
+// undefined tensor where it does not apply.
+at::Tensor conv_depthwise_weight_grad(const at::Tensor& x_in, const at::Tensor& g_in, at::IntArrayRef wsize,
+                                      at::IntArrayRef stride, const std::vector<std::pair<int64_t, int64_t>>& pad,
+                                      at::IntArrayRef dilation, int64_t groups) {
+  at::IntArrayRef out = g_in.sizes().slice(2);
+  int64_t taps = 1;
+  for (size_t d = 2; d < wsize.size(); ++d) taps *= wsize[d];
+  if (g_in.scalar_type() != x_in.scalar_type() || !dwconv_ok(x_in, wsize, groups, out) || taps > 65535 ||
+      wsize[0] > 65535) {
+    return {};
+  }
+  at::Tensor x = x_in.contiguous(), g = g_in.contiguous();
+  at::Tensor gw = at::empty(wsize, x.options());
+  DwconvParams p = dwconv_params(x, wsize, stride, pad, dilation, groups, out);
+  p.x = gpu_address(x);
+  p.w = gpu_address_out(gw);
+  p.y = gpu_address(g);
+  p.total = static_cast<uint32_t>(x.size(0));
+  dispatch(std::string("dwconv_") + dwconv_label(x.scalar_type()), {0u, 1u}, p, static_cast<uint32_t>(taps),
+           static_cast<uint32_t>(wsize[0]));
+  return gw;
+}
+
 // Plain convolution: x [N, C, *S], w [Co, C/G, *K], symmetric or asymmetric
 // zero padding pad[d] = (lo, hi).
 at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::optional<at::Tensor>& bias,
@@ -267,6 +386,9 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   if (N == 0 || Co == 0 || L == 0) {
     return at::zeros(out_shape, x.options());
   }
+  if (at::Tensor y = conv_depthwise(x, w, bias, stride, pad, dilation, groups, out); y.defined()) {
+    return y;
+  }
   if (at::Tensor y = conv_direct(x, w, bias, stride, pad, dilation, groups, out); y.defined()) {
     return y;
   }
@@ -280,42 +402,6 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
   int64_t Kp = 1;
   for (int64_t v : k) Kp *= v;
   int64_t Cg = C / groups, Cog = Co / groups;
-  if (Cg == 1 && Kp <= 32) {
-    // Depthwise (one input channel per group): per tap, one multiply-add of
-    // the input's strided view into the result, [N, G, Cog, *O] (a product
-    // per group would have one row of k = Kp values: tiny matrices).
-    std::vector<int64_t> acc_shape = {N, groups, Cog}, xv_shape = {N, groups, 1}, w_shape = {1, groups, Cog};
-    std::vector<int64_t> xv_strides = {xp.stride(0), xp.stride(1), 0};
-    for (int64_t d = 0; d < s; ++d) {
-      acc_shape.push_back(out[d]);
-      xv_shape.push_back(out[d]);
-      xv_strides.push_back(xp.stride(2 + d) * stride[d]);
-      w_shape.push_back(1);
-    }
-    at::Tensor wt = w.reshape({Co, Kp});
-    at::Tensor acc = at::empty(acc_shape, x.options());
-    bool first = true;
-    if (bias.has_value() && bias->defined()) {
-      acc.copy_(bias->view(w_shape).expand(acc_shape));
-      first = false;
-    }
-    for (int64_t t = 0; t < Kp; ++t) {
-      int64_t offset = xp.storage_offset(), rest = t;
-      for (int64_t d = s - 1; d >= 0; --d) {
-        offset += (rest % k[d]) * dilation[d] * xp.stride(2 + d);
-        rest /= k[d];
-      }
-      at::Tensor xv = xp.as_strided(xv_shape, xv_strides, offset);
-      at::Tensor wv = wt.select(1, t).view(w_shape);
-      if (first) {
-        at::mul_out(acc, xv, wv);
-        first = false;
-      } else {
-        acc.addcmul_(xv, wv);
-      }
-    }
-    return acc.view(out_shape);
-  }
   if (groups == 1 || N == 1) {
     // out[n, g] = W_g [Cog, Cg*K] @ cols[n, g] [Cg*K, L]: the columns are
     // rows along the output positions (for stride 1, runs of the input),
@@ -609,6 +695,11 @@ at::Tensor conv_weight_grad(const at::Tensor& x, const at::Tensor& g, at::IntArr
   int64_t Cg = C / groups, Cog = Co / groups;
   if (N == 0 || L == 0) {
     return at::zeros(wsize, x.options());
+  }
+  if (Cg == 1) {
+    if (at::Tensor gw = conv_depthwise_weight_grad(x, g, wsize, stride, pad, dilation, groups); gw.defined()) {
+      return gw;
+    }
   }
   at::Tensor cols = im2col_view(pad_spatial(x, pad), k, stride, dilation, out);      // [N, L, C*K]
   cols = cols.reshape({N * L, groups, Cg * Kp}).permute({1, 0, 2});                  // [G, N*L, Cg*K]
