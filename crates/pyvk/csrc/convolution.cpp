@@ -202,6 +202,9 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   // (virtual columns: up to the last output's, rounded up to whole workgroups of columns)
   int64_t nv = ((Do - 1) * Hp + (Ho - 1)) * Wp + Wo;
   if (s >= 2 && Wo < 8) return {};  // (mostly wrapped columns: the columns' product does better)
+  // (few output positions, many channels: the product of columns did better
+  // on both GPUs measured, e.g. 1024 channels over 242 frames)
+  if (N * nv < 2048) return {};
   int64_t KH = s >= 2 ? w.size(-2) : 1, KD = s == 3 ? w.size(2) : 1, KO = KD * KH;
   int64_t off_h = s >= 2 ? dilation[s - 2] * Wp : 0, off_d = s == 3 ? dilation[0] * Hp * Wp : 0;
   const Conv4sTile& tile = conv4s_tile(half_math);
