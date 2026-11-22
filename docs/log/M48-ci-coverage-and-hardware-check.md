@@ -91,6 +91,8 @@ exposing one would pass unnoticed).
 
 ## Cost
 
-On the lab machine (4 lavapipe threads, validation on), the 8-lane pass
-took 285 s and the 16-lane pass without float64 466 s (16-wide code on
-AVX2 is two instructions per operation).
+In CI (this change's first run), the 8-lane pass: 1958 passed, 20 skipped
+in 241 s; the 16-lane pass without float64: 1472 passed, 495 skipped (480
+of them float64) in 102 s; the whole check 13 minutes instead of about 10.
+On the lab machine (4 lavapipe threads) the same two passes took 285 s and
+222 s.
