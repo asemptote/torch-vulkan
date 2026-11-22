@@ -1,4 +1,4 @@
-# Composites of many launches: an audit, and four kernels (M49)
+# Composites of many launches: an audit, and four kernels (M50)
 
 This cleanup looked for ops built from many small kernel launches. It
 started from #110, which added one launch per tap for convolution weights
