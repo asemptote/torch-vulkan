@@ -59,9 +59,9 @@ in chunks.
 
 | Route | Kernels | Selected when | Force with | Tuned on |
 |---|---|---|---|---|
-| Direct | `conv4s` (`conv4s_f16h` with float16 arithmetic); tile `r4n2` on Mali, else `r8n2` with float16 arithmetic, `r8n1` without | GPUs with 16-lane subgroups; on Mali only for float16 arithmetic, or float16/bfloat16 with 5 or more inner taps. Stride 1, inner dilation 1, 2, 3 or 5, at least 3 inner taps, not depthwise with at most 32 taps, 2-D/3-D outputs at least 8 wide, at least 2048 output positions over the batch, sizes within 32-bit offsets and 65535 workgroups | `TORCH_VK_CONV=direct` / `im2col`, `TORCH_VK_FP16_ARITHMETIC` | HD 530, Mali-G57 (M47; the 2048 and width rules on both) |
+| Direct | `conv4s` (`conv4s_f16h` with float16 arithmetic); tile `r4n2` on Mali, else `r8n2` with float16 arithmetic, `r8n1` without | GPUs with 16-lane subgroups; on Mali only for float16 arithmetic, or float16/bfloat16 with 5 or more inner taps. Stride 1, inner dilation 1, 2, 3 or 5, at least 3 inner taps, not depthwise, 2-D/3-D outputs at least 8 wide, at least 2048 output positions over the batch, sizes within 32-bit offsets and 65535 workgroups | `TORCH_VK_CONV=direct` / `im2col`, `TORCH_VK_FP16_ARITHMETIC` | HD 530, Mali-G57 (M47; the 2048 and width rules on both) |
 | float16/bfloat16 in float32 | the float32 routes below | 16-bit inputs `conv4s` did not take: computed in float32, rounded once | shape | — |
-| Depthwise multiply-adds | element-wise kernels | one input channel per group and at most 32 taps: one multiply-add per tap | shape | HD 530 (M46); the 32 is not measured |
+| Depthwise | `dwconv` | one input channel per group (any taps, stride, dilation, multiplier; float32, float64, int32, int64, and float16/bfloat16 storage), element offsets within 32 bits: one invocation per output | `TORCH_VK_DWCONV=0` (the products below) | HD 530, Mali-G57, lavapipe, L40S (M48) |
 | Rows layout | im2col columns and `bmm` | one group, or one sample: W [Cout, Cin K] @ columns, bias as the product's beta | shape | Mali-G57, HD 530, lavapipe (M39) |
 | Columns layout | im2col columns and `bmm` | groups > 1 and a batch: columns [G, N L, Cin K] @ W^T | shape | — |
 
@@ -71,8 +71,9 @@ stride exceeds 1 or a dilation of at least the stride leaves the phases as
 many taps as the kernel; then by zero insertion: the input with zeros
 inserted, convolved with the flipped weight. Either way the convolutions
 take the forward routes above. Phases were measured on the Mali-G57,
-HD 530, lavapipe and L40S (M46). The weight gradient is always im2col
-columns and `bmm`. Convolution products stay in float32 at every
+HD 530, lavapipe and L40S (M46). The weight gradient is im2col columns
+and `bmm`, or `dwconv`'s weight-gradient mode for a depthwise convolution
+(`TORCH_VK_DWCONV=0`: the columns). Convolution products stay in float32 at every
 `float32_matmul_precision`.
 
 ## FFT
@@ -126,12 +127,12 @@ cover each route by shape.
 `test_matmul.py` (`TORCH_VK_GEMM`, `TORCH_VK_SUBGROUP`, `TORCH_VK_SPLIT_K`,
 `TORCH_VK_GEMM_TILE`, `TORCH_VK_GEMM_GROUP`, `TORCH_VK_COMPUTE_UNITS`,
 `float32_matmul_precision`), `test_gemv4.py` (`TORCH_VK_GEMV`), `test_nn.py`
-(`TORCH_VK_CONV`), `test_linalg_gpu.py` (`TORCH_VK_EIGH_QL`,
+(`TORCH_VK_CONV`, `TORCH_VK_DWCONV`), `test_linalg_gpu.py` (`TORCH_VK_EIGH_QL`,
 `TORCH_VK_SVD_JACOBI`) and `test_fp16_arithmetic.py`. A forced route still
 runs only where the device can run its kernel (16-lane subgroups,
 cooperative matrices), and the tests skip elsewhere. The routes chosen by
 shape alone are covered by the shapes in the tests: the gemv grid limit,
-the `gemm4` copies, depthwise and the two im2col layouts, phases and zero
+the `gemm4` copies, the two im2col layouts, phases and zero
 insertion, and the FFT routes the device's shared memory allows (radix
 passes beyond 2^14 only where the register passes do not fit). The Jacobi
 fallbacks of `eigh` and `svd` depend on the data and are not forced.

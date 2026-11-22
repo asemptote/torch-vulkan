@@ -4,13 +4,16 @@
     python benchmarks/conv.py --dtype float32  # one dtype
     python benchmarks/conv.py --filter transpose
     python benchmarks/conv.py --cpu            # the CPU too (torch's thread count)
+    python benchmarks/conv.py --backward       # forward and backward (input and weight gradients)
 
 The cases are Kokoro-82M's vocoder convolutions (one sentence: 29,041 audio
 samples, 4,840 at the middle rate, 242 frames), its two upsampling transposed
 convolutions, and 2-D shapes of an image model (a VAE decoder's stride-2
-upsampling, a ResNet block). GFLOP/s counts the useful multiply-adds (2 per
-tap that reaches the output, not the zeros a transposed convolution would
-insert), so paths that do less work show it as speed.
+upsampling, a ResNet block), and depthwise convolutions (MobileNet's and
+ConvNeXt's, a conformer's 1-D one). GFLOP/s counts the useful multiply-adds
+(2 per tap that reaches the output, not the zeros a transposed convolution
+would insert), so paths that do less work show it as speed; with --backward
+three times that.
 """
 
 import os
@@ -39,7 +42,13 @@ CASES = [
     ("conv_transpose2d 256->128 k4 s2 64x64", "transpose", 1, 256, 128, 4, 2, 1, 1, 1, (64, 64)),
     ("conv_transpose2d 128->64 k3 s2 op1 b4", "transpose", 4, 128, 64, 3, 2, 1, 1, 1, (32, 32)),
     ("conv2d 64->64 k3 56x56 b8", "conv", 8, 64, 64, 3, 1, 1, 1, 1, (56, 56)),
+    ("conv2d depthwise 64 k3 56x56 b8", "conv", 8, 64, 64, 3, 1, 1, 1, 64, (56, 56)),
+    ("conv2d depthwise 64 k3 s2 56x56 b8", "conv", 8, 64, 64, 3, 2, 1, 1, 64, (56, 56)),
+    ("conv2d depthwise 64->128 k3 56x56 b8", "conv", 8, 64, 128, 3, 1, 1, 1, 64, (56, 56)),
+    ("conv2d depthwise 96 k7 56x56 b8", "conv", 8, 96, 96, 7, 1, 3, 1, 96, (56, 56)),
+    ("conv1d depthwise 256 k31 L1000 b4", "conv", 4, 256, 256, 31, 1, 15, 1, 256, (1000,)),
 ]
+BACKWARD = False
 
 
 def seconds(fn, sync, budget=0.5):
@@ -66,8 +75,8 @@ def flops(kind, n, cin, cout, k, stride, groups, spatial):
     if kind == "transpose":
         # every input position reaches K^dims outputs per output channel
         return 2 * n * positions * (cin // groups) * cout * taps
-    out = positions  # (stride 1, same padding, in these cases)
-    return 2 * n * out * (cin // groups) * cout * taps
+    out = positions // stride**dims  # (same padding, in these cases)
+    return 2 * n * out * (cin // groups) * cout * taps * (3 if BACKWARD else 1)
 
 
 def run(case, dtype, device):
@@ -86,6 +95,14 @@ def run(case, dtype, device):
         w = torch.randn((cout, cin // groups) + (k,) * dims, generator=g).div(k**0.5).to(device, dtype)
         fn = [F.conv1d, F.conv2d, F.conv3d][dims - 1]
         call = lambda: fn(x, w, None, stride, pad, dil, groups)  # noqa: E731
+    if BACKWARD:
+        x.requires_grad_()
+        w.requires_grad_()
+        forward = call
+        grad = forward().detach().clone()
+
+        def call():
+            torch.autograd.grad(forward(), (x, w), grad)
     sync = tv.synchronize if device == "vk" else (lambda: None)
     t = seconds(call, sync)
     return t, flops(kind, n, cin, cout, k, stride, groups, spatial) / t / 1e9
@@ -104,6 +121,8 @@ def main():
         filt = args[i + 1]
         del args[i : i + 2]
     cpu = "--cpu" in args
+    global BACKWARD
+    BACKWARD = "--backward" in args
     env = {k: v for k, v in os.environ.items() if k.startswith("TORCH_VK_") and not k.startswith("TORCH_VK_BENCH")}
     print(f"{tv.device_name()} {env or ''}, torch {torch.__version__}")
     for dt in dtypes:

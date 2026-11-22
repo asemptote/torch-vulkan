@@ -138,14 +138,8 @@ def test_conv_transpose_phases_dtypes(dtype):
     check(got, want, **tol)
 
 
-@pytest.mark.parametrize("dims,mult,k,stride,pad,dil,n,length", [
-    (1, 1, 3, 1, 1, 1, 2, 30), (1, 3, 31, 1, 15, 1, 1, 64), (1, 2, 5, 3, 0, 2, 2, 41),
-    (2, 1, 3, 1, 1, 1, 2, 12), (2, 1, 3, 2, 1, 1, 3, 13), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15),
-    (2, 1, (3, 1), (1, 2), (0, 0), (2, 1), 2, 9), (3, 1, 3, 1, 1, 1, 1, 7), (3, 2, (2, 3, 1), 2, 1, (1, 2, 1), 2, 8),
-])
-def test_conv_depthwise(dims, mult, k, stride, pad, dil, n, length):
-    # one input channel per group, mult outputs each: shaders/dwconv.slang,
-    # forward (one launch) and backward; taps past 32, strides, dilations
+def depthwise_case(dims, mult, k, stride, pad, dil, n, length):
+    """A depthwise convolution (5 channels, mult outputs each) and its inputs."""
     c = 5
     spatial = (length, length - 2, length - 1)[:dims]
     x = make((n, c) + spatial, torch.float32)
@@ -153,11 +147,24 @@ def test_conv_depthwise(dims, mult, k, stride, pad, dil, n, length):
     w = make((c * mult, 1) + ks, torch.float32, 1)
     b = make((c * mult,), torch.float32, 2)
     conv = [F.conv1d, F.conv2d, F.conv3d][dims - 1]
-    compare_with_cpu(lambda x, w, b: conv(x, w, b, stride, pad, dil, c), x, w, b)
-    compare_with_cpu(lambda x, w: conv(x, w, None, stride, pad, dil, c), x, w)
+    return (lambda x, w, b: conv(x, w, b, stride, pad, dil, c)), x, w, b
+
+
+@pytest.mark.parametrize("dims,mult,k,stride,pad,dil,n,length", [
+    (1, 1, 3, 1, 1, 1, 2, 30), (1, 3, 31, 1, 15, 1, 1, 64), (1, 2, 5, 3, 0, 2, 2, 41),
+    (2, 1, 3, 1, 1, 1, 2, 12), (2, 1, 3, 2, 1, 1, 3, 13), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15),
+    (2, 1, (3, 1), (1, 2), (0, 0), (2, 1), 2, 9), (3, 1, 3, 1, 1, 1, 1, 7), (3, 2, (2, 3, 1), 2, 1, (1, 2, 1), 2, 8),
+])
+def test_conv_depthwise(dims, mult, k, stride, pad, dil, n, length):
+    # one input channel per group, mult outputs each: shaders/dwconv.slang,
+    # forward (one launch) and backward (the weight's gradient in one launch);
+    # taps past 32, strides, dilations
+    fn, x, w, b = depthwise_case(dims, mult, k, stride, pad, dil, n, length)
+    compare_with_cpu(fn, x, w, b)
+    compare_with_cpu(lambda x, w: fn(x, w, None), x, w)
     with on_gpu():
         before = tv._native.dispatch_count()
-        conv(x.to("vk"), w.to("vk"), b.to("vk"), stride, pad, dil, c)
+        fn(x.to("vk"), w.to("vk"), b.to("vk"))
         assert tv._native.dispatch_count() - before == 1
 
 
@@ -183,6 +190,20 @@ def test_conv_depthwise_dtypes(dtype):
     with on_gpu():
         got = F.conv2d(x.to("vk"), w.to("vk"), b.to("vk"), 2, 1, 1, 6)
     check(got, want, **tol)
+
+
+def test_conv_depthwise_grouped_products():
+    # TORCH_VK_DWCONV=0: depthwise convolutions as grouped products (the
+    # other route, for comparison), in a subprocess
+    script = ("import sys; sys.path.insert(0, %r)\n" % os.path.dirname(__file__) +
+              "import test_nn as t\n"
+              "for case in [(1, 3, 5, 3, 1, 1, 1, 2, 30), (2, 2, (7, 5), 1, (3, 2), 1, 1, 15), (3, 1, 3, 1, 1, 1, 1, 7)]:\n"
+              "    t.compare_with_cpu(*t.depthwise_case(*case))\n"
+              "print('ok')\n")
+    out = subprocess.run([sys.executable, "-c", script], env=dict(os.environ, TORCH_VK_DWCONV="0"),
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "ok"
 
 
 def test_conv_depthwise_layouts_and_nonfinite():
