@@ -30,7 +30,7 @@ the venv should stay on the fast one, since every test process imports torch
 from it.
 
 The scripts that reach the machines from the local repo (`queue-run.sh`,
-`dev.sh`, `sync.sh`) and `full-run.sh` read the site's details (ssh options,
+`dev.sh`, `sync.sh`) read the site's details (ssh options,
 user name, host names, PBS queues, the shared run directory) from the
 environment or from `tools/cluster/cluster.env`, git-ignored: copy
 `cluster.env.example` there and fill it in. `sync.sh` and `dev.sh` copy it
@@ -48,9 +48,13 @@ home directory and rebuilds there with `build.sh` (log in
   machine, no GPU) or `nvidia`.
 - `pbs-lavapipe.sh`: a PBS job array, one single-core lavapipe shard per job.
 - `pbs-gpu.sh`: one GPU job running several shards side by side on its GPU.
-- `full-run.sh NAME [--gpu]` (on the head node): the standard full run, all
-  test files in `test_files.txt` in 48 lavapipe shards, and with `--gpu` one H100 job
-  of 16 shards alongside (a separate queue). (Thirteen files took about an hour.)
+- `pbs-vs-cuda.sh`: `benchmarks/vs_cuda.py` on a GPU node, vk against the
+  same PyTorch release built for CUDA (`CUDA_PYTHON`), for the README's
+  benchmark tables.
+
+A full run (every file in `test_files.txt`) goes through the queues below
+(`queue-run.sh`); these scripts run a fixed set of shards by hand, such as a
+rerun of one run's failures on one GPU.
 
 Each script's header has a `qsub` example. Pass several test files in
 `TEST_FILES` to run each one's slice in the same shard. To re-run only the
