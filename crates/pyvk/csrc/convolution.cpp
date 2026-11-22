@@ -136,10 +136,11 @@ const Conv4sTile& conv4s_tile(bool half_math) {
 // shaders/conv4s.slang: where the device runs it (16-lane subgroups with
 // shuffles: Intel's and Mali's Valhall GPUs) and it was measured faster than
 // im2col columns and a matrix product (docs/log/M47): on Intel always; on
-// Mali for float16 and bfloat16 (float32 stays with gemm4s's product, as
-// fast or faster there). TORCH_VK_CONV=im2col never, =direct wherever it
-// runs.
-bool use_conv4s(at::ScalarType t) {
+// Mali for float16 arithmetic, and float16 and bfloat16 with 5 or more
+// inner taps (float32, and 16-bit types with 3 or 4 taps, stay with
+// gemm4s's product, as fast or faster there). TORCH_VK_CONV=im2col never,
+// =direct wherever it runs.
+bool use_conv4s(at::ScalarType t, int64_t kw, bool half_math) {
   static const std::string choice = [] {
     const char* env = std::getenv("TORCH_VK_CONV");
     return std::string(env != nullptr ? env : "");
@@ -149,7 +150,7 @@ bool use_conv4s(at::ScalarType t) {
   static const bool bf16 = runs && has_feature(kFeatureInt16);
   bool can = t == at::kFloat ? runs : t == at::kHalf ? f16 : t == at::kBFloat16 ? bf16 : false;
   if (!can || choice == "direct" || !arm_gpu()) return can;
-  return t != at::kFloat;
+  return half_math || (t != at::kFloat && kw >= 5);
 }
 
 // A stride-1 convolution by shaders/conv4s.slang (where use_conv4s), reading
@@ -165,7 +166,7 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   at::ScalarType t = x_in.scalar_type();
   int64_t s = x_in.dim() - 2, N = x_in.size(0), C = x_in.size(1), Co = w.size(0);
   bool half_math = t == at::kHalf && fp16_arithmetic();
-  if (!use_conv4s(t) || w.scalar_type() != t ||
+  if (!use_conv4s(t, w.size(-1), half_math) || w.scalar_type() != t ||
       (bias.has_value() && bias->defined() && bias->scalar_type() != t)) {
     return {};
   }
