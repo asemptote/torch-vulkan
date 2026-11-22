@@ -34,9 +34,11 @@ Open an issue or a GitHub discussion. There is no chat channel.
   work (FFT twiddles, rotation schedules), makes control decisions from a few
   scalars read back (convergence, pivot errors), and reproduces PyTorch's
   errors where PyTorch rejects an input.
-- **PyTorch's CPU fallback is a safety net, not a design choice.** It is
-  counted by `torch_vulkan.fallback_counts()` and is an error under
-  `TORCH_VK_STRICT=1`; an op that falls back is a bug or a listed gap.
+- **PyTorch's CPU fallback is an opt-in safety net, not a design choice.**
+  It is off by default (an op without a kernel raises `NotImplementedError`),
+  on with `TORCH_VK_CPU_FALLBACK=1`, and counted by
+  `torch_vulkan.fallback_counts()`; an op that needs it is a bug or a listed
+  gap.
   `TORCH_VK_LINALG=cpu` is a reference for testing and comparison, not a
   performance option: a slow GPU kernel is fixed on the GPU.
 - **Match PyTorch's CPU results** within the tolerances PyTorch's own tests

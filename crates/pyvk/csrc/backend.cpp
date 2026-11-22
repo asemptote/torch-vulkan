@@ -26,6 +26,7 @@
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/impl/alloc_cpu.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -892,13 +893,45 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 
 }  // namespace
 
-// TORCH_VK_STRICT=1: every op must run on Vulkan; a CPU fallback raises.
-bool strict_mode() {
-  static const bool strict = [] {
-    const char* v = std::getenv("TORCH_VK_STRICT");
-    return v != nullptr && *v != '\0' && std::string(v) != "0";
-  }();
-  return strict;
+// The CPU fallback: off by default (an op without a Vulkan kernel for its
+// arguments raises NotImplementedError, as on Apple's MPS), on with
+// TORCH_VK_CPU_FALLBACK=1 or torch_vulkan.set_cpu_fallback(True). The older
+// TORCH_VK_STRICT still works: STRICT=1 is the default, STRICT=0 turns the
+// fallback on; TORCH_VK_CPU_FALLBACK wins where both are set.
+// TORCH_VK_LINALG=cpu, which asks for LAPACK on the CPU, turns it on too.
+namespace {
+std::atomic<bool>& fallback_switch() {
+  static std::atomic<bool> on([] {
+    auto set = [](const char* name) -> const char* {
+      const char* v = std::getenv(name);
+      return v != nullptr && *v != '\0' ? v : nullptr;
+    };
+    if (const char* v = set("TORCH_VK_CPU_FALLBACK")) return std::string(v) != "0";
+    if (const char* v = set("TORCH_VK_STRICT")) return std::string(v) == "0";
+    const char* linalg = set("TORCH_VK_LINALG");
+    return linalg != nullptr && std::string(linalg) == "cpu";
+  }());
+  return on;
+}
+}  // namespace
+
+bool cpu_fallback_enabled() {
+  return fallback_switch().load(std::memory_order_relaxed);
+}
+
+void set_cpu_fallback(bool on) {
+  fallback_switch().store(on, std::memory_order_relaxed);
+}
+
+// The error for an op that would compute on the CPU with the fallback off
+// (counted as "op (refused)").
+void refuse_fallback(const std::string& op) {
+  count_fallback(op + " (refused)", false);
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "torch_vulkan: ", op,
+                              " has no Vulkan kernel for these arguments, and the CPU fallback is off. "
+                              "To run it on the CPU instead (slower), set TORCH_VK_CPU_FALLBACK=1 or call "
+                              "torch_vulkan.set_cpu_fallback(True). Please report the op: "
+                              "https://github.com/asemptote/torch-vulkan/issues");
 }
 
 void check_out_devices(const c10::FunctionSchema& schema, const torch::jit::Stack& stack) {
@@ -1778,11 +1811,11 @@ void run_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack, bool 
                               op.schema().name(), "' with arguments from the 'vk' backend: it has no vk or CPU kernel.");
   // Counted and warned about only once the CPU has computed something: where
   // it only raises (a dtype or argument check, say), the call is counted
-  // apart as "op (raised)", silently, and its error is the user's. Under
-  // TORCH_VK_STRICT the CPU runs on copies first, so that its own error
-  // still reaches the user; only a call it would compute raises
+  // apart as "op (raised)", silently, and its error is the user's. With the
+  // fallback off the CPU runs on copies first, so that its own error still
+  // reaches the user; only a call it would compute raises
   // NotImplementedError.
-  if (strict_mode()) {
+  if (!cpu_fallback_enabled()) {
     strict_probe(op, *stack, key);
   }
   try {
@@ -1802,13 +1835,12 @@ void count_fallback(const std::string& op, bool warn) {
 }
 
 void record_fallback(const std::string& op) {
-  TORCH_CHECK_NOT_IMPLEMENTED(!strict_mode(), "torch_vulkan: ", op,
-                              " has no Vulkan kernel (TORCH_VK_STRICT forbids running it on the CPU)");
+  if (!cpu_fallback_enabled()) refuse_fallback(op);
   count_fallback(op, true);
 }
 
-// TORCH_VK_STRICT: the op on CPU copies of the vk tensors (so nothing the
-// caller holds changes): its error if it raises, else NotImplementedError.
+// With the fallback off: the op on CPU copies of the vk tensors (so nothing
+// the caller holds changes): its error if it raises, else NotImplementedError.
 void strict_probe(const c10::OperatorHandle& op, const torch::jit::Stack& stack, const std::string& key) {
   size_t n = std::min(stack.size(), op.schema().arguments().size());
   auto host = [](const c10::IValue& v) -> c10::IValue {
@@ -1838,21 +1870,23 @@ void strict_probe(const c10::OperatorHandle& op, const torch::jit::Stack& stack,
     count_fallback(key + " (raised)", false);
     throw;
   }
-  TORCH_CHECK_NOT_IMPLEMENTED(false, "torch_vulkan: ", key,
-                              " has no Vulkan kernel (TORCH_VK_STRICT forbids running it on the CPU)");
+  refuse_fallback(key);
 }
 
 }  // namespace vk
 
 // For Python-registered kernels (torch_vulkan/_decomp.py) that hand an op
-// to the CPU: counted and warned about like the C++ fallbacks. Returns 1 in
-// strict mode (TORCH_VK_STRICT), where the caller raises instead.
+// to the CPU: counted and warned about like the C++ fallbacks. Returns 1
+// with the fallback off, where the caller raises instead (counted as
+// "op (refused)").
 extern "C" int vkt_record_fallback(const char* op) {
   try {
     std::string name(op);
-    const std::string raised = " (raised)";
-    if (name.size() > raised.size() && name.compare(name.size() - raised.size(), raised.size(), raised) == 0) {
-      vk::count_fallback(name, false);  // (the CPU only raised: counted, silently, strict or not)
+    auto ends_with = [&](const std::string& tail) {
+      return name.size() > tail.size() && name.compare(name.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    if (ends_with(" (raised)") || ends_with(" (refused)")) {
+      vk::count_fallback(name, false);  // (the CPU only raised: counted, silently, the fallback on or off)
       return 0;
     }
     vk::record_fallback(name);
@@ -1860,6 +1894,14 @@ extern "C" int vkt_record_fallback(const char* op) {
   } catch (const std::exception&) {
     return 1;
   }
+}
+
+extern "C" int vkt_cpu_fallback_enabled() {
+  return vk::cpu_fallback_enabled() ? 1 : 0;
+}
+
+extern "C" void vkt_set_cpu_fallback(int on) {
+  vk::set_cpu_fallback(on != 0);
 }
 
 extern "C" void vkt_read_log_mark(const char* name) {

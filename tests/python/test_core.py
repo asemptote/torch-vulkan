@@ -57,18 +57,75 @@ def test_factories():
     assert r.shape == (100,) and r.device.type == "vk" and r.std().item() > 0.5
 
 
-@pytest.mark.skipif(os.environ.get("TORCH_VK_STRICT", "0") not in ("", "0"), reason="TORCH_VK_STRICT forbids the fallback")
-def test_cpu_fallback_matches_and_is_counted():
-    # (uint32, one of PyTorch's barely supported unsigned dtypes, has no sort kernel)
+@contextlib.contextmanager
+def cpu_fallback(enabled):
+    was = tv.cpu_fallback_enabled()
+    tv.set_cpu_fallback(enabled)
+    try:
+        yield
+    finally:
+        tv.set_cpu_fallback(was)
+
+
+def test_no_cpu_fallback_by_default():
+    # (uint32, one of PyTorch's barely supported unsigned dtypes, has no sort
+    # kernel: with the fallback off, the default, NotImplementedError naming
+    # the op and the switch, counted as refused)
     x = torch.tensor([3, 1, 4, 1, 5, 9, 2, 6], dtype=torch.uint32)
     name = "aten::sort.values_stable"
-    before = tv.fallback_counts().get(name, 0)
-    with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
-        got = torch.sort(x.to("vk")).values
-    check(got, torch.sort(x).values)
-    assert tv.fallback_counts()[name] == before + 1
-    y = make((20,), WIDE)
-    check(y.to("vk").sum(), y.sum())
+    with cpu_fallback(False):
+        before = tv.fallback_counts()
+        with pytest.raises(NotImplementedError, match=r"aten::sort\.values_stable has no Vulkan kernel.*"
+                                                      r"TORCH_VK_CPU_FALLBACK=1.*set_cpu_fallback\(True\)"):
+            torch.sort(x.to("vk"))
+        after = tv.fallback_counts()
+    assert after.get(name, 0) == before.get(name, 0)
+    assert after[name + " (refused)"] == before.get(name + " (refused)", 0) + 1
+
+
+def test_cpu_fallback_matches_and_is_counted():
+    x = torch.tensor([3, 1, 4, 1, 5, 9, 2, 6], dtype=torch.uint32)
+    name = "aten::sort.values_stable"
+    with cpu_fallback(True):
+        assert tv.cpu_fallback_enabled()
+        before = tv.fallback_counts().get(name, 0)
+        with pytest.warns(UserWarning, match="no Vulkan kernel") if before == 0 else contextlib.nullcontext():
+            got = torch.sort(x.to("vk")).values
+        check(got, torch.sort(x).values)
+        assert tv.fallback_counts()[name] == before + 1
+        y = make((20,), WIDE)
+        check(y.to("vk").sum(), y.sum())
+
+
+FALLBACK_SCRIPT = """
+import torch, torch_vulkan
+x = torch.tensor([3, 1, 2], dtype=torch.uint32).to("vk")
+try:
+    torch.sort(x)
+    print("ran", torch_vulkan.cpu_fallback_enabled())
+except NotImplementedError:
+    print("refused", torch_vulkan.cpu_fallback_enabled())
+"""
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({}, "refused"),
+    ({"TORCH_VK_CPU_FALLBACK": "1"}, "ran"),
+    ({"TORCH_VK_CPU_FALLBACK": "0"}, "refused"),
+    ({"TORCH_VK_STRICT": "1"}, "refused"),
+    ({"TORCH_VK_STRICT": "0"}, "ran"),  # (the older switch, kept)
+    ({"TORCH_VK_STRICT": "0", "TORCH_VK_CPU_FALLBACK": "0"}, "refused"),
+    ({"TORCH_VK_STRICT": "1", "TORCH_VK_CPU_FALLBACK": "1"}, "ran"),
+], ids=lambda v: ",".join(f"{k}={x}" for k, x in v.items()) if isinstance(v, dict) else v)
+def test_cpu_fallback_environment(env, expected):
+    import subprocess
+    import sys
+
+    base = {k: v for k, v in os.environ.items() if k not in ("TORCH_VK_CPU_FALLBACK", "TORCH_VK_STRICT")}
+    out = subprocess.run([sys.executable, "-c", FALLBACK_SCRIPT], env={**base, **env}, capture_output=True, text=True,
+                         timeout=300)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split() == [expected, str(expected == "ran")]
 
 
 def test_autograd():

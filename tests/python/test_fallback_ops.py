@@ -137,16 +137,17 @@ print("warned" if any("running it on the CPU" in str(x.message) for x in w) else
 """
 
 
-@pytest.mark.parametrize("strict", ["0", "1"])
-def test_cpu_check_that_only_raises_is_no_fallback(strict):
+@pytest.mark.parametrize("fallback", ["0", "1"])
+def test_cpu_check_that_only_raises_is_no_fallback(fallback):
     # (a CPU call that only raises, as for invalid compressed indices, gives
-    # the CPU's error with no "running it on the CPU" warning, also under
-    # TORCH_VK_STRICT, which then must not turn it into NotImplementedError)
+    # the CPU's error with no "running it on the CPU" warning, with the CPU
+    # fallback on, and with it off, which then must not turn it into
+    # NotImplementedError)
     import os
     import subprocess
     import sys
 
-    out = subprocess.run([sys.executable, "-c", STRICT_SCRIPT], env=dict(os.environ, TORCH_VK_STRICT=strict),
+    out = subprocess.run([sys.executable, "-c", STRICT_SCRIPT], env=dict(os.environ, TORCH_VK_CPU_FALLBACK=fallback),
                          capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.split() == ["same", "error", "no", "warning"], out.stdout
