@@ -115,6 +115,7 @@ jobs:
     needs: wheel-linux
     runs-on: ubuntu-24.04
     env:
+      GALLIUM_OVERRIDE_CPU_CAPS: "avx"  # (lavapipe's code AVX2 at most: see ci.yml)
       LP_NATIVE_VECTOR_WIDTH: "256"
     steps:
       - uses: actions/checkout@v4

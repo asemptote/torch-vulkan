@@ -1,4 +1,4 @@
-# PyTorch's test files a full run takes (queue-run.sh, full-run.sh), one per
+# PyTorch's test files a full run takes (queue-run.sh), one per
 # line; device-generic (instantiate_device_type_tests) unless noted.
 # Not taken: quantisation, jit, fx, mps, dataloader, CUDA-only files, and the
 # compiler/tracing ones (dynamo, inductor, export, fake/proxy tensors), and

@@ -108,24 +108,41 @@ optional.
 The extension's C++ layer is compiled against one PyTorch release, and the
 tests compare with that release's CPU results. That release is named in one
 place, `tools/torch-version`; `pyproject.toml` allows only its minor version,
-and CI's `tools/check_torch_version.py` fails if the two disagree. To move to
-a new release:
+and CI's `tools/check_torch_version.py` fails if the two disagree. Moving to
+a new release is one procedure, in this order:
 
-1. Update `tools/torch-version` and the torch requirement in
-   `pyproject.toml`, and rebuild.
-2. Regenerate the files derived from PyTorch's own code:
-   `python tools/port_special.py` (`shaders/_special.slang`, from ATen's
-   `Math.h`) and `python tools/dev/cpu_dtype_errors.py` (the CPU's dtype
-   errors that vk raises itself: the table's signatures probed again on the
-   new CPU, plus any new ones from a fallback-detail run given as
-   arguments). Review their diffs, and the release notes for checks whose
-   exception type changed (2.15 made many `TypeError` or
-   `NotImplementedError`): vk's kernels repeat some of those checks.
-3. Run `tests/python`, the strict OpInfo sweep and PyTorch's test files
-   (`tools/pytorch_tests.py`); differences in the CPU's results between
-   releases (2.15's float16 `linspace`, for example) show up here.
-4. Update the PyTorch version in the README's installation and building
-   sections.
+1. Set `tools/torch-version` and the torch requirement in `pyproject.toml`,
+   install that torch (`uv pip install "torch==$(cat tools/torch-version)"
+   --index-url https://download.pytorch.org/whl/cpu`) and rebuild.
+2. Regenerate what is derived from PyTorch's own code:
+   `python tools/dev/regenerate.py [RUN_DIR...]`. It checks the versions
+   agree and that `pytorch-src/` (PyTorch's tests) is at the new release's
+   commit, then runs `tools/port_special.py` (`shaders/_special.slang`, from
+   ATen's `Math.h`) and `tools/dev/cpu_dtype_errors.py` (the CPU's dtype
+   errors that vk raises itself, in `csrc/cpu_dtype_errors.inc` and
+   `python/torch_vulkan/_cpu_dtype_errors.py`: the table's signatures probed
+   again on the new CPU, plus any new ones from the RUN_DIRs of a
+   `TORCH_VK_FALLBACK_DETAIL=1` run of `tools/pytorch_tests.py`), and checks
+   the table against the CPU. Review the diffs, and the release notes for
+   checks whose exception type changed (2.15 made many `TypeError` or
+   `NotImplementedError`): vk's kernels repeat some of those checks. Rebuild
+   (the table is compiled in).
+3. `python -m pytest -q` (`tests/python`) and the strict OpInfo sweep
+   (`python tools/opinfo_coverage.py --strict --jobs 4`); differences in the
+   CPU's results between releases (2.15's float16 `linspace`, for example)
+   show up here.
+4. PyTorch's test files: a full run of `tools/pytorch_tests.py` on lavapipe
+   and on an NVIDIA GPU (`tools/cluster/queue-run.sh`), merged per driver
+   with `--merge`. New vk-only failures are fixed, or, when they are not vk
+   bugs, get an `EXPECTED` entry with the evidence; the merge also lists the
+   `EXPECTED` entries whose tests ran but matched no failure, which are
+   removed unless another driver's run still needs them. Rerun the failures
+   with `TORCH_VK_FALLBACK_DETAIL=1` and give their directories to step 2 if
+   new dtype errors reached the CPU.
+5. Termux's `python-torch` must be the same release before the next release
+   is tagged (the release workflow checks; `tools/termux_ci.sh`).
+6. Update the PyTorch version in the README's installation and building
+   sections (the maintainer does this at release time).
 
 ## Maintenance and support
 
