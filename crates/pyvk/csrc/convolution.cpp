@@ -174,6 +174,9 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   }
   int64_t KW = w.size(-1), DW = dilation[s - 1];
   if (DW != 1 && DW != 2 && DW != 3 && DW != 5) return {};  // (the kernel's variants: axis D)
+  // (fewer than 3 inner taps, padded to 4, waste half the work or more:
+  // M46's transposed-convolution phases, with 2 taps, ran 1.5x slower)
+  if (KW < 3) return {};
   int64_t Cg = C / groups, Cog = Co / groups, taps = 1;
   for (int64_t d = 0; d < s; ++d) taps *= w.size(2 + d);
   if (Cg == 1 && taps <= 32) return {};  // (depthwise: multiply-adds per tap, in conv_forward)
