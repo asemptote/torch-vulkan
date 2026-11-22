@@ -28,7 +28,7 @@ static_assert(sizeof(NllParams) == 80 && offsetof(NllParams, ignore) == 64, "mus
 constexpr int64_t kNone = 0, kMean = 1;
 
 // (t: the kernel's dtype, by default self's)
-bool kernel_ok(const at::Tensor& self, const at::Tensor& target, const std::optional<at::Tensor>& weight,
+bool nll_kernel_ok(const at::Tensor& self, const at::Tensor& target, const std::optional<at::Tensor>& weight,
                at::ScalarType t = at::ScalarType::Undefined) {
   if (t == at::ScalarType::Undefined) t = self.scalar_type();
   bool dtype = t == at::kFloat || (t == at::kDouble && vkt_has_float64());
@@ -76,7 +76,7 @@ void launch(uint32_t op, NllParams& p, at::ScalarType t, bool has_weight, bool p
 std::tuple<at::Tensor, at::Tensor> nll_loss_forward(const at::Tensor& self, const at::Tensor& target,
                                                     const std::optional<at::Tensor>& weight, int64_t reduction,
                                                     int64_t ignore_index) {
-  if (!kernel_ok(self, target, weight)) {
+  if (!nll_kernel_ok(self, target, weight)) {
     if (is_vk(self)) {
       // (the CPU's checks, in its order: shapes, weight, target dtype)
       check_shapes(self, target, true);
@@ -128,7 +128,7 @@ at::Tensor nll_loss_backward(const at::Tensor& grad_output, const at::Tensor& se
   at::ScalarType kt = half ? at::kFloat : t;
   std::optional<at::Tensor> kweight =
       half && weight.has_value() && weight->defined() ? std::optional<at::Tensor>(weight->to(at::kFloat)) : weight;
-  if (!kernel_ok(self, target, kweight, kt) || !is_vk(grad_output) ||
+  if (!nll_kernel_ok(self, target, kweight, kt) || !is_vk(grad_output) ||
       !is_vk(total_weight) || grad_output.scalar_type() != t || total_weight.scalar_type() != t) {
     return on_cpu("aten::nll_loss_backward", "", grad_output, self, target, weight, reduction, ignore_index,
                   total_weight)[0]

@@ -262,13 +262,9 @@ std::optional<at::Scalar> clamp_bound(const std::optional<at::Scalar>& bound, at
   return std::nullopt;
 }
 
-// uint16, uint32 and uint64 have no arithmetic kernels: they are clamped as
-// the signed type that orders them the same way (uint16 and uint32 widened,
-// uint64 with its top bit flipped), and converted back.
-bool wide_unsigned(at::ScalarType t) {
-  return t == at::kUInt16 || t == at::kUInt32 || t == at::kUInt64;
-}
-
+// uint16, uint32 and uint64 (wide_unsigned) have no arithmetic kernels: they
+// are clamped as the signed type that orders them the same way (uint16 and
+// uint32 widened, uint64 with its top bit flipped), and converted back.
 at::Tensor unsigned_to_signed(const at::Tensor& t) {
   switch (t.scalar_type()) {
     case at::kUInt16: return t.view(at::kShort).to(at::kInt).bitwise_and(0xFFFF);
@@ -842,14 +838,9 @@ at::Tensor& div_mode_out(const at::Tensor& self, const at::Tensor& other, std::o
 // from their .out overload; their functional and in-place overloads need
 // kernels of their own, which allocate (or reuse self) and call the .out op.
 
-at::ScalarType float_result(const at::Tensor& self) {
-  return at::isFloatingType(self.scalar_type()) ? self.scalar_type()
-                                                : c10::typeMetaToScalarType(at::get_default_dtype());
-}
-
 at::Tensor angle(const at::Tensor& self) {
-  at::ScalarType dtype =
-      at::isComplexType(self.scalar_type()) ? c10::toRealValueType(self.scalar_type()) : float_result(self);
+  at::ScalarType t = self.scalar_type();
+  at::ScalarType dtype = at::isComplexType(t) ? c10::toRealValueType(t) : float_result(t);
   at::Tensor out = at::empty({0}, self.options().dtype(dtype));
   return angle_out(self, out);
 }
@@ -884,7 +875,7 @@ at::Tensor& hardtanh_(at::Tensor& self, const at::Scalar& min, const at::Scalar&
 }
 
 at::Tensor logit(const at::Tensor& self, std::optional<double> eps) {
-  at::Tensor out = at::empty({0}, self.options().dtype(float_result(self)));
+  at::Tensor out = at::empty({0}, self.options().dtype(float_result(self.scalar_type())));
   return logit_out(self, eps, out);
 }
 

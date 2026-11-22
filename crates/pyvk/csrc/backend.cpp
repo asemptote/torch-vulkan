@@ -1042,13 +1042,13 @@ bool is_half_vk(const at::Tensor& t) {
   return s == at::kHalf || s == at::kBFloat16 || is_small_int(s);
 }
 
-at::ScalarType widened(at::ScalarType s) {
+at::ScalarType half_arg_type(at::ScalarType s) {
   return is_small_int(s) ? at::kInt : (at::isComplexType(s) ? at::kComplexFloat : at::kFloat);
 }
 
 at::Tensor widen_half_arg(const at::Tensor& t) {
   if (!is_half_vk(t)) return t;
-  return at::_to_copy(t, t.options().dtype(widened(t.scalar_type())));
+  return at::_to_copy(t, t.options().dtype(half_arg_type(t.scalar_type())));
 }
 
 // Ops whose integer results depend on the dtype's width beyond wrapping

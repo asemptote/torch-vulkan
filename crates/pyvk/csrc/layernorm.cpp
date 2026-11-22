@@ -26,8 +26,6 @@ struct LayerNormParams {
 static_assert(sizeof(LayerNormParams) == 80 && offsetof(LayerNormParams, eps) == 72,
               "must match shaders/layernorm.slang");
 
-constexpr int64_t kMaxGroups = 65535;
-
 // The CPU's _check_layer_norm_inputs, with its messages.
 void check_inputs(const at::Tensor& input, at::IntArrayRef normalized_shape, const at::Tensor& weight,
                   const at::Tensor& bias) {
@@ -51,7 +49,7 @@ void check_inputs(const at::Tensor& input, at::IntArrayRef normalized_shape, con
   }
 }
 
-bool kernel_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
+bool layernorm_kernel_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
   at::ScalarType t = x.scalar_type();
   bool dtype = t == at::kFloat || (t == at::kDouble && vkt_has_float64());
   for (const at::Tensor* p : {&w, &b}) {
@@ -110,7 +108,7 @@ bool half_ok(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
   return true;
 }
 
-at::Tensor widened(const at::Tensor& t) {
+at::Tensor as_float32(const at::Tensor& t) {
   return t.defined() ? t.to(at::kFloat) : t;
 }
 
@@ -128,11 +126,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm(const at::Tenso
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;
   if (half_ok(input, weight, bias) && m > 0 && n > 0) {
-    auto [out, mean, rstd] = vk::native_layer_norm(widened(input), normalized_shape, widened(weight), widened(bias), eps);
+    auto [out, mean, rstd] =
+        vk::native_layer_norm(as_float32(input), normalized_shape, as_float32(weight), as_float32(bias), eps);
     return {out.to(input.scalar_type()), mean, rstd};
   }
   if ((m == 0 || n == 0) && empty_ok(input, weight, bias)) return empty_layer_norm(input, k);
-  if (!kernel_ok(input, weight, bias) || m == 0 || n == 0) {
+  if (!layernorm_kernel_ok(input, weight, bias) || m == 0 || n == 0) {
     auto s = on_cpu("aten::native_layer_norm", "", input, normalized_shape, weight_opt, bias_opt, eps);
     return {s[0].toTensor(), s[1].toTensor(), s[2].toTensor()};
   }
@@ -166,8 +165,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm_backward(
   int64_t m = n == 0 ? 0 : input.numel() / n;
   if (half_ok(input, weight, bias) && m > 0 && n > 0 && is_vk(grad_out) && is_vk(mean) && is_vk(rstd) &&
       grad_out.scalar_type() == input.scalar_type() && grad_out.sizes().equals(input.sizes())) {
-    auto [gx, gw, gb] = vk::native_layer_norm_backward(widened(grad_out), widened(input), normalized_shape, widened(mean),
-                                                   widened(rstd), widened(weight), widened(bias), mask);
+    auto [gx, gw, gb] =
+        vk::native_layer_norm_backward(as_float32(grad_out), as_float32(input), normalized_shape, as_float32(mean),
+                                       as_float32(rstd), as_float32(weight), as_float32(bias), mask);
     return {gx.defined() ? gx.to(input.scalar_type()) : gx, gw.defined() ? gw.to(weight.scalar_type()) : gw,
             gb.defined() ? gb.to(bias.scalar_type()) : gb};
   }
@@ -178,7 +178,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_layer_norm_backward(
             mask[1] && weight.defined() ? zeros(weight) : at::Tensor(),
             mask[2] && bias.defined() ? zeros(bias) : at::Tensor()};
   }
-  if (!kernel_ok(input, weight, bias) || m == 0 || n == 0 || !is_vk(grad_out) ||
+  if (!layernorm_kernel_ok(input, weight, bias) || m == 0 || n == 0 || !is_vk(grad_out) ||
       grad_out.scalar_type() != input.scalar_type() || mean.scalar_type() != input.scalar_type() ||
       rstd.scalar_type() != input.scalar_type() || !grad_out.sizes().equals(input.sizes())) {
     auto s = on_cpu("aten::native_layer_norm_backward", "", grad_out, input, normalized_shape, mean, rstd, weight_opt,
@@ -243,8 +243,8 @@ std::tuple<at::Tensor, at::Tensor> fused_rms_norm(const at::Tensor& input, at::I
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;
   bool half = at::isReducedFloatingType(input.scalar_type());
-  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? widened(weight) : weight;
-  if (!kernel_ok(x, w, at::Tensor()) || m == 0 || n == 0 || k < 1) {
+  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? as_float32(weight) : weight;
+  if (!layernorm_kernel_ok(x, w, at::Tensor()) || m == 0 || n == 0 || k < 1) {
     return rms_norm_composite(input, normalized_shape, weight_opt, eps);
   }
   double e = eps.value_or(x.scalar_type() == at::kDouble ? std::numeric_limits<double>::epsilon()
@@ -273,12 +273,12 @@ std::tuple<at::Tensor, at::Tensor> fused_rms_norm_backward(const at::Tensor& gra
   int64_t n = c10::multiply_integers(normalized_shape);
   int64_t m = n == 0 ? 0 : input.numel() / n;
   bool half = at::isReducedFloatingType(input.scalar_type());
-  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? widened(weight) : weight;
+  at::Tensor x = half ? input.to(at::kFloat) : input, w = half ? as_float32(weight) : weight;
   at::Tensor g = grad_out.to(x.scalar_type()).contiguous(), rs = rstd.to(x.scalar_type()).contiguous();
   x = x.contiguous();
   at::Tensor gx, gw;
   if (mask[0]) {
-    if (kernel_ok(x, w, at::Tensor()) && m > 0 && n > 0 && is_vk(g) && is_vk(rs)) {
+    if (layernorm_kernel_ok(x, w, at::Tensor()) && m > 0 && n > 0 && is_vk(g) && is_vk(rs)) {
       gx = at::empty(input.sizes(), x.options());
       at::Tensor wc = w.defined() ? w.contiguous() : w;
       LayerNormParams p{};

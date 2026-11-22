@@ -37,13 +37,6 @@ enum : uint32_t { kScaled = 1, kMaximize = 2, kDecay = 4, kAmsgrad = 8, kMomentu
 
 using OptTensor = std::optional<at::Tensor>;
 
-// The dtype the kernel computes `t` in, or nullopt (the CPU then).
-std::optional<at::ScalarType> compute_type(at::ScalarType t) {
-  if (t == at::kFloat || t == at::kHalf || t == at::kBFloat16) return at::kFloat;
-  if (t == at::kDouble && vkt_has_float64()) return at::kDouble;
-  return std::nullopt;
-}
-
 // True if every tensor of the lists is a vk tensor with fewer than 2^31
 // elements, the shape of the parameter it belongs to, the parameters and
 // gradients (the first list) of dtype `t`, the other lists of `state`.
@@ -180,7 +173,7 @@ void fused_adam(at::TensorList params, at::TensorList grads, at::TensorList exp_
                   max_exp_avg_sqs[0].scalar_type());
     }
   }
-  auto ct = compute_type(t);
+  auto ct = float_compute_type(t);
   bool gpu = ct && (mixed ? storage_label(at::kBFloat16) != nullptr &&
                                 on_gpu(t, params, {grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}, at::kBFloat16)
                           : on_gpu(t, params, {grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs}));
@@ -232,7 +225,7 @@ void fused_sgd(at::TensorList params, at::TensorList grads, at::TensorList momen
     TORCH_CHECK(momentum_buffers.empty());
   }
   if (n == 0) return;
-  auto ct = compute_type(params[0].scalar_type());
+  auto ct = float_compute_type(params[0].scalar_type());
   if (!ct || !on_gpu(params[0].scalar_type(), params, {grads, momentum_buffers})) {
     on_cpu("aten::_fused_sgd_", "", params, grads, momentum_buffers, weight_decay, momentum, lr, dampening, nesterov,
            maximize, is_first_step, grad_scale, found_inf);
@@ -264,7 +257,7 @@ void fused_adagrad(at::TensorList params, at::TensorList grads, at::TensorList s
   TORCH_CHECK(state_sums.size() == n);
   TORCH_CHECK(state_steps.size() == n);
   if (n == 0) return;
-  auto ct = compute_type(params[0].scalar_type());
+  auto ct = float_compute_type(params[0].scalar_type());
   if (!ct || !on_gpu(params[0].scalar_type(), params, {grads, state_sums})) {
     on_cpu("aten::_fused_adagrad_", "", params, grads, state_sums, state_steps, lr, lr_decay, weight_decay, eps,
            maximize, grad_scale, found_inf);
