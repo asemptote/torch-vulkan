@@ -78,6 +78,11 @@ EIG = ("linalg.eig", "linalg.eigvals")
 # (native_layer_norm: its 16-bit saved statistics are float32 on vk, as
 # PyTorch's meta kernel and tests have them, and 16-bit on the CPU)
 FIRST_OUTPUT_ONLY = ("native_batch_norm", "_native_batch_norm_legit", "native_layer_norm")
+# Batch norm in training mode: for 16-bit inputs the saved statistics are
+# float32 on vk, as PyTorch's meta kernel and decomposition have them for
+# devices other than the CPU; the CPU's are in the input's dtype. Compared
+# by value, rounded to the CPU's dtype (issue #95).
+FLOAT32_STATS = ("_batch_norm_with_update",)
 
 
 def op_name(info):
@@ -277,6 +282,11 @@ def check_op(info, dtypes, nsamples):
                 problem = compare_eig(sample, expected, actual)
             elif name in FIRST_OUTPUT_ONLY and isinstance(expected, tuple):
                 problem = compare(expected[0], actual[0])
+            elif name in FLOAT32_STATS and isinstance(expected, tuple):
+                problem = compare(expected, tuple(
+                    a.to(e.dtype) if isinstance(a, torch.Tensor) and isinstance(e, torch.Tensor)
+                    and e.dtype in (torch.float16, torch.bfloat16) and a.dtype == torch.float32 else a
+                    for e, a in zip(expected, actual)))
             elif name in SIGN_AMBIGUOUS:
                 problem = compare(tree_map(_abs, expected), tree_map(_abs, actual))
             else:

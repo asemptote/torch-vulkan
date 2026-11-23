@@ -246,6 +246,52 @@ def test_norm_layers():
     check(vrv, rv, **TOL)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=str)
+@pytest.mark.parametrize("params", ["same", "float32", "none"])
+def test_batch_norm_with_update_16bit(dtype, params):
+    # (issue #95) as the CPU: a 16-bit input without float32 parameters is
+    # normalised with its statistics rounded to its dtype (a mean far from 0
+    # shows it: 17 float16 ulps before), and the running statistics are
+    # updated in float32 and rounded once. The saved statistics stay float32
+    # on vk, as PyTorch's meta kernel says for devices other than the CPU.
+    # (The CPU's bfloat16 running statistics are computed in bfloat16
+    # arithmetic, so they may differ by an ulp or two.)
+    if params == "float32" and dtype == torch.float32:
+        pytest.skip("not a mixed case")
+    pdt = dtype if params == "same" else torch.float32
+    for shape, loc, scale in [((4, 3, 5, 5), 0.0, 1.0), ((8, 4, 6), 5.0, 0.5), ((16, 5), 20.0, 3.0),
+                              ((3, 2, 4, 4, 2), -7.0, 0.1)]:
+        c = shape[1]
+        x = (make(shape, torch.float32) * scale + loc).to(dtype)
+        w, b = (make((c,), torch.float32, 1).to(pdt), make((c,), torch.float32, 2).to(pdt))
+        if params == "none":
+            w, b = None, None
+        rm, rv = (make((c,), torch.float32, 3) * 3).to(pdt), (make((c,), torch.float32, 4).abs() + 0.5).to(pdt)
+        vrm, vrv = rm.to("vk"), rv.to("vk")
+        want = torch.ops.aten._batch_norm_with_update(x, w, b, rm, rv, 0.1, 1e-5)
+        with on_gpu():
+            got = torch.ops.aten._batch_norm_with_update(x.to("vk"), None if w is None else w.to("vk"),
+                                                         None if b is None else b.to("vk"), vrm, vrv, 0.1, 1e-5)
+        eps = torch.finfo(dtype).eps
+        # (16-bit: an ulp or two, for statistics on either side of a rounding
+        # boundary; float32: x - mean cancels to 1 / 70 of x at loc -7, scale 0.1)
+        tol = dict(rtol=2 * eps, atol=2 * eps) if dtype != torch.float32 else dict(rtol=2e-5, atol=2e-5)
+        check(got[0], want[0], **tol)
+        for g, e in zip(got[1:3], want[1:3]):
+            assert g.dtype == torch.float32
+            torch.testing.assert_close(g.cpu().to(e.dtype), e, **tol)
+        check(vrm, rm, **tol)
+        check(vrv, rv, **tol)
+
+
+def test_batch_norm_integer_inputs_raise():
+    # (as the CPU: no batch norm for integer or bool inputs)
+    for dtype in (torch.int64, torch.uint8, torch.bool):
+        x, rm, rv = torch.ones(4, 3, 2, dtype=dtype), torch.zeros(3, dtype=dtype), torch.ones(3, dtype=dtype)
+        with pytest.raises(NotImplementedError, match="\"batch_norm\" not implemented for"):
+            torch.ops.aten._batch_norm_with_update(x.to("vk"), None, None, rm.to("vk"), rv.to("vk"), 0.1, 1e-5)
+
+
 def test_softmax_and_losses():
     x = make((6, 7), torch.float32)
     target = torch.randint(0, 7, (6,))
