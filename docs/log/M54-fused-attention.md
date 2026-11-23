@@ -87,8 +87,10 @@ which is what `gradgradcheck` uses.
 
 The fused kernel runs wherever it applies, with no size threshold: it was
 faster than the math path in every case measured, from 64 sequences of 128
-tokens to one of 8,192, on both devices measured (below), and its memory
-does not grow with L x S. `TORCH_VK_SDPA=math` prefers the math path (and
+tokens to one of 8,192, on both devices measured (below), except float16
+at head dim 128 on the H100, where it is level with the math path (and
+three times slower than the same kernel in bfloat16); its memory does not
+grow with L x S, so it is chosen there too. `TORCH_VK_SDPA=math` prefers the math path (and
 `flash` the fused kernel) when `sdpa_kernel` leaves both enabled; with only one enabled, that one
 runs, and the fused one raises PyTorch's "No available kernel" where it
 does not apply. `tests/python/test_attention.py` forces each route through
@@ -128,9 +130,13 @@ H100 NVL, forward:
 | b64 L128, 8 heads | float32 | 1.00 | 0.31 | 3.25x | 89 | 16 |
 | | float16 | 1.25 | 0.27 | 4.58x | 137 | 8 |
 
-(The Llama float16 rows were measured with float16 loaded as `half`;
-the kernel now reads float16 as its bits, as bfloat16, whose rows are 3x
-faster. To be measured again.)
+The Llama float16 rows are the outlier: level with the math path, where
+bfloat16 through the same kernel is 3x faster. They were measured with
+float16 loaded as `half`; reading it as its bits instead, as bfloat16 is
+read, did not change that (a second run, on a shared GPU whose math path
+ran 2 to 4 times slower than above: float16 22.6 ms fused against 22.8
+math, bfloat16 6.4 ms). The kernel keeps reading float16 as its bits, which
+needs no shaderFloat16; the cause of the gap is not yet known.
 
 H100 NVL, forward and backward:
 

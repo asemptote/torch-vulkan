@@ -4,9 +4,8 @@
 // Scaled dot-product attention without the attention matrix (FlashAttention
 // 2's tiling): out = softmax(q k^T scale + mask) v, its gradients, all in
 // float32 (16-bit inputs are widened as they are loaded, results rounded
-// once to nearest even; float16 is handled as its bits, which reads faster
-// than half loads on NVIDIA at the larger head dims and needs no
-// shaderFloat16). q [B, H, L, E], k [B, H / GROUP, S, E], v [B, H / GROUP, S, EV]
+// once to nearest even; float16 is handled as its bits, as bfloat16 is, so
+// it needs no shaderFloat16). q [B, H, L, E], k [B, H / GROUP, S, E], v [B, H / GROUP, S, EV]
 // with any strides along b, h and the sequence (the head dim contiguous);
 // query head h reads key / value head h / GROUP. D (64, 128, 256) bounds E
 // and EV; the spec constants E and EV are the head dims themselves.
