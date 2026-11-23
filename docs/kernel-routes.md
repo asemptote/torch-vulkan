@@ -108,6 +108,16 @@ as a reference for tests; it is not a route.
 
 LU, QR, Cholesky, triangular solves and `eig` have one route each.
 
+## Attention
+
+`scaled_dot_product_attention` (`attention.cpp`, `fused_sdp_choice`), as
+PyTorch's `SDPBackend` values:
+
+| Route | Kernels | Selected when | Force with | Tuned on |
+|---|---|---|---|---|
+| Fused (`overrideable`) | `attention` (forward; grad_q; grad_k and grad_v), `attention_aux` (the backward's stats) | float32, float16 and bfloat16; head dims up to 256; 4-d inputs with one batch size, key heads dividing query heads; any mask that needs no gradient, `is_causal`, dropout, GQA; 32-bit offsets, at most 65535 batches, heads and 64-row blocks; 32 KiB of shared memory; not nested, no forward-mode gradients | `sdpa_kernel([SDPBackend.OVERRIDEABLE])` (raises where it does not apply), `TORCH_VK_SDPA=flash` | H100 NVL, lavapipe (M52) |
+| Math | PyTorch's composite: matrix products, softmax, dropout | everything else (float64 among it), and where `sdpa_kernel` disables the fused route | `sdpa_kernel([SDPBackend.MATH])`, `TORCH_VK_SDPA=math` | — |
+
 ## Other ops
 
 These choose by shape or layout only, with no switch; the project's tests
@@ -129,7 +139,8 @@ cover each route by shape.
 `test_matmul.py` (`TORCH_VK_GEMM`, `TORCH_VK_SUBGROUP`, `TORCH_VK_SPLIT_K`,
 `TORCH_VK_GEMM_TILE`, `TORCH_VK_GEMM_GROUP`, `TORCH_VK_COMPUTE_UNITS`,
 `float32_matmul_precision`), `test_gemv4.py` (`TORCH_VK_GEMV`), `test_nn.py`
-(`TORCH_VK_CONV`, `TORCH_VK_DWCONV`), `test_linalg_gpu.py` (`TORCH_VK_EIGH_QL`,
+(`TORCH_VK_CONV`, `TORCH_VK_DWCONV`), `test_attention.py` (`sdpa_kernel`,
+`TORCH_VK_SDPA`), `test_linalg_gpu.py` (`TORCH_VK_EIGH_QL`,
 `TORCH_VK_SVD_JACOBI`) and `test_fp16_arithmetic.py`. A forced route still
 runs only where the device can run its kernel (16-lane subgroups,
 cooperative matrices), and the tests skip elsewhere. The routes chosen by

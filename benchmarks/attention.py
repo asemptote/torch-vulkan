@@ -8,7 +8,9 @@ the math path on "vk", milliseconds and peak device memory per call.
 
 Peak memory is the most device memory the call's tensors (temporaries and
 outputs, beyond the inputs) held at once (torch.accelerator's
-max_memory_allocated); "OOM" where the device's allocation failed. The cases are attention layers of real models: DINOv2's ViT-B/14 at
+max_memory_allocated); "fails" where the call raised (an allocation the
+device refused, or on the math path a matrix product too large for one
+launch, #131). The cases are attention layers of real models: DINOv2's ViT-B/14 at
 518 x 518 (1,370 tokens; the TIMM benchmark's batch of 128 too), GPT-2's
 causal attention, a Llama-style layer with grouped-query attention, a long
 sequence and a small batch of short ones.
@@ -59,11 +61,11 @@ def measure(backend, case, dtype, backward, reps):
     try:
         run(backend, q, k, v, causal, H != Hk, backward, g)
         tv.synchronize()
-    except RuntimeError as e:
-        if "allocation" in str(e) or "memory" in str(e).lower():
-            tv.empty_cache()
-            return None, None
-        raise
+    except (RuntimeError, NotImplementedError):
+        del q, k, v, g
+        tv.synchronize()
+        tv.empty_cache()
+        return None, None
     peak = torch.accelerator.max_memory_allocated() - base
     best = float("inf")
     for _ in range(reps):
@@ -95,8 +97,8 @@ def main():
             fm, fp = measure(SDPBackend.OVERRIDEABLE, case, dtype, args.backward, args.reps)
             mm, mp = measure(SDPBackend.MATH, case, dtype, args.backward, args.reps)
             dt = str(dtype).replace("torch.", "")
-            ms = lambda x: "OOM" if x is None else f"{x:.2f}"
-            mib = lambda x: "OOM" if x is None else f"{x:.0f}"
+            ms = lambda x: "fails" if x is None else f"{x:.2f}"
+            mib = lambda x: "fails" if x is None else f"{x:.0f}"
             speed = f"{mm / fm:.2f}x" if mm and fm else "-"
             print(f"| {case[0]} | {dt} | {ms(mm)} | {ms(fm)} | {speed} | {mib(mp)} | {mib(fp)} |", flush=True)
 
