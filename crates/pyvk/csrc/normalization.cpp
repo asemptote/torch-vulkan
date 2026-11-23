@@ -42,6 +42,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
                                                                const std::optional<at::Tensor>& running_mean,
                                                                const std::optional<at::Tensor>& running_var,
                                                                bool training, double momentum, double eps) {
+  // (as the CPU: integer and bool inputs, whose running statistics would now
+  // take the float32 update)
+  TORCH_CHECK_NOT_IMPLEMENTED(at::isFloatingType(x.scalar_type()), "\"batch_norm\" not implemented for '",
+                              x.scalar_type(), "'");
   // (the CPU's mixed-type rule: parameters may differ from the input only as
   // float parameters of a reduced-precision input)
   at::ScalarType params = at::ScalarType::Undefined;

@@ -284,6 +284,14 @@ def test_batch_norm_with_update_16bit(dtype, params):
         check(vrv, rv, **tol)
 
 
+def test_batch_norm_integer_inputs_raise():
+    # (as the CPU: no batch norm for integer or bool inputs)
+    for dtype in (torch.int64, torch.uint8, torch.bool):
+        x, rm, rv = torch.ones(4, 3, 2, dtype=dtype), torch.zeros(3, dtype=dtype), torch.ones(3, dtype=dtype)
+        with pytest.raises(NotImplementedError, match="\"batch_norm\" not implemented for"):
+            torch.ops.aten._batch_norm_with_update(x.to("vk"), None, None, rm.to("vk"), rv.to("vk"), 0.1, 1e-5)
+
+
 def test_softmax_and_losses():
     x = make((6, 7), torch.float32)
     target = torch.randint(0, 7, (6,))
