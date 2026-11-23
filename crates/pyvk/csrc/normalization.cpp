@@ -78,16 +78,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
       var = (xf - mean.view(shape)).square().mean(dims);  // biased
     }
     invstd = at::rsqrt(var + eps);
-    save_mean = mean;
-    save_invstd = invstd;
+    // The running statistics as the CPU updates them: momentum * batch +
+    // (1 - momentum) * running, in float32 (float64 for float64) with the
+    // momentum rounded to it first, from the unrounded batch statistics,
+    // and rounded to the running statistics' dtype once (not twice, as
+    // in-place mul_ then add_ in float16 would).
+    double m = acc == at::kDouble ? momentum : static_cast<double>(static_cast<float>(momentum));
+    double keep = acc == at::kDouble ? 1 - momentum : static_cast<double>(1.0f - static_cast<float>(momentum));
     if (running_mean.has_value() && running_mean->defined()) {
-      running_mean->mul_(1 - momentum).add_(mean.to(running_mean->scalar_type()), momentum);
+      running_mean->copy_(mean * m + running_mean->to(acc) * keep);
     }
     if (running_var.has_value() && running_var->defined()) {
       // (n = 1: 0 * inf, NaN, as on the CPU)
       at::Tensor unbiased = var * (static_cast<double>(n) / static_cast<double>(n - 1));
-      running_var->mul_(1 - momentum).add_(unbiased.to(running_var->scalar_type()), momentum);
+      running_var->copy_(unbiased * m + running_var->to(acc) * keep);
     }
+    if (at::isReducedFloatingType(x.scalar_type()) && params != at::kFloat) {
+      // (a 16-bit input without float32 parameters: the CPU keeps the saved
+      // statistics in the input's dtype and normalises with those)
+      mean = mean.to(x.scalar_type()).to(acc);
+      invstd = invstd.to(x.scalar_type()).to(acc);
+    }
+    save_mean = mean;
+    save_invstd = invstd;
   } else {
     TORCH_CHECK(running_mean.has_value() && running_mean->defined() && running_var.has_value() &&
                     running_var->defined(),
@@ -98,22 +111,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_impl(const at::Tensor&
     save_mean = mean.clone();  // (a copy: mean may be running_mean itself, and outputs must not alias inputs)
     save_invstd = invstd;
   }
-  at::Tensor scale = invstd, shift = -mean * invstd;
+  // (out = x scale + shift, with the CPU's scale = invstd weight and shift =
+  // bias - mean scale)
+  at::Tensor scale = invstd;
   if (weight.has_value() && weight->defined()) {
     scale = scale * weight->to(acc);
-    shift = shift * weight->to(acc);
   }
+  at::Tensor shift = -(mean * scale);
   if (bias.has_value() && bias->defined()) {
-    shift = shift + bias->to(acc);
+    shift = bias->to(acc) - mean * scale;
   }
   at::Tensor out = kernels ? slice_affine(x3, scale, shift).view(x.sizes()).to(x.scalar_type())
                            : (xf * scale.view(shape) + shift.view(shape)).to(x.scalar_type());
   // (saved statistics in float32 for 16-bit inputs, as PyTorch's meta kernel
-  // says and CUDA gives them: FakeTensor and torch.compile go by the meta
-  // kernel; the CPU keeps them in the input's dtype unless the parameters
-  // are float32)
+  // and decomposition say for devices other than the CPU and CUDA gives them:
+  // FakeTensor and torch.compile go by the meta kernel. The CPU keeps them in
+  // the input's dtype unless the parameters are float32; their values here
+  // are the CPU's, rounded to that dtype.)
   at::ScalarType stat = at::isReducedFloatingType(x.scalar_type()) ? at::kFloat : x.scalar_type();
-  (void)params;
   return {out, save_mean.to(stat), save_invstd.to(stat)};
 }
 
