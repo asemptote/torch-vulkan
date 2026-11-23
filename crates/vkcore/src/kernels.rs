@@ -7,8 +7,9 @@
 //! `VkPipelineCache` file.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use ash::vk;
 
@@ -30,24 +31,108 @@ pub struct KernelCache {
     layout: vk::PipelineLayout,
     cache: vk::PipelineCache,
     cache_file: Option<PathBuf>,
+    /// The hash of the data read from `cache_file` (written back only if it changed).
+    initial: u64,
     kernels: HashMap<(String, Vec<u32>), Arc<Kernel>>,
 }
 
-/// `TORCH_VK_CACHE_DIR`, else `%LOCALAPPDATA%\torch-vulkan` (or `$XDG_CACHE_HOME`/`~/.cache`).
-fn cache_file() -> Option<PathBuf> {
-    let dir = std::env::var_os("TORCH_VK_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("torch-vulkan")))
+// The pipeline cache on disk (docs/log/M53): one file per build of the
+// kernels and per GPU and driver, `pipelines-<key>.bin` in the cache
+// directory. A process reads its own file, adds the pipelines it compiled
+// and writes it back at exit; it only refreshes the file's modification time
+// when it compiled nothing new. Other files, from earlier builds or versions,
+// other GPUs or drivers, are removed once unused for `CACHE_MAX_AGE`, or
+// beyond `CACHE_MAX_BYTES` together, least recently used first.
+
+/// Other cache files unused (not written or refreshed) for this long are removed.
+const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Other cache files beyond this total size are removed, least recently used first.
+const CACHE_MAX_BYTES: u64 = 256 << 20;
+/// A writer's temporary file this old was left by a process that died while writing.
+const TMP_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// `TORCH_VK_CACHE_DIR` (set but empty: no cache on disk), else
+/// `%LOCALAPPDATA%\torch-vulkan` (or `$XDG_CACHE_HOME`/`~/.cache`).
+fn cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TORCH_VK_CACHE_DIR") {
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("torch-vulkan"))
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|d| PathBuf::from(d).join("torch-vulkan")))
-        .or_else(|| std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".cache").join("torch-vulkan")))?;
-    Some(dir.join("pipelines.bin"))
+        .or_else(|| std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".cache").join("torch-vulkan")))
+}
+
+/// This build's and this device's cache file name: keyed by the kernels'
+/// SPIR-V (build.rs's `SPIRV_HASH`) and the identity the driver checks in the
+/// data's header (vendor, device, driver version, pipeline cache UUID).
+fn cache_file_name(props: &vk::PhysicalDeviceProperties) -> String {
+    format!("pipelines-{:016x}.bin", cache_key(SPIRV_HASH, props))
+}
+
+fn cache_key(spirv: u64, props: &vk::PhysicalDeviceProperties) -> u64 {
+    let mut bytes = spirv.to_le_bytes().to_vec();
+    for v in [props.vendor_id, props.device_id, props.driver_version] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes.extend_from_slice(&props.pipeline_cache_uuid);
+    fnv(&bytes)
+}
+
+/// FNV-1a.
+fn fnv(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Removes the cache directory's stale files (see above), keeping `keep`;
+/// best effort: another process may be pruning or writing too. The
+/// unversioned `pipelines.bin` of releases up to 0.2 goes at once.
+fn prune_cache_dir(dir: &Path, keep: &str, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut others = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || name == keep {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or_default();
+        let path = entry.path();
+        if name == "pipelines.bin" {
+            let _ = std::fs::remove_file(&path);
+        } else if name.starts_with("pipelines-") && name.contains(".tmp") {
+            if age > TMP_MAX_AGE {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if name.starts_with("pipelines-") && name.ends_with(".bin") {
+            if age > CACHE_MAX_AGE {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                others.push((modified, meta.len(), path));
+            }
+        }
+    }
+    others.sort_by_key(|o| std::cmp::Reverse(o.0));  // (most recently used first)
+    let mut total = 0;
+    for (_, size, path) in others {
+        total += size;
+        if total > CACHE_MAX_BYTES {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 impl KernelCache {
     pub fn new(ctx: Arc<Context>) -> Result<Self> {
-        let cache_file = cache_file();
-        // The driver validates the header (vendor, device, driver UUID) and
-        // ignores data from another GPU or driver version.
+        let name = cache_file_name(&ctx.properties());
+        let cache_file = cache_dir().map(|dir| {
+            prune_cache_dir(&dir, &name, SystemTime::now());
+            dir.join(&name)
+        });
+        // (The driver also validates the data's header, and ignores data
+        // from another GPU or driver version.)
         let initial = cache_file.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
         unsafe {
             let range = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(PUSH_CONSTANT_BYTES);
@@ -55,7 +140,7 @@ impl KernelCache {
                 .device
                 .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(std::slice::from_ref(&range)), None)?;
             let cache = ctx.device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&initial), None)?;
-            Ok(Self { ctx, layout, cache, cache_file, kernels: HashMap::new() })
+            Ok(Self { ctx, layout, cache, cache_file, initial: fnv(&initial), kernels: HashMap::new() })
         }
     }
 
@@ -144,6 +229,13 @@ impl KernelCache {
     fn save(&self) {
         let Some(path) = &self.cache_file else { return };
         let Ok(data) = (unsafe { self.ctx.device.get_pipeline_cache_data(self.cache) }) else { return };
+        if fnv(&data) == self.initial && path.exists() {
+            // (nothing new: mark the file as used, for pruning, without rewriting it)
+            if let Ok(f) = std::fs::File::options().write(true).open(path) {
+                let _ = f.set_modified(SystemTime::now());
+            }
+            return;
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -454,5 +546,51 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         assert!(offenders.is_empty(), "forward pointers left in: {offenders:?}");
+    }
+
+    /// The cache directory keeps this build's file, recently used other
+    /// files up to the size cap (most recent first), and drops the rest.
+    #[test]
+    fn prunes_stale_cache_files() {
+        use super::{prune_cache_dir, CACHE_MAX_BYTES};
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("vkcore-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 3600);
+        let half = (CACHE_MAX_BYTES / 2 + 1) as usize;
+        let files: [(&str, Duration, usize); 8] = [
+            ("pipelines-0000000000000001.bin", 90 * day, 10),  // ours, however old
+            ("pipelines-0000000000000002.bin", 40 * day, 10),  // unused for over 30 days
+            ("pipelines-0000000000000003.bin", day, half),     // recent
+            ("pipelines-0000000000000004.bin", 2 * day, half), // beyond the cap with 3
+            ("pipelines-0000000000000005.bin", 3 * day, 10),   // (still beyond it)
+            ("pipelines.bin", Duration::ZERO, 10),             // 0.2's
+            ("pipelines-0000000000000006.tmp42", 2 * day, 10), // a dead writer's
+            ("other.txt", 90 * day, 10),                       // not ours
+        ];
+        for (name, age, size) in files {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_len(size as u64).unwrap();
+            f.set_modified(now - age).unwrap();
+        }
+        prune_cache_dir(&dir, "pipelines-0000000000000001.bin", now);
+        let mut left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(left, ["other.txt", "pipelines-0000000000000001.bin", "pipelines-0000000000000003.bin"]);
+    }
+
+    /// Cache file keys differ by build (SPIR-V) and by device identity.
+    #[test]
+    fn cache_keys() {
+        use super::cache_key;
+        let a = ash::vk::PhysicalDeviceProperties::default();
+        let mut b = a;
+        b.pipeline_cache_uuid[3] = 1;
+        assert_ne!(cache_key(1, &a), cache_key(2, &a));
+        assert_ne!(cache_key(1, &a), cache_key(1, &b));
+        assert_eq!(cache_key(1, &b), cache_key(1, &b));
     }
 }

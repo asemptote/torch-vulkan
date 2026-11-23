@@ -413,6 +413,11 @@ impl Context {
         &self.memory.memory_heaps[..self.memory.memory_heap_count as usize]
     }
 
+    /// The physical device's properties (IDs, driver version, pipeline cache UUID, limits).
+    pub fn properties(&self) -> vk::PhysicalDeviceProperties {
+        unsafe { self.instance.get_physical_device_properties(self.physical_device) }
+    }
+
     /// First memory type allowed by `bits` that has all of `want`.
     pub(crate) fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
         let types = &self.memory.memory_types[..self.memory.memory_type_count as usize];

@@ -197,13 +197,27 @@ fn prebuilt(dir: &Path, out: &Path) {
     files.sort();
     assert!(!files.is_empty(), "VKCORE_PREBUILT_SPIRV={}: no .spv files", dir.display());
     let mut table = String::from("pub static SPIRV: &[(&str, &[u8])] = &[\n");
+    let mut spvs = Vec::new();
     for f in files {
         let name = f.file_stem().unwrap().to_str().unwrap();
         let abs = std::fs::canonicalize(&f).unwrap();
         writeln!(table, "    ({name:?}, include_bytes!({:?})),", abs.display().to_string()).unwrap();
+        spvs.push((name.to_owned(), abs));
     }
     table.push_str("];\n");
+    bundle_hash(&mut table, &spvs);
     std::fs::write(out.join("kernels.rs"), table).unwrap();
+}
+
+/// `SPIRV_HASH`, a hash of every kernel's name and SPIR-V: the pipeline
+/// cache's file is named by it (src/kernels.rs), so that a build with other
+/// kernels starts a file of its own instead of adding to the last one's.
+fn bundle_hash(table: &mut String, spvs: &[(String, PathBuf)]) {
+    let mut h = DefaultHasher::new();
+    for (name, spv) in spvs {
+        (name, std::fs::read(spv).unwrap()).hash(&mut h);
+    }
+    writeln!(table, "pub const SPIRV_HASH: u64 = 0x{:016x};", h.finish()).unwrap();
 }
 
 fn main() {
@@ -251,6 +265,7 @@ fn main() {
     let mut jobs = Vec::new();
     let mut table = String::from("pub static SPIRV: &[(&str, &[u8])] = &[\n");
     let mut names = std::collections::HashSet::new();
+    let mut spvs = Vec::new();
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
         let stem = src.file_stem().unwrap().to_str().unwrap();
@@ -264,6 +279,7 @@ fn main() {
             assert!(names.insert(name.clone()), "two shaders produce kernel {name}; rename one");
             let spv = out.join(format!("{name}.spv"));
             writeln!(table, "    ({name:?}, include_bytes!({:?})),", spv.display().to_string()).unwrap();
+            spvs.push((name.clone(), spv.clone()));
 
             let precise = !DEFAULT_FP_MODE.contains(&stem);
             let mut key = DefaultHasher::new();
@@ -329,5 +345,6 @@ fn main() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     table.push_str("];\n");
+    bundle_hash(&mut table, &spvs);
     std::fs::write(out.join("kernels.rs"), table).unwrap();
 }
