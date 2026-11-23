@@ -11,14 +11,14 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from _util import on_gpu
+from _util import HAS_FLOAT64, on_gpu
 
 import torch_vulkan as tv
 
 FUSED = int(SDPBackend.OVERRIDEABLE)
 MATH = int(SDPBackend.MATH)
-HALF_OK = bool(tv._native.capabilities() & 4) and bool(tv._native.capabilities() & 2)
-DTYPES = [torch.float32, torch.bfloat16] + ([torch.float16] if HALF_OK else [])
+INT16 = bool(tv._native.capabilities() & 2)
+DTYPES = [torch.float32] + ([torch.bfloat16, torch.float16] if INT16 else [])
 TOL = {
     torch.float32: dict(rtol=2e-5, atol=2e-5),
     torch.float16: dict(rtol=2e-3, atol=2e-3),
@@ -206,17 +206,18 @@ def test_routes():
     choice = torch.ops.aten._fused_sdp_choice
     assert choice(q, q, q) == FUSED
     assert choice(q, q, q, dropout_p=0.1) == FUSED
-    assert choice(q.double(), q.double(), q.double()) == MATH  # float64: the math path
+    if HAS_FLOAT64:
+        assert choice(q.double(), q.double(), q.double()) == MATH  # float64: the math path
     assert choice(q[0], q[0], q[0]) == MATH  # (3-d: sdpa adds the batch dim before choosing)
     m = torch.zeros(8, 8, device="vk", requires_grad=True)
     assert choice(q, q, q, m) == MATH  # a mask that needs a gradient
     with sdpa_kernel([SDPBackend.MATH]):
         assert choice(q, q, q) == MATH
-    with sdpa_kernel([SDPBackend.OVERRIDEABLE]):
-        with pytest.raises(RuntimeError, match="No available kernel"):
-            choice(q.double(), q.double(), q.double())
     big = torch.randn(1, 1, 8, 300, device="vk")
     assert choice(big, big, big) == MATH  # head dim past 256
+    with sdpa_kernel([SDPBackend.OVERRIDEABLE]):
+        with pytest.raises(RuntimeError, match="No available kernel"):
+            choice(big, big, big)
 
 
 def test_forced_math():

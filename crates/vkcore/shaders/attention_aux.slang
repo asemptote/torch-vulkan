@@ -1,4 +1,4 @@
-// axis T: f32=float f16=half bf16=uint16_t
+// axis T: f32=float f16=uint16_t bf16=uint16_t
 //
 // Helpers of attention.slang:
 //   MODE 0, the backward's stats: for each row (b, h, r) of out and
@@ -37,7 +37,7 @@ float ld(T v)
 #if defined(T_bf16)
     return asfloat(uint(v) << 16);
 #elif defined(T_f16)
-    return float(v);
+    return f16tof32(uint(v));
 #else
     return v;
 #endif

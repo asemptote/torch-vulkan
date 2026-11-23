@@ -61,7 +61,7 @@ static_assert(sizeof(AttnAuxParams) == 72, "must match shaders/attention_aux.sla
 const char* attention_label(at::ScalarType t) {
   switch (t) {
     case at::kFloat: return "f32";
-    case at::kHalf: return has_feature(kFeatureFloat16) && has_feature(kFeatureInt16) ? "f16" : nullptr;
+    case at::kHalf: return has_feature(kFeatureInt16) ? "f16" : nullptr;  // (as its bits)
     case at::kBFloat16: return has_feature(kFeatureInt16) ? "bf16" : nullptr;
     default: return nullptr;
   }

@@ -1,10 +1,12 @@
-// axis T: f32=float f16=half bf16=uint16_t
+// axis T: f32=float f16=uint16_t bf16=uint16_t
 // axis D: d64=64 d128=128 d256=256
 //
 // Scaled dot-product attention without the attention matrix (FlashAttention
 // 2's tiling): out = softmax(q k^T scale + mask) v, its gradients, all in
 // float32 (16-bit inputs are widened as they are loaded, results rounded
-// once). q [B, H, L, E], k [B, H / GROUP, S, E], v [B, H / GROUP, S, EV]
+// once to nearest even; float16 is handled as its bits, which reads faster
+// than half loads on NVIDIA at the larger head dims and needs no
+// shaderFloat16). q [B, H, L, E], k [B, H / GROUP, S, E], v [B, H / GROUP, S, EV]
 // with any strides along b, h and the sequence (the head dim contiguous);
 // query head h reads key / value head h / GROUP. D (64, 128, 256) bounds E
 // and EV; the spec constants E and EV are the head dims themselves.
@@ -82,7 +84,7 @@ float ld(T v)
 #if defined(T_bf16)
     return asfloat(uint(v) << 16);
 #elif defined(T_f16)
-    return float(v);
+    return f16tof32(uint(v));
 #else
     return v;
 #endif
@@ -91,7 +93,7 @@ float ld(T v)
 T st(float f)
 {
 #if defined(T_f16)
-    return to_half(f);
+    return f16_bits_rne(f);
 #elif defined(T_bf16)
     if (isnan(f))
         return uint16_t(0x7fc0);
