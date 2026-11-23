@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/native/Resize.h>
 
@@ -96,6 +97,14 @@ inline int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 // kMaxGroups (kernels then loop over the rest).
 inline uint32_t groups_for(int64_t threads) {
   return static_cast<uint32_t>(std::clamp<int64_t>((threads + 255) / 256, 1, kMaxGroups));
+}
+
+// `groups` workgroups (at most kMaxGroups^2) as a grid's two dimensions
+// {x, y}: kernels that take them take workgroup gid.y * 65535 + gid.x, and
+// skip those past the last (docs/log/M52).
+inline std::pair<uint32_t, uint32_t> folded_groups(int64_t groups) {
+  TORCH_CHECK(groups <= kMaxGroups * kMaxGroups, "torch_vulkan: ", groups, " workgroups are more than one dispatch takes");
+  return {static_cast<uint32_t>(std::min(groups, kMaxGroups)), static_cast<uint32_t>(ceil_div(groups, kMaxGroups))};
 }
 
 // Waits for queued GPU work; raises IndexError if an indexing kernel met an

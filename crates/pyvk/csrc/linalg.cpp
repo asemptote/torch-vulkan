@@ -375,9 +375,6 @@ bool gemv4(const Gemv4& g) {
   int64_t per_thread = nc <= 2 ? 4 : 2;
   int64_t lanes = w == "q4" || nc >= 4 ? 8 : 32;
   int64_t groups = ceil_div(rows, 64 / lanes * per_thread);
-  if (groups > kMaxGroups) {
-    return false;
-  }
   bool use_cin = g.cin != nullptr && g.beta != 0.0;
   Gemv4Params p{};
   p.w = g.w;
@@ -400,7 +397,8 @@ bool gemv4(const Gemv4& g) {
   p.group = static_cast<uint32_t>(g.group);
   p.ncol = static_cast<uint32_t>(ncol);
   std::vector<uint32_t> spec = {use_cin ? 1u : 0u, static_cast<uint32_t>(lanes), aligned ? 1u : 0u};
-  dispatch(std::string("gemv4_") + w + xl + "_c" + std::to_string(nc), spec, p, static_cast<uint32_t>(groups));
+  auto [gx, gy] = folded_groups(groups);  // (more than kMaxGroups row blocks: folded into y)
+  dispatch(std::string("gemv4_") + w + xl + "_c" + std::to_string(nc), spec, p, gx, gy);
   return true;
 }
 
@@ -797,11 +795,9 @@ bool gemm4s(const at::Tensor& a_in, const at::Tensor& b_in, const at::Tensor& c_
   return true;
 }
 
-// c = alpha * a @ b (+ beta * cin), all 3-D views: a [B, M, K], b [B, K, N],
-// c and cin [B, M, N] (cin may broadcast through zero strides). Returns false
-// if the kernel cannot handle the case.
-bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
-          double beta) {
+// gemm() for a product whose grid fits one dispatch (see gemm below).
+bool gemm_whole(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
+                double beta) {
   int64_t batch = c.size(0), m = c.size(1), n = c.size(2), k = a.size(2);
   if ((n <= 8 || m <= 8) && c.numel() > 0 && gemm_vectors(a, b, c, cin, alpha, beta)) {
     return true;
@@ -864,7 +860,7 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
     int64_t copied = (copy_a ? a.size(0) * m * k4 : 0) + (copy_b ? b.size(0) * k4 * n4 : 0);
     if (copied * 16 <= work) {
       at::Tensor a2 = copy_a ? padded(a, m, k4) : a, b2 = copy_b ? padded(b, k4, n4) : b;
-      if (gemm4_layout(a2, b2, n, k4)) return gemm(a2, b2, c, cin, alpha, beta);
+      if (gemm4_layout(a2, b2, n, k4)) return gemm_whole(a2, b2, c, cin, alpha, beta);
     }
   }
   GemmParams p = gemm_params(a, b, c, cin, alpha, beta);
@@ -876,6 +872,77 @@ bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const a
   }
   dispatch(std::string("gemm_") + dtype_label(c.scalar_type()), {use_cin ? 1u : 0u}, p,
            static_cast<uint32_t>(gx), static_cast<uint32_t>(gy), static_cast<uint32_t>(batch));
+  return true;
+}
+
+// Rows or columns of C per piece of a product too large for one dispatch
+// (docs/log/M52): every kernel's grid then stays within kMaxGroups
+// workgroups along each dimension, since none takes fewer than 8 rows or
+// columns of C per workgroup (gemm4.slang's BM, gemv.slang's and
+// gemv4.slang's rows per workgroup); a multiple of 256, so that pieces start
+// on every kernel's tile boundaries and keep the operands' alignment. The
+// testing switch TORCH_VK_GEMM_PIECE=n lowers it (to a multiple of 256, at
+// least 512).
+int64_t gemm_piece() {
+  static const int64_t piece = [] {
+    int64_t limit = kMaxGroups * 8 / 256 * 256;  // (524,032)
+    int64_t forced = env_int("TORCH_VK_GEMM_PIECE", 0);
+    return forced > 0 ? std::clamp<int64_t>(forced / 256 * 256, 512, limit) : limit;
+  }();
+  return piece;
+}
+
+// Splits [0, size) into as few pieces of at most `most` (a multiple of 256,
+// at least 512) as it can, of about equal lengths: multiples of 256 but the
+// last, which is at least 256 long (a thin last piece would take another
+// route, such as a matrix-vector product's, which 16-bit products on
+// cooperative matrices do not have). Their starts and lengths.
+std::vector<std::pair<int64_t, int64_t>> pieces(int64_t size, int64_t most) {
+  int64_t count = ceil_div(size, most), len = std::min(most, ceil_div(ceil_div(size, count), 256) * 256);
+  std::vector<std::pair<int64_t, int64_t>> out;
+  for (int64_t s = 0; s < size; s += len) out.emplace_back(s, std::min(len, size - s));
+  if (out.size() > 1 && out.back().second < 256) {
+    // (len >= 512 here: 256 of the piece before moves to the last)
+    out[out.size() - 2].second -= 256;
+    out.back().first -= 256;
+    out.back().second += 256;
+  }
+  return out;
+}
+
+// c = alpha * a @ b (+ beta * cin), all 3-D views: a [B, M, K], b [B, K, N],
+// c and cin [B, M, N] (cin may broadcast through zero strides). Returns false
+// if the kernels cannot handle the case. A product with more than kMaxGroups
+// matrices, or more rows or columns than gemm_piece(), runs as products of
+// pieces of C (views: the operands are passed by address and strides), one
+// dispatch (or split-k pair) each, so that no grid passes Vulkan's
+// guaranteed 65,535 workgroups along a dimension (#131).
+bool gemm(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, const at::Tensor* cin, double alpha,
+          double beta) {
+  int64_t batch = c.size(0), m = c.size(1), n = c.size(2), piece = gemm_piece();
+  int64_t most_batch = std::min(piece, kMaxGroups);  // (matrices: one grid dimension each)
+  if (batch <= most_batch && m <= piece && n <= piece) {
+    return gemm_whole(a, b, c, cin, alpha, beta);
+  }
+  bool first = true;
+  for (auto [b0, bl] : pieces(batch, most_batch / 256 * 256)) {
+    for (auto [m0, ml] : pieces(m, piece)) {
+      for (auto [n0, nl] : pieces(n, piece)) {
+        at::Tensor ap = a.narrow(0, b0, bl).narrow(1, m0, ml), bp = b.narrow(0, b0, bl).narrow(2, n0, nl);
+        at::Tensor cp = c.narrow(0, b0, bl).narrow(1, m0, ml).narrow(2, n0, nl), cinp;
+        if (cin != nullptr) cinp = cin->narrow(0, b0, bl).narrow(1, m0, ml).narrow(2, n0, nl);
+        bool ok = gemm_whole(ap, bp, cp, cin != nullptr ? &cinp : nullptr, alpha, beta);
+        if (first && !ok) {
+          return false;  // (nothing written: the caller's fallback takes the product)
+        }
+        // (the pieces differ only in their offsets and the last ones' sizes,
+        // of 256 or more, on which no route's refusal turns: the routes
+        // that ran the first run the rest)
+        TORCH_INTERNAL_ASSERT(ok, "matrix product: a piece of ", batch, " x ", m, " x ", n, " did not run");
+        first = false;
+      }
+    }
+  }
   return true;
 }
 
@@ -1031,17 +1098,7 @@ at::Tensor& bmm_out(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& 
     out.copy_(r);
     return out;
   }
-  constexpr int64_t kMaxBatch = 65535;  // (workgroups per dispatch dimension)
-  if (is_vk(self) && is_vk(mat2) && is_vk(out) && self.dim() == 3 && mat2.dim() == 3 && self.size(0) > kMaxBatch &&
-      out.is_contiguous()) {
-    // (more matrices than one dispatch takes: in chunks)
-    bool ok = true;
-    for (int64_t s = 0; s < self.size(0) && ok; s += kMaxBatch) {
-      int64_t len = std::min(kMaxBatch, self.size(0) - s);
-      ok = any_gemm(self.narrow(0, s, len), mat2.narrow(0, s, len), out.narrow(0, s, len), nullptr, 1, 0);
-    }
-    if (ok) return out;
-  }
+  // (more matrices than one dispatch takes: gemm() runs them in pieces)
   if (!any_gemm(self, mat2, out, nullptr, 1, 0)) {
     on_cpu("aten::bmm", "out", self, mat2, out);
   }
