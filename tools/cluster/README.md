@@ -51,6 +51,9 @@ home directory and rebuilds there with `build.sh` (log in
 - `pbs-vs-cuda.sh`: `benchmarks/vs_cuda.py` on a GPU node, vk against the
   same PyTorch release built for CUDA (`CUDA_PYTHON`), for the README's
   benchmark tables.
+- `pbs-models.sh`: `benchmarks/models/sweep.py` (PyTorch's TorchBench, TIMM
+  and HuggingFace suites in eager mode, vk against CUDA on one GPU; docs/log/M51),
+  its CPU reference phase as a CPU job and its GPU phase on a GPU node.
 
 A full run (every file in `test_files.txt`) goes through the queues below
 (`queue-run.sh`); these scripts run a fixed set of shards by hand, such as a
