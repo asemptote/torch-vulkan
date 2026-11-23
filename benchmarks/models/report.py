@@ -20,12 +20,14 @@ import re
 
 
 def last_by_key(paths):
+    """One row per (suite, model, mode, precision); a later row's fields
+    replace an earlier one's (a rerun of the accuracy steps alone, say)."""
     rows = {}
     for path in paths:
         for line in open(path):
             if line.strip():
                 r = json.loads(line)
-                rows[(r["suite"], r["model"], r["mode"], r["precision"])] = r
+                rows.setdefault((r["suite"], r["model"], r["mode"], r["precision"]), {}).update(r)
     return list(rows.values())
 
 
@@ -34,7 +36,7 @@ def short_error(err):
         return ""
     m = re.search(r"(aten::[\w.]+) has no Vulkan kernel", err)
     if m:
-        return f"{m.group(1)}: no Vulkan kernel"
+        return f"{m.group(1)} (no Vulkan kernel)"
     err = re.sub(r"^RuntimeError: Eager run failed\s*", "", err)
     return err.replace("|", "/")[:160]
 
@@ -42,7 +44,13 @@ def short_error(err):
 def op_name(key):
     # fallback_counts() keys: "aten::op", "aten::op (raised)", or with
     # TORCH_VK_FALLBACK_DETAIL=1 "aten::op [dtypes and shapes]"
-    return key.split(" [")[0]
+    return key.split(" [")[0].replace(" (refused)", "")
+
+
+CUDA_ONLY_BENCHMARKS = {
+    "moco": "its benchmark raises NotImplementedError for any device but cuda (DistributedDataParallel)",
+    "nvidia_deeprecommender": "its benchmark builds the model only for cpu and cuda",
+}
 
 
 def status(rec):
@@ -53,16 +61,24 @@ def summarise(r):
     s = {k: r[k] for k in ("suite", "model", "mode", "precision")}
     acc_cuda, acc_vk, perf_cuda, perf_vk = (r.get(k) for k in ("acc_cuda", "acc_vk", "perf_cuda", "perf_vk"))
     # (the accuracy run's fallback rerun, or the latency run's where only it failed)
-    fb = r.get("acc_vk_fallback") or (r.get("perf_vk_fallback") if r.get("vk_ms") is None else None)
-    vk_steps = [x for x in (acc_vk, perf_vk) if x]
-    cuda_steps = [x for x in (acc_cuda, perf_cuda) if x]
-    vk_ok = [status(x) in ("captured", "pass") and not (x is perf_vk and r.get("vk_ms") is None)
-             for x in vk_steps]
-    cuda_ok = [status(x) in ("captured", "pass") and not (x is perf_cuda and r.get("cuda_ms") is None)
-               for x in cuda_steps]
+    fb = (r.get("acc_vk_fallback") if status(r.get("acc_vk")) != "captured" else None) or (
+        r.get("perf_vk_fallback") if r.get("vk_ms") is None else None)
+    def ok(x, ms):
+        return status(x) in ("captured", "pass") and not (ms in r and r.get(ms) is None)
+
+    # each vk step beside its CUDA step: a step that fails on CUDA too (a
+    # model that does not fit, a benchmark broken on this release) says
+    # nothing about vk
+    pairs = [(v, c, ok(v, ms) if v else None, ok(c, ms) if c else None)
+             for v, c, ms in ((acc_vk, acc_cuda, None), (perf_vk, perf_cuda, "vk_ms"))]
+    pairs = [(v, c, okv, ok(c, "cuda_ms") if (c and c is perf_cuda) else okc) for v, c, okv, okc in pairs]
+    cuda_steps = [c for _, c, _, _ in pairs if c]
+    cuda_ok = [okc for _, c, _, okc in pairs if c]
     s["cuda_fails"] = bool(cuda_steps) and not any(cuda_ok)
-    if acc_vk and acc_cuda and status(acc_cuda) != "captured" and status(acc_vk) != "captured":
-        s["cuda_fails"] = True
+    # (TorchBench models whose benchmark builds them only for "cpu" or "cuda")
+    s["cuda_only_benchmark"] = s["model"] in CUDA_ONLY_BENCHMARKS
+    vk_steps = [v for v, c, _, okc in pairs if v and (c is None or okc)]
+    vk_ok = [okv for v, c, okv, okc in pairs if v and (c is None or okc)]
     s["runs_on_vk"] = bool(vk_steps) and all(vk_ok)
     first_fail = next((x for x, ok in zip(vk_steps, vk_ok) if not ok), None)
     s["vk_error"] = short_error((first_fail or {}).get("error") or (status(first_fail) if first_fail else ""))
@@ -85,6 +101,10 @@ def summarise(r):
     s["cuda_ms"], s["vk_ms"] = r.get("cuda_ms"), r.get("vk_ms")
     s["vk_ms_fallback"] = r.get("vk_ms_fallback")
     s["ratio"] = s["vk_ms"] / s["cuda_ms"] if s["vk_ms"] and s["cuda_ms"] else None
+    # (the HF LLMs' latency is model.generate's, whose length ends at an
+    # end-of-sequence token: the devices can generate different lengths)
+    s["generate"] = s["suite"] == "huggingface" and "/" in s["model"]
+    s["gpu"] = r.get("gpu") or "NVIDIA L40S"  # (the rows from before sweep.py recorded it)
     s["batch_size"] = ((perf_vk or {}).get("row") or (perf_cuda or {}).get("row") or {}).get("batch_size")
     s["cuda_error"] = short_error(next((x.get("error") or status(x) for x, ok in zip(cuda_steps, cuda_ok)
                                         if not ok), ""))
@@ -94,7 +114,7 @@ def summarise(r):
 def blockers(rows):
     by = collections.defaultdict(list)
     for s in rows:
-        if s["cuda_fails"] or s["runs_on_vk"]:
+        if s["cuda_fails"] or s["runs_on_vk"] or s["cuda_only_benchmark"]:
             continue
         keys = [f"{op} (no Vulkan kernel)" for op in s["cpu_ops"] if "(raised)" not in op]
         if s["fallback_run"] != "ok":
@@ -121,19 +141,28 @@ def markdown(rows, title, notes):
         out += [open(notes).read().strip(), ""]
     configs = sorted({(s["mode"], s["precision"]) for s in rows})
     out += ["## Summary", "",
-            "| mode | precision | models | CUDA fails too | run fully on vk | accuracy ok (of those compared) "
-            "| vk time / CUDA time, geometric mean (models) |",
-            "|---|---|--:|--:|--:|--:|--:|"]
-    for mode, prec in configs:
-        sel = [s for s in rows if (s["mode"], s["precision"]) == (mode, prec)]
-        tried = [s for s in sel if not s["cuda_fails"]]
+            "Models: those tried; left out: models that fail on CUDA too, or whose benchmark builds them only "
+            "for cpu and cuda. The geometric mean is over the models that run fully on vk.", "",
+            "| mode | precision | GPU | suite | models | left out | run fully on vk "
+            "| accuracy ok (of those compared) | vk time / CUDA time, geometric mean (models) |",
+            "|---|---|---|---|--:|--:|--:|--:|--:|"]
+    keys = sorted({(s["mode"], s["precision"], s["gpu"]) for s in rows})
+    for mode, prec, gpu in keys:
+      for suite in ("torchbench", "timm", "huggingface", "all"):
+        sel = [s for s in rows if (s["mode"], s["precision"], s["gpu"]) == (mode, prec, gpu)
+               and suite in (s["suite"], "all")]
+        if not sel:
+            continue
+        tried = [s for s in sel if not s["cuda_fails"] and not s["cuda_only_benchmark"]]
         ok = [s for s in tried if s["runs_on_vk"]]
         compared = [s for s in ok if s["accuracy"]]
         acc = [s for s in compared if s["accuracy"] == "pass"]
-        ratios = [s["ratio"] for s in ok if s["ratio"]]
+        ratios = [s["ratio"] for s in ok if s["ratio"] and not s["generate"]]
         g = geomean(ratios)
-        out.append(f"| {mode} | {prec} | {len(tried)} | {len(sel) - len(tried)} | {len(ok)} | "
-                   f"{len(acc)} / {len(compared)} | {fmt(g, '.2f')} ({len(ratios)}) |")
+        b = "**" if suite == "all" else ""
+        out.append(f"| {mode} | {prec} | {gpu.replace('NVIDIA ', '')} | {b}{suite}{b} | {b}{len(tried)}{b} | "
+                   f"{len(sel) - len(tried)} | {b}{len(ok)}{b} | {len(acc)} / {len(compared)} | "
+                   f"{b}{fmt(g, '.2f')}{b} ({len(ratios)}) |")
     out.append("")
     for mode, prec in configs:
         sel = [s for s in rows if (s["mode"], s["precision"]) == (mode, prec)]
@@ -152,17 +181,22 @@ def markdown(rows, title, notes):
                          key=lambda s: s["model"].lower())
             if not sel:
                 continue
-            out += [f"## {suite}: {mode}, {prec}", "",
+            gpus = ", ".join(sorted({s["gpu"] for s in sel}))
+            out += [f"## {suite}: {mode}, {prec} ({gpus})", "",
                     "| model | batch | runs on vk | first error on vk (fallback off) | ops on the CPU (fallback on) "
                     "| accuracy vs CUDA | rel. error vs fp64: vk / CUDA | CUDA ms | vk ms | vk / CUDA |",
                     "|---|--:|---|---|---|---|---|--:|--:|--:|"]
             for s in sel:
-                if s["cuda_fails"]:
+                if s["cuda_only_benchmark"]:
+                    runs = "(left out: " + CUDA_ONLY_BENCHMARKS[s["model"]] + ")"
+                elif s["cuda_fails"]:
                     runs = "(CUDA fails: " + (s["cuda_error"] or "?")[:80] + ")"
                 else:
                     runs = "yes" if s["runs_on_vk"] else "**no**"
                 ops = ", ".join(f"{k.replace('aten::', '')} ({v})" for k, v in sorted(s["cpu_ops"].items()))
-                if s["fallback_run"] and s["fallback_run"] != "ok":
+                if s["runs_on_vk"]:
+                    ops = ""
+                if s["fallback_run"] and s["fallback_run"] != "ok" and not s["runs_on_vk"]:
                     ops = (ops + "; " if ops else "") + "fails with the fallback too: " + s["fallback_error"][:80]
                 acc = s["accuracy"] or ""
                 if acc and s["accuracy_with_fallback"]:
@@ -173,13 +207,13 @@ def markdown(rows, title, notes):
                 vk_ms = fmt(s["vk_ms"], ".2f")
                 if not vk_ms and s["vk_ms_fallback"]:
                     vk_ms = f"({s['vk_ms_fallback']:.2f}, fallback on)"
-                out.append(f"| {s['model']} | {s['batch_size'] or ''} | {runs} | {s['vk_error'] if not s['runs_on_vk'] else ''} "
+                out.append(f"| {s['model']}{' (generate)' if s['generate'] else ''} | {s['batch_size'] or ''} | {runs} | {s['vk_error'] if not s['runs_on_vk'] else ''} "
                            f"| {ops} | {acc} | {err} | {fmt(s['cuda_ms'], '.2f')} | {vk_ms} | {fmt(s['ratio'], '.2f')} |")
             out.append("")
     return "\n".join(out)
 
 
-COLUMNS = ["suite", "model", "mode", "precision", "batch_size", "cuda_fails", "runs_on_vk", "vk_error",
+COLUMNS = ["suite", "model", "mode", "precision", "gpu", "batch_size", "cuda_fails", "runs_on_vk", "vk_error",
            "cpu_ops", "fallback_run", "fallback_error", "accuracy", "accuracy_with_fallback", "err_vk", "err_cuda",
            "deterministic_vk", "tol", "cuda_ms", "vk_ms", "vk_ms_fallback",
            "ratio", "cuda_error"]
@@ -198,17 +232,18 @@ def main():
     rows.sort(key=lambda s: (s["mode"], s["precision"], s["suite"], s["model"].lower()))
     md = markdown(rows, a.title, a.notes)
     if a.md:
-        open(a.md, "w").write(md + "\n")
+        with open(a.md, "w", newline="\n") as f:
+            f.write(md + "\n")
     else:
         print(md)
     if a.csv:
         with open(a.csv, "w", newline="") as f:
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n")
             w.writerow(COLUMNS)
             for s in rows:
                 w.writerow([json.dumps(s[c]) if isinstance(s[c], dict) else s[c] for c in COLUMNS])
     if a.json:
-        with open(a.json, "w") as f:
+        with open(a.json, "w", newline="\n") as f:
             json.dump({"rows": rows, "blockers": {f"{m}/{pr}": blockers(
                 [s for s in rows if (s["mode"], s["precision"]) == (m, pr)])
                 for m, pr in sorted({(s["mode"], s["precision"]) for s in rows})}}, f, indent=1)

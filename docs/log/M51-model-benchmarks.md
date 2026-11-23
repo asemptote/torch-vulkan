@@ -33,7 +33,7 @@ runners load each model on the device they are given, as on CUDA.
 
 The runner's own: `--nothing --performance` is its speed-up experiment with
 no compiler, eager against eager. After loading (which runs the model once)
-and five warm-up calls, it times `--repeat` (30) calls, each followed by
+and five warm-up calls, it times `--repeat` calls (its default 30; `sweep.py` passes 10), each followed by
 `synchronize()`; its `abs_latency` is their median, in ms. Batch sizes are
 the suites' (`timm_models_list.txt`, `huggingface_models_list.txt` and
 `huggingface.yaml`'s divisors, TorchBench's per-model defaults and
@@ -82,7 +82,48 @@ ranked by the number of models each stops.
 
 ## Results
 
-RESULTS
+On the L40S, at main 269e49d (the tables, per model, in
+[benchmarks/models/results.md](../../benchmarks/models/results.md)):
+
+| | models | run fully on vk | accuracy ok (compared) | vk / CUDA time, geomean |
+|---|--:|--:|--:|--:|
+| inference, float32 | 78 | 73 | 67 / 68 | 3.6 |
+| inference, bfloat16 | 75 | 70 | 63 / 65 | 6.7 |
+| inference, AMP (float16), a subset | 20 | 20 | 20 / 20 | 6.2 |
+| training, float32 (one step), a subset | 20 | 18 | | 3.3 |
+
+"Models" leaves out six TorchBench models that fail on CUDA too or whose
+benchmark builds them only for cpu and cuda; the geometric mean leaves out the
+HuggingFace LLMs, whose `generate` can stop at different lengths on the two
+devices. By suite, float32 inference is 4.6x CUDA's time on TorchBench (whose
+batches are small, so the per-op overhead counts), 3.0x on TIMM and 3.1x on
+HuggingFace.
+
+All 689 OpInfo ops pass on the GPU, and the models confirm it: no model
+needed an op that vk lacks altogether, except torchvision's own `nms` and
+`roi_align`. What stops models is size, memory and the composites:
+
+- **#133**: allocations fail at about 19 GiB of the L40S's 46 GiB (every
+  tensor was in host-mapped memory): BlenderbotForCausalLM; inception_v3 and
+  vit_base_patch16_siglip_256 in training.
+- **#132**: `scaled_dot_product_attention` materialises the attention matrix:
+  vit_base_patch14_dinov2 at batch 128 (an 11.5 GB score matrix where CUDA
+  peaks at 7.6 GB in all).
+- **#131**: products with more than 65,535 workgroups along N refused:
+  ghostnet_100 and mobilenetv3_large_100 at batch 512 (fixed on main since).
+- **#143**: `torchvision::nms` and `roi_align`: vision_maskrcnn.
+- **#142**: one accuracy failure, pytorch_unet (relative error 3e-2 against
+  CUDA's 5e-8): a convolution whose im2col columns pass 4 GiB gives wrong
+  results, silently.
+- **#134**: 16-bit is slower than float32 on vk for 47 of 70 models
+  (bfloat16), where CUDA's 16-bit takes 0.6 of its float32 time.
+
+Two things the method had to get right. The devices' random numbers differ
+and the runners generate inputs on the device, so without the CPU
+reference's weights and inputs the accuracy check compares different inputs.
+And a model that needs more host memory than the batch job allows (demucs on
+vk) killed the whole sweep with it; `sweep.py` now stops such a step itself
+(`--max-rss-gb`).
 
 ## Reproducing
 

@@ -64,29 +64,53 @@ def listed_models(suite, d):
     return [line.strip() for line in lines if line.strip()]
 
 
+MAX_RSS_GB = 40.0  # (--max-rss-gb)
+
+
+def rss_gb(pid):
+    """The resident memory of a process and its children, in GB (0 without psutil)."""
+    try:
+        import psutil
+
+        p = psutil.Process(pid)
+        return sum(q.memory_info().rss for q in [p] + p.children(recursive=True)) / 1e9
+    except Exception:
+        return 0.0
+
+
 def step(name, cmd, log_dir, timeout, env=None):
-    """Runs cmd with --record; returns the record (or a status for a timeout
-    or a crash without one)."""
+    """Runs cmd with --record; returns the record (or a status for a timeout,
+    host memory past MAX_RSS_GB, or a crash without one). (A batch job's
+    memory limit would otherwise kill the whole sweep with the step.)"""
     rec_path = os.path.join(log_dir, name + ".json")
     log_path = os.path.join(log_dir, name + ".log")
     if os.path.exists(rec_path):
         os.remove(rec_path)
     t0 = time.time()
     with open(log_path, "w") as log:
-        try:
-            p = subprocess.run(cmd + ["--record", rec_path], stdout=log, stderr=subprocess.STDOUT,
-                               timeout=timeout, env=env)
-            code = p.returncode
-        except subprocess.TimeoutExpired:
-            code = "timeout"
+        p = subprocess.Popen(cmd + ["--record", rec_path], stdout=log, stderr=subprocess.STDOUT, env=env)
+        code = None
+        while code is None:
+            try:
+                code = p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if time.time() - t0 > timeout:
+                    code = "timeout"
+                elif rss_gb(p.pid) > MAX_RSS_GB:
+                    code = "host_memory"
+                if code is not None:
+                    p.kill()
+                    p.wait()
     rec = {}
     if os.path.exists(rec_path):
         with open(rec_path) as f:
             rec = json.load(f)
     rec["seconds"] = round(time.time() - t0, 1)
     rec["returncode"] = code
-    if code == "timeout":
-        rec["status"] = "timeout"
+    if code in ("timeout", "host_memory"):
+        rec["status"] = code
+        if code == "host_memory":
+            rec["error"] = f"stopped: host memory over {MAX_RSS_GB:g} GB"
     elif not rec.get("status") or (code != 0 and rec.get("status") in ("pass", None)):
         rec["status"] = rec.get("status") or "crashed"
         if code != 0 and not rec.get("error"):
@@ -118,7 +142,11 @@ def main():
     p.add_argument("--cuda-python")
     p.add_argument("--vk-python", default=sys.executable)
     p.add_argument("--timeout", type=int, default=1800, help="seconds per step")
-    p.add_argument("--repeat", type=int, default=30, help="the runner's timed calls")
+    p.add_argument("--max-rss-gb", type=float, default=MAX_RSS_GB,
+                   help="stop a step whose processes use more host memory than this")
+    p.add_argument("--repeat", type=int, default=10, help="the runner's timed calls (its default: 30)")
+    p.add_argument("--fallback-timeout", type=int, default=900,
+                   help="seconds for a rerun with the CPU fallback on (which only lists the ops)")
     p.add_argument("--no-accuracy", action="store_true", help="latency only")
     p.add_argument("--no-perf", action="store_true", help="accuracy only")
     p.add_argument("--delete-reference", action="store_true",
@@ -128,10 +156,11 @@ def main():
                    help="where vk's latency run fails with the fallback off, run it with the fallback on (for "
                         "the ops that went to the CPU, and the time)")
     a = p.parse_args()
+    globals()["MAX_RSS_GB"] = a.max_rss_gb  # (read by step())
     pytorch_dir = os.environ.get("PYTORCH_BENCH_DIR")
     if not pytorch_dir:
         sys.exit("set PYTORCH_BENCH_DIR (see run.py)")
-    names = a.models.split(",") if a.models else model_names(a.suite, pytorch_dir)
+    names = [n for n in a.models.split(",") if n] if a.models is not None else model_names(a.suite, pytorch_dir)
     out = os.path.abspath(a.out)
     ref_dir = os.path.join(out, "ref", a.suite)
     os.makedirs(ref_dir, exist_ok=True)
@@ -152,6 +181,11 @@ def main():
                   flush=True)
         return
 
+    try:  # (recorded with each row: sweeps can run on several GPUs)
+        gpu = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True,
+                             text=True, timeout=60).stdout.strip().splitlines()[0]
+    except (OSError, IndexError, subprocess.SubprocessError):
+        gpu = None
     results = os.path.join(out, "results.jsonl")
     done = set()
     if os.path.exists(results):
@@ -178,9 +212,11 @@ def main():
                 cmd += ["--accuracy", "--output", os.path.join(log_dir, f"acc-{dev}{tag}.csv"),
                         "--reference", ref, "--outputs", outputs]
             else:
-                cmd += ["--performance", "--nothing", "--repeat", str(a.repeat),
+                # (a rerun with the fallback on is for its list of ops: one timed call)
+                cmd += ["--performance", "--nothing", "--repeat", str(1 if tag else a.repeat),
                         "--output", os.path.join(log_dir, f"perf-{dev}{tag}.csv")]
-            return step(f"{kind}-{dev}{tag}", cmd, log_dir, a.timeout, env)
+            return step(f"{kind}-{dev}{tag}", cmd, log_dir, min(a.timeout, a.fallback_timeout) if tag else a.timeout,
+                        env)
 
         accuracy = not a.no_accuracy and a.mode == "inference" and os.path.exists(ref)
         if not a.no_accuracy and a.mode == "inference" and not accuracy:
@@ -216,6 +252,8 @@ def main():
                 r["perf_vk_fallback"] = run("vk", a.vk_python, "performance", env_on, "-fallback")
                 r["vk_ms_fallback"] = latency_ms(r["perf_vk_fallback"])
         r["torch_vulkan_commit"] = os.environ.get("TORCH_VULKAN_COMMIT")
+        r["repeat"] = a.repeat
+        r["gpu"] = gpu
         with open(results, "a") as f:
             f.write(json.dumps(r) + "\n")
         if a.delete_reference and os.path.exists(ref):

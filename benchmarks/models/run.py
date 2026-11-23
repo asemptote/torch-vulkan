@@ -123,9 +123,11 @@ def like(ref, native):
     import torch
 
     if isinstance(native, torch.Tensor):
-        if not isinstance(ref, torch.Tensor) or ref.shape != native.shape or ref.dtype != native.dtype:
+        # (in the native dtype: the runner casts some suites' inputs as it loads them, --bfloat16 say)
+        if (not isinstance(ref, torch.Tensor) or ref.shape != native.shape
+                or ref.is_floating_point() != native.is_floating_point()):
             raise ValueError(f"reference input {getattr(ref, 'shape', type(ref))} != {native.shape} {native.dtype}")
-        return ref.to(native.device).requires_grad_(native.requires_grad)
+        return ref.to(native.device, native.dtype).requires_grad_(native.requires_grad)
     if isinstance(native, dict):
         if not isinstance(ref, dict) or set(ref) != set(native):
             raise ValueError("reference inputs: different keys")
