@@ -116,7 +116,8 @@ The element-wise and copy launches (`launch.cpp`, `strided.h`) were already
 bounded (each operand's span below 2^31, the outer dims on the host), as
 were the matrix products (`max_offset` below 2^31 for every operand, M52's
 pieces), softmax, the norms and losses (`numel` below 2^31), `sort`
-(`total` below 2^31) and `cumsum`.
+(`total` below 2^31), `cumsum` and the fused attention (M54; its dropout
+mask's count now below 2^31 too).
 
 ## Tests
 
