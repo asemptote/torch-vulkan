@@ -355,3 +355,13 @@ STEDC VEC 4
 # shaders/latrd.slang
 LATRD SYMV 0
 LATRD FIN 1
+
+# shaders/nms.slang
+NMS MASK 0
+NMS SCAN 1
+
+# shaders/roialign.slang
+ROI FORWARD 0
+ROI GRID 1
+ROI PLAN 2
+ROI GATHER 3

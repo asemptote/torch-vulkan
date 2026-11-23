@@ -130,6 +130,21 @@ their dtypes. `torch.vk.get_amp_supported_dtype()` lists float16, bfloat16
 and float32. Combine it with `torch.amp.GradScaler("vk")` for float16
 training, as on CUDA.
 
+## torchvision's ops
+
+torchvision is not a dependency, but where it is installed its detection ops
+`torchvision.ops.nms` (and so `batched_nms`) and `roi_align` (with its
+gradient; `RoIAlign`, `MultiScaleRoIAlign`) run on `"vk"` tensors as kernels
+of the package's own: nms keeps the boxes torchvision's CPU kernel keeps
+(score ties in index order), and roi_align's results and gradients equal the
+CPU's bit for bit. They take float32, and float64 where the device has it;
+roi_align computes float16 and bfloat16 in float32, rounded once (the CPU
+rejects bfloat16), and nms raises the CPU's error for them. torchvision's
+other ops (`roi_pool`, `ps_roi_align`, `ps_roi_pool`, `deform_conv2d`) have
+no Vulkan kernels yet: they run on the CPU with the fallback on, as any op
+without one. A region's batch index outside the input's batch raises when
+the device next synchronises (an `IndexError`), not at the call.
+
 ## float32 matrix products and `torch.set_float32_matmul_precision`
 
 By default (`"highest"`) float32 matrix products are computed in float32.
