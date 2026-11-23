@@ -109,6 +109,7 @@ fn main() {
             "csrc/quantized.cpp",
             "csrc/autocast.cpp",
             "csrc/attention.cpp",
+            "csrc/vision.cpp",
     ];
     let mut build = cc::Build::new();
     build
