@@ -103,7 +103,6 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
   }
   if (M <= 8) {
     // (qmm8.slang ROWS: matrix-vector products, 8 output columns per workgroup)
-    TORCH_CHECK((N + 7) / 8 <= kMaxGroups, "_weight_int8pack_mm: too many output columns for one dispatch: ", N);
     Q8Params p{};
     p.a = gpu_address(A);
     p.b = gpu_address(B);
@@ -114,11 +113,11 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
     p.k = static_cast<uint32_t>(K);
     p.a_sm = static_cast<int32_t>(A.stride(0));
     p.a_sk = static_cast<int32_t>(A.stride(1));
-    dispatch(std::string("qmm8_") + label, {static_cast<uint32_t>(M)}, p, static_cast<uint32_t>((N + 7) / 8));
+    auto [gx, gy] = folded_groups((N + 7) / 8);
+    dispatch(std::string("qmm8_") + label, {static_cast<uint32_t>(M)}, p, gx, gy);
     return C;
   }
-  int64_t gx = (N + 63) / 64;
-  TORCH_CHECK(gx <= kMaxGroups, "_weight_int8pack_mm: too many output columns for one dispatch: ", N);
+  auto [gx, gz] = folded_groups((N + 63) / 64);  // (column blocks past kMaxGroups: folded into z)
   for (int64_t r0 = 0; r0 < M; r0 += kMaxGroups * 64) {  // (rows in chunks of the grid's limit)
     int64_t rows = std::min<int64_t>(M - r0, kMaxGroups * 64);
     Q8Params p{};
@@ -131,7 +130,7 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
     p.k = static_cast<uint32_t>(K);
     p.a_sm = static_cast<int32_t>(A.stride(0));
     p.a_sk = static_cast<int32_t>(A.stride(1));
-    dispatch(std::string("qmm8_") + label, {}, p, static_cast<uint32_t>(gx), static_cast<uint32_t>((rows + 63) / 64));
+    dispatch(std::string("qmm8_") + label, {}, p, gx, static_cast<uint32_t>((rows + 63) / 64), gz);
   }
   return C;
 }
@@ -285,8 +284,7 @@ at::Tensor dyn_quant_matmul_4bit(const at::Tensor& inp, const at::Tensor& packed
   at::Tensor rows = at::empty({M, 2}, inp.options().dtype(at::kFloat));
   uint32_t groupwise = block_size != K ? 1u : 0u;
   std::string kernel = std::string("qmm4_") + label;
-  int64_t gx = (N + 31) / 32;
-  TORCH_CHECK(gx <= kMaxGroups, "_dyn_quant_matmul_4bit: too many output features for one dispatch: ", N);
+  auto [gx, gz] = folded_groups((N + 31) / 32);  // (column blocks past kMaxGroups: folded into z)
   int64_t item = x.element_size();
   for (int64_t r0 = 0; r0 < M; r0 += kMaxGroups) {  // (rows in chunks of the grid's limit)
     int64_t rows_here = std::min<int64_t>(M - r0, kMaxGroups);
@@ -302,7 +300,7 @@ at::Tensor dyn_quant_matmul_4bit(const at::Tensor& inp, const at::Tensor& packed
     p.bs = static_cast<uint32_t>(block_size);
     p.has_bias = bias_elements != 0 ? 1u : 0u;
     dispatch(kernel, {0u, groupwise}, p, static_cast<uint32_t>(rows_here));
-    dispatch(kernel, {1u, groupwise}, p, static_cast<uint32_t>(gx), static_cast<uint32_t>((rows_here + 7) / 8));
+    dispatch(kernel, {1u, groupwise}, p, gx, static_cast<uint32_t>((rows_here + 7) / 8), gz);
   }
   return output;
 }

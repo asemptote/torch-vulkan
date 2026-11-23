@@ -133,7 +133,7 @@ impl Runtime {
     /// Workgroup count and grid stride for a 1-D grid-stride kernel over `n`
     /// elements with `workgroup` threads per group.
     pub fn grid_1d(&self, n: u64, workgroup: u32) -> (u32, u32) {
-        let max = self.ctx.caps.max_workgroup_count_x.min(65_535) as u64;
+        let max = self.ctx.caps.max_workgroup_count[0].min(65_535) as u64;
         let groups = n.div_ceil(workgroup as u64).clamp(1, max) as u32;
         (groups, groups * workgroup)
     }

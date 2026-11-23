@@ -570,3 +570,138 @@ def test_float32_matmul_precision_scope():
     if COOPMAT[torch.bfloat16]:
         with float32_matmul_precision("highest"):
             assert not torch.equal(product, (vsq @ vspd).cpu())  # (while matmul did change)
+
+
+# Products past Vulkan's guaranteed 65,535 workgroups along a grid dimension
+# (#131): csrc/linalg.cpp's gemm() runs them as products of pieces of C, and
+# gemv4.slang, qmm8.slang and qmm4.slang fold their extra workgroups into
+# another grid dimension (docs/log/M52).
+def test_products_past_the_grid_limit():
+    # Operands short along k, so that they stay fast on lavapipe: 4.2M
+    # columns or rows pass every kernel's grid along that dimension (64 per
+    # workgroup: gemm.slang; 32: gemmsg.slang with CI's 8 lanes), a batch of
+    # 70,000 matrices the grid's z, 600,000 rows the 8 rows per workgroup of
+    # gemv.slang and gemv4.slang.
+    big = 4_200_000
+    for dt in [torch.float32] + ([torch.float16] if tv._native.capabilities() & 4 else []):
+        tol = dict(rtol=2e-3, atol=1e-3) if dt == torch.float16 else mm_tol(torch.float32, 3)
+        a, b = make((9, 3), torch.float32, 1).to(dt), make((3, big), torch.float32, 2).to(dt)
+        with on_gpu():
+            got = a.to("vk") @ b.to("vk")
+        check(got, (a.float() @ b.float()).to(dt), **tol)
+        del got
+        with on_gpu():  # (rows)
+            got = b.to("vk").t() @ a.to("vk").t()
+        check(got, (b.float().t() @ a.float().t()).to(dt), **tol)
+        del got
+    a, b = make((70_000, 2, 3), torch.float32, 3), make((70_000, 3, 2), torch.float32, 4)
+    out = torch.empty(2, 70_000, 2, device="vk").transpose(0, 1)  # (a strided out=)
+    bias = make((2,), torch.float32, 5)
+    with on_gpu():
+        torch.bmm(a.to("vk"), b.to("vk"), out=out)
+        got_add = torch.baddbmm(bias.to("vk"), a.to("vk"), b.to("vk"), beta=0.5, alpha=2.0)
+    check(out, torch.bmm(a, b), **mm_tol(torch.float32, 3))
+    check(got_add, torch.baddbmm(bias, a, b, beta=0.5, alpha=2.0), **mm_tol(torch.float32, 3))
+    m, v, c, x = (make((600_000, 3), torch.float32, 6), make((3,), torch.float32, 7),
+                  make((600_000,), torch.float32, 8), make((4, 3), torch.float32, 9))
+    with on_gpu():
+        got_mv = torch.addmv(c.to("vk"), m.to("vk"), v.to("vk"), beta=0.5)
+        got_vm = v.to("vk") @ m.to("vk").t()
+        got_lin = torch.nn.functional.linear(x.to("vk"), m.to("vk"))
+    check(got_mv, torch.addmv(c, m, v, beta=0.5), **mm_tol(torch.float32, 3))
+    check(got_vm, v @ m.t(), **mm_tol(torch.float32, 3))
+    check(got_lin, torch.nn.functional.linear(x, m), **mm_tol(torch.float32, 3))
+
+
+PIECES_SCRIPT = r"""
+import torch, torch_vulkan as tv
+torch.manual_seed(0)
+caps = tv._native.capabilities()
+dtypes = [torch.float32, torch.int32] + ([torch.float64] if caps & 1 else [])
+dtypes += [torch.float16, torch.bfloat16] if caps & 4 else []
+worst = 0.0
+for dt in dtypes + [torch.complex64, "high"]:
+    if dt == "high":  # (float32 on bfloat16 parts, shaders/bf16parts.slang, where the device has them)
+        if not caps & 32:
+            continue
+        torch.set_float32_matmul_precision("high")
+        dt = torch.float32
+    wide = torch.complex128 if dt == torch.complex64 else torch.float64
+    def rand(*shape):
+        x = torch.randn(*shape, dtype=torch.complex64 if dt == torch.complex64 else torch.float32)
+        return (x * 20).round().to(dt) if dt == torch.int32 else x.to(dt)
+    def ref(a, b, alpha=1, beta=0, cin=None):
+        # the product in float64 (complex128) rounded to dt, and the
+        # products' magnitudes
+        r = alpha * (a.to(wide) @ b.to(wide)) + (beta * cin.to(wide) if cin is not None else 0)
+        mag = abs(alpha) * (a.to(wide).abs() @ b.to(wide).abs()) + (abs(beta) * cin.to(wide).abs() if cin is not None else 0)
+        return r.to(dt), mag.double()
+    def close(got, want, mag):
+        # an ulp of dt (16-bit types) and summation error relative to the
+        # products' magnitudes (2^-13 at "high": docs/log/M41)
+        global worst
+        got = got.cpu()
+        assert got.dtype == want.dtype and got.shape == want.shape, (got.dtype, got.shape, want.shape)
+        if dt == torch.int32:
+            assert torch.equal(got, want)
+            return
+        assert not torch.isnan(got).any(), "NaN"
+        eps = {torch.float16: 2**-10, torch.bfloat16: 2**-7}.get(dt, 0.0)
+        rel = 2**-48 if dt == torch.float64 else 2**-13 if torch.get_float32_matmul_precision() == "high" else 2**-20
+        tol = eps * want.abs().double() + rel * mag + 1e-30
+        worst = max(worst, float(((got.to(wide) - want.to(wide)).abs().double() / tol).max()))
+    one, half = (1, 1) if dt == torch.int32 else (1.0, 0.5)
+    # (sizes past TORCH_VK_GEMM_PIECE=512: pieces of 512, 256 and 432 for 1200)
+    for m, k, n in [(1200, 40, 1300), (1200, 3, 9), (9, 37, 1200), (1, 20, 1300), (1300, 20, 1), (5, 33, 1200)]:
+        a, b = rand(m, k), rand(k, n)
+        va, vb = a.to("vk"), b.to("vk")
+        want, mag = ref(a, b)
+        close(va @ vb, want, mag)
+        close(va.t().contiguous().t() @ vb.t().contiguous().t(), want, mag)  # (column-major operands)
+        out = torch.empty(n, m, dtype=dt, device="vk").t()  # (a transposed result)
+        torch.mm(va, vb, out=out)
+        close(out, want, mag)
+    a, b, bias = rand(1100, 30), rand(30, 1250), rand(1250)
+    want, mag = ref(a, b, 2, half, bias.expand(1100, 1250))
+    close(torch.addmm(bias.to("vk"), a.to("vk"), b.to("vk"), beta=half, alpha=2), want, mag)
+    x = rand(1300, 50)
+    want, mag = ref(x[3:1203, 5:45], x[:40, 1:1290])
+    close(x.to("vk")[3:1203, 5:45] @ x.to("vk")[:40, 1:1290], want, mag)  # (strided views)
+    a, b, c = rand(1100, 3, 5), rand(1100, 5, 4), rand(4)  # (a batch past the piece, a broadcast bias)
+    want, mag = ref(a, b, one, one, c.expand(1100, 3, 4))
+    close(torch.baddbmm(c.to("vk"), a.to("vk"), b.to("vk")), want, mag)
+    a, b = rand(2, 700, 20), rand(2, 20, 600)
+    want, mag = ref(a, b)
+    close(torch.bmm(a.to("vk"), b.to("vk")), want, mag)
+    torch.set_float32_matmul_precision("highest")
+if caps & 8 and caps & 4:
+    # int8 weights with 600,000 output columns: past the grid's 65,535
+    # workgroups of 8 columns (gemv4.slang, or qmm8.slang's ROWS with
+    # TORCH_VK_GEMV=scalar)
+    a, w, s = torch.randn(2, 16), torch.randint(-128, 128, (600_000, 16), dtype=torch.int8), torch.rand(600_000) / 50
+    want = a.double() @ (w.double() * s.double()[:, None]).t()
+    mag = a.double().abs() @ (w.double() * s.double()[:, None]).abs().t()
+    got = torch._weight_int8pack_mm(a.to("vk"), w.to("vk"), s.to("vk")).cpu().double()
+    worst = max(worst, float(((got - want).abs() / (2**-20 * mag + 2**-24 * want.abs() + 1e-30)).max()))
+print(tv.fallback_counts())
+print(worst)
+"""
+
+
+@pytest.mark.parametrize("env", [{}, dict(TORCH_VK_GEMM="tiled"), dict(TORCH_VK_GEMM="float4"),
+                                 dict(TORCH_VK_GEMV="vector"), dict(TORCH_VK_GEMV="scalar"),
+                                 dict(TORCH_VK_SPLIT_K="2")])
+def test_products_in_pieces(env):
+    # TORCH_VK_GEMM_PIECE=512 runs products with more than 512 rows, columns
+    # or matrices in pieces, as gemm() runs those past the grid's limit:
+    # each route (by default gemmsg.slang, and gemmcm.slang for 16-bit types
+    # and float32 at "high" where the device has cooperative matrices; forced
+    # by the other switches: gemm.slang's tiles, gemm4.slang or gemm4s.slang,
+    # gemv4.slang, gemv.slang, split k) on pieces at offsets of C, A and B,
+    # with cin, strided and transposed operands
+    env = dict(os.environ, TORCH_VK_GEMM_PIECE="512", **env)
+    out = subprocess.run([sys.executable, "-c", PIECES_SCRIPT], env=env, capture_output=True, text=True, timeout=900)
+    assert out.returncode == 0, out.stderr[-3000:]
+    lines = out.stdout.strip().splitlines()
+    assert lines[-2] == "{}", f"ran on the CPU: {lines[-2]}"
+    assert float(lines[-1]) <= 1.0, lines[-1]

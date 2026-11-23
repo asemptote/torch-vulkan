@@ -23,6 +23,9 @@
 //   the output type's finite range, stored (bfloat16 by truncation, as the
 //   CPU's bf16 kernel does). A 256-thread workgroup computes an 8 x 32 tile,
 //   one output per thread, staging 32 values of k of q and the weights.
+//   Grid: (N / 32, M / 8), column block gid.z * 65535 + gid.x (more than
+//   65,535 column blocks, Vulkan's guaranteed grid limit, folded into z;
+//   blocks past the last store nothing).
 //
 // GROUPWISE (spec constant 1): the groupwise kernel adds the zero point's
 // error terms left to right ((qmin + dmin) + qmax) + dmax, the channelwise
@@ -182,7 +185,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
 
     // PHASE 1
     uint mi = t / 32, ni = t % 32;
-    uint m0 = gid.y * 8, n0 = gid.x * 32;
+    uint m0 = gid.y * 8, n0 = (gid.z * 65535u + gid.x) * 32;
     uint m = m0 + mi, n = n0 + ni;
     uint rstride = (p.k + 1) / 2;                  // bytes per weight row
     uint wcount = p.n * p.k / 2;                   // (the CPU's weights_elements)

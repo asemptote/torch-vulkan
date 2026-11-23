@@ -432,6 +432,16 @@ impl Stream {
     /// outside its declaration races with the commands around it.
     pub fn dispatch_declared(&mut self, kernel: &Kernel, push: &[u8], groups: [u32; 3], acc: Option<&[Access]>) -> Result<()> {
         assert!(push.len() <= PUSH_CONSTANT_BYTES as usize, "push constants too large for {}", kernel.name);
+        let max = self.ctx.caps.max_workgroup_count;
+        if groups.iter().zip(max).any(|(&g, m)| g > m) {
+            // (past the limit a dispatch is undefined behaviour: refused,
+            // naming the kernel, rather than run)
+            return Err(format!(
+                "{}: a grid of {}x{}x{} workgroups is more than the device's limit of {}x{}x{} (maxComputeWorkGroupCount)",
+                kernel.name, groups[0], groups[1], groups[2], max[0], max[1], max[2]
+            )
+            .into());
+        }
         self.dispatches += 1;
         // Always set the whole range the layout declares, so no byte a kernel
         // might read is left undefined.
