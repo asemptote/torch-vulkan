@@ -212,11 +212,12 @@ fn kernels() -> Vec<&'static str> {
     vkcore::KernelCache::names().collect()
 }
 
-/// (allocated bytes, reserved bytes, blocks) of the memory pool.
+/// (allocated bytes, reserved bytes, blocks, reserved bytes in unmapped
+/// memory) of the memory pool.
 #[pyfunction]
-fn memory_stats() -> PyResult<(u64, u64, usize)> {
+fn memory_stats() -> PyResult<(u64, u64, usize, u64)> {
     let s = py_runtime()?.pool.lock().unwrap().stats();
-    Ok((s.allocated, s.reserved, s.blocks))
+    Ok((s.allocated, s.reserved, s.blocks, s.unmapped))
 }
 
 /// Releases cached, unused pool blocks back to the driver.

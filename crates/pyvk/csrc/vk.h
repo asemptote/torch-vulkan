@@ -50,12 +50,17 @@ enum class TypedError { Index, Type, Value, NotImplemented };
 extern "C" {
 struct VktAlloc {
   void* handle;
-  uint8_t* host;
+  uint8_t* host;  // (unmapped memory: a key, not to be dereferenced)
   uint64_t address;
   uint64_t size;
+  int32_t mapped;
 };
 const char* vkt_last_error();
 int vkt_alloc(uint64_t nbytes, VktAlloc* out);
+int vkt_alloc_host(uint64_t nbytes, VktAlloc* out);
+int vkt_read(uint64_t address, uint8_t* dst, uint64_t n);
+int vkt_write(uint64_t address, const uint8_t* src, uint64_t n);
+int vkt_copy(uint64_t dst, uint64_t src, uint64_t n);
 void vkt_free(void* handle);
 int vkt_synchronize();
 int vkt_empty_cache();
@@ -163,7 +168,23 @@ struct AllocCtx {
   uint8_t* host;
   uint64_t address;
   uint64_t size;
+  bool mapped;
 };
+
+// Whether the host maps the memory of vk tensor data pointer `data` (vk
+// tensors past what the driver maps live in unmapped device memory, whose
+// data pointers are keys, not addresses: docs/log/M55).
+bool host_mapped(const void* data);
+
+// Copies `n` bytes of the vk memory at data pointer `data` to `dst`, after
+// the queued work; and the other way.
+void read_device(const void* data, void* dst, size_t n);
+void write_device(void* data, const void* src, size_t n);
+
+// A CPU tensor with vk tensor `t`'s values, sizes and strides, after the
+// queued work: a view of the mapping where the host maps it, else a copy
+// of the memory its elements span. Read only.
+at::Tensor host_readable(const at::Tensor& t);
 
 // GPU address of the first element of `t` (0 for empty storage).
 uint64_t gpu_address(const at::TensorBase& t);

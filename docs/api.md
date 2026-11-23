@@ -22,7 +22,7 @@ a `python-torch` upgrade, install the matching build or rebuild).
 | `device_count()` | `1` if a device is available, else `0` (one device for now). |
 | `device_name()` | The device's name, e.g. `"Intel(R) UHD Graphics 620"`. |
 | `synchronize(device=None)` | Waits until all queued GPU work has finished. Reading a value back (`.item()`, `.cpu()`) synchronises by itself. |
-| `memory_stats()` | `{"allocated_bytes", "reserved_bytes", "blocks"}`: memory held by live tensors, memory held by the caching allocator in total, and the number of device memory blocks. |
+| `memory_stats()` | `{"allocated_bytes", "reserved_bytes", "blocks", "unmapped_bytes"}`: memory held by live tensors, memory held by the caching allocator in total, the number of device memory blocks, and how much of the reserved memory is device memory the host does not map (see [Device memory](#device-memory)). |
 | `empty_cache()` | Returns cached, unused device memory to the driver. |
 | `fallback_counts()` | `{op: count}` of aten ops that ran on the CPU instead of the GPU since the process started; an op whose CPU call only raised an error appears as `"op (raised)"`, and one refused with the CPU fallback off as `"op (refused)"`. Empty in normal use. |
 | `set_cpu_fallback(enabled)` | Lets ops with no Vulkan kernel for their arguments run on the CPU (`True`) or makes them raise `NotImplementedError` (`False`, the default), for the whole process. See [The CPU fallback](#the-cpu-fallback). |
@@ -41,6 +41,32 @@ most bytes live tensors held at once since the start or the last
 Random numbers come from a Philox generator on the GPU. They are
 deterministic for a given seed, but not the same numbers as the CPU's
 generator.
+
+## Device memory
+
+Tensors are sub-allocated from blocks of device memory (64 MiB, or one
+block for a larger tensor) that a caching allocator keeps for reuse, as
+CUDA's does; `empty_cache()` returns unused blocks to the driver.
+
+- First, blocks are memory the host maps (host-visible and, where the GPU
+  has it, device-local), so that `.cpu()`, `.item()` and copies from the
+  CPU read and write it directly. On integrated GPUs that is all of the
+  memory. On discrete GPUs it is the part the host reaches over PCIe,
+  which drivers limit: 256 MiB without resizable BAR, 19 GiB of the L40S's
+  45 GiB and 34.5 GiB of the H100 NVL's 94 GiB (NVIDIA driver 615).
+- Past that limit, new blocks are device memory the host does not map
+  (`memory_stats()["unmapped_bytes"]`): kernels use it as any other, and
+  the host reads and writes it through copies to and from host memory
+  (64 MiB at a time). Those reads and writes cost a copy more; nothing else
+  changes.
+- When the driver refuses a block, cached unused blocks are released and
+  the block is tried again; when that fails too, the error names the
+  request, what the allocator holds and why each kind of memory refused.
+- One tensor's storage is one Vulkan buffer, so it can be at most the
+  device's `maxBufferSize` (1 TiB on NVIDIA's drivers); larger requests are
+  refused with an error naming both. Past `maxMemoryAllocationSize` (4 GiB
+  on some older drivers) an allocation is still tried, and its error names
+  that limit if it fails.
 
 ## Dtypes
 
@@ -201,6 +227,7 @@ in [kernel-routes.md](kernel-routes.md).
 | `TORCH_VK_COMPUTE_UNITS=n` | tuning | The GPU's SM or compute-unit count, which matrix products choose their tile shape and k split by (default: the driver's count where it reports one, or a table's for Intel's discrete GPUs; `0`, unknown, elsewhere: then products are never split). |
 | `TORCH_VK_SPLIT_K=n` | tuning | Split the k of every matrix product on the `subgroup` or cooperative-matrix kernels into `n` pieces where it can (`1`: never), instead of choosing by the GPU's size; the other kernels never split. The pieces' sums are added in a fixed order, so results are the same from run to run either way. |
 | `TORCH_VK_GEMM_TILE=l`, `m` or `s` | tuning | The cooperative-matrix kernel's tile (128 x 256, 128 x 128 or 64 x 128) for every product it runs (float16, bfloat16, and float32 in bfloat16 parts), instead of choosing by the GPU's size. |
+| `TORCH_VK_UNMAPPED=1` | testing | Put every tensor in device memory the host does not map, as tensors past the mapped memory's limit are (see [Device memory](#device-memory)): for testing the host's copies to and from it on any GPU. `TORCH_VK_BARRIERS=check` does not check kernels' writes to unmapped memory. |
 | `TORCH_VK_GEMM_GROUP=g` | tuning | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). |
 | `TORCH_VK_GEMM_PIECE=n` | testing | Run matrix products with more than `n` rows, columns or matrices (a multiple of 256, at least 512) in pieces of at most `n`, one dispatch each, as those too large for one dispatch always run (more than 524,032 rows or columns, or 65,535 matrices: docs/log/M52). For testing that path on small products. |
 | `TORCH_VK_WIDE_ADDRESSES=1` | testing | Run every kernel with 64-bit address arithmetic, as kernels run where a dispatch can reach more than 4 GiB past a tensor's address (docs/log/M56). For testing those kernels on small tensors; slower. |

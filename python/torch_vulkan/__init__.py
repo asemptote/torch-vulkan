@@ -172,8 +172,9 @@ def synchronize(device=None):
 
 
 def memory_stats():
-    allocated, reserved, blocks = _native.memory_stats()
-    return {"allocated_bytes": allocated, "reserved_bytes": reserved, "blocks": blocks}
+    allocated, reserved, blocks, unmapped = _native.memory_stats()
+    return {"allocated_bytes": allocated, "reserved_bytes": reserved, "blocks": blocks,
+            "unmapped_bytes": unmapped}
 
 
 def empty_cache():
