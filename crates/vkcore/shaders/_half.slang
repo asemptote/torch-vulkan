@@ -41,3 +41,19 @@ half to_half(float f)
 {
     return bit_cast<half>(f16_bits_rne(f));
 }
+
+// float16 bits -> float, on the bits: exact without the GPU's conversion,
+// whose handling of float16 denormals (shaderDenormPreserveFloat16, not
+// requested by vkcore) is the driver's choice. A denormal h = m 2^-24 is a
+// normal float32, and so is m * 2^-24.
+float f32_from_f16_bits(uint h)
+{
+    uint sign = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u)
+        return bit_cast<float>(bit_cast<uint>(float(m) * 5.9604644775390625e-8f) | sign);  // (2^-24)
+    if (e == 31u)
+        return bit_cast<float>(sign | 0x7f800000u | (m << 13));  // inf, NaN (payload kept)
+    return bit_cast<float>(sign | ((e + 112u) << 23) | (m << 13));
+}
