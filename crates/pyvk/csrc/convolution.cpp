@@ -196,6 +196,7 @@ at::Tensor conv_direct(const at::Tensor& x_in, const at::Tensor& w, const std::o
   int64_t slack = std::max<int64_t>(0, reach - plane);
   int64_t total = N * C * plane + slack;
   if (total >= (int64_t(1) << 31) || N * Co * (Do * Ho * Wo) >= (int64_t(1) << 31) || N * groups > 65535 ||
+      Co * Cg * KO * (ceil_div(KW, 4) * 4) >= kKernelOffsets ||  // (the padded weight's offsets: docs/log/M56)
       ceil_div(nv, cols) > 65535 || ceil_div(Cog, tile.rows) > 65535) {
     return {};
   }
@@ -398,9 +399,22 @@ at::Tensor conv_forward(const at::Tensor& x, const at::Tensor& w, const std::opt
     if (bias.has_value() && bias->defined()) bf = bias->to(at::kFloat);
     return conv_forward(x.to(at::kFloat), w.to(at::kFloat), bf, stride, pad, dilation, groups).to(x.scalar_type());
   }
-  at::Tensor xp = pad_spatial(x, pad);
   int64_t Kp = 1;
   for (int64_t v : k) Kp *= v;
+  // Columns past the kernels' 32-bit offsets (docs/log/M56): the batch in
+  // pieces whose columns stay within them (one sample's that do not: the
+  // copy into the columns refuses them).
+  int64_t per_sample = C * Kp * ((L + 3) / 4 * 4);
+  if (N > 1 && N * per_sample >= kKernelOffsets) {
+    int64_t step = std::max<int64_t>(1, (kKernelOffsets - 1) / per_sample);
+    at::Tensor y = at::empty(out_shape, x.options());
+    for (int64_t n0 = 0; n0 < N; n0 += step) {
+      int64_t len = std::min(step, N - n0);
+      y.narrow(0, n0, len).copy_(conv_forward(x.narrow(0, n0, len), w, bias, stride, pad, dilation, groups));
+    }
+    return y;
+  }
+  at::Tensor xp = pad_spatial(x, pad);
   int64_t Cg = C / groups, Cog = Co / groups;
   if (groups == 1 || N == 1) {
     // out[n, g] = W_g [Cog, Cg*K] @ cols[n, g] [Cg*K, L]: the columns are
@@ -700,6 +714,16 @@ at::Tensor conv_weight_grad(const at::Tensor& x, const at::Tensor& g, at::IntArr
     if (at::Tensor gw = conv_depthwise_weight_grad(x, g, wsize, stride, pad, dilation, groups); gw.defined()) {
       return gw;
     }
+  }
+  if (N > 1 && N * L * C * Kp >= kKernelOffsets) {
+    // (columns past 32-bit offsets: the sum over pieces of the batch, as conv_forward)
+    int64_t step = std::max<int64_t>(1, (kKernelOffsets - 1) / (L * C * Kp));
+    at::Tensor gw = at::zeros(wsize, x.options());
+    for (int64_t n0 = 0; n0 < N; n0 += step) {
+      int64_t len = std::min(step, N - n0);
+      gw.add_(conv_weight_grad(x.narrow(0, n0, len), g.narrow(0, n0, len), wsize, stride, pad, dilation, groups));
+    }
+    return gw;
   }
   at::Tensor cols = im2col_view(pad_spatial(x, pad), k, stride, dilation, out);      // [N, L, C*K]
   cols = cols.reshape({N * L, groups, Cg * Kp}).permute({1, 0, 2});                  // [G, N*L, Cg*K]

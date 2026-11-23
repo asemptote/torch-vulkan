@@ -242,21 +242,22 @@ fn small_allocations_leave_an_empty_large_block_alone() -> Result<()> {
 fn kernel_cache_reuses_pipelines() -> Result<()> {
     let rt = Runtime::new()?;
     let mut cache = rt.kernels.lock().unwrap();
-    let a = cache.get("axpy_f64", &[1])?;
-    let b = cache.get("axpy_f64", &[1])?;
-    let c = cache.get("axpy_f64", &[0])?;
+    let a = cache.get("axpy_f64", &[1], false)?;
+    let b = cache.get("axpy_f64", &[1], false)?;
+    let c = cache.get("axpy_f64", &[0], false)?;
     assert!(std::sync::Arc::ptr_eq(&a, &b));
     assert_ne!(a.pipeline, c.pipeline);
-    assert!(cache.get("no_such_kernel", &[]).is_err());
+    assert!(cache.get("no_such_kernel", &[], false).is_err());
     drop(cache);
     assert_clean();
     Ok(())
 }
 
 /// Every kernel this device can run (those whose capabilities it has) builds
-/// a pipeline, with default specialization constants: the first check on a
-/// new GPU or driver. `cargo test -p vkcore --release every_kernel_builds -- --nocapture`
-/// lists the failures.
+/// a pipeline, with default specialization constants, and again with 64-bit
+/// addresses (docs/log/M56): the first check on a new GPU or driver.
+/// `cargo test -p vkcore --release every_kernel_builds -- --nocapture` lists
+/// the failures.
 #[test]
 fn every_kernel_builds() -> Result<()> {
     let rt = Runtime::new()?;
@@ -264,10 +265,12 @@ fn every_kernel_builds() -> Result<()> {
     let mut failed = Vec::new();
     let mut refused = 0;
     for name in vkcore::kernels::KernelCache::names() {
-        match cache.get(name, &[]) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("which this device does not support") => refused += 1,
-            Err(e) => failed.push(format!("{name}: {e}")),
+        for wide in [false, true] {
+            match cache.get(name, &[], wide) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("which this device does not support") => refused += 1,
+                Err(e) => failed.push(format!("{name} (wide: {wide}): {e}")),
+            }
         }
     }
     drop(cache);

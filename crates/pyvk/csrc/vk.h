@@ -99,6 +99,25 @@ constexpr int64_t kMaxGroups = 65535;
 
 inline int64_t ceil_div(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
+// Kernels address each operand with 32-bit element offsets from the address
+// they are given (the tensor's first element), and count elements in 32
+// bits: kKernelOffsets bounds both (docs/log/M56). Launchers that can meet
+// larger tensors run them in pieces or refuse them (the CPU fallback, or an
+// error), never letting an offset wrap.
+constexpr int64_t kKernelOffsets = int64_t(1) << 31;
+
+// Whether every element of `t` is within kKernelOffsets of its first
+// (strides taken by magnitude), and it has fewer elements than that.
+inline bool offsets_fit(const at::TensorBase& t) {
+  if (t.numel() >= kKernelOffsets) return false;
+  int64_t span = 0;
+  for (int64_t d = 0; d < t.dim(); ++d) {
+    if (t.size(d) > 1) span += (t.size(d) - 1) * std::abs(t.stride(d));
+    if (span >= kKernelOffsets) return false;
+  }
+  return true;
+}
+
 // Workgroups of 256 threads for `threads` threads, at least 1 and at most
 // kMaxGroups (kernels then loop over the rest).
 inline uint32_t groups_for(int64_t threads) {

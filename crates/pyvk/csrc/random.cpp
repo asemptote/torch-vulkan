@@ -139,7 +139,8 @@ at::Tensor& fill_random(at::Tensor& self, uint32_t op, at::ScalarType compute, B
   if (self.numel() == 0) {
     return self;
   }
-  TORCH_CHECK(self.numel() < (int64_t(1) << 32), "torch_vulkan: random fill of more than 2^32 elements");
+  // (rng.slang counts and offsets elements in 32 bits: docs/log/M56)
+  TORCH_CHECK(self.numel() < kKernelOffsets, "torch_vulkan: random fill of more than 2^31 elements");
   bool direct = self.scalar_type() == compute && self.is_contiguous();
   at::Tensor target = direct ? self : at::empty(self.sizes(), self.options().dtype(compute));
   auto [seed, offset] = generator(gen)->next_call();
@@ -611,7 +612,7 @@ at::Tensor sample_kernel(uint32_t op, at::IntArrayRef shape, at::ScalarType dtyp
   if (out.numel() == 0) {
     return out.to(dtype);
   }
-  TORCH_CHECK(out.numel() < (int64_t(1) << 32), "torch_vulkan: sampling more than 2^32 elements");
+  TORCH_CHECK(out.numel() < kKernelOffsets, "torch_vulkan: sampling more than 2^31 elements");
   for (auto& t : inputs) {
     t = t.to(compute).expand(shape).contiguous();
   }

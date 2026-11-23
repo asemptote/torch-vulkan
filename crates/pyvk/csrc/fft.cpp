@@ -350,6 +350,15 @@ bool fft_dtype(const at::Tensor& t) {
   return is_vk(t) && dtype_label(t.scalar_type()) != nullptr;
 }
 
+// Whether the FFT kernels' 32-bit offsets reach every element of the buffers
+// a transform of `t` (`elements` complex values, the larger of input and
+// output) uses: Bluestein's padded rows are up to 4 times as long, and some
+// passes index real components, twice as many (docs/log/M56). Larger
+// transforms run on the CPU (where the fallback is on).
+bool fft_fits(int64_t elements) {
+  return elements < kKernelOffsets / 8;
+}
+
 // float16 and complex32 (which the CPU does not transform; CUDA does): in
 // float32 / complex64, the result rounded back, any size.
 bool half_fft(const at::Tensor& t) {
@@ -408,7 +417,7 @@ at::Tensor fft_c2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
   if (half_fft(self) && self.is_complex()) {
     return narrow_fft(fft_c2c_compute(widen_fft(self), dim, normalization, forward));
   }
-  if (!fft_dtype(self) || !at::isComplexType(self.scalar_type())) {
+  if (!fft_dtype(self) || !at::isComplexType(self.scalar_type()) || !fft_fits(self.numel())) {
     return on_cpu("aten::_fft_c2c", "", self, dim, normalization, forward)[0].toTensor();
   }
   at::Tensor out = self;
@@ -427,7 +436,7 @@ at::Tensor fft_r2c_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
   if (half_fft(self) && !self.is_complex() && !dim.empty()) {
     return narrow_fft(fft_r2c_compute(widen_fft(self), dim, normalization, onesided));
   }
-  if (!fft_dtype(self) || !at::isFloatingType(self.scalar_type()) || dim.empty()) {
+  if (!fft_dtype(self) || !at::isFloatingType(self.scalar_type()) || dim.empty() || !fft_fits(self.numel())) {
     return on_cpu("aten::_fft_r2c", "", self, dim, normalization, onesided)[0].toTensor();
   }
   int64_t n = 1;
@@ -469,7 +478,8 @@ at::Tensor fft_c2r_compute(const at::Tensor& self, at::IntArrayRef dim, int64_t 
   }
   int64_t last = dim.empty() ? 0 : at::maybe_wrap_dim(dim.back(), self.dim());
   if (!fft_dtype(self) || !at::isComplexType(self.scalar_type()) || dim.empty() ||
-      self.size(last) < last_dim_size / 2 + 1 || last_dim_size < 1) {
+      self.size(last) < last_dim_size / 2 + 1 || last_dim_size < 1 ||
+      !fft_fits(std::max(self.numel(), self.numel() / std::max<int64_t>(self.size(last), 1) * last_dim_size))) {
     return on_cpu("aten::_fft_c2r", "", self, dim, normalization, last_dim_size)[0].toTensor();
   }
   at::Tensor x = self;

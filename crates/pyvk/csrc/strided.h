@@ -74,29 +74,64 @@ StridedDims<K> plan_operands(const at::Tensor& out, const std::array<const at::T
 }
 
 // Splits the work into dispatches: the innermost `max_inner` dims go to the
-// kernel, the rest are looped over here. For each dispatch calls
-// emit(inner_count, offsets) where offsets[k] is operand k's element offset.
-// Checks the kernel-side limits (32-bit element offsets and counts).
+// kernel, the rest are looped over here. Kernels count elements and offset
+// operands in 32 bits (docs/log/M56: below 2^31, so that a grid-stride
+// loop's counter cannot wrap either); where the kernel's dims pass that,
+// the outermost of them is cut into pieces (fewer dims go to the kernel
+// where even one element of it does not fit). For each dispatch calls
+// emit(count, offsets, inner, last): offsets[k] is operand k's element
+// offset, `inner` the dims the kernel takes and `last` the length of the
+// outermost of them (index inner - 1) in that dispatch.
 template <size_t K, typename F>
 void for_each_dispatch(const StridedDims<K>& d, size_t max_inner, F&& emit) {
+  constexpr int64_t kLimit = int64_t(1) << 31;
   size_t inner = std::min(d.ndim(), max_inner);
-  int64_t inner_count = 1;
+  // (the dims below the outermost inner one: their count and spans)
+  int64_t below = 1;
   std::array<int64_t, K> span{};
-  for (size_t i = 0; i < inner; ++i) {
-    inner_count *= d.size[i];
-    for (size_t k = 0; k < K; ++k) span[k] += (d.size[i] - 1) * std::abs(d.stride[i][k]);
+  int64_t piece = 0;  // elements of the outermost inner dim per dispatch
+  while (true) {
+    below = 1;
+    span = {};
+    for (size_t i = 0; i + 1 < inner; ++i) {
+      below *= d.size[i];
+      for (size_t k = 0; k < K; ++k) span[k] += (d.size[i] - 1) * std::abs(d.stride[i][k]);
+    }
+    if (inner == 0) {
+      piece = 1;
+      break;
+    }
+    // the longest piece of dim inner - 1 that keeps count and spans below the limit
+    piece = (kLimit - 1) / below;
+    bool negative = false;
+    for (size_t k = 0; k < K; ++k) {
+      int64_t st = std::abs(d.stride[inner - 1][k]);
+      negative = negative || d.stride[inner - 1][k] < 0;
+      if (span[k] >= kLimit) piece = 0;
+      else if (st > 0) piece = std::min(piece, (kLimit - 1 - span[k]) / st + 1);
+    }
+    piece = std::min(piece, d.size[inner - 1]);
+    // (a reversed dim only whole: copy_reversed's offsets assume it)
+    if (negative && piece < d.size[inner - 1]) piece = 0;
+    if (piece >= 1 || inner == 1) break;
+    --inner;  // (not even one element of it fits: it goes to the host's loop)
   }
-  TORCH_CHECK(inner_count < (int64_t(1) << 32), "torch_vulkan: more than 2^32 elements per dispatch");
-  for (size_t k = 0; k < K; ++k) {
-    TORCH_CHECK(span[k] < (int64_t(1) << 31), "torch_vulkan: element offsets beyond 2^31");
-  }
+  TORCH_CHECK(piece >= 1, "torch_vulkan: element offsets beyond 2^31 in one dim");
   std::vector<int64_t> index(d.ndim() - inner, 0);
+  int64_t last = inner > 0 ? d.size[inner - 1] : 1;
   while (true) {
     std::array<int64_t, K> offsets{};
     for (size_t j = 0; j < index.size(); ++j) {
       for (size_t k = 0; k < K; ++k) offsets[k] += index[j] * d.stride[inner + j][k];
     }
-    emit(inner_count, offsets);
+    for (int64_t start = 0; start < last; start += piece) {
+      int64_t len = std::min(piece, last - start);
+      std::array<int64_t, K> at = offsets;
+      if (inner > 0) {
+        for (size_t k = 0; k < K; ++k) at[k] += start * d.stride[inner - 1][k];
+      }
+      emit(below * len, at, inner, len);
+    }
     size_t j = 0;
     for (; j < index.size(); ++j) {
       if (++index[j] < d.size[inner + j]) break;

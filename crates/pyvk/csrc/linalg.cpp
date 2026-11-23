@@ -349,7 +349,9 @@ bool gemv4(const Gemv4& g) {
   int64_t wsize = w == "q8" ? 1 : esize;  // (q4: never addressed by element)
   bool aligned = g.w % 16 == 0 && g.w_row % 16 == 0;
   if ((w == "q4" && (!aligned || k % chunk != 0)) || g.w_row % wsize != 0 ||
-      (rows - 1) * g.w_row + ceil_div(k * (w == "q4" ? 1 : 2 * wsize), 2) >= (int64_t(1) << 32)) {
+      (rows - 1) * g.w_row + ceil_div(k * (w == "q4" ? 1 : 2 * wsize), 2) >= (int64_t(1) << 32) ||
+      // (gemv4.slang's k0 * WBITS, bits along a row, in 32 bits: docs/log/M56)
+      k * (w == "q4" ? 4 : 8 * wsize) >= (int64_t(1) << 32)) {
     return false;
   }
   // The vectors contiguous along k, 16-byte aligned, padded with zeros to a

@@ -76,7 +76,9 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
 
   const char* label = float_label(A.scalar_type());
   if (!all_vk({&A, &B, &scales}) || label == nullptr || storage_label(at::kChar) == nullptr ||
-      A.stride(0) >= (int64_t(1) << 31) || B.numel() >= (int64_t(1) << 31) || M * N >= (int64_t(1) << 31)) {
+      A.stride(0) >= (int64_t(1) << 31) || B.numel() >= (int64_t(1) << 31) || M * N >= (int64_t(1) << 31) ||
+      // (qmm8.slang's rows of A at 32-bit offsets, in one dispatch for M <= 8: docs/log/M56)
+      (M <= 8 && (M - 1) * A.stride(0) + K >= kKernelOffsets)) {
     return on_cpu("aten::_weight_int8pack_mm", "", A, B, scales)[0].toTensor();
   }
   at::Tensor C = at::empty({M, N}, A.options());
@@ -118,8 +120,10 @@ at::Tensor weight_int8pack_mm(const at::Tensor& A, const at::Tensor& B, const at
     return C;
   }
   auto [gx, gz] = folded_groups((N + 63) / 64);  // (column blocks past kMaxGroups: folded into z)
-  for (int64_t r0 = 0; r0 < M; r0 += kMaxGroups * 64) {  // (rows in chunks of the grid's limit)
-    int64_t rows = std::min<int64_t>(M - r0, kMaxGroups * 64);
+  // (rows in chunks of the grid's limit, and of A's 32-bit offsets: docs/log/M56)
+  int64_t step = std::clamp<int64_t>((kKernelOffsets - K) / std::max<int64_t>(A.stride(0), 1), 1, kMaxGroups * 64);
+  for (int64_t r0 = 0; r0 < M; r0 += step) {
+    int64_t rows = std::min<int64_t>(M - r0, step);
     Q8Params p{};
     p.a = gpu_address(A) + static_cast<uint64_t>(r0 * A.stride(0) * item);
     p.b = gpu_address(B);

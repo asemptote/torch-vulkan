@@ -258,7 +258,7 @@ FwdResult sdpa_forward(const at::Tensor& q_in, const at::Tensor& k_in, const at:
   at::Tensor debug;
   if (return_debug_mask && dropout) {
     int64_t n = B * H * L * S;
-    TORCH_CHECK(n < (int64_t(1) << 32), "torch_vulkan: dropout mask of more than 2^32 elements");
+    TORCH_CHECK(n < kKernelOffsets, "torch_vulkan: dropout mask of more than 2^31 elements");  // (docs/log/M56)
     at::Tensor keep = at::empty({B, H, L, S}, q.options().dtype(at::kInt));
     if (n > 0) {
       AttnAuxParams p{};

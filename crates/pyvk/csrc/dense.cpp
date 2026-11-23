@@ -106,24 +106,41 @@ at::Tensor abs2(const at::Tensor& t) {
   return t.is_complex() ? at::view_as_real(t.resolve_conj()).square().sum(-1) : t.square();
 }
 
-// A batch of matrices this file handles: vk, float32/64 (or complex), at least 2-D, and
-// at most kMaxBatch matrices.
+// The most elements of the matrices one launch of this file's kernels
+// takes: they offset matrices and their workspaces (up to twice as large)
+// in 32 bits (docs/log/M56).
+constexpr int64_t kDenseElements = int64_t(1) << 30;
+
+// Whether a launch can take all of t's elements (right-hand sides: the
+// matrices are checked by gpu_matrices).
+bool dense_fits(const at::Tensor& t) {
+  return t.numel() <= kDenseElements;
+}
+
+// Matrices per launch for matrices of `per` elements.
+int64_t chunk_matrices(int64_t per) {
+  return std::clamp<int64_t>(kDenseElements / std::max<int64_t>(per, 1), 1, kMaxBatch);
+}
+
+// A batch of matrices this file handles: vk, float32/64 (or complex), at
+// least 2-D, and as many matrices as one launch takes (at most kMaxBatch,
+// and kDenseElements in all).
 bool gpu_matrices(const at::Tensor& t) {
   if (linalg_on_cpu() || !is_vk(t) || t.dim() < 2 || !float_dtype(t.scalar_type())) {
     return false;
   }
-  int64_t batch = 1;
+  int64_t batch = 1, per = t.size(-2) * t.size(-1);
   for (int64_t d = 0; d + 2 < t.dim(); ++d) batch *= t.size(d);
-  return batch <= kMaxBatch;
+  return per <= kDenseElements && batch <= chunk_matrices(per);
 }
 
-// More matrices than one dispatch takes, otherwise as gpu_matrices: done in
-// chunks of kMaxBatch (by the callers below).
+// More matrices than one launch takes, otherwise as gpu_matrices: done in
+// chunks of chunk_matrices (by the callers below).
 bool gpu_matrices_chunked(const at::Tensor& t) {
   if (linalg_on_cpu() || !is_vk(t) || t.dim() < 3 || !float_dtype(t.scalar_type())) return false;
-  int64_t batch = 1;
+  int64_t batch = 1, per = t.size(-2) * t.size(-1);
   for (int64_t d = 0; d + 2 < t.dim(); ++d) batch *= t.size(d);
-  return batch > kMaxBatch;
+  return per <= kDenseElements && batch > chunk_matrices(per);
 }
 
 // [B, rows, cols] view (or copy) of t's matrices; B explicit so empty
@@ -1176,7 +1193,8 @@ at::Tensor rhs_batched(const at::Tensor& a, const at::Tensor& b, bool& vector) {
 std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> solve_ex_out(
     const at::Tensor& a, const at::Tensor& b, bool left, bool check, at::Tensor& result, at::Tensor& lu,
     at::Tensor& pivots, at::Tensor& info) {
-  if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || !is_vk(result)) {
+  if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || !dense_fits(b) || b.scalar_type() != a.scalar_type() ||
+      !is_vk(result)) {
     on_cpu("aten::_linalg_solve_ex", "result", a, b, left, check, result, lu, pivots, info);
     return {result, lu, pivots, info};
   }
@@ -1260,8 +1278,8 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> slogdet_out(const
 
 at::Tensor& lu_solve_out(const at::Tensor& lu, const at::Tensor& pivots, const at::Tensor& b, bool left, bool adjoint,
                          at::Tensor& out) {
-  if (!gpu_matrices(lu) || !is_square(lu) || !is_vk(b) || !is_vk(pivots) || b.scalar_type() != lu.scalar_type() ||
-      !is_vk(out)) {
+  if (!gpu_matrices(lu) || !is_square(lu) || !is_vk(b) || !dense_fits(b) || !is_vk(pivots) ||
+      b.scalar_type() != lu.scalar_type() || !is_vk(out)) {
     on_cpu("aten::linalg_lu_solve", "out", lu, pivots, b, left, adjoint, out);
     return out;
   }
@@ -1299,8 +1317,8 @@ at::Tensor& solve_triangular_out(const at::Tensor& a, const at::Tensor& b, bool 
   TORCH_CHECK_NOT_IMPLEMENTED(!is_vk(a) || ((at::isFloatingType(st) || at::isComplexType(st)) && st != at::kHalf &&
                                                st != at::kBFloat16 && st != at::kComplexHalf),
                               "\"triangular_solve_cpu\" not implemented for '", st, "'");
-  if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || b.dim() < 2 ||
-      !is_vk(out)) {
+  if (!gpu_matrices(a) || !is_square(a) || !is_vk(b) || !dense_fits(b) || b.scalar_type() != a.scalar_type() ||
+      b.dim() < 2 || !is_vk(out)) {
     on_cpu("aten::linalg_solve_triangular", "out", a, b, upper, left, unit, out);
     return out;
   }
@@ -1342,7 +1360,7 @@ std::tuple<at::Tensor&, at::Tensor&> triangular_solve_legacy_out(const at::Tenso
                                                                   at::Tensor& m) {
   check_exact_out(a, a.scalar_type(), x);
   check_exact_out(a, a.scalar_type(), m);
-  if (!gpu_matrices(a) || !is_vk(b)) {
+  if (!gpu_matrices(a) || !is_vk(b) || !dense_fits(b)) {
     on_cpu("aten::triangular_solve", "X", b, a, upper, transpose, unit, x, m);
     return {x, m};
   }
@@ -1385,8 +1403,9 @@ std::tuple<at::Tensor&, at::Tensor&> cholesky_ex_out(const at::Tensor& self, boo
     at::Tensor a3 = self.reshape({-1, n, n});
     int64_t B = a3.size(0);
     at::Tensor l3 = at::empty_like(a3), info1 = at::empty({B}, info.options());
-    for (int64_t s = 0; s < B; s += kMaxBatch) {
-      int64_t len = std::min(kMaxBatch, B - s);
+    int64_t step = chunk_matrices(n * n);
+    for (int64_t s = 0; s < B; s += step) {
+      int64_t len = std::min(step, B - s);
       auto [lc, ic] = at::linalg_cholesky_ex(a3.narrow(0, s, len), upper, false);
       l3.narrow(0, s, len).copy_(lc);
       info1.narrow(0, s, len).copy_(ic);
@@ -1423,8 +1442,8 @@ bool one_matrix_broadcast(const at::Tensor& t) {
 }
 
 at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bool upper) {
-  if (one_matrix_broadcast(a) && is_vk(self) && self.dim() == a.dim() && float_dtype(a.scalar_type()) &&
-      is_vk(a) && !linalg_on_cpu()) {
+  if (one_matrix_broadcast(a) && is_vk(self) && dense_fits(self) && self.dim() == a.dim() &&
+      float_dtype(a.scalar_type()) && is_vk(a) && !linalg_on_cpu() && a.size(-1) * a.size(-1) <= kDenseElements) {
     // (one factor for every batch, as cholesky_solve's broadcasting gives: one
     // solve of the batches side by side, [n, batch * k])
     int64_t n = a.size(-1), k = self.size(-1);
@@ -1439,17 +1458,18 @@ at::Tensor cholesky_solve_helper(const at::Tensor& self, const at::Tensor& a, bo
   }
   if (gpu_matrices_chunked(a) && is_vk(self) && self.dim() == a.dim() &&
       self.sizes().slice(0, a.dim() - 2).equals(a.sizes().slice(0, a.dim() - 2))) {
-    // (its inputs come broadcast to one batch shape: in chunks of kMaxBatch)
+    // (its inputs come broadcast to one batch shape: in chunks of chunk_matrices)
     int64_t n = a.size(-1), k = self.size(-1);
     at::Tensor a3 = a.reshape({-1, n, n}), b3 = self.reshape({-1, self.size(-2), k});
     std::vector<at::Tensor> parts;
-    for (int64_t s = 0; s < a3.size(0); s += kMaxBatch) {
-      int64_t len = std::min(kMaxBatch, a3.size(0) - s);
+    int64_t step = std::min(chunk_matrices(n * n), chunk_matrices(self.size(-2) * k));
+    for (int64_t s = 0; s < a3.size(0); s += step) {
+      int64_t len = std::min(step, a3.size(0) - s);
       parts.push_back(at::_cholesky_solve_helper(b3.narrow(0, s, len), a3.narrow(0, s, len), upper));
     }
     return at::cat(parts).view(self.sizes());
   }
-  if (!gpu_matrices(a) || !is_vk(self)) {
+  if (!gpu_matrices(a) || !is_vk(self) || !dense_fits(self)) {
     return on_cpu("aten::_cholesky_solve_helper", "", self, a, upper)[0].toTensor();
   }
   at::Tensor l = upper ? adj(a) : a;  // lower factor
@@ -1710,7 +1730,7 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&> lstsq_out(
   TORCH_CHECK(a.size(-2) == (vector ? b.size(-1) : b.size(-2)),
               vector ? "torch.linalg.lstsq: input.size(-2) should match other.size(-1)"
                      : "torch.linalg.lstsq: input.size(-2) should match other.size(-2)");
-  if (!gpu_matrices(a) || !is_vk(b) || b.scalar_type() != a.scalar_type() || !is_vk(solution)) {
+  if (!gpu_matrices(a) || !is_vk(b) || !dense_fits(b) || b.scalar_type() != a.scalar_type() || !is_vk(solution)) {
     on_cpu("aten::linalg_lstsq", "out", a, b, rcond, driver, solution, residuals, rank, singular_values);
     return {solution, residuals, rank, singular_values};
   }
@@ -1782,8 +1802,8 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> ldl_factor_ex_out(const at::Te
 
 at::Tensor& ldl_solve_out(const at::Tensor& LD, const at::Tensor& pivots, const at::Tensor& b, bool hermitian,
                           at::Tensor& out) {
-  if (!gpu_matrices(LD) || !is_square(LD) || !is_vk(b) || !is_vk(pivots) || b.scalar_type() != LD.scalar_type() ||
-      b.dim() < 2 || !is_vk(out)) {
+  if (!gpu_matrices(LD) || !is_square(LD) || !is_vk(b) || !dense_fits(b) || !is_vk(pivots) ||
+      b.scalar_type() != LD.scalar_type() || b.dim() < 2 || !is_vk(out)) {
     on_cpu("aten::linalg_ldl_solve", "out", LD, pivots, b, hermitian, out);
     return out;
   }
@@ -1964,6 +1984,10 @@ at::Tensor& triangle_out(const at::Tensor& self, int64_t diagonal, at::Tensor& o
     return out;
   }
   if (self.numel() == 0) {
+    return out;
+  }
+  if (!offsets_fit(self) || !offsets_fit(out)) {  // (triangle.slang's 32-bit offsets: docs/log/M56)
+    on_cpu(Upper ? "aten::triu" : "aten::tril", "out", self, diagonal, out);
     return out;
   }
   at::Tensor in3 = flat3(self);

@@ -130,6 +130,7 @@ cover each route by shape.
 | Sparse products (`sparse.cpp`) | sparse @ sparse by `spgemm` without dense dims, else densified; dense @ sparse computed transposed; compressed layouts through COO |
 | Copies (`launch.cpp`), and `flip` as a copy that reads the flipped dims backwards (a bit per dim) | `copy8` for 5 to 8 dims after merging, else the strided kernels with a dispatch per outer index |
 | Interpolation, grid sampling (`python/torch_vulkan/_kernels.py`) | uint8 bilinear/bicubic/antialiased resizes in fixed point; float resizes by `resample` or by products, bicubic ones by `gridsample` (its upsample mode, as the backward's per-dim matrices); `grid_sample` by `gridsample` (bicubic: the composite of gathers for an input extent of 2^31 or more, which only an expanded view has) |
+| Every kernel (`crates/vkcore/src/lib.rs`, `wide_address.rs`) | with its addresses computed in 64-bit integers where an address in its push constants has more than 4 GiB of its tensor's allocation after it (NVIDIA wraps 32-bit offsets there; refused without `shaderInt64`), else as compiled (M56). Forced by `TORCH_VK_WIDE_ADDRESSES=1` (`test_addressing.py`) |
 | `col2im` (`fold`), `_kernels.py` | `col2im` for real dtypes (16-bit ones in float32), PyTorch's decomposition for complex |
 | Reflection and replication padding's backward (`_kernels.py`) | `padgrad` for float32 and float64; other dtypes the decomposition (reflection) or an `index_add` per padded dim (replication) |
 
@@ -141,7 +142,8 @@ cover each route by shape.
 `float32_matmul_precision`), `test_gemv4.py` (`TORCH_VK_GEMV`), `test_nn.py`
 (`TORCH_VK_CONV`, `TORCH_VK_DWCONV`), `test_attention.py` (`sdpa_kernel`,
 `TORCH_VK_SDPA`), `test_linalg_gpu.py` (`TORCH_VK_EIGH_QL`,
-`TORCH_VK_SVD_JACOBI`) and `test_fp16_arithmetic.py`. A forced route still
+`TORCH_VK_SVD_JACOBI`), `test_addressing.py` (`TORCH_VK_WIDE_ADDRESSES`) and
+`test_fp16_arithmetic.py`. A forced route still
 runs only where the device can run its kernel (16-lane subgroups,
 cooperative matrices), and the tests skip elsewhere. The routes chosen by
 shape alone are covered by the shapes in the tests: the gemv grid limit,

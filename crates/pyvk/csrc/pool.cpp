@@ -44,8 +44,11 @@ void set_window(PoolParams& p, at::IntArrayRef in, at::IntArrayRef out, at::IntA
   }
 }
 
-void launch(uint32_t op, at::ScalarType t, PoolParams& p, int64_t total) {
-  TORCH_CHECK(total < (int64_t(1) << 32), "max_pool: more elements than 32-bit offsets address");
+// `total` elements written, from `read` elements read: pool.slang offsets
+// both in 32 bits (docs/log/M56).
+void launch(uint32_t op, at::ScalarType t, PoolParams& p, int64_t total, int64_t read) {
+  TORCH_CHECK(total < kKernelOffsets && read < kKernelOffsets, "pooling: ", std::max(total, read),
+              " elements, more than the kernels' 32-bit offsets address (2^31)");
   p.total = static_cast<uint32_t>(total);
   int64_t groups = std::min<int64_t>((total + kGroup - 1) / kGroup, kMaxGroups);
   p.ngroups = static_cast<uint32_t>(groups);
@@ -71,7 +74,7 @@ std::tuple<at::Tensor, at::Tensor> max_pool_forward(const at::Tensor& x, at::Int
   p.out = gpu_address_out(out);
   p.idx = gpu_address_out(idx);
   set_window(p, in.sizes().slice(1), output_size, kernel_size, stride, padding, dilation);
-  launch(op::POOL_MAX_FORWARD, x.scalar_type(), p, out.numel());
+  launch(op::POOL_MAX_FORWARD, x.scalar_type(), p, out.numel(), in.numel());
   return {out, idx};
 }
 
@@ -92,7 +95,7 @@ at::Tensor max_pool_backward(const at::Tensor& grad_output, const at::Tensor& in
   p.out = gpu_address_out(gin);
   p.idx = gpu_address(i);
   set_window(p, input_size, g.sizes().slice(1), kernel_size, stride, padding, dilation);
-  launch(op::POOL_MAX_BACKWARD, g.scalar_type(), p, gin.numel());
+  launch(op::POOL_MAX_BACKWARD, g.scalar_type(), p, gin.numel(), g.numel());
   return gin;
 }
 
@@ -122,7 +125,7 @@ at::Tensor avg_pool_forward(const at::Tensor& x, at::IntArrayRef output_size, at
   int64_t ones[] = {1, 1, 1};
   set_window(p, in.sizes().slice(1), output_size, kernel_size, stride, padding, ones);
   set_avg(p, divisor_override, count_include_pad, truncate);
-  launch(op::POOL_AVG_FORWARD, x.scalar_type(), p, out.numel());
+  launch(op::POOL_AVG_FORWARD, x.scalar_type(), p, out.numel(), in.numel());
   return out;
 }
 
@@ -144,7 +147,7 @@ at::Tensor avg_pool_backward(const at::Tensor& grad_output, at::IntArrayRef inpu
   int64_t ones[] = {1, 1, 1};
   set_window(p, input_size, g.sizes().slice(1), kernel_size, stride, padding, ones);
   set_avg(p, divisor_override, count_include_pad, false);
-  launch(op::POOL_AVG_BACKWARD, g.scalar_type(), p, gin.numel());
+  launch(op::POOL_AVG_BACKWARD, g.scalar_type(), p, gin.numel(), g.numel());
   return gin;
 }
 
@@ -172,7 +175,7 @@ at::Tensor upsample_linear(const at::Tensor& x, at::IntArrayRef output_size, boo
     return out;
   }
   int64_t total = out.numel();
-  TORCH_CHECK(total < (int64_t(1) << 32) && in.numel() < (int64_t(1) << 32),
+  TORCH_CHECK(total < kKernelOffsets && in.numel() < kKernelOffsets,
               "upsample_linear: more elements than 32-bit offsets address");
   ResampleParams p{};
   p.in = gpu_address(in);
@@ -205,7 +208,7 @@ at::Tensor upsample_linear_backward_dim(const at::Tensor& g, int64_t n_in, bool 
   if (g.size(1) == 0) {
     return out.zero_();
   }
-  TORCH_CHECK(out.numel() < (int64_t(1) << 32) && in.numel() < (int64_t(1) << 32),
+  TORCH_CHECK(out.numel() < kKernelOffsets && in.numel() < kKernelOffsets,
               "upsample_linear_backward_dim: more elements than 32-bit offsets address");
   ResampleParams p{};
   p.in = gpu_address(in);
@@ -261,8 +264,9 @@ GridParams grid_params(const at::Tensor& input, const at::Tensor& grid, int64_t 
   }
   p.sc = static_cast<int32_t>(input.stride(1));
   p.sn = static_cast<int32_t>(input.stride(0));
+  // (gridsample.slang's tap offsets within a plane, also in 32 bits: docs/log/M56)
   TORCH_CHECK(grid.numel() < (int64_t(1) << 31) && int64_t(p.c) * p.n * p.p < (int64_t(1) << 31) &&
-                  (input.numel() == 0 || span < (int64_t(1) << 31)),
+                  (input.numel() == 0 || (span < (int64_t(1) << 31) && plane < kKernelOffsets)),
               "grid_sampler: more elements than 32-bit offsets address");
   return p;
 }
@@ -303,6 +307,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> grid_sampler_backward(const at::T
   at::Tensor in = mode >= 2 ? input : input.contiguous(), g = grid.contiguous(), go = grad_output.contiguous();
   GridParams p = grid_params(in, g, padding, align_corners);
   int64_t corners = mode >= 2 ? int64_t(1) << (2 * p.k) : int64_t(1) << p.k;  // (bicubic: 4^k taps)
+  TORCH_CHECK(int64_t(p.n) * p.p * corners < kKernelOffsets,
+              "grid_sampler_backward: more sample corners than 32-bit offsets address");
   at::Tensor ggrid = want_grid ? at::empty(g.sizes(), g.options()) : at::empty({0}, g.options());
   at::Tensor idx = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options().dtype(at::kLong));
   at::Tensor wgt = at::empty({int64_t(p.n), int64_t(p.p), corners}, g.options());
