@@ -154,6 +154,74 @@ def test_item_repr_and_memory_reuse():
     assert tv.memory_stats()["allocated_bytes"] == start
 
 
+UNMAPPED_SCRIPT = r"""
+import torch, torch_vulkan as tv
+torch.manual_seed(0)
+x = torch.randn(1000, 37)
+v = x.to("vk")
+assert torch.equal(v.cpu(), x)  # (whole: a write and a read through host staging memory)
+assert torch.equal(v[3:900:7, 5:30:3].cpu(), x[3:900:7, 5:30:3])  # (strided: the memory spanned)
+assert torch.equal(v.t().cpu(), x.t()) and torch.equal(v[5].cpu(), x[5])
+assert v[17, 3].item() == x[17, 3].item() and v.sum().item() == v.cpu().sum().item()
+w = torch.zeros(50, 40, device="vk")
+w[::3, 1::2] = x[:17, :20]  # (a strided upload)
+want = torch.zeros(50, 40)
+want[::3, 1::2] = x[:17, :20]
+assert torch.equal(w.cpu(), want)
+z = torch.zeros(6, 8, dtype=torch.complex64, device="vk")
+z[1::2, ::3] = torch.complex(x[:3, :3], x[3:6, :3])  # (complex: another copy kernel)
+assert torch.equal(z[1::2, ::3].cpu(), torch.complex(x[:3, :3], x[3:6, :3])) and z[0].abs().sum().item() == 0
+u = torch.full((10, 12), 7, dtype=torch.uint8).to("vk")
+u[1::3, ::5] = torch.arange(9, dtype=torch.uint8).view(3, 3)  # (with TORCH_VK_DISABLE=int8: no 1-byte copy kernel)
+want = torch.full((10, 12), 7, dtype=torch.uint8)
+want[1::3, ::5] = torch.arange(9, dtype=torch.uint8).view(3, 3)
+assert torch.equal(u.cpu(), want)
+big = torch.randn(20_000_000)  # (80 MB: pieces of 64 MiB of staging)
+assert torch.equal(big.to("vk").cpu(), big)
+s = torch.arange(10.0, device="vk")
+s.resize_(100)  # (the storage grows: a copy on the GPU)
+assert torch.equal(s[:10].cpu(), torch.arange(10.0))
+c = torch._lazy_clone(v)  # (copy on write: the copy when c is written)
+c.add_(1)
+assert torch.equal(v.cpu(), x) and torch.equal(c.cpu(), x + 1)
+try:
+    torch.arange(5, device="vk")[torch.tensor([7], device="vk")].cpu()
+    raise AssertionError("no IndexError")
+except IndexError:
+    pass  # (the device's error word, still read on the host)
+tv.set_cpu_fallback(True)
+k = torch.tensor([3, 1, 4, 1, 5, 9, 2, 6], dtype=torch.uint32)
+assert torch.equal(torch.sort(k.to("vk")).values.cpu(), torch.sort(k).values)  # (the CPU fallback: copies both ways)
+stats = tv.memory_stats()
+assert stats["unmapped_bytes"] > 0 and stats["unmapped_bytes"] <= stats["reserved_bytes"], stats
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("env", [{}, {"TORCH_VK_DISABLE": "int8"}])
+def test_unmapped_memory(env):
+    # TORCH_VK_UNMAPPED=1 puts every tensor in device memory the host does
+    # not map, where tensors go once the driver maps no more (docs/log/M53):
+    # the host's reads and writes then go through copies, item(), strided
+    # uploads and downloads (without a copy kernel for the type: read,
+    # updated and written back), storage resizes, copy on write and the CPU
+    # fallback included
+    import subprocess
+    import sys
+
+    out = subprocess.run([sys.executable, "-c", UNMAPPED_SCRIPT], env=dict(os.environ, TORCH_VK_UNMAPPED="1", **env),
+                         capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stderr[-3000:]
+    assert out.stdout.split()[-1] == "ok"
+
+
+def test_allocation_past_the_device_says_so():
+    # a request no buffer or heap can take names its size and the limit
+    with pytest.raises(RuntimeError, match=r"maxBufferSize|out of device memory allocating"):
+        torch.empty(2**62, dtype=torch.uint8, device="vk")
+    x = torch.ones(3, device="vk")  # (and nothing is left broken)
+    assert x.sum().item() == 3
+
 
 def test_strided_views_share_memory():
     x = make((4, 6), torch.float32)

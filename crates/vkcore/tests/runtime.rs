@@ -2,7 +2,7 @@
 //! Run under validation with `TORCH_VK_VALIDATE=1 cargo test`; every test
 //! then also fails on any validation warning or error.
 
-use vkcore::{as_bytes, memory::BLOCK_SIZE, validation_issues, Result, Runtime};
+use vkcore::{as_bytes, memory::BLOCK_SIZE, validation_issues, Placement, Result, Runtime, STAGING_BYTES};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -183,6 +183,57 @@ fn pool_blocks_large_allocations_and_trim() -> Result<()> {
     pool.reset_peak();
     assert_eq!(pool.stats(), Default::default());
     drop(pool);
+    assert_clean();
+    Ok(())
+}
+
+#[test]
+fn unmapped_memory_through_staging() -> Result<()> {
+    // Unmapped device memory (tensors past what the driver maps): kernels use
+    // it as any other, the host reaches it through copies to and from host
+    // staging memory, in pieces of STAGING_BYTES; best fit across blocks.
+    let rt = Runtime::new()?;
+    let n = (STAGING_BYTES / 8 + 1000) as u32; // (two staging pieces)
+    let x = rt.alloc_in(n as u64 * 8, Placement::Unmapped)?;
+    assert!(!x.mapped && x.host_ptr() as u64 >= vkcore::memory::UNMAPPED_BASE);
+    let y = rt.alloc(n as u64 * 8)?;
+    fill(&rt, y.address, 0.0, n)?;
+    let values: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    rt.write(x.address, &bytes)?;
+    axpy(&rt, true, 2.0, x.address, y.address, n)?; // y = 2 x
+    rt.copy(x.address + 8, y.address, 16)?; // x[1..3] = y[0..2]
+    let mut back = vec![0u8; bytes.len()];
+    rt.read(x.address, &mut back)?;
+    let got: Vec<f64> = back.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect();
+    assert_eq!(&got[..4], &[0.0, 0.0, 2.0, 3.0]);
+    assert!(got[4..].iter().enumerate().all(|(i, &v)| v == (i + 4) as f64));
+    let mut ys = vec![0u8; 8];
+    rt.read(y.address + (n as u64 - 1) * 8, &mut ys)?; // (mapped: straight from the mapping)
+    assert_eq!(f64::from_le_bytes(ys.try_into().unwrap()), 2.0 * (n - 1) as f64);
+    assert!(rt.pool.lock().unwrap().stats().unmapped >= n as u64 * 8);
+    rt.free(x);
+    rt.free(y);
+    rt.pool.lock().unwrap().trim();
+    assert_clean();
+    Ok(())
+}
+
+#[test]
+fn small_allocations_leave_an_empty_large_block_alone() -> Result<()> {
+    // Best fit across blocks: a small request goes to the tightest range,
+    // not into a large block left empty (which would then never be released).
+    let rt = Runtime::new()?;
+    let small = rt.alloc(1000)?;
+    let big = rt.alloc(4 * BLOCK_SIZE)?;
+    rt.free(big);
+    let more: Vec<_> = (0..10).map(|_| rt.alloc(1000)).collect::<Result<_>>()?;
+    assert!(more.iter().all(|a| a.block == small.block), "small allocations went into the large block");
+    for a in more {
+        rt.free(a);
+    }
+    rt.free(small);
+    rt.pool.lock().unwrap().trim();
     assert_clean();
     Ok(())
 }

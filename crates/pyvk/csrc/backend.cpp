@@ -154,7 +154,7 @@ struct VkAllocator final : c10::DeviceAllocator {
     check(vkt_alloc(nbytes, &a));
     {
       std::lock_guard<std::mutex> lock(g_allocations_mutex);
-      g_allocations[a.host] = AllocCtx{a.handle, a.host, a.address, a.size};
+      g_allocations[a.host] = AllocCtx{a.handle, a.host, a.address, a.size, a.mapped != 0};
     }
     return {a.host, a.host, &delete_allocation, device};
   }
@@ -164,14 +164,75 @@ struct VkAllocator final : c10::DeviceAllocator {
   }
 
   void copy_data(void* dest, const void* src, std::size_t count) const override {
-    synchronize();
-    std::memcpy(dest, src, count);
+    // (a copy command, ordered after the queued work like a kernel: the
+    // memory may be unmapped)
+    if (count > 0) check(vkt_copy(address_of(dest), address_of(src), count));
+  }
+
+  // The allocation holding vk data pointer `p`.
+  static AllocCtx find(const void* p);
+  static uint64_t address_of(const void* p) {
+    AllocCtx a = find(p);
+    return a.address + static_cast<uint64_t>(static_cast<const uint8_t*>(p) - a.host);
   }
 };
+
+AllocCtx VkAllocator::find(const void* data) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  std::lock_guard<std::mutex> lock(g_allocations_mutex);
+  auto it = g_allocations.upper_bound(p);
+  TORCH_CHECK(it != g_allocations.begin(), "torch_vulkan: tensor storage was not allocated by the vk allocator");
+  --it;
+  const AllocCtx& a = it->second;
+  TORCH_CHECK(p < a.host + a.size || (p == a.host + a.size && a.size > 0),
+              "torch_vulkan: tensor storage was not allocated by the vk allocator");
+  return a;
+}
 
 VkAllocator g_allocator;
 
 }  // namespace
+
+bool host_mapped(const void* data) {
+  return data == nullptr || VkAllocator::find(data).mapped;
+}
+
+void read_device(const void* data, void* dst, size_t n) {
+  if (n == 0) return;
+  synchronize();  // (also reports an indexing kernel's error, as before a read)
+  check(vkt_read(VkAllocator::address_of(data), static_cast<uint8_t*>(dst), n));
+}
+
+void write_device(void* data, const void* src, size_t n) {
+  if (n == 0) return;
+  synchronize();
+  check(vkt_write(VkAllocator::address_of(data), static_cast<const uint8_t*>(src), n));
+}
+
+// The bytes [lo, hi) of t's storage that its elements span (lo, hi in
+// elements from the storage's start), for a copy of them.
+static std::pair<int64_t, int64_t> element_span(const at::Tensor& t) {
+  int64_t lo = t.storage_offset(), hi = t.storage_offset() + 1;
+  for (int64_t d = 0; d < t.dim(); ++d) {
+    if (t.size(d) == 0) return {lo, lo};
+    int64_t reach = (t.size(d) - 1) * t.stride(d);
+    if (reach < 0) lo += reach; else hi += reach;
+  }
+  return {lo, hi};
+}
+
+at::Tensor host_readable(const at::Tensor& t) {
+  synchronize();
+  if (t.numel() == 0 || host_mapped(t.const_data_ptr())) {
+    return at::from_blob(const_cast<void*>(t.const_data_ptr()), t.sizes(), t.strides(),
+                         at::TensorOptions().dtype(t.scalar_type()));
+  }
+  auto [lo, hi] = element_span(t);
+  at::Tensor span = at::empty({hi - lo}, at::TensorOptions().dtype(t.scalar_type()));
+  const auto* base = static_cast<const uint8_t*>(t.storage().data()) + lo * static_cast<int64_t>(t.itemsize());
+  read_device(base, span.data_ptr(), span.nbytes());
+  return span.as_strided(t.sizes(), t.strides(), t.storage_offset() - lo);
+}
 
 c10::Allocator* allocator() {
   return &g_allocator;
@@ -247,7 +308,7 @@ namespace {
 VktAlloc& error_word() {
   if (g_error_word == nullptr) {
     auto* a = new VktAlloc{};
-    check(vkt_alloc(16, a));
+    check(vkt_alloc_host(16, a));  // (host memory: read after every synchronization)
     // Pool memory is reused in stream order: kernels still queued may write
     // its previous contents, so wait before the host clears it.
     check(vkt_synchronize());
@@ -425,8 +486,7 @@ void resize_storage(const c10::Storage& storage, size_t nbytes) {
   }
   c10::DataPtr fresh = allocator()->allocate(nbytes);
   if (storage.nbytes() > 0 && storage.data() != nullptr) {
-    synchronize();  // queued kernels may still write the old memory
-    std::memcpy(fresh.get(), storage.data(), storage.nbytes());
+    allocator()->copy_data(fresh.get(), storage.data(), storage.nbytes());  // (queued after the kernels)
   }
   storage.unsafeGetStorageImpl()->set_data_ptr_noswap(std::move(fresh));
   storage.unsafeGetStorageImpl()->set_nbytes(nbytes);
@@ -442,8 +502,7 @@ void resize_storage_bytes(const c10::Storage& storage, size_t nbytes) {
   c10::DataPtr fresh = allocator()->allocate(nbytes);
   size_t keep = std::min(nbytes, storage.nbytes());
   if (keep > 0 && storage.data() != nullptr) {
-    synchronize();  // queued kernels may still write the old memory
-    std::memcpy(fresh.get(), storage.data(), keep);
+    allocator()->copy_data(fresh.get(), storage.data(), keep);  // (queued after the kernels)
   }
   storage.unsafeGetStorageImpl()->set_data_ptr_noswap(std::move(fresh));
   storage.unsafeGetStorageImpl()->set_nbytes(nbytes);
@@ -702,16 +761,13 @@ void copy_vk_to_vk(const at::Tensor& dst, const at::Tensor& src) {
 }
 
 at::Tensor host_view(const at::Tensor& vk_tensor);
-at::Tensor host_view_const(const at::Tensor& vk_tensor);
 
 // dst (vk) <- src (cpu), with broadcasting and dtype conversion.
 void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
   at::Tensor host = src.to(dst.scalar_type()).expand(dst.sizes());
   if (dst.is_contiguous() && host.is_contiguous()) {
-    if (dst.numel() > 0) {
-      synchronize();  // the destination may still be in use by queued kernels
-      std::memcpy(dst.data_ptr(), host.const_data_ptr(), dst.nbytes());
-    }
+    // (after the queued kernels, which may still use the destination)
+    write_device(dst.data_ptr(), host.const_data_ptr(), dst.nbytes());
     return;
   }
   if (!move_kernel(dst.itemsize()).empty()) {
@@ -722,20 +778,24 @@ void copy_cpu_to_vk(const at::Tensor& dst, const at::Tensor& src) {
     return;
   }
   synchronize();
-  host_view(dst).copy_(host);
+  if (host_mapped(dst.const_data_ptr())) {
+    host_view(dst).copy_(host);
+    return;
+  }
+  // (unmapped: the memory dst spans, read, updated on the host and written
+  // back, so that the elements in its gaps keep their values)
+  auto [lo, hi] = element_span(dst);
+  auto* base = static_cast<uint8_t*>(dst.storage().mutable_data()) + lo * static_cast<int64_t>(dst.itemsize());
+  at::Tensor span = at::empty({hi - lo}, at::TensorOptions().dtype(dst.scalar_type()));
+  read_device(base, span.data_ptr(), span.nbytes());
+  span.as_strided(dst.sizes(), dst.strides(), dst.storage_offset() - lo).copy_(host);
+  write_device(base, span.const_data_ptr(), span.nbytes());
 }
 
 // A CPU tensor aliasing the mapped memory of `t` (valid until queued GPU work
-// touches it again; callers synchronize first).
+// touches it again; callers synchronize first; host_readable for any memory).
 at::Tensor host_view(const at::Tensor& t) {
   return at::from_blob(t.data_ptr(), t.sizes(), t.strides(), at::TensorOptions().dtype(t.scalar_type()));
-}
-
-// A read-only host view: does not materialize a copy-on-write storage (as
-// asking for the mutable data pointer would).
-at::Tensor host_view_const(const at::Tensor& t) {
-  return at::from_blob(const_cast<void*>(t.const_data_ptr()), t.sizes(), t.strides(),
-                       at::TensorOptions().dtype(t.scalar_type()));
 }
 
 // Applies conj (complex) and/or negation in place to vk tensor `t`'s data.
@@ -829,8 +889,7 @@ at::Tensor copy_from(const at::Tensor& self, const at::Tensor& dst, bool /*non_b
     fix_up_in_place(dst, dst.is_conj(), dst.is_neg());
   } else {
     TORCH_CHECK(src_vk && dst.is_cpu(), "torch_vulkan: unsupported copy from ", self.device(), " to ", dst.device());
-    synchronize();
-    at::Tensor host = host_view_const(self);
+    at::Tensor host = host_readable(self);
     if (self.is_conj()) host = host.conj();
     if (self.is_neg()) host = host._neg_view();
     dst.copy_(host);
@@ -850,9 +909,9 @@ at::Tensor copy_from_and_resize(const at::Tensor& self, const at::Tensor& dst) {
 
 at::Scalar local_scalar_dense(const at::Tensor& self) {
   TORCH_CHECK(self.numel() > 0, "_local_scalar_dense: Empty tensor not supported");
-  synchronize();
-  log_read(host_view_const(self));
-  return host_view_const(self).item();
+  at::Tensor host = host_readable(self);
+  log_read(host);
+  return host.item();
 }
 
 at::Tensor& fill_scalar(at::Tensor& self, const at::Scalar& value) {

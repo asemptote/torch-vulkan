@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use vkcore::{Allocation, Declared};
+use vkcore::{Allocation, Declared, Placement};
 
 use crate::{runtime, RUNTIME};
 
@@ -32,11 +32,24 @@ fn status<T, E: std::fmt::Display>(r: Result<T, E>) -> i32 {
 pub struct VktAlloc {
     /// Opaque handle to pass back to `vkt_free`.
     pub handle: *mut c_void,
-    /// Host pointer to the first byte (memory is persistently mapped).
+    /// Host pointer to the first byte: mapped memory, or for unmapped
+    /// memory a key that must not be dereferenced (`vkt_read`, `vkt_write`).
     pub host: *mut u8,
     /// GPU address of the first byte.
     pub address: u64,
     pub size: u64,
+    /// 1 if the host maps the memory, 0 if not.
+    pub mapped: i32,
+}
+
+unsafe fn give(a: Allocation, out: *mut VktAlloc) {
+    *out = VktAlloc {
+        handle: Box::into_raw(Box::new(a)) as *mut c_void,
+        host: a.host_ptr(),
+        address: a.address,
+        size: a.size,
+        mapped: a.mapped as i32,
+    };
 }
 
 #[no_mangle]
@@ -52,9 +65,56 @@ pub unsafe extern "C" fn vkt_alloc(nbytes: u64, out: *mut VktAlloc) -> i32 {
     };
     match rt.alloc(nbytes) {
         Ok(a) => {
-            *out = VktAlloc { handle: Box::into_raw(Box::new(a)) as *mut c_void, host: a.host_ptr(), address: a.address, size: a.size };
+            give(a, out);
             0
         }
+        Err(e) => fail(e),
+    }
+}
+
+/// `vkt_alloc` in host memory, which the host maps wherever the GPU's
+/// memory is full: for words it reads after every synchronization (the
+/// device's error word).
+#[no_mangle]
+pub unsafe extern "C" fn vkt_alloc_host(nbytes: u64, out: *mut VktAlloc) -> i32 {
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => return fail(e),
+    };
+    match rt.alloc_in(nbytes, Placement::Host) {
+        Ok(a) => {
+            give(a, out);
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Copies `n` bytes of device memory at GPU address `address` to `dst`,
+/// after the queued work.
+#[no_mangle]
+pub unsafe extern "C" fn vkt_read(address: u64, dst: *mut u8, n: u64) -> i32 {
+    match runtime() {
+        Ok(rt) => status(rt.read(address, std::slice::from_raw_parts_mut(dst, n as usize))),
+        Err(e) => fail(e),
+    }
+}
+
+/// Copies `n` bytes from `src` to device memory at GPU address `address`,
+/// after the queued work.
+#[no_mangle]
+pub unsafe extern "C" fn vkt_write(address: u64, src: *const u8, n: u64) -> i32 {
+    match runtime() {
+        Ok(rt) => status(rt.write(address, std::slice::from_raw_parts(src, n as usize))),
+        Err(e) => fail(e),
+    }
+}
+
+/// Queues a copy of `n` bytes of device memory from GPU address `src` to `dst`.
+#[no_mangle]
+pub extern "C" fn vkt_copy(dst: u64, src: u64, n: u64) -> i32 {
+    match runtime() {
+        Ok(rt) => status(rt.copy(dst, src, n)),
         Err(e) => fail(e),
     }
 }

@@ -1,7 +1,7 @@
 //! Vulkan compute core for the torch-vulkan backend.
 //!
 //! - [`Context`]: one device and compute queue (optionally validated).
-//! - [`Pool`]: caching sub-allocator over persistently mapped, device-addressable memory.
+//! - [`Pool`]: caching sub-allocator over device-addressable memory, mapped where the driver allows.
 //! - [`KernelCache`]: compiled pipelines keyed by (kernel, specialization constants).
 //! - [`Stream`]: batched, in-order command submission tracked by a timeline semaphore.
 //! - [`Runtime`]: all of the above, shared behind mutexes.
@@ -18,10 +18,14 @@ use std::sync::{Arc, Mutex};
 pub use context::{last_validation_message, validation_issues, validation_requested, version_string, Capabilities, Context};
 pub use kernels::{kernel_subgroup_size, Kernel, KernelCache, PUSH_CONSTANT_BYTES};
 pub use declare::Declared;
-pub use memory::{Allocation, Pool, PoolStats};
+pub use memory::{Allocation, Placement, Pool, PoolStats};
 pub use stream::{Access, BarrierMode, BarrierStats, Stream};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// The most host staging memory a read or write of unmapped memory uses at
+/// once (larger ones go in pieces).
+pub const STAGING_BYTES: u64 = 64 << 20;
 
 /// The bytes of a `#[repr(C)]` push-constant struct.
 pub fn as_bytes<P: Copy>(p: &P) -> &[u8] {
@@ -52,10 +56,103 @@ impl Runtime {
         self.pool.lock().unwrap().alloc(bytes, &mut || self.synchronize())
     }
 
+    /// [`Self::alloc`] in memory of one placement (mapped memory for words
+    /// the host reads often, say).
+    pub fn alloc_in(&self, bytes: u64, placement: Placement) -> Result<Allocation> {
+        self.pool.lock().unwrap().alloc_in(bytes, placement, &mut || self.synchronize())
+    }
+
     /// Returns `a` to the pool. Queued GPU work may still use it: reuse is
     /// stream-ordered (see [`memory`]).
     pub fn free(&self, a: Allocation) {
         self.pool.lock().unwrap().free(a)
+    }
+
+    /// The pool memory `[address, address + bytes)`, which must lie in one block.
+    fn view(&self, address: u64, bytes: u64) -> Result<Allocation> {
+        self.pool.lock().unwrap().view(address, bytes).ok_or_else(|| format!("{address:#x} + {bytes} is not in the pool's memory").into())
+    }
+
+    /// Host staging for unmapped memory: a [`Placement::Host`] allocation of
+    /// up to [`STAGING_BYTES`], and the bytes it holds.
+    fn staging(&self, bytes: u64) -> Result<(Allocation, u64)> {
+        let len = bytes.min(STAGING_BYTES);
+        Ok((self.alloc_in(len, Placement::Host)?, len))
+    }
+
+    /// Copies the pool memory at GPU address `address` to `dst`, once the
+    /// queued work is done: from the mapping, or for unmapped memory through
+    /// host staging memory, in pieces of at most [`STAGING_BYTES`].
+    pub fn read(&self, address: u64, dst: &mut [u8]) -> Result<()> {
+        let n = dst.len() as u64;
+        self.synchronize()?;
+        if n == 0 {
+            return Ok(());
+        }
+        let src = self.view(address, n)?;
+        if src.mapped {
+            unsafe { std::ptr::copy_nonoverlapping(src.host_ptr(), dst.as_mut_ptr(), dst.len()) };
+            return Ok(());
+        }
+        let (staging, len) = self.staging(n)?;
+        let result = (|| -> Result<()> {
+            let mut done = 0;
+            while done < n {
+                let k = len.min(n - done);
+                self.stream.lock().unwrap().copy(&src, done, &staging, 0, k)?;
+                self.synchronize()?;
+                unsafe { std::ptr::copy_nonoverlapping(staging.host_ptr(), dst.as_mut_ptr().add(done as usize), k as usize) };
+                done += k;
+            }
+            Ok(())
+        })();
+        self.free(staging);
+        result
+    }
+
+    /// Copies `src` to the pool memory at GPU address `address`, after the
+    /// queued work (which may still use that memory): into the mapping, or
+    /// for unmapped memory through host staging memory and a copy command
+    /// (queued: later commands see it).
+    pub fn write(&self, address: u64, src: &[u8]) -> Result<()> {
+        let n = src.len() as u64;
+        self.synchronize()?;
+        if n == 0 {
+            return Ok(());
+        }
+        let dst = self.view(address, n)?;
+        if dst.mapped {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.host_ptr(), src.len()) };
+            return Ok(());
+        }
+        let (staging, len) = self.staging(n)?;
+        let result = (|| -> Result<()> {
+            let mut done = 0;
+            while done < n {
+                let k = len.min(n - done);
+                if done > 0 {
+                    self.synchronize()?; // (the staging memory's last piece copied out)
+                }
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(done as usize), staging.host_ptr(), k as usize) };
+                self.stream.lock().unwrap().copy(&staging, 0, &dst, done, k)?;
+                done += k;
+            }
+            Ok(())
+        })();
+        // (freed while its copy may be queued: reuse is stream-ordered, and
+        // a host write to it synchronizes first, as this one did)
+        self.free(staging);
+        result
+    }
+
+    /// Queues a copy of `bytes` bytes of pool memory from GPU address `src`
+    /// to `dst` (each within one block).
+    pub fn copy(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (s, d) = (self.view(src, bytes)?, self.view(dst, bytes)?);
+        self.stream.lock().unwrap().copy(&s, 0, &d, 0, bytes)
     }
 
     /// Queues kernel `name` (specialized with `spec`) with push constants `params`.

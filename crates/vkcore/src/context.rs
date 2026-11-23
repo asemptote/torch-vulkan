@@ -418,10 +418,9 @@ impl Context {
         unsafe { self.instance.get_physical_device_properties(self.physical_device) }
     }
 
-    /// First memory type allowed by `bits` that has all of `want`.
-    pub(crate) fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
-        let types = &self.memory.memory_types[..self.memory.memory_type_count as usize];
-        (0..types.len() as u32).find(|&i| bits & (1 << i) != 0 && types[i as usize].property_flags.contains(want))
+    /// The device's memory types (each in one of [`Self::memory_heaps`]).
+    pub fn memory_types(&self) -> &[vk::MemoryType] {
+        &self.memory.memory_types[..self.memory.memory_type_count as usize]
     }
 }
 
