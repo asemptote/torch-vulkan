@@ -12,6 +12,7 @@ pub mod kernels;
 pub mod memory;
 pub mod spirv_fix;
 pub mod stream;
+pub mod wide_address;
 
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,9 @@ pub struct Runtime {
     pub kernels: Mutex<KernelCache>,
     pub pool: Mutex<Pool>,
     pub ctx: Arc<Context>,
+    /// `TORCH_VK_WIDE_ADDRESSES=1`: every dispatch computes its addresses
+    /// in 64 bits (for tests of those kernels; docs/log/M56).
+    pub wide_always: bool,
 }
 
 impl Runtime {
@@ -44,7 +48,36 @@ impl Runtime {
         let ctx = Arc::new(Context::new()?);
         let kernels = KernelCache::new(ctx.clone())?;
         let stream = Stream::new(ctx.clone(), kernels.layout())?;
-        Ok(Self { stream: Mutex::new(stream), kernels: Mutex::new(kernels), pool: Mutex::new(Pool::new(ctx.clone())), ctx })
+        let wide_always = std::env::var("TORCH_VK_WIDE_ADDRESSES").is_ok_and(|v| !v.is_empty() && v != "0");
+        Ok(Self {
+            stream: Mutex::new(stream),
+            kernels: Mutex::new(kernels),
+            pool: Mutex::new(Pool::new(ctx.clone())),
+            ctx,
+            wide_always,
+        })
+    }
+
+    /// Whether a dispatch with push constants `push` must compute its
+    /// addresses in 64 bits (wide_address.rs; docs/log/M56): an address in
+    /// them has more than 4 GiB of its allocation after it, which 32-bit
+    /// offsets from it do not reach correctly on every driver. Kernels take
+    /// every address they use from their push constants (as for barriers:
+    /// declare.rs), so this sees them all.
+    pub fn wide_addresses(&self, push: &[u8]) -> bool {
+        const REACH: u64 = 1 << 32;
+        if self.wide_always {
+            return true;
+        }
+        let pool = self.pool.lock().unwrap();
+        let (lo, hi) = pool.span();
+        if hi - lo <= REACH {
+            return false;
+        }
+        push.as_chunks::<8>().0.iter().any(|word| {
+            let w = u64::from_le_bytes(*word);
+            w >= lo && w < hi && matches!(pool.locate(w), memory::Located::Allocation(_, end) if end - w > REACH)
+        })
     }
 
     pub fn alloc(&self, bytes: u64) -> Result<Allocation> {
@@ -60,7 +93,8 @@ impl Runtime {
 
     /// Queues kernel `name` (specialized with `spec`) with push constants `params`.
     pub fn dispatch<P: Copy>(&self, name: &str, spec: &[u32], params: &P, groups: [u32; 3]) -> Result<()> {
-        let kernel = self.kernels.lock().unwrap().get(name, spec)?;
+        let wide = self.wide_addresses(as_bytes(params));
+        let kernel = self.kernels.lock().unwrap().get(name, spec, wide)?;
         self.stream.lock().unwrap().dispatch(&kernel, as_bytes(params), groups)
     }
 
@@ -71,7 +105,8 @@ impl Runtime {
     /// before it only where that memory conflicts with commands since the
     /// last barrier.
     pub fn dispatch_declared(&self, name: &str, spec: &[u32], push: &[u8], groups: [u32; 3], declared: &[Declared]) -> Result<()> {
-        let kernel = self.kernels.lock().unwrap().get(name, spec)?;
+        let wide = self.wide_addresses(push);
+        let kernel = self.kernels.lock().unwrap().get(name, spec, wide)?;
         let mode = self.stream.lock().unwrap().mode();
         if !mode.tracked() {
             return self.stream.lock().unwrap().dispatch(&kernel, push, groups);

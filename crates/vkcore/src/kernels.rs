@@ -33,7 +33,7 @@ pub struct KernelCache {
     cache_file: Option<PathBuf>,
     /// The hash of the data read from `cache_file` (written back only if it changed).
     initial: u64,
-    kernels: HashMap<(String, Vec<u32>), Arc<Kernel>>,
+    kernels: HashMap<(String, Vec<u32>, bool), Arc<Kernel>>,
 }
 
 // The pipeline cache on disk (docs/log/M53): one file per build of the
@@ -153,9 +153,10 @@ impl KernelCache {
     }
 
     /// The pipeline for `name`, with specialization constants `spec[i]` bound
-    /// to `constant_id = i`. Compiled on first use, then cached.
-    pub fn get(&mut self, name: &str, spec: &[u32]) -> Result<Arc<Kernel>> {
-        let key = (name.to_owned(), spec.to_vec());
+    /// to `constant_id = i`, and with `wide`, its addresses computed in 64
+    /// bits (wide_address.rs). Compiled on first use, then cached.
+    pub fn get(&mut self, name: &str, spec: &[u32], wide: bool) -> Result<Arc<Kernel>> {
+        let key = (name.to_owned(), spec.to_vec(), wide);
         if let Some(k) = self.kernels.get(&key) {
             return Ok(k.clone());
         }
@@ -181,6 +182,15 @@ impl KernelCache {
             if declared.contains(&cap) && !have {
                 return Err(format!("kernel {name} needs {what}, which this device does not support").into());
             }
+        }
+        if wide {
+            if !caps.shader_int64 {
+                return Err(format!(
+                    "kernel {name} would address more than 4 GiB past a tensor's address, which needs shaderInt64                      (docs/log/M56), which this device does not support"
+                )
+                .into());
+            }
+            crate::wide_address::integer_addresses(&mut words);
         }
         strip_denorm_preserve(&mut words, !caps.denorm_preserve_f32, !caps.denorm_preserve_f64);
         if caps.nan_preserve_f64 && declared.contains(&CAP_FLOAT64) {

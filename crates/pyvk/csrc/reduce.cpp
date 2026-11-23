@@ -156,7 +156,8 @@ bool plan_reduce(const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep
       plan.out_shape.push_back(size);
     }
   }
-  if (span >= (int64_t(1) << 31) || plan.n_out * std::max<int64_t>(plan.n_red, 1) >= (int64_t(1) << 32)) {
+  // (reduce.slang and argreduce.slang count and offset elements in 32 bits: docs/log/M56)
+  if (span >= kKernelOffsets || plan.n_out * std::max<int64_t>(plan.n_red, 1) >= kKernelOffsets) {
     return false;
   }
   // The reduced dims in memory order (outermost first), as TensorIterator

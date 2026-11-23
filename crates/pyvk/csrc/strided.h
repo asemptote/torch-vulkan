@@ -86,7 +86,9 @@ void for_each_dispatch(const StridedDims<K>& d, size_t max_inner, F&& emit) {
     inner_count *= d.size[i];
     for (size_t k = 0; k < K; ++k) span[k] += (d.size[i] - 1) * std::abs(d.stride[i][k]);
   }
-  TORCH_CHECK(inner_count < (int64_t(1) << 32), "torch_vulkan: more than 2^32 elements per dispatch");
+  // (2^31: a grid-stride loop's 32-bit counter must not wrap past 2^32, as it
+  // could within one step of it; docs/log/M56)
+  TORCH_CHECK(inner_count < (int64_t(1) << 31), "torch_vulkan: more than 2^31 elements per dispatch");
   for (size_t k = 0; k < K; ++k) {
     TORCH_CHECK(span[k] < (int64_t(1) << 31), "torch_vulkan: element offsets beyond 2^31");
   }

@@ -348,6 +348,9 @@ const char* rowscan_label(at::ScalarType t) {
 
 void rowscan(uint32_t op, const at::Tensor& x, const at::Tensor& out, const at::Tensor* idx,
              const at::Tensor* out_idx = nullptr) {
+  // (rowscan.slang's 32-bit offsets: docs/log/M56)
+  TORCH_CHECK(offsets_fit(x) && offsets_fit(out), "torch_vulkan: a scan of ", x.numel(),
+              " elements: more than the kernels' 32-bit offsets address (2^31)");
   RowScanParams p{};
   p.x = gpu_address(x);
   p.out = gpu_address_out(out);
@@ -513,7 +516,10 @@ at::Tensor& searchsorted_impl(const at::Tensor& sorted, const at::Tensor& self, 
   at::ScalarType dtype = at::result_type(sorted, self);
   const char* label = rowscan_label(dtype);
   bool ok = is_vk(sorted) && is_vk(self) && is_vk(out) && label != nullptr && dtype != at::kBool &&
-            (!sorter || is_vk(*sorter)) && (sorted.dim() == 1 || sorted.dim() == self.dim());
+            (!sorter || is_vk(*sorter)) && (sorted.dim() == 1 || sorted.dim() == self.dim()) &&
+            // (searchsorted.slang's 32-bit offsets: docs/log/M56)
+            self.numel() < kKernelOffsets && sorted.numel() < kKernelOffsets &&
+            (!sorter || sorter->numel() < kKernelOffsets);
   if (!ok) {
     on_cpu("aten::searchsorted", "Tensor_out", sorted, self, out_int32, right, std::nullopt, sorter, out);
     return out;

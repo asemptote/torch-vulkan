@@ -84,8 +84,24 @@ at::Tensor index_offsets(at::IntArrayRef shape, const std::vector<IndexTerm>& te
   return offsets;
 }
 
+// Whether kernels can address `view`'s storage from its first element (the
+// view's own strides plus offsets of indices into the tensor it was made
+// from) with 32-bit offsets: fewer than 2^31 elements from there to the
+// storage's end (docs/log/M56).
+bool storage_fits(const at::Tensor& view) {
+  int64_t total = static_cast<int64_t>(view.storage().nbytes()) / static_cast<int64_t>(view.element_size());
+  return total - view.storage_offset() <= kKernelOffsets;
+}
+
+void check_storage_fits(const at::Tensor& view) {
+  TORCH_CHECK(storage_fits(view), "torch_vulkan: indexing a tensor of ",
+              static_cast<int64_t>(view.storage().nbytes()) / static_cast<int64_t>(view.element_size()),
+              " elements: more than the kernels' 32-bit offsets address (2^31)");
+}
+
 // out = src_view[offsets], src_view being the source restrided to out's shape.
 void gather(const at::Tensor& out, const at::Tensor& src_view, const at::Tensor& offsets) {
+  check_storage_fits(src_view);
   std::string kernel = move_kernel(out.itemsize());
   launch_strided(kernel.c_str(), {op::MOVE_GATHER, 0}, out, &src_view, &offsets);
 }
@@ -106,6 +122,7 @@ at::Tensor view_offsets(const at::Tensor& v) {
 // on the CPU (index_put_, index_copy_ with repeated indices); otherwise
 // which one lands is unspecified.
 void scatter(const at::Tensor& dst_view, const at::Tensor& values, const at::Tensor& offsets) {
+  check_storage_fits(dst_view);
   std::string kernel = move_kernel(dst_view.itemsize());
   if (at::globalContext().deterministicAlgorithms() && dst_view.numel() > 1) {
     at::Tensor addr = (view_offsets(dst_view) + offsets.to(at::kLong).expand(dst_view.sizes())).reshape({-1});
@@ -125,6 +142,7 @@ void scatter(const at::Tensor& dst_view, const at::Tensor& values, const at::Ten
 
 // dst_view[offsets] = value.
 void scatter_fill(const at::Tensor& dst_view, const at::Scalar& value, const at::Tensor& offsets) {
+  check_storage_fits(dst_view);
   std::string kernel = move_kernel(dst_view.itemsize());
   std::array<uint64_t, 2> bits = fill_bits(value, dst_view.scalar_type());
   launch_strided_bits(kernel.c_str(), {op::MOVE_SCATTER, 1}, dst_view, nullptr, &offsets, bits);
@@ -699,6 +717,7 @@ void accumulate(const at::Tensor& dst_view, const at::Tensor& offsets, const at:
     return;
   }
   TORCH_CHECK(n < (int64_t(1) << 31), "torch_vulkan: accumulation of more than 2^31 elements");
+  check_storage_fits(dst_view);
   at::Tensor offs = (offsets + view_positions(dst_view)).reshape({1, n}).contiguous();
   at::Tensor vals = values.to(dst_view.scalar_type()).expand(offsets.sizes()).contiguous();
   at::Tensor order = sort_rows(offs, false);
@@ -726,7 +745,7 @@ at::Tensor sum_rows_by_key(const at::Tensor& keys, const at::Tensor& vals, int64
               "sum_rows_by_key: expected int64 keys [T] and float vals [T, W] on vk, got ", keys.sizes(), " ",
               keys.scalar_type(), " and ", vals.sizes(), " ", vals.scalar_type());
   int64_t n = keys.numel(), width = vals.size(1);
-  TORCH_CHECK(n * width < (int64_t(1) << 31) && (num_rows + 1024) * width < (int64_t(1) << 62),
+  TORCH_CHECK(n * width < kKernelOffsets && (num_rows + 1024) * width < kKernelOffsets,
               "sum_rows_by_key: more elements than 32-bit offsets address");
   at::Tensor v = vals.contiguous();
   // (kSpare rows more, where skipped keys go, spread by position: in one row
@@ -772,7 +791,8 @@ at::Tensor embedding_dense_backward(const at::Tensor& grad_output, const at::Ten
   at::ScalarType t = grad_output.scalar_type();
   int64_t n = indices.numel(), width = grad_output.dim() > 0 ? grad_output.size(-1) : 1;
   bool kernel = is_vk(grad_output) && is_vk(indices) && (t == at::kFloat || (t == at::kDouble && vkt_has_float64())) &&
-                grad_output.dim() > 0 && n * width < (int64_t(1) << 31) && num_weights >= 0;
+                grad_output.dim() > 0 && n * width < kKernelOffsets && num_weights >= 0 &&
+                (num_weights + 1024) * width < kKernelOffsets;  // (sum_rows_by_key's offsets)
   if (!kernel) {
     return on_cpu("aten::embedding_dense_backward", "", grad_output, indices, num_weights, padding_idx,
                   scale_grad_by_freq)[0]
@@ -792,7 +812,7 @@ bool accumulate_rows(const at::Tensor& dst, const at::Tensor& offsets, const at:
                      uint32_t op, bool include_self) {
   at::ScalarType t = dst.scalar_type();
   int64_t n = offsets.numel();
-  if (at::isComplexType(t) || n * width >= (int64_t(1) << 31)) return false;
+  if (at::isComplexType(t) || n * width >= kKernelOffsets || !offsets_fit(dst)) return false;
   if (accum_label(t) == nullptr) {
     // (bool as int32, the small types widened, as accumulate)
     at::ScalarType wide = t == at::kBool ? at::kInt : widened(t);
@@ -1253,7 +1273,8 @@ at::Tensor& nonzero_out(const at::Tensor& self, at::Tensor& out) {
   p.mask = gpu_address(mask);
   p.csum = gpu_address(csum);
   p.out = gpu_address_out(target);
-  TORCH_CHECK(mask.numel() < (int64_t(1) << 32), "torch_vulkan: nonzero of more than 2^32 elements");
+  TORCH_CHECK(mask.numel() < kKernelOffsets && count * ndim < kKernelOffsets,
+              "torch_vulkan: nonzero of more than 2^31 elements, or coordinates");
   p.n = static_cast<uint32_t>(mask.numel());
   p.ndim = static_cast<uint32_t>(ndim);
   for (int64_t d = 0; d < ndim; ++d) {
@@ -1843,7 +1864,8 @@ at::Tensor& isin_out(const at::Tensor& elements, const at::Tensor& test, bool as
 at::Tensor sum_rows_by_sorted_group(const at::Tensor& vals, const at::Tensor& group, const at::Tensor& order,
                                     int64_t groups) {
   int64_t n = vals.size(0), width = vals.size(1);
-  if (accum_label(vals.scalar_type()) == nullptr || !is_vk(vals) || n * width >= (int64_t(1) << 31) || width == 0) {
+  if (accum_label(vals.scalar_type()) == nullptr || !is_vk(vals) || n * width >= kKernelOffsets ||
+      groups * width >= kKernelOffsets || width == 0) {
     return at::zeros({groups, width}, vals.options()).index_add_(0, group.index_select(0, order.to(at::kLong)),
                                                                  vals.index_select(0, order.to(at::kLong)));
   }

@@ -185,7 +185,7 @@ bool copy8_dims(const StridedDims<2>& dims, uint64_t out, uint64_t a, int64_t it
     count *= dims.size[d];
     for (size_t k = 0; k < 2; ++k) span[k] += (dims.size[d] - 1) * std::abs(dims.stride[d][k]);
   }
-  if (count >= (int64_t(1) << 32) || span[0] >= (int64_t(1) << 31) || span[1] >= (int64_t(1) << 31)) {
+  if (count >= (int64_t(1) << 31) || span[0] >= (int64_t(1) << 31) || span[1] >= (int64_t(1) << 31)) {
     return false;
   }
   Copy8Layout p{};
