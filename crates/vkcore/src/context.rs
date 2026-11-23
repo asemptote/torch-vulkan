@@ -62,7 +62,9 @@ pub struct Capabilities {
     /// a table of Intel device IDs; `TORCH_VK_COMPUTE_UNITS` overrides it.
     pub compute_units: u32,
     pub max_shared_memory: u32,
-    pub max_workgroup_count_x: u32,
+    /// maxComputeWorkGroupCount: workgroups per dispatch along x, y and z
+    /// (Vulkan guarantees 65,535 each).
+    pub max_workgroup_count: [u32; 3],
     pub max_push_constants: u32,
     pub max_allocation_size: u64,
     pub max_buffer_size: u64,
@@ -678,7 +680,7 @@ unsafe fn query_capabilities(
             && !disabled("bfloat16"),
         compute_units,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
-        max_workgroup_count_x: props.limits.max_compute_work_group_count[0],
+        max_workgroup_count: props.limits.max_compute_work_group_count,
         max_push_constants: props.limits.max_push_constants_size,
         max_allocation_size: m3.max_memory_allocation_size,
         // (without maintenance4: no stated limit beyond one allocation's)

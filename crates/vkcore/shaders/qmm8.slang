@@ -10,11 +10,14 @@
 // ROWS 0: gemm.slang's tiling: each 256-thread workgroup computes a 64x64
 // tile of C, staging A's and the dequantised weights' slices of TK values of
 // k in shared memory (the weights dequantised as they are staged: no float
-// copy of B), each thread a 4x4 block. Grid: (N / 64, M / 64).
+// copy of B), each thread a 4x4 block. Grid: (N / 64, M / 64), column block
+// gid.z * 65535 + gid.x (more than 65,535 column blocks, Vulkan's guaranteed
+// grid limit, folded into z; blocks past the last store nothing).
 // ROWS r (1 to 8; a decoding step's few rows): matrix-vector products. A
 // workgroup takes 8 weight rows (output columns), 32 threads each along k
 // (contiguous reads of the weights), each accumulating all r rows of A;
-// the 32 partial sums are added up in shared memory. Grid: N / 8.
+// the 32 partial sums are added up in shared memory. Grid: N / 8, block
+// gid.y * 65535 + gid.x (folded into y as above).
 
 #include "_half.slang"
 
@@ -117,10 +120,10 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     uint tx = tid.x, ty = tid.y, lin = ty * 16 + tx;
     if (ROWS != 0)
     {
-        small_m(lin, gid.x);
+        small_m(lin, gid.y * 65535u + gid.x);
         return;
     }
-    uint row0 = gid.y * BM, col0 = gid.x * BN;
+    uint row0 = gid.y * BM, col0 = (gid.z * 65535u + gid.x) * BN;
     if (lin < BN)
         SS(lin) = ld(p.scales[min(col0 + lin, p.n - 1)]);
 

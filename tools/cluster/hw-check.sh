@@ -113,7 +113,19 @@ run_checks() {
       [ -n "$VK_DRIVER_FILES" ] || { echo "HW|$KIND|fast paths|FAIL|no $KIND Vulkan driver manifest"; return; }
       export VK_DRIVER_FILES
       ;;
-    mali) py=python; export PYTHONPATH=$PWD/python ;;  # (Termux: Android's loader, the build in place)
+    mali)
+      # The build in place, through Android's own Vulkan loader (the GPU's
+      # driver) whichever Termux loader package is installed: Termux's
+      # generic loader finds only Mesa's llvmpipe (README, "Installing").
+      py=python
+      export PYTHONPATH=$PWD/python
+      local sys=/system/lib
+      [ "$($py -c 'import struct; print(struct.calcsize("P") * 8)')" = 64 ] && sys=/system/lib64
+      mkdir -p .hw-check/android-vulkan
+      ln -sf "$sys/libvulkan.so" .hw-check/android-vulkan/libvulkan.so
+      ln -sf "$sys/libvulkan.so" .hw-check/android-vulkan/libvulkan.so.1
+      export LD_LIBRARY_PATH=$PWD/.hw-check/android-vulkan${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+      ;;
     *) echo "unknown kind $KIND (intel, nvidia or mali)" >&2; exit 2 ;;
   esac
   # (a log line naming the device, for the table)
