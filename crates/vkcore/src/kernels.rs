@@ -186,7 +186,7 @@ impl KernelCache {
         if wide {
             if !caps.shader_int64 {
                 return Err(format!(
-                    "kernel {name} would address more than 4 GiB past a tensor's address, which needs shaderInt64                      (docs/log/M56), which this device does not support"
+                    "kernel {name} would address more than 4 GiB past a tensor's address, which needs shaderInt64 (docs/log/M56), which this device does not support"
                 )
                 .into());
             }
