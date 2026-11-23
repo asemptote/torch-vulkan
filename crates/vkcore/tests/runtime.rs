@@ -178,7 +178,9 @@ fn pool_blocks_large_allocations_and_trim() -> Result<()> {
     let mut pool = rt.pool.lock().unwrap();
     assert_eq!(pool.stats().allocated, 0);
     assert_eq!(pool.stats().blocks, 2, "empty blocks stay cached");
+    assert!(pool.stats().peak > BLOCK_SIZE + 10 * 1024, "the peak counts every allocation live at once");
     pool.trim();
+    pool.reset_peak();
     assert_eq!(pool.stats(), Default::default());
     drop(pool);
     assert_clean();

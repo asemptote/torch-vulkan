@@ -134,12 +134,16 @@ pub struct PoolStats {
     /// Bytes held from Vulkan.
     pub reserved: u64,
     pub blocks: usize,
+    /// The most bytes handed out at once since the pool started or
+    /// [`Pool::reset_peak`].
+    pub peak: u64,
 }
 
 pub struct Pool {
     ctx: Arc<Context>,
     blocks: Vec<Option<Block>>,
     allocated: u64,
+    peak: u64,
     /// Live allocations by GPU address (address -> size), for [`Pool::locate`].
     live: BTreeMap<u64, u64>,
 }
@@ -161,7 +165,7 @@ unsafe impl Send for Pool {}
 
 impl Pool {
     pub fn new(ctx: Arc<Context>) -> Self {
-        Self { ctx, blocks: Vec::new(), allocated: 0, live: BTreeMap::new() }
+        Self { ctx, blocks: Vec::new(), allocated: 0, peak: 0, live: BTreeMap::new() }
     }
 
     /// Sub-allocates `size` bytes, growing the pool if no cached block has
@@ -210,6 +214,7 @@ impl Pool {
             if let Some(offset) = block.ranges.alloc(size) {
                 let offset = block.guard + offset;  // (within the buffer)
                 self.allocated += size;
+                self.peak = self.peak.max(self.allocated);
                 self.live.insert(block.address + offset, size);
                 return Some(Allocation {
                     block: i as u32,
@@ -277,7 +282,17 @@ impl Pool {
 
     pub fn stats(&self) -> PoolStats {
         let live = self.blocks.iter().flatten();
-        PoolStats { allocated: self.allocated, reserved: live.clone().map(|b| b.size).sum(), blocks: live.count() }
+        PoolStats {
+            allocated: self.allocated,
+            reserved: live.clone().map(|b| b.size).sum(),
+            blocks: live.count(),
+            peak: self.peak,
+        }
+    }
+
+    /// Restarts the peak of [`PoolStats`] from the bytes allocated now.
+    pub fn reset_peak(&mut self) {
+        self.peak = self.allocated;
     }
 
     fn create_block(&self, size: u64, guard: u64) -> Result<Block> {

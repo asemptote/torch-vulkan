@@ -58,7 +58,8 @@ int vkt_alloc(uint64_t nbytes, VktAlloc* out);
 void vkt_free(void* handle);
 int vkt_synchronize();
 int vkt_empty_cache();
-void vkt_memory_stats(uint64_t* allocated, uint64_t* reserved);
+void vkt_memory_stats(uint64_t* allocated, uint64_t* reserved, uint64_t* peak);
+void vkt_reset_memory_peak();
 int vkt_dispatch(const char* name, const uint32_t* spec, size_t nspec, const uint8_t* push, size_t npush, uint32_t gx,
                  uint32_t gy, uint32_t gz);
 // For address `ptr` in a dispatch's push constants: the kernel touches memory
@@ -219,6 +220,9 @@ void launch_strided4(const char* kernel, std::vector<uint32_t> spec, const at::T
 // random.cpp).
 const at::Generator& default_generator();
 at::Generator new_generator();
+// (seed, offset) for one call of a Philox kernel on the default generator,
+// advancing its offset (random.cpp).
+std::pair<uint64_t, uint64_t> next_rng_call();
 
 // Stable sort of each row of `x` (contiguous [rows, n], any real dtype with
 // a storage_label): the int32 indices [rows, n] that order each row

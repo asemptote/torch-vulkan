@@ -93,18 +93,28 @@ pub extern "C" fn vkt_empty_cache() -> i32 {
     }
 }
 
-/// The pool's allocated and reserved bytes (0 before the runtime starts).
+/// The pool's allocated and reserved bytes, and the peak of the allocated
+/// bytes (0 before the runtime starts).
 #[no_mangle]
-pub unsafe extern "C" fn vkt_memory_stats(allocated: *mut u64, reserved: *mut u64) {
-    let (a, r) = match RUNTIME.lock().unwrap().as_ref() {
+pub unsafe extern "C" fn vkt_memory_stats(allocated: *mut u64, reserved: *mut u64, peak: *mut u64) {
+    let (a, r, p) = match RUNTIME.lock().unwrap().as_ref() {
         Some(rt) => {
             let s = rt.pool.lock().unwrap().stats();
-            (s.allocated, s.reserved)
+            (s.allocated, s.reserved, s.peak)
         }
-        None => (0, 0),
+        None => (0, 0, 0),
     };
     *allocated = a;
     *reserved = r;
+    *peak = p;
+}
+
+/// Restarts the peak of the allocated bytes from the bytes allocated now.
+#[no_mangle]
+pub extern "C" fn vkt_reset_memory_peak() {
+    if let Some(rt) = RUNTIME.lock().unwrap().as_ref() {
+        rt.pool.lock().unwrap().reset_peak();
+    }
 }
 
 /// Queues kernel `name` specialized with `spec[..nspec]`, with `push[..npush]`
