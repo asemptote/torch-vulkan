@@ -70,6 +70,16 @@ struct Params
 [vk::constant_id(5)] const int DROPOUT = 0;
 [vk::constant_id(6)] const int GROUP = 1;
 
+// The small fixed loops unrolled up to D = 128: kept as loops, float16's
+// longer rounding and widening code made the H100's compiler leave the
+// accumulators in local memory (float16 at head dim 128 ran 3.5x slower than
+// bfloat16); unrolled at D = 256, every dtype ran 2.4x slower there.
+#if D <= 128
+#define UNROLL [ForceUnroll]
+#else
+#define UNROLL
+#endif
+
 static const uint NK = D / 64;  // column groups of 64 per output row
 static const uint D4 = D / 4;   // float4s per staged row
 static const uint CR = 2048 / D;  // rows per staged chunk
@@ -126,6 +136,7 @@ T* as_ptr(uint2 w)
 void stage_slice(T* a, uint base, uint rs, uint n, uint d0, uint depth, uint at, uint lid)
 {
     uint r = lid >> 2, dd = (lid & 3) * 4;
+    UNROLL
     for (uint t = 0; t < 4; t++)
     {
         uint d = d0 + dd + t;
@@ -140,6 +151,7 @@ void scores(inout float4 x[4], T* a, uint abase, uint ars, uint na, T* b, uint b
             uint lid)
 {
     uint tx = lid & 15, ty = lid >> 4;
+    UNROLL
     for (uint i = 0; i < 4; i++)
         x[i] = float4(0.0f);
     for (uint d0 = 0; d0 < depth; d0 += 16)
@@ -151,6 +163,7 @@ void scores(inout float4 x[4], T* a, uint abase, uint ars, uint na, T* b, uint b
         for (uint dd = 0; dd < 16; dd++)
         {
             float4 av = sh_u[dd * 16 + ty], bv = sh_u[256 + dd * 16 + tx];
+            UNROLL
             for (uint i = 0; i < 4; i++)
                 x[i] = fma(float4(av[i]), bv, x[i]);
         }
@@ -172,6 +185,7 @@ void weighted_rows(inout float4 acc[4][NK], T* c, uint base, uint rs, uint n, ui
             if (c0 + r < n)
             {
                 uint e = base + (c0 + r) * rs + d;
+                UNROLL
                 for (uint t = 0; t < 4; t++)
                     if (d + t < width)
                         x[t] = ld(c[e + t]);
@@ -182,13 +196,17 @@ void weighted_rows(inout float4 acc[4][NK], T* c, uint base, uint rs, uint n, ui
         for (uint cc = 0; cc < CR; cc += 4)
         {
             float4 w[4];
+            UNROLL
             for (uint i = 0; i < 4; i++)
                 w[i] = sh_p[(4 * ty + i) * PS + (c0 + cc) / 4];
+            UNROLL
             for (uint t = 0; t < 4; t++)
             {
+                UNROLL
                 for (uint k = 0; k < NK; k++)
                 {
                     float4 cv = sh_u[(cc + t) * D4 + 16 * k + tx];
+                    UNROLL
                     for (uint i = 0; i < 4; i++)
                         acc[i][k] = fma(float4(w[i][t]), cv, acc[i][k]);
                 }
@@ -242,10 +260,12 @@ void forward(uint3 gid, uint lid)
         nblk = min(nblk, (r0 + 63) / 64 + 1);
     float m[4], l[4];
     float4 acc[4][NK];
+    UNROLL
     for (uint i = 0; i < 4; i++)
     {
         m[i] = -m_inf();
         l[i] = 0.0f;
+        UNROLL
         for (uint k = 0; k < NK; k++)
             acc[i][k] = float4(0.0f);
     }
@@ -255,8 +275,10 @@ void forward(uint3 gid, uint lid)
         float4 x[4];
         scores(x, p.q, qbase, p.qs.z, nq, p.k, kbase + c0 * p.ks.z, p.ks.z, nk, uint(E), lid);
         float4 bm = float4(-m_inf());
+        UNROLL
         for (uint i = 0; i < 4; i++)
         {
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 x[i][j] = score(x[i][j], scale, b, h, r0 + 4 * ty + i, c0 + 4 * tx + j, L, S);
@@ -269,6 +291,7 @@ void forward(uint3 gid, uint lid)
         GroupMemoryBarrierWithGroupSync();
         for (uint t = 0; t < 16; t++)
             bm = max(bm, sh_u[t * 16 + ty]);
+        UNROLL
         for (uint i = 0; i < 4; i++)
         {
             float mn = max(m[i], bm[i]);
@@ -276,9 +299,11 @@ void forward(uint3 gid, uint lid)
             float ms = mn == -m_inf() ? 0.0f : mn;
             m[i] = mn;
             float4 pr;
+            UNROLL
             for (uint j = 0; j < 4; j++)
                 pr[j] = m_exp(x[i][j] - ms);
             l[i] = l[i] * alpha + ((pr.x + pr.y) + (pr.z + pr.w));
+            UNROLL
             for (uint k = 0; k < NK; k++)
                 acc[i][k] = acc[i][k] * alpha;
             if (DROPOUT != 0)
@@ -294,6 +319,7 @@ void forward(uint3 gid, uint lid)
     float4 ls = float4(0.0f);
     for (uint t = 0; t < 16; t++)
         ls += sh_u[t * 16 + ty];
+    UNROLL
     for (uint i = 0; i < 4; i++)
     {
         uint r = r0 + 4 * ty + i;
@@ -301,8 +327,10 @@ void forward(uint3 gid, uint lid)
             continue;
         float li = ls[i];
         uint obase = ((b * L + r) * H + h) * uint(EV);
+        UNROLL
         for (uint k = 0; k < NK; k++)
         {
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 uint d = 64 * k + 4 * tx + j;
@@ -341,10 +369,12 @@ void grad_q(uint3 gid, uint lid)
         nblk = min(nblk, (r0 + 63) / 64 + 1);
     float2 rs[4];
     float4 acc[4][NK];
+    UNROLL
     for (uint i = 0; i < 4; i++)
     {
         uint r = r0 + 4 * ty + i;
         rs[i] = r < L ? row_stats(b, h, r, H, L) : float2(m_inf(), 0.0f);
+        UNROLL
         for (uint k = 0; k < NK; k++)
             acc[i][k] = float4(0.0f);
     }
@@ -354,11 +384,13 @@ void grad_q(uint3 gid, uint lid)
         float4 x[4], y[4];
         scores(x, p.q, qbase, p.qs.z, nq, p.k, kbase + c0 * p.ks.z, p.ks.z, nk, uint(E), lid);
         scores(y, p.o, obase, ors, nq, p.v, vbase + c0 * p.vs.z, p.vs.z, nk, uint(EV), lid);
+        UNROLL
         for (uint i = 0; i < 4; i++)
         {
             uint r = r0 + 4 * ty + i;
             float4 ds;
             float4 z = DROPOUT != 0 ? keep4(c0 / 4 + tx, r, b * H + h, key, ctr, pdrop) : float4(1.0f);
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 float pr = m_exp(score(x[i][j], scale, b, h, r, c0 + 4 * tx + j, L, S) - rs[i].x);
@@ -369,13 +401,16 @@ void grad_q(uint3 gid, uint lid)
         weighted_rows(acc, p.k, kbase + c0 * p.ks.z, p.ks.z, nk, uint(E), lid);
     }
     T* gq = as_ptr(p.w48);
+    UNROLL
     for (uint i = 0; i < 4; i++)
     {
         uint r = r0 + 4 * ty + i;
         if (r >= L)
             continue;
         uint gbase = ((b * L + r) * H + h) * uint(E);
+        UNROLL
         for (uint k = 0; k < NK; k++)
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 uint d = 64 * k + 4 * tx + j;
@@ -398,7 +433,9 @@ void grad_kv(uint3 gid, uint lid)
     uint kbase = b * p.ks.x + hk * p.ks.y + c0 * p.ks.z, vbase = b * p.vs.x + hk * p.vs.y + c0 * p.vs.z;
     uint nk = min(64u, S - c0), ors = H * uint(EV);
     float4 acck[4][NK], accv[4][NK];
+    UNROLL
     for (uint i = 0; i < 4; i++)
+        UNROLL
         for (uint k = 0; k < NK; k++)
         {
             acck[i][k] = float4(0.0f);
@@ -417,11 +454,13 @@ void grad_kv(uint3 gid, uint lid)
             scores(x, p.k, kbase, p.ks.z, nk, p.q, qbase, p.qs.z, nq, uint(E), lid);
             scores(y, p.v, vbase, p.vs.z, nk, p.o, obase, ors, nq, uint(EV), lid);
             float4 pz[4], ds[4];
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 uint r = r0 + 4 * tx + j;
                 float2 rs = r < L ? row_stats(b, h, r, H, L) : float2(m_inf(), 0.0f);
                 float4 z = DROPOUT != 0 ? keep4(c0 / 4 + ty, r, b * H + h, key, ctr, pdrop) : float4(1.0f);
+                UNROLL
                 for (uint i = 0; i < 4; i++)
                 {
                     float pr = m_exp(score(x[i][j], scale, b, h, r, c0 + 4 * ty + i, L, S) - rs.x);
@@ -429,10 +468,12 @@ void grad_kv(uint3 gid, uint lid)
                     ds[i][j] = pr * (y[i][j] * z[i] - rs.y);
                 }
             }
+            UNROLL
             for (uint i = 0; i < 4; i++)
                 sh_p[(4 * ty + i) * PS + tx] = pz[i];
             weighted_rows(accv, p.o, obase, ors, nq, uint(EV), lid);
             GroupMemoryBarrierWithGroupSync();
+            UNROLL
             for (uint i = 0; i < 4; i++)
                 sh_p[(4 * ty + i) * PS + tx] = ds[i];
             weighted_rows(acck, p.q, qbase, p.qs.z, nq, uint(E), lid);
@@ -440,13 +481,16 @@ void grad_kv(uint3 gid, uint lid)
     }
     T* gk = as_ptr(p.w48);
     T* gv = as_ptr(p.w56);
+    UNROLL
     for (uint i = 0; i < 4; i++)
     {
         uint c = c0 + 4 * ty + i;
         if (c >= S)
             continue;
         uint kb = ((b * S + c) * HK + hk) * uint(E), vb = ((b * S + c) * HK + hk) * uint(EV);
+        UNROLL
         for (uint k = 0; k < NK; k++)
+            UNROLL
             for (uint j = 0; j < 4; j++)
             {
                 uint d = 64 * k + 4 * tx + j;
