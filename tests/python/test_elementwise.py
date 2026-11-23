@@ -164,7 +164,7 @@ def test_casts_keep_denormals():
     # (issue #126) conversions between float types give the CPU's bits for
     # values that are, come from or round to float32 or float16 denormals,
     # on GPUs that flush them (NVIDIA's drivers have no
-    # shaderDenormPreserveFloat32): with float64's denormal 2^-127 vs 0
+    # shaderDenormPreserveFloat32; float8_e8m0fnu's 2^-127 became 0 in float64)
     tiny = 2.0 ** -149
     v = [0.0, -0.0, tiny, -tiny, 2.0 ** -127, 3 * 2.0 ** -130, 1e-40, -1e-39, (2 ** 23 - 1) * tiny, 2.0 ** -126,
          2.5 * tiny, 3.5 * tiny, -1.5 * tiny, 0.5 * tiny, 0.5000001 * tiny, 0.25 * tiny, (2 ** 23 - 0.5) * tiny,
