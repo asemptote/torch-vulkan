@@ -353,27 +353,50 @@ def test_coopmat_16bit_gemm(dtype):
           0.5 * bias.float().abs() + 2.0 * (a[0].float().abs() @ b[0].float().abs().t()))
 
 
+# The products' error bound (issue #94). Each result is a sum of k products
+# accumulated in float32 (float64 for float64; 16-bit products are exact in
+# float32), a chain of at most n = k + 2 roundings of unit roundoff u: the
+# products added in turn, then alpha's product and beta cin's sum. Split into
+# S pieces of kc (csrc/linalg.cpp's split_pieces), a chain is a piece's kc
+# then splitk.slang's S - 1 additions, kc + S - 1 <= k: the split only
+# shortens it, so one bound covers every split and every route. With
+# rounding errors taken as independent and mean-zero (Higham and Mary, "A
+# new approach to probabilistic rounding error analysis", SIAM J. Sci.
+# Comput. 41, 2019, Theorem 3.1), the error is at most
+# expm1(lambda sqrt(n) u + n u^2 / (1 - u)) ~ lambda sqrt(n) u times
+# sum |a b|, with probability at least 1 - 2 n exp(-lambda^2 (1 - u)^2 / 2)
+# per result: lambda = 8 leaves 5e-11 for n ~ 2000, under 1e-4 over the
+# script's results. The fixed 2^-20 (16 u) it replaces did not grow with k:
+# x.t() @ x's diagonal, sums of 1200 positive squares, comes to about 19 u
+# in one float32 chain (0.55 sqrt(n) u; the Mali's unsplit gemm4 was at
+# 1.31x of 2^-20, the L40S's split at 1.075x). Lost precision is still
+# caught: a partial sum rounded to 16 bits, or one product dropped, is off
+# by ~2^-11 or ~1/k of the magnitudes, where the bound is under 2^-15 for
+# k <= 2048.
 SPLIT_K_SCRIPT = r"""
-import os, torch, torch_vulkan as tv
+import math, os, torch, torch_vulkan as tv
 torch.manual_seed(0)
 coop = {torch.float16: bool(tv._native.capabilities() & 16), torch.bfloat16: bool(tv._native.capabilities() & 32)}
 dtypes = [torch.float32] + ([torch.float64] if tv._native.capabilities() & 1 else [])
 dtypes += [t for t in (torch.float16, torch.bfloat16) if coop[t]]
+LAMBDA = 8.0
 worst = 0.0
 for dt in dtypes:
     def close(got, a, b, alpha=1.0, beta=0.0, cin=None):
-        # the CPU's product in float64 (float32 for 16-bit inputs, rounded
-        # once as the kernels do), against float32 or float64 summation error
-        # relative to the products' magnitudes
-        wide = torch.float64 if dt == torch.float64 else torch.float32
-        ref = alpha * (a.to(wide) @ b.to(wide)) + (beta * cin.to(wide) if cin is not None else 0)
-        mag = abs(alpha) * (a.to(wide).abs() @ b.to(wide).abs()) + (abs(beta) * cin.to(wide).abs() if cin is not None else 0)
-        got = got.cpu().to(wide)
+        # against the CPU's product in float64 (rounded once to 16 bits, as
+        # the kernels round their float32 sums), in units of the bound above
+        u = 2.0**-53 if dt == torch.float64 else 2.0**-24
+        n = a.shape[-1] + 2
+        a, b = a.double(), b.double()
+        ref = alpha * (a @ b) + (beta * cin.double() if cin is not None else 0)
+        mag = abs(alpha) * (a.abs() @ b.abs()) + (abs(beta) * cin.double().abs() if cin is not None else 0)
+        # (float64: the CPU's reference is a float64 sum too, with its own error)
+        tol = math.expm1(LAMBDA * math.sqrt(n) * u + n * u * u / (1 - u)) * mag * (2 if dt == torch.float64 else 1)
         if dt in (torch.float16, torch.bfloat16):
-            ref = ref.to(dt).to(wide)
-            tol = torch.finfo(dt).eps * ref.abs().clamp_min(2**-14) + 2**-20 * mag
-        else:
-            tol = (2**-20 if dt == torch.float32 else 2**-48) * mag + 1e-30
+            ref = ref.to(dt).double()
+            tol = tol + torch.finfo(dt).eps * ref.abs().clamp_min(torch.finfo(dt).tiny)  # (the rounding to 16 bits)
+        tol = tol.clamp_min(torch.finfo(torch.float64).tiny)
+        got = got.cpu().double()
         assert not torch.isnan(got).any(), "NaN"
         return float(((got - ref).abs() / tol).max())
     for m, k, n in [(70, 600, 50), (130, 1000, 257), (8, 2048, 300), (2, 513, 2), (200, 300, 16)]:
@@ -404,13 +427,9 @@ def test_split_k_gemm(env):
     # fixed order: the same results from run to run) by gemmsg.slang and, where
     # the device has cooperative matrices, gemmcm.slang's tiles (and its
     # banded launch order); TORCH_VK_COMPUTE_UNITS=300 makes the GPU look big
-    # enough that the default choice splits these products
-    if "Mali" in tv.device_name() or (tv._native.kernel_subgroup_size("gemmsg_f32") == 0 and not any(COOPMAT.values())):
-        # (Arm GPUs run gemm4s.slang or gemm4.slang, and others without
-        # subgroups gemm.slang, which never split k; their unsplit float32
-        # sums over k = 2048 can exceed this test's 2^-20 of the products'
-        # magnitudes)
-        pytest.skip("no kernel here splits k")
+    # enough that the default choice splits these products. (Where no kernel
+    # splits k, on Arm GPUs (gemm4s.slang, gemm4.slang) and others without
+    # subgroups (gemm.slang), the products run whole, within the same bound.)
     out = subprocess.run([sys.executable, "-c", SPLIT_K_SCRIPT], env=dict(os.environ, **env), capture_output=True,
                          text=True, timeout=600)
     assert out.returncode == 0, out.stderr[-2000:]
