@@ -132,11 +132,15 @@ mask's count now below 2^31 too).
 - `test_tensor_past_4_gib`: one float32 tensor of 4 GiB + 4 MiB, each kernel
   given its start: fill, multiply, sums, max, a `bmm` whose last matrix is
   past 4 GiB, `arange`.
+- `test_elementwise_past_2_31_elements`: fill, add, clone, a strided fill
+  and a product on uint8 and float32 tensors of 2^31 + 4096 elements (in
+  pieces).
 - `test_convolution_with_columns_past_4_gib`: #142's convolution at batch 2
   and 4 (columns in one piece, then in two), forward and weight gradient,
   with data whose sums are exact.
-- These two skip on lavapipe (the host's memory) and where the device
-  cannot allocate the tensors; on the H100 they take 16 s together.
+- These three skip on lavapipe (the host's memory) and where the device
+  cannot allocate the tensors; on the H100 they take 20 s together, and
+  pass with #141's unmapped memory (`TORCH_VK_UNMAPPED=1`) as well.
 - `test_wide_kernels_need_int64`: with `TORCH_VK_DISABLE=int64` and every
   dispatch wide, a kernel is refused by name.
 - `test_wide_kernels`: `test_core.py`, `test_indexing.py` and
