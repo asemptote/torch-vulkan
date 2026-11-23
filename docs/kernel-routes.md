@@ -115,7 +115,7 @@ PyTorch's `SDPBackend` values:
 
 | Route | Kernels | Selected when | Force with | Tuned on |
 |---|---|---|---|---|
-| Fused (`overrideable`) | `attention` (forward; grad_q; grad_k and grad_v), `attention_aux` (the backward's stats) | float32, float16 and bfloat16; head dims up to 256; 4-d inputs with one batch size, key heads dividing query heads; any mask that needs no gradient, `is_causal`, dropout, GQA; 32-bit offsets, at most 65535 batches, heads and 64-row blocks; 32 KiB of shared memory; not nested, no forward-mode gradients | `sdpa_kernel([SDPBackend.OVERRIDEABLE])` (raises where it does not apply), `TORCH_VK_SDPA=flash` | H100 NVL, lavapipe (M52) |
+| Fused (`overrideable`) | `attention` (forward; grad_q; grad_k and grad_v), `attention_aux` (the backward's stats) | float32, float16 and bfloat16; head dims up to 256; 4-d inputs with one batch size, key heads dividing query heads; any mask that needs no gradient, `is_causal`, dropout, GQA; 32-bit offsets, at most 65535 batches, heads and 64-row blocks; 32 KiB of shared memory; not nested, no forward-mode gradients | `sdpa_kernel([SDPBackend.OVERRIDEABLE])` (raises where it does not apply), `TORCH_VK_SDPA=flash` | H100 NVL, lavapipe (M54) |
 | Math | PyTorch's composite: matrix products, softmax, dropout | everything else (float64 among it), and where `sdpa_kernel` disables the fused route | `sdpa_kernel([SDPBackend.MATH])`, `TORCH_VK_SDPA=math` | — |
 
 ## Other ops

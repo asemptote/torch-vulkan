@@ -1,4 +1,4 @@
-"""scaled_dot_product_attention on "vk" (M52): the fused kernel
+"""scaled_dot_product_attention on "vk" (M54): the fused kernel
 (shaders/attention.slang, the "overrideable" backend) and the math path,
 forward and backward, against the math path on the CPU in float64."""
 

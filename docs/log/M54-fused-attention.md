@@ -1,4 +1,4 @@
-# Fused attention (M52)
+# Fused attention (M54)
 
 `scaled_dot_product_attention` on vk always took PyTorch's math path:
 `_fused_sdp_choice` returned 0 (math), so every call built the full

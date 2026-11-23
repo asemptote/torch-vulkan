@@ -1,4 +1,4 @@
-// Scaled dot-product attention for device "vk" (docs/log/M52): a fused
+// Scaled dot-product attention for device "vk" (docs/log/M54): a fused
 // kernel without the attention matrix (shaders/attention.slang, the tiling
 // of FlashAttention 2 in float32), forward and backward, chosen by
 // _fused_sdp_choice through PyTorch's "overrideable" backend, the slot
