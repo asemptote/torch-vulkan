@@ -84,6 +84,26 @@ def test_dyn_quant_matmul_4bit_exact(m, k, n, bs, bias, dtype):
     assert torch.equal(got_cpu_packed.cpu(), want)
 
 
+def test_quantised_products_past_the_grid_limit():
+    # more output columns than 65,535 workgroups take along the grid's x
+    # (qmm8.slang's 64 per workgroup, qmm4.slang's 32): folded into z (#131)
+    a, b = torch.randn(9, 4, generator=gen(1)), torch.randint(-128, 128, (4_200_000, 4), dtype=torch.int8, generator=gen(2))
+    s = torch.rand(4_200_000, generator=gen(3)) / 50
+    with on_gpu():
+        got = torch._weight_int8pack_mm(a.to("vk"), b.to("vk"), s.to("vk")).cpu()
+    deq = b.float() * s[:, None]
+    tol = 2**-24 * (a @ deq.t()).abs() + 2**-20 * (a.abs() @ deq.abs().t())
+    assert ((got - a @ deq.t()).abs() <= tol).all()
+    del got, deq
+    n, k = 2_100_000, 32
+    w, sc, _ = pack_case(n, k, k, 7, False)
+    x = torch.randn(3, k, generator=gen(11))
+    packed = torch._dyn_quant_pack_4bit_weight(w, sc, None, k, k, n)
+    with on_gpu():
+        got = torch._dyn_quant_matmul_4bit(x.to("vk"), packed.to("vk"), k, k, n)
+    assert torch.equal(got.cpu(), torch._dyn_quant_matmul_4bit(x, packed, k, k, n))
+
+
 def test_dyn_quant_errors():
     x = torch.randn(2, 64, device="vk")
     w, sc, _ = pack_case(8, 64, 32, 3, False)

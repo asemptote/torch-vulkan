@@ -37,7 +37,9 @@
 // and are zero-padded to a whole step. W's steps are vector loads where
 // W_ALIGNED (rows start 16-byte aligned); otherwise, and for a row's last
 // partial chunk, W's elements are loaded one at a time (past k: zeros).
-// Grid: row blocks.
+// Grid: row blocks, block gid.y * 65535 + gid.x (more than 65,535 blocks,
+// Vulkan's guaranteed grid limit, folded into y; blocks past the last load
+// clamped rows and store nothing).
 
 #include "_half.slang"
 #include "_slot.slang"
@@ -277,7 +279,7 @@ void main(uint3 tid: SV_GroupThreadID, uint3 gid: SV_GroupID)
     uint t = tid.x;
     uint groups = WG / uint(LANES);  // row groups in the workgroup
     uint lane = t % uint(LANES), g = t / uint(LANES);
-    uint row0 = gid.x * groups * RB;
+    uint row0 = (gid.y * 65535u + gid.x) * groups * RB;
     uint rr[RB];
     [ForceUnroll]
     for (uint i = 0; i < RB; i++)

@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         "  subgroup {} | shared mem {} KiB | max groups.x {} | push constants {} B | max alloc {:.2} GiB | max buffer {:.2} GiB",
         c.subgroup_size,
         c.max_shared_memory / 1024,
-        c.max_workgroup_count_x,
+        c.max_workgroup_count[0],
         c.max_push_constants,
         c.max_allocation_size as f64 / (1u64 << 30) as f64,
         c.max_buffer_size as f64 / (1u64 << 30) as f64
