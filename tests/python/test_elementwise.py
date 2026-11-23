@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import torch_vulkan as tv
-from _util import ALL, COMPLEX, FLOATS, NUMERIC, WIDE, check, make, make_complex, on_gpu
+from _util import ALL, COMPLEX, FLOATS, HAS_FLOAT64, NUMERIC, WIDE, check, make, make_complex, on_gpu
 
 
 F32, FLOAT = [torch.float32], [torch.float32, torch.float64]
@@ -158,6 +158,37 @@ def test_casts(src, dst):
     with on_gpu():
         got = x.to("vk").to(dst)
     check(got, x.to(dst))
+
+
+def test_casts_keep_denormals():
+    # (issue #126) conversions between float types give the CPU's bits for
+    # values that are, come from or round to float32 or float16 denormals,
+    # on GPUs that flush them (NVIDIA's drivers have no
+    # shaderDenormPreserveFloat32; float8_e8m0fnu's 2^-127 became 0 in float64)
+    tiny = 2.0 ** -149
+    v = [0.0, -0.0, tiny, -tiny, 2.0 ** -127, 3 * 2.0 ** -130, 1e-40, -1e-39, (2 ** 23 - 1) * tiny, 2.0 ** -126,
+         2.5 * tiny, 3.5 * tiny, -1.5 * tiny, 0.5 * tiny, 0.5000001 * tiny, 0.25 * tiny, (2 ** 23 - 0.5) * tiny,
+         (2 ** 23 - 0.6) * tiny, 2.0 ** -1074, 1e-300, 2.0 ** -24, 3 * 2.0 ** -25, 2.0 ** -15 * 1.25, -2.0 ** -20,
+         6e-5, 1.0, -3.5, float("inf"), float("-inf")]  # (NaN: the CPU's vectorised bfloat16 conversion gives 0xffff)
+    dtypes = [torch.float32, torch.float16, torch.bfloat16] + ([torch.float64] if HAS_FLOAT64 else [])
+    bits = {torch.float64: torch.int64, torch.float32: torch.int32, torch.float16: torch.int16,
+            torch.bfloat16: torch.int16}
+    for src, dst in itertools.product(dtypes, dtypes):
+        if src == dst:
+            continue
+        x = torch.tensor(v, dtype=torch.float64).to(src)
+        with on_gpu():
+            got = x.to("vk").to(dst).cpu()
+        assert torch.equal(got.view(bits[dst]), x.to(dst).view(bits[dst])), (src, dst)
+    if HAS_FLOAT64:
+        z = torch.complex(torch.tensor(v, dtype=torch.float64), torch.tensor(v[::-1], dtype=torch.float64))
+        for src, dst in ((torch.complex128, torch.complex64), (torch.complex64, torch.complex128)):
+            x = z.to(src)
+            with on_gpu():
+                got = x.to("vk").to(dst).cpu()
+            want = x.to(dst)
+            int_t = torch.int64 if dst == torch.complex128 else torch.int32
+            assert torch.equal(torch.view_as_real(got).view(int_t), torch.view_as_real(want).view(int_t)), (src, dst)
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.int16, torch.float16, torch.bfloat16])

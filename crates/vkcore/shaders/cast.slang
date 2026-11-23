@@ -18,6 +18,13 @@
 // (as PyTorch does, with a warning on its side); real to complex sets the
 // imaginary part to 0. bfloat16 is stored as its 16 bits; both 16-bit float
 // types are converted through float with round-to-nearest-even.
+//
+// Conversions between float types never depend on the device's handling of
+// denormals: values that are (or come from, or round to) float32 or float16
+// denormals are converted on their bits. Without shaderDenormPreserveFloat32
+// (NVIDIA's drivers) vkcore strips the kernels' DenormPreserve modes and the
+// GPU's own conversions flush them to zero (issue #126: float8_e8m0fnu's
+// 2^-127 cast to float64 as 0).
 
 #if defined(SRC_f64) || defined(SRC_c128) || defined(DST_f64) || defined(DST_c128)
 #define I64_DOUBLE 1  // (int64 <-> double conversions: float64 kernels only)
@@ -27,17 +34,21 @@
 #define IN_T SRC
 #include "_strided.slang"
 
-// The value types: bfloat16 is handled as float.
+// The value types: bfloat16 and float16 are handled as float.
 #if defined(SRC_bf16)
 typedef float SV;
 SV load(SRC x) { return bit_cast<float>(uint(x) << 16); }
+#elif defined(SRC_f16)
+#include "_half.slang"
+typedef float SV;
+SV load(SRC x) { return f32_from_f16_bits(uint(bit_cast<uint16_t>(x))); }
 #else
 typedef SRC SV;
 SV load(SRC x) { return x; }
 #endif
 
 #if defined(DST_f16)
-#include "_half.slang"
+#include "_half.slang"  // (pragma once)
 typedef float DV;
 DST store(float f) { return to_half(f); }
 #elif defined(DST_bf16)
@@ -65,14 +76,43 @@ DST store(DV x) { return x; }
 
 #if (defined(DST_f64) || defined(DST_c128)) && (defined(SRC_f32) || defined(SRC_bf16) || defined(SRC_f16) || defined(SRC_c64))
 // float to double keeping a NaN's sign and payload (shifted up, quiet bit
-// set), as x86 does: NVIDIA's conversion returns a canonical NaN.
+// set), as x86 does: NVIDIA's conversion returns a canonical NaN. Zero and
+// denormals on the bits: x = m 2^-149 with m < 2^23, exact as a float64
+// product.
 double widen(float x)
 {
-    if (!isnan(x)) return double(x);
     uint u = bit_cast<uint>(x);
+    if ((u & 0x7f800000u) == 0u)
+    {
+        double v = double(u & 0x7fffffu) * bit_cast<double>(uint64_t(1023 - 149) << 52);
+        return (u >> 31) != 0u ? -v : v;
+    }
+    if (!isnan(x)) return double(x);
     return bit_cast<double>((uint64_t(u >> 31) << 63) | 0x7FF8000000000000ull | (uint64_t(u & 0x7fffffu) << 29));
 }
 #define TO_WIDE(v) widen(float(v))
+#endif
+
+#if (defined(SRC_f64) || defined(SRC_c128)) && (defined(DST_f32) || defined(DST_c64) || defined(DST_f16) || defined(DST_bf16))
+// double to float. Below float32's smallest normal 2^-126 (results zero or
+// denormal) on the bits: |x| 2^149, exact, rounded to the nearest integer,
+// ties to even, by adding and subtracting 2^52 (whose ulp is 1); the result
+// 2^23 is the smallest normal's bits, also right. (16-bit results then
+// round this float again, as the CPU's double -> float -> half does.)
+float narrow(double x)
+{
+    uint64_t u = bit_cast<uint64_t>(x);
+    uint sign = uint(u >> 32) & 0x80000000u;
+    if (isnan(x))  // (as x86: the sign and the payload's top bits kept, quiet bit set)
+        return bit_cast<float>(sign | 0x7fc00000u | uint((u >> 29) & 0x7fffffull));
+    double a = abs(x);
+    if (!(a < 1.1754943508222875e-38l))
+        return float(x);
+    double s = a * bit_cast<double>(uint64_t(1023 + 149) << 52);
+    uint m = uint((s + 4503599627370496.0l) - 4503599627370496.0l);
+    return bit_cast<float>(sign | m);
+}
+#define TO_NARROW(v) narrow(v)
 #endif
 
 // The low 32 bits of float x truncated to int64, as the CPU converts: |x| <
@@ -199,11 +239,23 @@ DV convert(SV x)
 #else
     return DV(TO_WIDE(x), DST_PART(0));
 #endif
+#elif defined(DST_PART) && defined(TO_NARROW)
+#ifdef SRC_COMPLEX
+    return DV(TO_NARROW(x.x), TO_NARROW(x.y));
+#else
+    return DV(TO_NARROW(x), DST_PART(0));
+#endif
 #elif defined(DST_PART)
 #ifdef SRC_COMPLEX
     return DV(DST_PART(x.x), DST_PART(x.y));
 #else
     return DV(DST_PART(x), DST_PART(0));
+#endif
+#elif defined(TO_NARROW)
+#ifdef SRC_COMPLEX
+    return DV(TO_NARROW(x.x));
+#else
+    return DV(TO_NARROW(x));
 #endif
 #elif defined(TO_WIDE)
 #ifdef SRC_COMPLEX
