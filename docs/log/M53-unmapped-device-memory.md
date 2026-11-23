@@ -25,12 +25,12 @@ through the PCIe BAR, and drivers limit it:
 |---|---|---|---|
 | Tesla M4, 4 GB (dev host, no resizable BAR) | 3.75 GiB | a separate 246 MiB heap | none of 256 MiB: the first failed |
 | H100 NVL, 94 GB (NVIDIA 615.71) | 93.6 GiB | the same heap, but allocations stop at 34.5 GiB | 138 x 256 MiB |
-| L40S, 48 GB (NVIDIA 615.71) | (not measured) | not measured here (its queue was busy; the model benchmarks' memory test is queued, #133) | not BlenderbotForCausalLM's peak, about 24 GB on the H100 |
+| L40S, 48 GB (NVIDIA 615.71) | 45 GiB | allocations stop at 19 GiB (the model benchmarks' memory test, #133) | 19 x 1 GiB |
 
 The H100's driver reports its host-visible type on the full 93.6 GiB heap
 (BAR1 is 128 GiB) and `maxMemoryAllocationSize` is unlimited, yet the
 139th 256 MiB block fails. On the L40S the same limit, smaller, falls below
-Blenderbot's peak. The pool's existing recovery (release empty cached
+Blenderbot's peak (about 24 GB on the H100). The pool's existing recovery (release empty cached
 blocks, retry) could not help: nothing was cached.
 
 ## Unmapped device memory
@@ -146,7 +146,9 @@ products of mapped and unmapped tensors above gave the expected values).
 BlenderbotForCausalLM (HuggingFace suite, eager inference) on the H100
 passes with and without this change, at batch 4 and 16, float32 and
 bfloat16: its peak, 24 GB in `nvidia-smi`, is under the H100's 34.5 GiB.
-On the L40S, the model benchmarks' memory test measures that limit (#133).
+The L40S's limit, 19 GiB, is below that peak: the failure of #133. Past
+the limit, new blocks are now unmapped, as the H100's runs past 34.5 GiB
+show (the L40S was not free to rerun the model on).
 
 ## Left open
 

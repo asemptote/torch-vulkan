@@ -52,7 +52,8 @@ CUDA's does; `empty_cache()` returns unused blocks to the driver.
   has it, device-local), so that `.cpu()`, `.item()` and copies from the
   CPU read and write it directly. On integrated GPUs that is all of the
   memory. On discrete GPUs it is the part the host reaches over PCIe,
-  which drivers limit: 256 MiB without resizable BAR, about 34 GiB of the
+  which drivers limit: 256 MiB without resizable BAR, 19 GiB of the L40S's
+  45 GiB and 34.5 GiB of the
   H100 NVL's 94 GiB (NVIDIA driver 615).
 - Past that limit, new blocks are device memory the host does not map
   (`memory_stats()["unmapped_bytes"]`): kernels use it as any other, and
