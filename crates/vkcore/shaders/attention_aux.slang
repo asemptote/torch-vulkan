@@ -32,12 +32,24 @@ struct Params
 
 [vk::constant_id(0)] const int MODE = 0;
 
+// float16's bits widened exactly with integer ops (f16tof32 becomes a
+// half conversion, which needs shaderFloat16).
+float f16_bits_to_float(uint h)
+{
+    uint s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u)
+        return asfloat(s | asuint(float(m) * 5.9604644775390625e-8f));  // subnormal: m 2^-24
+    if (e == 31u)
+        return asfloat(s | 0x7f800000u | (m << 13));
+    return asfloat(s | ((e + 112u) << 23) | (m << 13));
+}
+
 float ld(T v)
 {
 #if defined(T_bf16)
     return asfloat(uint(v) << 16);
 #elif defined(T_f16)
-    return f16tof32(uint(v));
+    return f16_bits_to_float(uint(v));
 #else
     return v;
 #endif
