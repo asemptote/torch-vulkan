@@ -105,16 +105,22 @@ one, else an error naming the limit):
 | pooling (pool.slang: `plane * iv`) | only the elements written | the elements read too; error past 2^31 |
 | grid sampling | a plane past 2^31 (expanded input); the backward's corner tables | errors |
 | `conv_direct` (conv4s.slang) | the padded weight | its size, else im2col |
-| random fills and sampling, upsampling, the strided element-wise launches | counts up to 2^32 (a grid-stride loop's 32-bit counter can wrap within a step of 2^32: a hang) | 2^31 |
+| random fills and sampling, upsampling | counts up to 2^32 (a grid-stride loop's 32-bit counter can wrap within a step of 2^32: a hang) | 2^31 |
 
 The convolution's columns: a batch whose im2col columns reach 2^31
 elements runs in pieces of the batch, forward and weight gradient (#142's
 model at batch 4: 2.8e9 elements of columns, 3 samples then 1). One sample
 whose columns reach 2^31 is refused by the columns' copy.
 
-The element-wise and copy launches (`launch.cpp`, `strided.h`) were already
-bounded (each operand's span below 2^31, the outer dims on the host), as
-were the matrix products (`max_offset` below 2^31 for every operand, M52's
+The element-wise and copy launches (`launch.cpp`, `strided.h`) were
+bounded (each operand's span below 2^31 and the count below 2^32, the dims
+past the kernel's 4 on the host), but refused a tensor past those: `fill_`
+on a 16 GiB float32 tensor raised "more than 2^32 elements per dispatch".
+`for_each_dispatch` now cuts the outermost of the kernel's dims into
+pieces that keep the count and every operand's offsets below 2^31 (and
+moves it to the host's loop where not one element of it fits), each piece
+a dispatch at its own addresses; only a reversed dim (`flip`'s copies) is
+kept whole. Already bounded were the matrix products (`max_offset` below 2^31 for every operand, M52's
 pieces), softmax, the norms and losses (`numel` below 2^31), `sort`
 (`total` below 2^31), `cumsum` and the fused attention (M54; its dropout
 mask's count now below 2^31 too).

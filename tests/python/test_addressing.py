@@ -57,6 +57,28 @@ def test_tensor_past_4_gib():
             assert x[i].item() == torch.tensor(i, dtype=torch.float32).item()  # (float32's rounding of i)
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+def test_elementwise_past_2_31_elements(dtype):
+    # (element-wise launches cut a dim past 2^31 elements into pieces, each
+    # dispatch at its own addresses: these refused before)
+    n = 2**31 + 4096
+    big_tensor_or_skip(3 * n * torch.empty(0, dtype=dtype).element_size() + GIB)
+    x = torch.empty(n, dtype=dtype, device="vk")
+    with on_gpu():
+        x.fill_(1)
+        x.add_(2)
+        y = x.clone()
+        y[::3] = 5  # (strided: a dim of 7.2e8 elements, 3 apart)
+        for t, at, want in [(x, 0, 3), (x, n - 1, 3), (y, n - 2, 5 if (n - 2) % 3 == 0 else 3), (y, 2**31 + 1, 3 if (2**31 + 1) % 3 else 5)]:
+            assert t[at].item() == want
+        for lo in (0, 2**30, 2**31 - 2**20):  # (sums in slices: a reduction refuses 2^31 elements)
+            assert x[lo:lo + 2**20].sum().item() == 3 * 2**20
+        assert y[2**31 - 3 * 2**20:2**31].long().sum().item() == 5 * 2**20 + 3 * 2 * 2**20
+        z = torch.empty(n, dtype=dtype, device="vk")
+        torch.mul(x, y, out=z)
+        assert z[-6:].tolist() == [a * b for a, b in zip(x[-6:].tolist(), y[-6:].tolist())]
+
+
 @pytest.mark.parametrize("N", [2, 4])
 def test_convolution_with_columns_past_4_gib(N):
     # (#142: pytorch_unet's Conv2d(128, 64, 3, padding=1) on [2, 128, 640,
