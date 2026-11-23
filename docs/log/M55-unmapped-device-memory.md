@@ -1,4 +1,4 @@
-# Device memory past what the driver maps (M53)
+# Device memory past what the driver maps (M55)
 
 BlenderbotForCausalLM's inference failed on the 48 GB L40S with "A device
 memory allocation has failed" (#133), where CUDA peaks at 21 GB (float32)

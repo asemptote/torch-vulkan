@@ -92,7 +92,7 @@ pub enum Placement {
     /// device-local where the device has such a memory type. On discrete
     /// GPUs that is the memory the host reaches through the PCIe BAR, which
     /// drivers limit: 246 MiB without resizable BAR, 34 GiB of the H100
-    /// NVL's 94 (docs/log/M53).
+    /// NVL's 94 (docs/log/M55).
     Mapped,
     /// Device-local memory the host does not map, for tensors past what
     /// mapped memory holds: the host reads and writes it through copies to

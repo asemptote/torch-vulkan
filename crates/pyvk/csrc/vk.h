@@ -154,7 +154,7 @@ struct AllocCtx {
 
 // Whether the host maps the memory of vk tensor data pointer `data` (vk
 // tensors past what the driver maps live in unmapped device memory, whose
-// data pointers are keys, not addresses: docs/log/M53).
+// data pointers are keys, not addresses: docs/log/M55).
 bool host_mapped(const void* data);
 
 // Copies `n` bytes of the vk memory at data pointer `data` to `dst`, after

@@ -201,7 +201,7 @@ print("ok")
 @pytest.mark.parametrize("env", [{}, {"TORCH_VK_DISABLE": "int8"}])
 def test_unmapped_memory(env):
     # TORCH_VK_UNMAPPED=1 puts every tensor in device memory the host does
-    # not map, where tensors go once the driver maps no more (docs/log/M53):
+    # not map, where tensors go once the driver maps no more (docs/log/M55):
     # the host's reads and writes then go through copies, item(), strided
     # uploads and downloads (without a copy kernel for the type: read,
     # updated and written back), storage resizes, copy on write and the CPU
