@@ -89,6 +89,10 @@ at::Generator new_generator() {
   return at::make_generator<VkGenerator>();
 }
 
+std::pair<uint64_t, uint64_t> next_rng_call() {
+  return at::get_generator_or_default<VkGenerator>(std::nullopt, default_generator())->next_call();
+}
+
 namespace {
 
 VkGenerator* generator(const std::optional<at::Generator>& gen) {

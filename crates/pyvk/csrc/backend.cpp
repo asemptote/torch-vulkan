@@ -130,17 +130,20 @@ struct VkAllocator final : c10::DeviceAllocator {
   void recordStream(const c10::DataPtr& /*ptr*/, c10::Stream /*stream*/) override {}  // (one queue)
 
   c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex /*device*/) override {
-    uint64_t allocated = 0, reserved = 0;
-    vkt_memory_stats(&allocated, &reserved);
+    uint64_t allocated = 0, reserved = 0, peak = 0;
+    vkt_memory_stats(&allocated, &reserved, &peak);
     c10::CachingDeviceAllocator::DeviceStats stats;
-    for (auto& s : stats.allocated_bytes) s.current = static_cast<int64_t>(allocated);
+    for (auto& s : stats.allocated_bytes) {
+      s.current = static_cast<int64_t>(allocated);
+      s.peak = static_cast<int64_t>(peak);
+    }
     for (auto& s : stats.reserved_bytes) s.current = static_cast<int64_t>(reserved);
     return stats;
   }
 
   void resetAccumulatedStats(c10::DeviceIndex /*device*/) override {}
 
-  void resetPeakStats(c10::DeviceIndex /*device*/) override {}
+  void resetPeakStats(c10::DeviceIndex /*device*/) override { vkt_reset_memory_peak(); }
 
   c10::DataPtr allocate(size_t nbytes) override {
     c10::Device device(kDevice, 0);

@@ -74,6 +74,7 @@ crates/pyvk/               extension module torch_vulkan._native
   csrc/random.cpp          Philox generator and random fills, multinomial, randperm, dropout
   csrc/convolution.cpp     convolution (im2col + GEMM), transposed, backward
   csrc/normalization.cpp   batch norm entry points, attention math path
+  csrc/attention.cpp       scaled_dot_product_attention's fused kernel (attention.slang), its choice
   csrc/reduce.cpp          reductions, arg-reductions, scans
   csrc/linalg.cpp          matrix products (batched strided GEMM)
   csrc/fft.cpp             FFTs (Stockham + Bluestein, r2c/c2r)
@@ -99,6 +100,7 @@ benchmarks/elementwise.py  per-op overhead, element-wise, reduction and scan thr
 benchmarks/matmul.py       matrix multiply GFLOP/s vs CPU
 benchmarks/fft.py          FFT timings vs CPU
 benchmarks/linalg.py       solve / cholesky / inv timings vs CPU
+benchmarks/attention.py    scaled_dot_product_attention: fused kernel vs math path, time and memory
 pyproject.toml             maturin build of the Python package
 ```
 

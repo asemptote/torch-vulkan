@@ -1,5 +1,6 @@
-// Batch normalization and attention entry points for device "vk" (M12),
-// composed from existing kernels (reductions, element-wise ops, matmul).
+// Batch normalization and the CPU's attention entry point for device "vk"
+// (M12), composed from existing kernels (reductions, element-wise ops,
+// matmul). scaled_dot_product_attention's own kernel: attention.cpp.
 //
 // Batch norm has several aten entry points (native_batch_norm,
 // _native_batch_norm_legit*, _batch_norm_with_update/_no_update) that
@@ -220,12 +221,6 @@ std::tuple<at::Tensor, at::Tensor> sdpa_flash_for_cpu(const at::Tensor& q, const
   return {at::matmul(attn, va).to(q.scalar_type()), lse};
 }
 
-// Which fused attention kernel to use: always the math path on "vk".
-int64_t fused_sdp_choice(const at::Tensor&, const at::Tensor&, const at::Tensor&, const std::optional<at::Tensor>&,
-                         double, bool, std::optional<double>, bool) {
-  return 0;  // sdp::SDPBackend::math
-}
-
 // out= forms: the functional kernels' results (via the dispatcher) in the
 // given tensors (they ran on the CPU, whose eval-mode statistics differ in shape).
 using BnOuts = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&>;
@@ -291,5 +286,4 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_batch_norm_with_update", &batch_norm_with_update);
   m.impl("_batch_norm_no_update", &batch_norm_no_update);
   m.impl("_scaled_dot_product_flash_attention_for_cpu", &sdpa_flash_for_cpu);
-  m.impl("_fused_sdp_choice", &fused_sdp_choice);
 }

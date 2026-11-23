@@ -108,6 +108,7 @@ fn main() {
             "csrc/nested.cpp",
             "csrc/quantized.cpp",
             "csrc/autocast.cpp",
+            "csrc/attention.cpp",
     ];
     let mut build = cc::Build::new();
     build

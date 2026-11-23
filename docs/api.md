@@ -33,6 +33,11 @@ a `python-torch` upgrade, install the matching build or rebuild).
 | `get_rng_state(device="vk")` / `set_rng_state(state, device="vk")` | The generator's state (seed and offset) as a `uint8` tensor, and restoring it. |
 | `set_fp16_arithmetic(enabled)` / `get_fp16_arithmetic()` | Lets float16 matrix products and convolutions multiply and add in float16 instead of float32 (off by default; see [float16 arithmetic](#float16-arithmetic)). Applies to calls made after it. |
 
+`torch.accelerator`'s memory functions work for `"vk"` too:
+`memory_allocated()`, `memory_reserved()`, `max_memory_allocated()` (the
+most bytes live tensors held at once since the start or the last
+`reset_peak_memory_stats()`) and `empty_cache()`.
+
 Random numbers come from a Philox generator on the GPU. They are
 deterministic for a given seed, but not the same numbers as the CPU's
 generator.
@@ -188,6 +193,7 @@ in [kernel-routes.md](kernel-routes.md).
 | `TORCH_VK_GEMM=tiled`, `float4` or `subgroup` | kernel | The matrix-multiply kernel: `float4` is the default on Arm GPUs, `subgroup` on other GPUs with subgroup size control, `tiled` elsewhere. `float4` shares operands across subgroups where the GPU runs 16-lane subgroups (Mali's Valhall GPUs; `TORCH_VK_DISABLE=subgroups` turns that off), and there also runs float16 and bfloat16 products, computed in float32. By default float16 and bfloat16 products use cooperative matrices (tensor cores) where available; setting this variable runs them in float32 instead. |
 | `TORCH_VK_CONV=im2col` or `direct` | kernel | Stride-1 convolutions: `im2col` runs them as im2col columns and a matrix product, `direct` with the direct convolution kernel (`conv4s.slang`) wherever the GPU can run it (16-lane subgroups: Intel, Mali). By default, direct wherever it runs except on Mali, where only float16 arithmetic and float16 and bfloat16 with 5 or more inner taps take it; im2col elsewhere and where the direct kernel does not apply. |
 | `TORCH_VK_DWCONV=0` | kernel | Depthwise convolutions (one input channel per group) without the depthwise kernel (`dwconv.slang`): as grouped products of im2col columns. |
+| `TORCH_VK_SDPA=math` or `flash` | kernel | `scaled_dot_product_attention`: `math` prefers the math path (the full attention matrix, as before 0.3), `flash` the fused kernel (`attention.slang`) wherever it applies, when `torch.nn.attention.sdpa_kernel` leaves both enabled. By default the fused kernel wherever it applies: float32, float16 and bfloat16, head dims up to 256, no mask gradient (see [kernel-routes.md](kernel-routes.md#attention)). `sdpa_kernel([SDPBackend.MATH])` or `([SDPBackend.OVERRIDEABLE])` chooses per call. |
 | `TORCH_VK_GEMV=vector` or `scalar` | kernel | Matrix products with one to eight vectors (decoding steps: `x @ W.t()` for a few rows of `x`, `W @ v`, `addmv`, `_weight_int8pack_mm` with up to 8 rows): `vector` reads the weights in 16-byte loads and keeps float32 sums (`gemv4.slang`), `scalar` uses `gemv.slang` and the GEMM kernels for float weights and `qmm8.slang` for int8 ones. By default `vector`, except for float32 weights on NVIDIA and AMD GPUs. `_weight_int4pack_mm` always reads its 4-bit weights in 16-byte loads. |
 | `TORCH_VK_EIGH_QL=1` | kernel | `eigh`: tridiagonal QL instead of divide and conquer for every size from 4 (Jacobi below). |
 | `TORCH_VK_SVD_JACOBI=1` | kernel | `svd`: one-sided Jacobi instead of bidiagonalisation for every size. |
