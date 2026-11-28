@@ -13,3 +13,6 @@ pytorch-src/
 dist/
 # Written by tools/build-termux.sh
 python/torch_vulkan/_build_info.py
+# Claude Code worktrees and per-user settings
+.claude/worktrees/
+.claude/settings.local.json
