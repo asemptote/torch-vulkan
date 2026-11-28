@@ -95,6 +95,92 @@ fn bounded_submissions_in_flight() -> Result<()> {
     Ok(())
 }
 
+/// The stream's estimate of a kernel's time, against the wall time of one
+/// run of it alone, and the bound on the estimated GPU time queued
+/// (docs/log/M59): after every dispatch, the work in flight is within the
+/// bound, or a single submission.
+#[test]
+fn bounded_queued_time() -> Result<()> {
+    let rt = Runtime::new()?;
+    if !rt.stream.lock().unwrap().pacing.timing {
+        eprintln!("no timestamps on this queue: skipped");
+        return Ok(());
+    }
+    let n = 1 << 22;
+    let y = rt.alloc(n as u64 * 8)?;
+    // Timed at its 1st, 2nd and 4th runs: the estimate is then known.
+    let mut wall = f64::MAX;
+    for i in 0..4 {
+        let t = std::time::Instant::now();
+        fill(&rt, y.address, i as f64, n)?;
+        rt.synchronize()?;
+        wall = wall.min(t.elapsed().as_nanos() as f64);
+    }
+    {
+        let mut s = rt.stream.lock().unwrap();
+        assert_eq!(s.queued_ns(), 0.0, "nothing queued after a synchronize");
+        assert!(s.queue_stats().timed >= 3, "{:?}", s.queue_stats());
+        s.max_batch = 1; // one submission per kernel
+        s.max_in_flight = 0;
+        s.pacing.max_batch_ns = 0;
+    }
+    fill(&rt, y.address, 0.0, n)?;
+    let one = rt.stream.lock().unwrap().queued_ns();
+    assert!(one > 0.0 && one <= wall * 1.5 + 1e6, "estimate {one} ns, alone {wall} ns");
+    rt.synchronize()?;
+    // (about 4 kernels' estimated time)
+    let limit = 4.0 * one;
+    rt.stream.lock().unwrap().pacing.max_queued_ns = limit as u64;
+    let limit = limit.floor();
+    for i in 0..200 {
+        fill(&rt, y.address, i as f64, n)?;
+        let s = rt.stream.lock().unwrap();
+        let (in_flight, _) = s.in_flight();
+        assert!(in_flight <= 1 || s.queued_ns() <= limit * 1.0001, "{in_flight} submissions, {} ns queued > {limit}", s.queued_ns());
+    }
+    rt.synchronize()?;
+    let stats = rt.stream.lock().unwrap().queue_stats();
+    assert!(stats.max_queued_ns <= limit * 2.0, "{stats:?}");
+    assert!(unsafe { y.as_slice_mut::<f64>() }.iter().all(|&v| v == 199.0));
+    rt.free(y);
+    assert_clean();
+    Ok(())
+}
+
+/// Measure-first (Intel GPUs under Linux, docs/log/M59): a kernel whose time
+/// is unknown goes at the end of its batch, and at most one submission with
+/// such a kernel is in flight.
+#[test]
+fn measure_first() -> Result<()> {
+    let rt = Runtime::new()?;
+    {
+        let mut s = rt.stream.lock().unwrap();
+        if !s.pacing.timing {
+            eprintln!("no timestamps on this queue: skipped");
+            return Ok(());
+        }
+        s.pacing.measure_first = true;
+        s.max_in_flight = 0;
+    }
+    let y = rt.alloc(1 << 20)?;
+    // Grids of new sizes, so new cost classes, as well as repeats.
+    for i in 0..60u32 {
+        let elems = 64 << (i % 12);
+        fill(&rt, y.address, i as f64, elems)?;
+        let s = rt.stream.lock().unwrap();
+        let (_, unknown) = s.in_flight();
+        assert!(unknown <= 1, "{unknown} submissions of unknown cost in flight");
+        if i < 12 {
+            assert_eq!(s.pending(), 0, "a new class is submitted at once");
+        }
+    }
+    rt.synchronize()?;
+    assert!(unsafe { y.as_slice_mut::<f64>() }[..64].iter().all(|&v| v == 59.0));
+    rt.free(y);
+    assert_clean();
+    Ok(())
+}
+
 #[test]
 fn specialization_constants() -> Result<()> {
     let rt = Runtime::new()?;

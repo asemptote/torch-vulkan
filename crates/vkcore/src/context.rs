@@ -142,6 +142,11 @@ pub struct Context {
     /// exports each submission's fence as a sync_file to read the kernel's
     /// status for it (see [`crate::stream::intel_linux`]).
     pub fence_fd: Option<ash::khr::external_fence_fd::Device>,
+    /// Valid bits of the compute queue's timestamps (0: it has none), and
+    /// nanoseconds per timestamp tick: the stream times kernels with them to
+    /// bound the GPU time queued (see [`crate::pacing`]).
+    pub timestamp_bits: u32,
+    pub timestamp_period: f32,
 }
 
 static VALIDATION_ISSUES: AtomicUsize = AtomicUsize::new(0);
@@ -264,11 +269,11 @@ impl Context {
                 }
             }
 
-            let queue_family = instance
-                .get_physical_device_queue_family_properties(physical_device)
-                .iter()
-                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .ok_or("no compute queue")? as u32;
+            let families = instance.get_physical_device_queue_family_properties(physical_device);
+            let queue_family =
+                families.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)).ok_or("no compute queue")? as u32;
+            let timestamp_period = props.limits.timestamp_period;
+            let timestamp_bits = if timestamp_period > 0.0 { families[queue_family as usize].timestamp_valid_bits } else { 0 };
 
             // The features through their own structures (core since Vulkan
             // 1.2, extensions before), so that Vulkan 1.1 devices work too;
@@ -368,7 +373,7 @@ impl Context {
                  ash::khr::timeline_semaphore::Device::new(&instance, &device))
             });
             let fence_fd = fence_fd.then(|| ash::khr::external_fence_fd::Device::new(&instance, &device));
-            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr, fence_fd })
+            Ok(Self { _entry: entry, instance, debug, physical_device, device, queue, queue_family, device_name, vendor_id: props.vendor_id, discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU, integrated: props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU, caps, memory, khr, fence_fd, timestamp_bits, timestamp_period })
         }
     }
 

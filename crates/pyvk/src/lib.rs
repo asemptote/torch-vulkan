@@ -87,6 +87,32 @@ fn barrier_stats() -> PyResult<Vec<(&'static str, u64)>> {
     Ok(vec![("commands", s.commands), ("barriers", s.barriers), ("undeclared", s.undeclared)])
 }
 
+/// The stream's back-pressure so far, as (name, value) pairs (docs/log/M59):
+/// batches submitted, waits before a submission and their total time (s),
+/// kernels timed with timestamp queries, the most estimated GPU time queued
+/// after a submission (s), the most submissions in flight, the estimated GPU
+/// time queued now (s), cost classes seen, and the bounds in force (0: none):
+/// estimated time queued (s), submissions in flight, measure-first (0 or 1).
+#[pyfunction]
+fn queue_stats() -> PyResult<Vec<(&'static str, f64)>> {
+    let rt = py_runtime()?;
+    let s = rt.stream.lock().unwrap();
+    let q = s.queue_stats();
+    Ok(vec![
+        ("submissions", q.submissions as f64),
+        ("waits", q.waits as f64),
+        ("wait_s", q.wait_ns as f64 * 1e-9),
+        ("timed", q.timed as f64),
+        ("max_queued_s", q.max_queued_ns * 1e-9),
+        ("max_in_flight", q.max_in_flight as f64),
+        ("queued_s", s.queued_ns() * 1e-9),
+        ("cost_classes", s.pacing.costs.len() as f64),
+        ("limit_queued_s", s.pacing.max_queued_ns as f64 * 1e-9),
+        ("limit_in_flight", s.max_in_flight as f64),
+        ("measure_first", s.pacing.measure_first as u8 as f64),
+    ])
+}
+
 /// The stream's barrier mode: "tracked", "check", "every" or "full"
 /// (TORCH_VK_BARRIERS; docs/log/M37).
 #[pyfunction]
@@ -274,6 +300,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     unsafe { vkt_register_backend() };
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
     m.add_function(wrap_pyfunction!(barrier_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(queue_stats, m)?)?;
     m.add_function(wrap_pyfunction!(read_log_mark, m)?)?;
     m.add_function(wrap_pyfunction!(barrier_mode, m)?)?;
     m.add_function(wrap_pyfunction!(set_barrier_mode, m)?)?;

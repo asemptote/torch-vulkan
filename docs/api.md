@@ -68,6 +68,30 @@ CUDA's does; `empty_cache()` returns unused blocks to the driver.
   on some older drivers) an allocation is still tried, and its error names
   that limit if it fails.
 
+## Queued work
+
+Ops on `"vk"` tensors are queued and return at once, as on CUDA: the host
+records kernels into batches and submits them, and only a read of a value
+(`.item()`, `.cpu()`) or `synchronize()` waits for the GPU. So that a loop
+that never reads anything back does not queue minutes of work (which the
+next read would wait for, holding the memory its batches use meanwhile),
+the host waits before submitting a batch while the work already queued is
+too much:
+
+- more than about 0.5 s of GPU time, as estimated from earlier runs of the
+  same kernels on similar sizes, timed on the GPU with timestamp queries
+  (`TORCH_VK_MAX_QUEUED_MS`);
+- or 16 batches (2 on Intel GPUs under Linux) (`TORCH_VK_MAX_IN_FLIGHT`).
+
+A batch goes at once when nothing else is queued, however long it is. On
+Intel GPUs under Linux, where the kernel driver cancels GPU work still
+unfinished 20 s after it was submitted, a kernel not yet timed is also
+submitted on its own, once earlier untimed kernels have finished
+(`TORCH_VK_MEASURE_FIRST`); a batch the driver cancelled anyway (a single
+kernel running for 20 s) is detected and raises an error, and every later
+call fails as on a lost device. The variables are developer switches
+(below); the defaults cost no measurable throughput (docs/log/M59).
+
 ## Dtypes
 
 - float32, float64, complex64 and complex128 are computed natively; float64
@@ -215,7 +239,6 @@ release, and a change to one is announced in the release notes.
 | `TORCH_VK_CPU_FALLBACK=1` | Run an op that has no Vulkan kernel for its arguments on the CPU (with a one-time warning, counted in `fallback_counts()`) instead of raising `NotImplementedError`, the default. `0` keeps it off. See [The CPU fallback](#the-cpu-fallback). |
 | `TORCH_VK_FP16_ARITHMETIC=1` | Start with float16 arithmetic allowed (`set_fp16_arithmetic(True)`; see [float16 arithmetic](#float16-arithmetic)). |
 | `TORCH_VK_CACHE_DIR=dir` | Directory for the compiled-pipeline cache (default `%LOCALAPPDATA%\torch-vulkan`, else `$XDG_CACHE_HOME/torch-vulkan`, else `~/.cache/torch-vulkan`); set but empty, nothing is kept on disk. It holds one `pipelines-<key>.bin` per build of the kernels and per GPU and driver. Files not used for 30 days, and other builds' or GPUs' files beyond 256 MB in all (least recently used first), are removed when torch-vulkan starts, as is the single `pipelines.bin` of releases up to 0.2. |
-| `TORCH_VK_MAX_IN_FLIGHT=n` | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. The default, 2 on Intel GPUs under Linux and no limit elsewhere, keeps the work queued there well under i915's 20 s limit, which counts queue time too. On those GPUs a batch the kernel cancelled anyway (a single kernel running for 20 s) is detected from its fence and raises an error, and every later call fails as on a lost device. |
 | `TORCH_VK_DISABLE=a,b,...` | Hide device features: `int64`, `float64`, `int16`, `float16`, `int8`, `storage16`, `storage8`, `denorm`, `subgroups`, `coopmat`, `bfloat16`. To work around a driver's bug in one feature, or to test a smaller GPU's code paths on a bigger one. |
 | `TORCH_VK_VALIDATE=1` | Enable the Khronos validation layer with synchronisation and best-practices checks; every message is printed and counted. |
 | `TORCH_VK_LINALG=cpu` | Send dense linear algebra to LAPACK on the CPU: a reference for testing and comparison, not a performance option. Turns the CPU fallback on (unless `TORCH_VK_CPU_FALLBACK=0`). |
@@ -246,6 +269,9 @@ in [kernel-routes.md](kernel-routes.md).
 | `TORCH_VK_GEMM_GROUP=g` | tuning | Launch the cooperative-matrix kernel's tiles in bands of `g` tile rows (`0`: row by row). |
 | `TORCH_VK_GEMM_PIECE=n` | testing | Run matrix products with more than `n` rows, columns or matrices (a multiple of 256, at least 512) in pieces of at most `n`, one dispatch each, as those too large for one dispatch always run (more than 524,032 rows or columns, or 65,535 matrices: docs/log/M52). For testing that path on small products. |
 | `TORCH_VK_WIDE_ADDRESSES=1` | testing | Run every kernel with 64-bit address arithmetic, as kernels run where a dispatch can reach more than 4 GiB past a tensor's address (docs/log/M56). For testing those kernels on small tensors; slower. |
+| `TORCH_VK_MAX_QUEUED_MS=ms` | tuning | The most estimated GPU time the host lets queue up before it waits (see [Queued work](#queued-work)); `0`: no bound, and no kernels timed. Default 500. Batches are also submitted once their estimated time reaches a quarter of it. |
+| `TORCH_VK_MAX_IN_FLIGHT=n` | tuning | Let at most `n` submitted batches be queued or running on the GPU at once (`0`: no limit); before submitting another, wait for the oldest. Default 2 on Intel GPUs under Linux, where with batches of at most 8192 workgroups it keeps the work queued well under i915's 20 s limit, which counts queue time too, and 16 elsewhere. |
+| `TORCH_VK_MEASURE_FIRST=0` or `1` | tuning | Submit a kernel whose GPU time has not been measured yet at the end of its batch, and only once earlier such batches have finished, so that kernels of unknown cost never queue up behind each other. On by default on Intel GPUs under Linux (i915's 20 s limit), off elsewhere. Needs timestamp queries. |
 | `TORCH_VK_MAX_BATCH_GROUPS=n` | tuning | Submit a batch of queued kernels once it holds `n` workgroups (`0`: no limit). The default, 8192 on Intel GPUs and no limit elsewhere, keeps each submission short there: under Linux, i915 cancels GPU work still unfinished 20 s after it was submitted, and Mesa's driver does not report it. |
 | `TORCH_VK_API=1.1` | small GPUs | Use the Vulkan 1.1 code path on a newer driver. |
 | `TORCH_VK_BARRIERS=full`, `every` or `check` | debugging | Where the stream puts barriers. By default only where a command touches memory that one since the last barrier wrote, or writes memory one since then read, so kernels that touch disjoint memory run concurrently (docs/log/M37). `every`: a barrier before every command, matched to the two commands' kinds (compute to compute between kernels), as torch-vulkan 0.2 did; `full`: a full compute and transfer barrier before every command. Both rule out a missed dependency when a race is suspected. `check`: run each kernel alone and fail with an error if it changed device memory outside what it was declared to write; very slow, as it reads all live device memory twice per kernel. |

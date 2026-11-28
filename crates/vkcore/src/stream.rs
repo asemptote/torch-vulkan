@@ -7,6 +7,10 @@
 //! last barrier (read after write, write after read, write after write), as
 //! llama.cpp's Vulkan backend does. A command without a declaration is
 //! ordered against everything, before and after it. See docs/log/M37.
+//!
+//! The host waits before a submission while too much work is queued on the
+//! GPU already: by estimated GPU time, from kernels timed with timestamp
+//! queries, and by submissions in flight ([`crate::pacing`], docs/log/M59).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,6 +19,7 @@ use ash::vk;
 
 use crate::kernels::{Kernel, PUSH_CONSTANT_BYTES};
 use crate::memory::Allocation;
+use crate::pacing::{CostKey, Pacing, QueueStats, DEFAULT_MAX_IN_FLIGHT, TIMED_PER_BATCH};
 use crate::{Context, Result};
 
 /// Commands per batch before the stream submits on its own.
@@ -50,18 +55,21 @@ pub fn intel_linux(vendor_id: u32) -> bool {
 
 /// Submissions the stream lets the GPU have queued or running at once
 /// (0: no limit): TORCH_VK_MAX_IN_FLIGHT, by default 2 on Intel GPUs under
-/// Linux ([`intel_linux`]) and 0 elsewhere. Before submitting a batch, the
-/// stream waits until fewer than this many earlier ones are unfinished. With
-/// 2, a batch waits behind at most the one before it, so each finishes within
-/// two batches' time of its submission, while the GPU still has the next
-/// batch queued whenever one finishes. (i915 itself blocks a submission only
-/// once the context's ring is nearly full, a few dozen submissions: on the
-/// HD 530 that let over 20 s of work queue up.)
+/// Linux ([`intel_linux`]) and [`DEFAULT_MAX_IN_FLIGHT`] elsewhere. Before
+/// submitting a batch, the stream waits until fewer than this many earlier
+/// ones are unfinished. With 2, a batch waits behind at most the one before
+/// it, so each finishes within two batches' time of its submission, while the
+/// GPU still has the next batch queued whenever one finishes. (i915 itself
+/// blocks a submission only once the context's ring is nearly full, a few
+/// dozen submissions: on the HD 530 that let over 20 s of work queue up.)
+/// Elsewhere the bound is on the command buffers queued, and the host and
+/// driver memory they hold; the GPU time queued has its own bound
+/// ([`crate::pacing`]).
 pub fn default_max_in_flight(vendor_id: u32) -> u32 {
     std::env::var("TORCH_VK_MAX_IN_FLIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if intel_linux(vendor_id) { 2 } else { 0 })
+        .unwrap_or(if intel_linux(vendor_id) { 2 } else { DEFAULT_MAX_IN_FLIGHT })
 }
 
 /// Microseconds [`Stream::wait`] polls before blocking: 500 on discrete GPUs
@@ -151,14 +159,51 @@ pub struct BarrierStats {
 /// instead about 1.
 const CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A command buffer and the timestamp queries its batch uses (null where the
+/// stream does not time kernels).
+#[derive(Clone, Copy)]
+struct Slot {
+    cb: vk::CommandBuffer,
+    queries: vk::QueryPool,
+}
+
+/// What the stream estimates and times of a batch ([`crate::pacing`]).
+#[derive(Default)]
+struct BatchCost {
+    /// Estimated GPU time (ns) of its kernels whose class was timed before.
+    ns: f64,
+    /// Its kernels of classes not timed yet: (class, workgroups).
+    unknown: Vec<(CostKey, u64)>,
+    /// The kernels it times, in query order: (class, workgroups).
+    timed: Vec<(CostKey, u64)>,
+}
+
+impl BatchCost {
+    /// Moves the kernels whose class has since been timed into the estimate.
+    fn refresh(&mut self, pacing: &Pacing) {
+        if self.unknown.is_empty() {
+            return;
+        }
+        let ns = &mut self.ns;
+        self.unknown.retain(|&(k, g)| match pacing.costs.estimate(k, g) {
+            Some(e) => {
+                *ns += e;
+                false
+            }
+            None => true,
+        });
+    }
+}
+
 /// A submitted batch not yet retired.
 struct Submission {
     /// The timeline value it signals.
     value: u64,
-    cb: vk::CommandBuffer,
+    slot: Slot,
     /// The exportable fence it signals (null unless the context has `fence_fd`).
     fence: vk::Fence,
     at: std::time::Instant,
+    cost: BatchCost,
 }
 
 pub struct Stream {
@@ -166,14 +211,16 @@ pub struct Stream {
     layout: vk::PipelineLayout,
     pool: vk::CommandPool,
     timeline: vk::Semaphore,
-    recording: Option<vk::CommandBuffer>,
+    recording: Option<Slot>,
+    /// The estimate and timings of the batch being recorded.
+    batch: BatchCost,
     commands: u32,
     bound: vk::Pipeline,
     /// Timeline value signaled by the most recent submission.
     submitted: u64,
     /// Submitted batches not yet retired.
     in_flight: VecDeque<Submission>,
-    spare: Vec<vk::CommandBuffer>,
+    spare: Vec<Slot>,
     spare_fences: Vec<vk::Fence>,
     /// Set once a retired submission's fence carried an error (the kernel
     /// cancelled it): from then on every call fails, as on a lost device.
@@ -204,6 +251,8 @@ pub struct Stream {
     /// transfer stage, so that every write is made visible to both kinds.
     transfers: bool,
     pub stats: BarrierStats,
+    /// Time bounds and kernel-cost estimates ([`crate::pacing`]).
+    pub pacing: Pacing,
 }
 
 // The stream owns its queue: only one stream is created per Context.
@@ -226,12 +275,14 @@ impl Stream {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(if ctx.vendor_id == 0x8086 { INTEL_MAX_BATCH_GROUPS } else { 0 });
             let max_in_flight = default_max_in_flight(ctx.vendor_id);
+            let pacing = Pacing::new(ctx.vendor_id, ctx.timestamp_bits, ctx.timestamp_period);
             Ok(Self {
                 ctx,
                 layout,
                 pool,
                 timeline,
                 recording: None,
+                batch: BatchCost::default(),
                 commands: 0,
                 bound: vk::Pipeline::null(),
                 submitted: 0,
@@ -251,6 +302,7 @@ impl Stream {
                 opaque: false,
                 transfers: false,
                 stats: BarrierStats::default(),
+                pacing,
             })
         }
     }
@@ -282,22 +334,37 @@ impl Stream {
         let ctx = self.ctx.clone();
         let d = &ctx.device;
         let cb = match self.recording {
-            Some(cb) => cb,
+            Some(slot) => slot.cb,
             None => unsafe {
                 self.recycle()?;
-                let cb = match self.spare.pop() {
-                    Some(cb) => cb,
-                    None => d.allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(self.pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(1),
-                    )?[0],
+                let slot = match self.spare.pop() {
+                    Some(slot) => slot,
+                    None => {
+                        let cb = d.allocate_command_buffers(
+                            &vk::CommandBufferAllocateInfo::default()
+                                .command_pool(self.pool)
+                                .level(vk::CommandBufferLevel::PRIMARY)
+                                .command_buffer_count(1),
+                        )?[0];
+                        let queries = if self.pacing.timing {
+                            let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2 * TIMED_PER_BATCH);
+                            match d.create_query_pool(&info, None) {
+                                Ok(q) => q,
+                                Err(e) => {
+                                    d.free_command_buffers(self.pool, &[cb]);
+                                    return Err(e.into());
+                                }
+                            }
+                        } else {
+                            vk::QueryPool::null()
+                        };
+                        Slot { cb, queries }
+                    }
                 };
-                d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-                self.recording = Some(cb);
+                d.begin_command_buffer(slot.cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+                self.recording = Some(slot);
                 self.bound = vk::Pipeline::null();
-                cb
+                slot.cb
             },
         };
         if self.mode.tracked() {
@@ -412,9 +479,17 @@ impl Stream {
         self.last_transfer = Some(transfer);
     }
 
-    fn end_command(&mut self) -> Result<()> {
+    /// Submits the batch once it is long enough: [`Self::max_batch`]
+    /// commands, [`Self::max_batch_groups`] workgroups, or the estimated time
+    /// [`Pacing::max_batch_ns`]; with [`Pacing::measure_first`], also right
+    /// after a kernel whose time is not known yet (`unknown`).
+    fn end_command(&mut self, unknown: bool) -> Result<()> {
         self.commands += 1;
-        if self.commands >= self.max_batch || (self.max_batch_groups > 0 && self.batch_groups >= self.max_batch_groups) {
+        if self.commands >= self.max_batch
+            || (self.max_batch_groups > 0 && self.batch_groups >= self.max_batch_groups)
+            || (self.pacing.max_batch_ns > 0 && self.batch.ns >= self.pacing.max_batch_ns as f64)
+            || (unknown && self.pacing.measure_first)
+        {
             self.flush()?;
         }
         Ok(())
@@ -449,17 +524,45 @@ impl Stream {
         padded[..push.len()].copy_from_slice(push);
 
         let cb = self.begin_command(false, acc)?;
-        self.batch_groups += groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
+        let total = groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
+        self.batch_groups += total;
+        // Its estimated time, and whether to time it: between two
+        // timestamps, the first written once the commands before it have
+        // finished, the second once it has.
+        let key = CostKey::new(kernel.pipeline, total);
+        let (estimate, time) = if self.pacing.timing { self.pacing.costs.note(key, total) } else { (None, false) };
+        let query = match self.recording {
+            Some(slot) if time && (self.batch.timed.len() as u32) < TIMED_PER_BATCH => Some((slot.queries, 2 * self.batch.timed.len() as u32)),
+            _ => None,
+        };
         let d = &self.ctx.device;
         unsafe {
+            if let Some((pool, q)) = query {
+                if q == 0 {
+                    d.cmd_reset_query_pool(cb, pool, 0, 2 * TIMED_PER_BATCH);
+                }
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
+            }
             if self.bound != kernel.pipeline {
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
                 self.bound = kernel.pipeline;
             }
             d.cmd_push_constants(cb, self.layout, vk::ShaderStageFlags::COMPUTE, 0, &padded);
             d.cmd_dispatch(cb, groups[0], groups[1], groups[2]);
+            if let Some((pool, q)) = query {
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q + 1);
+            }
         }
-        self.end_command()
+        if query.is_some() {
+            self.batch.timed.push((key, total));
+            self.pacing.stats.timed += 1;
+        }
+        match estimate {
+            Some(ns) => self.batch.ns += ns,
+            None if self.pacing.timing => self.batch.unknown.push((key, total)),
+            None => {}
+        }
+        self.end_command(estimate.is_none())
     }
 
     /// Queues a copy of `bytes` bytes from `src + src_offset` to `dst + dst_offset`.
@@ -475,7 +578,7 @@ impl Stream {
         let cb = self.begin_command(true, Some(&acc))?;
         let region = vk::BufferCopy::default().src_offset(src.offset + src_offset).dst_offset(dst.offset + dst_offset).size(bytes);
         unsafe { self.ctx.device.cmd_copy_buffer(cb, src.buffer, dst.buffer, &[region]) };
-        self.end_command()
+        self.end_command(false)
     }
 
     /// Queues filling `bytes` bytes at `dst + offset` with the 32-bit pattern
@@ -488,7 +591,7 @@ impl Stream {
         let acc = [Access { lo: dst.address + offset, hi: dst.address + offset + bytes, write: true }];
         let cb = self.begin_command(true, Some(&acc))?;
         unsafe { self.ctx.device.cmd_fill_buffer(cb, dst.buffer, dst.offset + offset, bytes, value) };
-        self.end_command()
+        self.end_command(false)
     }
 
     /// Submits everything recorded so far. Returns the timeline value that
@@ -497,9 +600,11 @@ impl Stream {
         if self.recording.is_none() {
             return Ok(self.submitted);
         }
-        self.limit_in_flight()?;
+        self.pace()?;
         let fence = self.fence()?;
-        let Some(cb) = self.recording.take() else { return Ok(self.submitted) };
+        let Some(slot) = self.recording.take() else { return Ok(self.submitted) };
+        let cb = slot.cb;
+        let cost = std::mem::take(&mut self.batch);
         let d = &self.ctx.device;
         unsafe {
             // Make the batch's writes visible to the host once it completes.
@@ -526,27 +631,89 @@ impl Stream {
             let at = std::time::Instant::now();
             d.queue_submit(self.ctx.queue, &[submit], fence)?;
             self.submitted = value;
-            self.in_flight.push_back(Submission { value, cb, fence, at });
+            self.in_flight.push_back(Submission { value, slot, fence, at, cost });
         }
         self.commands = 0;
         self.batch_groups = 0;
         Ok(self.submitted)
     }
 
-    /// With [`Self::max_in_flight`] set, waits until fewer than that many
-    /// submissions are unfinished, so that the next one can go.
-    fn limit_in_flight(&mut self) -> Result<()> {
-        let max = self.max_in_flight as usize;
-        if max == 0 || self.in_flight.len() < max {
-            return Ok(());
-        }
-        self.recycle()?;
-        if self.in_flight.len() >= max {
-            let value = self.in_flight[self.in_flight.len() - max].value;
+    /// Waits, before the batch being recorded is submitted, until the work
+    /// in flight leaves room for it ([`crate::pacing`]): see
+    /// [`Self::wait_target`]. Never waits with nothing in flight.
+    fn pace(&mut self) -> Result<()> {
+        while self.wait_target().is_some() {
+            // (submissions finished by now may be enough)
+            self.recycle()?;
+            let Some(value) = self.wait_target() else { break };
+            let start = std::time::Instant::now();
             self.wait(value)?;
+            self.pacing.stats.waits += 1;
+            self.pacing.stats.wait_ns += start.elapsed().as_nanos() as u64;
             self.recycle()?;
         }
+        let s = &mut self.pacing.stats;
+        let queued = self.batch.ns + self.in_flight.iter().map(|s| s.cost.ns).sum::<f64>();
+        s.submissions += 1;
+        s.max_queued_ns = s.max_queued_ns.max(queued);
+        s.max_in_flight = s.max_in_flight.max(self.in_flight.len() as u64 + 1);
         Ok(())
+    }
+
+    /// The timeline value to wait for before submitting the batch being
+    /// recorded, if any:
+    /// - with [`Pacing::measure_first`], if the batch has a kernel whose time
+    ///   is not known, the newest earlier batch with one;
+    /// - with [`Self::max_in_flight`] set, the one that leaves fewer than
+    ///   that many in flight;
+    /// - with [`Pacing::max_queued_ns`] set, the oldest one whose finishing
+    ///   leaves the estimated time of the rest, and of this batch, within it.
+    fn wait_target(&mut self) -> Option<u64> {
+        let n = self.in_flight.len();
+        if n == 0 {
+            return None;
+        }
+        self.batch.refresh(&self.pacing);
+        if self.pacing.measure_first && !self.batch.unknown.is_empty() {
+            if let Some(s) = self.in_flight.iter().rev().find(|s| !s.cost.unknown.is_empty()) {
+                return Some(s.value);
+            }
+        }
+        let max = self.max_in_flight as usize;
+        if max > 0 && n >= max {
+            return Some(self.in_flight[n - max].value);
+        }
+        if self.pacing.max_queued_ns > 0 {
+            let limit = self.pacing.max_queued_ns as f64;
+            let mut queued = self.batch.ns + self.in_flight.iter().map(|s| s.cost.ns).sum::<f64>();
+            if queued > limit {
+                for s in &self.in_flight {
+                    queued -= s.cost.ns;
+                    if queued <= limit {
+                        return Some(s.value);
+                    }
+                }
+                return Some(self.in_flight[n - 1].value);
+            }
+        }
+        None
+    }
+
+    /// What the stream's back-pressure has done so far.
+    pub fn queue_stats(&self) -> QueueStats {
+        self.pacing.stats
+    }
+
+    /// Estimated GPU time (ns) of the work submitted and not yet seen
+    /// finished, and of the batch being recorded.
+    pub fn queued_ns(&self) -> f64 {
+        self.batch.ns + self.in_flight.iter().map(|s| s.cost.ns).sum::<f64>()
+    }
+
+    /// Submissions not yet seen finished, and how many of them hold a
+    /// kernel whose time is still unknown.
+    pub fn in_flight(&self) -> (usize, usize) {
+        (self.in_flight.len(), self.in_flight.iter().filter(|s| !s.cost.unknown.is_empty()).count())
     }
 
     /// A fence for the next submission: an unsignalled exportable one where
@@ -638,10 +805,12 @@ impl Stream {
     fn recycle(&mut self) -> Result<()> {
         self.check_cancelled()?;
         let done = self.completed()?;
+        let mut learned = false;
         while self.in_flight.front().is_some_and(|s| s.value <= done) {
             let s = self.in_flight.pop_front().unwrap();
-            unsafe { self.ctx.device.reset_command_buffer(s.cb, vk::CommandBufferResetFlags::empty())? };
-            self.spare.push(s.cb);
+            learned |= self.learn(&s);
+            unsafe { self.ctx.device.reset_command_buffer(s.slot.cb, vk::CommandBufferResetFlags::empty())? };
+            self.spare.push(s.slot);
             if s.fence != vk::Fence::null() {
                 match self.fence_error(&s) {
                     Ok(error) => {
@@ -655,7 +824,33 @@ impl Stream {
                 }
             }
         }
+        if learned {
+            for s in self.in_flight.iter_mut() {
+                s.cost.refresh(&self.pacing);
+            }
+        }
         self.check_cancelled()
+    }
+
+    /// Learns the times of the kernels a finished submission timed; whether
+    /// it timed any.
+    fn learn(&mut self, s: &Submission) -> bool {
+        let n = s.cost.timed.len();
+        if n == 0 || s.slot.queries == vk::QueryPool::null() {
+            return false;
+        }
+        let mut ticks = [0u64; 2 * TIMED_PER_BATCH as usize];
+        let ticks = &mut ticks[..2 * n];
+        // (the submission has finished, so its results are available; if a
+        // driver says otherwise, they are skipped)
+        if unsafe { self.ctx.device.get_query_pool_results(s.slot.queries, 0, ticks, vk::QueryResultFlags::TYPE_64) }.is_err() {
+            return false;
+        }
+        for (i, &(key, groups)) in s.cost.timed.iter().enumerate() {
+            let ns = self.pacing.elapsed_ns(ticks[2 * i], ticks[2 * i + 1]);
+            self.pacing.costs.learn(key, groups, ns);
+        }
+        true
     }
 }
 
@@ -671,9 +866,14 @@ impl Drop for Stream {
             let d = &self.ctx.device;
             for s in self.in_flight.drain(..) {
                 self.spare_fences.push(s.fence);
+                self.spare.push(s.slot);
             }
+            self.spare.extend(self.recording.take());
             for f in self.spare_fences.drain(..).filter(|&f| f != vk::Fence::null()) {
                 d.destroy_fence(f, None);
+            }
+            for q in self.spare.drain(..).map(|s| s.queries).filter(|&q| q != vk::QueryPool::null()) {
+                d.destroy_query_pool(q, None);
             }
             d.destroy_command_pool(self.pool, None);
             d.destroy_semaphore(self.timeline, None);

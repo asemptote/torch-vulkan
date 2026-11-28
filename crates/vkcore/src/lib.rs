@@ -10,6 +10,7 @@ pub mod context;
 pub mod declare;
 pub mod kernels;
 pub mod memory;
+pub mod pacing;
 pub mod spirv_fix;
 pub mod stream;
 pub mod wide_address;
@@ -20,6 +21,7 @@ pub use context::{last_validation_message, validation_issues, validation_request
 pub use kernels::{kernel_subgroup_size, Kernel, KernelCache, PUSH_CONSTANT_BYTES};
 pub use declare::Declared;
 pub use memory::{Allocation, Placement, Pool, PoolStats};
+pub use pacing::QueueStats;
 pub use stream::{Access, BarrierMode, BarrierStats, Stream};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
